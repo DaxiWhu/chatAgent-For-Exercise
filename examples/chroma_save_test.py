@@ -1,17 +1,20 @@
 # 功能说明：将PDF文件进行向量计算并持久化存储到向量数据库（chroma）
+# 注意：这是教程原型脚本，不属于生产链路；所需依赖为 openai / chromadb / pdfminer.six
+#      运行：python -m examples.chroma_save_test
 
 # 相关依赖库
-# pip install openai chromadb
+# pip install openai chromadb pdfminer.six
 
 
 # 引入相关库
+import os
 import logging
 from openai import OpenAI
 import chromadb
 import uuid
 import numpy as np
-from tools import pdfSplitTest_Ch
-from tools import pdfSplitTest_En
+from examples import pdf_split_zh as pdfSplitTest_Ch
+from examples import pdf_split_en as pdfSplitTest_En
 
 
 # 设置日志模版
@@ -20,31 +23,32 @@ logger = logging.getLogger(__name__)
 
 
 # 模型设置相关  根据自己的实际情况进行调整
-API_TYPE = "oneapi"  # openai:调用gpt模型；oneapi:调用oneapi方案支持的模型(这里调用通义千问)
+API_TYPE = os.getenv("EMB_API_TYPE", "oneapi")  # openai:调用gpt模型；oneapi:调用oneapi方案支持的模型(这里调用通义千问)
 
-# openai模型相关配置 根据自己的实际情况进行调整
-OPENAI_API_BASE = "https://api.wlai.vip/v1"
-OPENAI_EMBEDDING_API_KEY = "sk-t9pOWmiGVE02RBH88e87Eb8aE282471291F34640E787C2C6"
-OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
-# oneapi相关配置(通义千问为例) 根据自己的实际情况进行调整
-ONEAPI_API_BASE = "http://139.224.72.218:3000/v1"
-ONEAPI_EMBEDDING_API_KEY = "sk-aFXNklkEVj0McTUf6bA4EcC2F1B84c9aB2DeB494A1EbF87c"
-ONEAPI_EMBEDDING_MODEL = "text-embedding-v1"
+# openai / oneapi 相关配置：一律从环境变量读取，禁止把密钥写进代码
+# 需要在 .env 或系统环境变量中提供：
+#   OPENAI_API_BASE / OPENAI_EMBEDDING_API_KEY / OPENAI_EMBEDDING_MODEL
+#   ONEAPI_API_BASE / ONEAPI_EMBEDDING_API_KEY / ONEAPI_EMBEDDING_MODEL
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "")
+OPENAI_EMBEDDING_API_KEY = os.getenv("OPENAI_EMBEDDING_API_KEY", "")
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+ONEAPI_API_BASE = os.getenv("ONEAPI_API_BASE", "")
+ONEAPI_EMBEDDING_API_KEY = os.getenv("ONEAPI_EMBEDDING_API_KEY", "")
+ONEAPI_EMBEDDING_MODEL = os.getenv("ONEAPI_EMBEDDING_MODEL", "text-embedding-v1")
 
 # 设置测试文本类型
-TEXT_LANGUAGE = 'Chinese'  #Chinese 或 English
+TEXT_LANGUAGE = os.getenv("TEXT_LANGUAGE", "Chinese")  #Chinese 或 English
 # TEXT_LANGUAGE = 'English'  #Chinese 或 English
-# 测试的pdf文件路径
-INPUT_PDF = "input/健康档案.pdf"
-# INPUT_PDF = "input/llama2.pdf"
+# 测试的pdf文件路径（请自行放入 examples/input/ 或改成实际路径）
+INPUT_PDF = os.getenv("INPUT_PDF", "examples/input/健康档案.pdf")
+# INPUT_PDF = "examples/input/llama2.pdf"
 # 指定文件中待处理的页码，全部页码则填None
 PAGE_NUMBERS=None
 # PAGE_NUMBERS=[2, 3]
 
 # 指定向量数据库chromaDB的存储位置和集合 根据自己的实际情况进行调整
-CHROMADB_DIRECTORY = "chromaDB"  # chromaDB向量数据库的持久化路径
-CHROMADB_COLLECTION_NAME = "demo001"  # 待查询的chromaDB向量数据库的集合名称
-# CHROMADB_COLLECTION_NAME = "demo002"  # 待查询的chromaDB向量数据库的集合名称
+CHROMADB_DIRECTORY = os.getenv("CHROMADB_DIRECTORY", "chromaDB")  # chromaDB向量数据库的持久化路径
+CHROMADB_COLLECTION_NAME = os.getenv("CHROMADB_COLLECTION_NAME", "demo001")  # 待查询的chromaDB向量数据库的集合名称
 
 
 # get_embeddings方法计算向量

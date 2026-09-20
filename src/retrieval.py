@@ -5,14 +5,15 @@
 - 生成：复用 chatAgent 里的 ChatOpenAI + agnes 后端
 - 切分：langchain 的 RecursiveCharacterTextSplitter
 
-运行：
-    python rag.py --docs docs --question "你的提问"
-    python rag.py --make-sample        # 先生成一份示例文档
-    python rag.py --docs docs          # 不传 question 会用内置示例问题
+运行（在项目根目录执行）：
+    python -m src.retrieval --docs data --question "你的提问"
+    python -m src.retrieval --make-sample        # 先生成一份示例文档
+    python -m src.retrieval --docs data          # 不传 question 会用内置示例问题
 
 说明：
 - 默认用 TF-IDF 关键词检索，足够简单场景。若要更强的语义检索，
   把下方 EMBEDDING_BACKEND 改成 "openai" 并确保 agnes 支持 /v1/embeddings。
+- 本文件原名 rag.py，为消除与教程目录 rag/ 的同名冲突而迁入 src/ 并改名。
 """
 
 import os
@@ -34,7 +35,12 @@ TOP_K = 3
 
 # ---------- 1. 加载文档 ----------
 def load_documents(doc_folder: str):
-    """读取目录下所有 .txt / .md 文件，返回 [(文件名, 文本), ...]"""
+    """读取目录下所有 .txt / .md 文件，返回 [(文件名, 文本), ...]
+
+    目录不存在或未配置时返回空列表（不抛异常），由调用方决定降级策略。
+    """
+    if not doc_folder or not os.path.isdir(doc_folder):
+        return []
     texts = []
     files = glob.glob(os.path.join(doc_folder, "**", "*"), recursive=True)
     for f in files:
@@ -104,7 +110,20 @@ class OpenAIRetriever:
         return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
 
+class NullRetriever:
+    """无语料 / 未配置 DOCS_DIR 时的空检索器：永远返回空结果。
+
+    作用是把「没配知识库」变成正常降级，而不是让 TF-IDF 在空语料上抛
+    ValueError（empty vocabulary）之后把整张图带崩。
+    """
+
+    def search(self, query, top_k=TOP_K):
+        return []
+
+
 def build_retriever(chunks):
+    if not chunks:
+        return NullRetriever()
     if EMBEDDING_BACKEND == "openai":
         return OpenAIRetriever(chunks)
     return TfidfRetriever(chunks)
@@ -132,7 +151,7 @@ def answer(question, retriever, model):
 
 
 # ---------- 示例 ----------
-def make_sample_docs(folder="docs"):
+def make_sample_docs(folder="data"):
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, "intro.txt")
     with open(path, "w", encoding="utf-8") as f:
@@ -148,7 +167,7 @@ def make_sample_docs(folder="docs"):
 
 def main():
     parser = argparse.ArgumentParser(description="简单 RAG 示例")
-    parser.add_argument("--docs", default="docs", help="文档目录")
+    parser.add_argument("--docs", default="data", help="文档目录")
     parser.add_argument("--question", default=None, help="提问（不填用内置示例）")
     parser.add_argument("--make-sample", action="store_true", help="生成示例文档")
     args = parser.parse_args()

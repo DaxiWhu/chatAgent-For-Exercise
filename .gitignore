@@ -72,5 +72,11 @@ htmlcov/
 Thumbs.db
 Desktop.ini
 
+# ---- 临时产物 / 本地数据 ----
+.verify.out
+*.verify.out
+chromaDB/
+examples/input/
+
 # ---- WorkBuddy project data (do not delete, but usually not committed) ----
 .workbuddy/

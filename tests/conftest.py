@@ -13,6 +13,22 @@ if ROOT not in sys.path:
 from src.graph import build_graph, ReviewResult  # noqa: E402
 
 
+class FakeRetriever:
+    """假检索器：可指定返回值，避免测试真的去读语料 / 跑 TF-IDF。"""
+
+    def __init__(self, hits=None):
+        self.hits = hits if hits is not None else []
+
+    def search(self, query, top_k=3):
+        return self.hits
+
+
+@pytest.fixture
+def fake_retriever():
+    """默认不召回任何片段（等价于未配置知识库的降级路径）。"""
+    return FakeRetriever()
+
+
 @pytest.fixture
 def mock_model():
     """用 MagicMock 模拟 ChatOpenAI：generate 返回草稿，evaluate 返回合法评分。"""
@@ -26,5 +42,5 @@ def mock_model():
 
 
 @pytest.fixture
-def graph(mock_model):
-    return build_graph(model=mock_model)
+def graph(mock_model, fake_retriever):
+    return build_graph(model=mock_model, retriever=fake_retriever)

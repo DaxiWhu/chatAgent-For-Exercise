@@ -1,3 +1,4 @@
+# ---- 核心运行时 ----
 langgraph>=0.3
 langgraph-checkpoint-postgres>=2
 langchain-openai>=0.3
@@ -6,8 +7,23 @@ langchain-text-splitters>=0.3
 psycopg>=3.2
 pydantic>=2.7
 python-dotenv>=1.0
+
+# ---- 服务化 ----
 fastapi>=0.110
 uvicorn>=0.30
 sse-starlette>=2.1
+
+# ---- RAG 检索（src/retrieval.py）----
 scikit-learn>=1.4
 numpy>=1.26
+
+# ---- 测试 ----
+pytest>=8.0
+httpx>=0.27           # fastapi.testclient（tests/test_api.py）依赖
+
+# ---- examples/ 教程原型专用（不参与生产，按需安装）----
+# 安装示例脚本依赖：pip install -r requirements.txt pdfminer.six nltk chromadb openai
+# pdfminer.six>=20231228   # examples/pdf_split_*.py 解析 PDF
+# nltk>=3.8                # examples/pdf_split_en.py 英文断句
+# chromadb>=0.5            # examples/chroma_save_test.py 向量库
+# openai>=1.30             # examples/chroma_save_test.py embedding 接口
