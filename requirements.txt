@@ -13,17 +13,27 @@ fastapi>=0.110
 uvicorn>=0.30
 sse-starlette>=2.1
 
-# ---- RAG 检索（src/retrieval.py）----
+# ---- RAG：检索（src/retrieval.py）----
 scikit-learn>=1.4
 numpy>=1.26
 
+# ---- RAG：文档解析（src/loaders.py + src/pdf_parser.py）----
+pdfminer.six>=20231228       # .pdf
+python-docx>=1.1             # .docx
+openpyxl>=3.1                # .xlsx / .xlsm
+python-pptx>=0.6             # .pptx
+beautifulsoup4>=4.12         # .html / .htm
+lxml>=5.0                    # bs4 的解析后端
+# .txt/.md/.csv/.tsv/.json/.jsonl 用标准库，无需额外依赖
+
 # ---- 测试 ----
 pytest>=8.0
-httpx>=0.27           # fastapi.testclient（tests/test_api.py）依赖
+httpx>=0.27                  # fastapi.testclient（tests/test_api.py）依赖
+
+# ---- 可选：装了更准，不装也能跑（自动回退标点正则）----
+# nltk>=3.8                  # 英文断句更准；未安装/无 punkt 数据时回退正则
 
 # ---- examples/ 教程原型专用（不参与生产，按需安装）----
-# 安装示例脚本依赖：pip install -r requirements.txt pdfminer.six nltk chromadb openai
-# pdfminer.six>=20231228   # examples/pdf_split_*.py 解析 PDF
-# nltk>=3.8                # examples/pdf_split_en.py 英文断句
+# 安装示例脚本依赖：pip install chromadb openai
 # chromadb>=0.5            # examples/chroma_save_test.py 向量库
 # openai>=1.30             # examples/chroma_save_test.py embedding 接口

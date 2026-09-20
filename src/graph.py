@@ -19,7 +19,7 @@ from langgraph.types import interrupt
 from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel, Field, ValidationError, ConfigDict
 
-from .retrieval import load_documents, split_documents, build_retriever
+from .retrieval import load_chunks, build_retriever
 
 # ----------------------------------------------------------------------------
 # 常量
@@ -85,10 +85,10 @@ _RETRIEVER = None
 def get_retriever():
     global _RETRIEVER
     if _RETRIEVER is None:
-        docs = load_documents(DOCS_DIR)
-        chunks = split_documents(docs)
+        # load_chunks 统一处理 .txt/.md（递归切分）与 .pdf（pdfminer + 句子级交叠切块）
+        chunks = load_chunks(DOCS_DIR)
         _RETRIEVER = build_retriever(chunks)
-        logging.info("RAG 检索器构建完成：%d 篇文档 / %d 个片段", len(docs), len(chunks))
+        logging.info("RAG 检索器构建完成：%d 个片段（DOCS_DIR=%s）", len(chunks), DOCS_DIR)
     return _RETRIEVER
 
 

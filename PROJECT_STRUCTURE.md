@@ -24,6 +24,17 @@
 
 > ⚠️ 遗留提示：分析时 8000 端口上仍有一个**旧实例**（PID 3744）在跑迁移前的代码，需要用新命令重启才会生效。
 
+### 增量更新（2026-09-20 之后）
+
+| 变更 | 说明 |
+|------|------|
+| 新增 `src/pdf_parser.py` | 收编教程 `examples/pdf_split_*.py`，修掉硬编码路径、中文插空格、`punkt_tab` 缺失必崩三个问题 |
+| 新增 `tests/test_retrieval.py`、`tests/test_pdf_parser.py` | 检索层与 PDF 解析的离线回归测试（PDF 由测试现场生成） |
+| `src/retrieval.py` 新增 `load_chunks()` | 统一语料入口，按扩展名分派：`.txt/.md` 递归切分、`.pdf` 走教程链路 |
+| `src/graph.py` 的 `get_retriever()` | 改调 `load_chunks()`，PDF 因此进入 RAG |
+| embedding 与 LLM 解耦 | 新增 `EMBEDDING_API_BASE/KEY/MODEL` 三个环境变量，LLM 仍走 `AGNES_*` |
+| 修 bug | TF-IDF 中文检索失效（改字符 n-gram）、`build_prompt` 解包错误、`retrieval.py` 缺 `load_dotenv` |
+
 ---
 
 ## 一、结论速览（问题清单 —— 状态见上方执行记录）
