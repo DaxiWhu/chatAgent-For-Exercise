@@ -104,10 +104,37 @@ human_review → END（accept）| generate（revise，带人工意见重写）
 | `EMBEDDING_MODEL` | 否 | embedding 模型名 |
 | `EMBEDDING_BATCH` | 否 | 单次请求条数，默认 `10`（各家上限不同：百炼约 10，硅基流动可更大） |
 | `EMBEDDING_QUERY_PREFIX` | 否 | 查询侧指令前缀，默认空。BGE 系模型对此敏感（实测 bge-m3：无前缀 38% → 英文指令 62%） |
-| `RAG_EMBEDDING` | 否 | `tfidf`（默认，纯本地）或 `semantic`（用上面的 embedding） |
+| `RAG_EMBEDDING` | 否 | 检索后端：`tfidf`（纯本地关键词）/ `semantic`（embedding 向量）/ `hybrid`（双路 RRF 融合） |
+| `RAG_CHUNK_STRATEGY` | 否 | `headings`（默认，按 Markdown 标题切且标题路径入块）/ `recursive` |
+| `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` | 否 | 块大小（默认 300 字符）与重叠（默认 50） |
+| `RAG_HYBRID_POOL` | 否 | hybrid 每一路各取多少条候选送入融合，默认 10 |
+| `RERANK_MODEL` | 否 | 填了就在 hybrid 上挂一层精排（失败自动回退到融合顺序）；留空则关闭 |
 
-> `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` 没填满时，`RAG_EMBEDDING=semantic` 会**自动回退 TF-IDF**
+> `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` 没填满时，`RAG_EMBEDDING=semantic|hybrid` 会**自动回退 TF-IDF**
 > 并打一条 WARNING，服务不会因配置缺失而崩。
+
+## 检索质量评测
+
+```bash
+python -m scripts.eval_retrieval              # 完整对比（每个组合会逐条发请求，较慢）
+python -m scripts.eval_quick                  # 快速版：批量算查询向量，秒级返回
+python -m scripts.eval_retrieval --show-miss  # 打印未命中明细，便于定位问题
+```
+
+评测集在 `scripts/eval_set.json`，把 `documents` 换成你自己的语料、`queries` 换成你真会问的问题即可。
+**务必保留 `type` 字段**：`literal`（照抄原文词）与 `paraphrase`（换种说法）必须分开统计——
+混在一起会得出「关键词就够用」的错误结论。
+
+实测参考（28 条中文查询 / 6 篇共 17 个片段，bge-m3）：
+
+| 后端 | 整体 Top1 | 照抄 Top1 | 改写 Top1 |
+|------|-----------|-----------|-----------|
+| tfidf | **75%** | **100%** | 42% |
+| hybrid + 前缀 | 61% | 75% | 42% |
+| semantic + 前缀 | 39% | 50% | 25% |
+
+结论：**小语料、查询多照抄原文词时关键词最强**；把切分从「递归 500」改成「结构感知 300」后，
+tfidf 照抄 Top1 由 88% → 100%。语义检索的价值要在文档变长、说法差异大时才体现出来。
 
 ## 说明
 
