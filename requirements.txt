@@ -1,0 +1,13 @@
+langgraph>=0.3
+langgraph-checkpoint-postgres>=2
+langchain-openai>=0.3
+langchain-community>=0.3
+langchain-text-splitters>=0.3
+psycopg>=3.2
+pydantic>=2.7
+python-dotenv>=1.0
+fastapi>=0.110
+uvicorn>=0.30
+sse-starlette>=2.1
+scikit-learn>=1.4
+numpy>=1.26
