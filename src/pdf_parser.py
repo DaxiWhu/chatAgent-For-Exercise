@@ -1,12 +1,16 @@
 """PDF 解析：从教程 examples/pdf_split_zh.py / pdf_split_en.py 收编并清理。
 
-相对教程版本修掉了三个问题：
+相对教程版本修掉了五个问题：
 1. 教程英文版 `nltk.data.path.append('../other/punkt_tab')` —— 该目录并不存在，
    一跑就崩。这里改为「优先 nltk，缺失自动回退标点正则」，不再依赖外部数据目录。
 2. 教程在拼接行时无条件加空格，中文会被拼成「梧州 是 广西」这种断字；
    这里按字符判断，中文之间不加空格。
 3. 教程把文件名/页码/语言全写死在模块级、`__main__` 里硬编码 PDF 路径；
    这里全部改成函数参数，可复用、可测试。
+4. 原用 `"".join(容器)` 拼接，容器边界只剩一个 \\n，导致「空行」永远不出现，
+   段落层实际失效（整页永远 1 段）。改为容器之间插入空行。
+5. 短行分支原先只做断段、把该行本身直接丢弃，`min_line_length>1` 时会静默丢正文；
+   改为「非空短行先并入再断段」。
 
 流程（与教程一致）：pdfminer 提文本 → 短行断段重组成段落 → 句子级交叠切块。
 """
@@ -51,6 +55,11 @@ def extract_pdf_text(path: str, page_numbers=None) -> str:
     """用 pdfminer 提取 PDF 文本（按页顺序拼接）。
 
     page_numbers: 可选的页码集合（0 基），None 表示全部页。
+
+    容器（LTTextContainer）之间用【空行】分隔——这一点很关键：
+    pdfminer 已经按垂直间距把文字切成了「段落级」容器，如果直接用 "" 拼接，
+    容器边界只会剩一个 \\n，下游的 rebuild_paragraphs 就再也分不出段落了
+    （实测两个视觉上明显分开的段落会被合并成 1 段）。
     """
     from pdfminer.high_level import extract_pages
     from pdfminer.layout import LTTextContainer
@@ -61,38 +70,57 @@ def extract_pdf_text(path: str, page_numbers=None) -> str:
             continue
         for element in page_layout:
             if isinstance(element, LTTextContainer):
-                parts.append(element.get_text())
-    return "".join(parts)
+                text = element.get_text()
+                if text.strip():                      # 跳过纯空白容器
+                    parts.append(text.strip("\n"))    # 只去首尾换行，保留容器内部换行
+    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
 # 2. 段落重组（纯函数，便于单测）
 # ---------------------------------------------------------------------------
+def _absorb_line(prev: str, line: str, join_no_space: bool) -> tuple[str, bool]:
+    """把一行并入缓冲区，返回 (新缓冲区, 下一行是否要无缝续接)。
+
+    join_no_space=True 表示上一行以连字符结尾（断词），当前行必须直接贴上：
+    走 _join 会补一个空格，把 example 拼成 exam ple。
+    """
+    merged = prev + line if (join_no_space and prev) else _join(prev, line)
+    if merged.endswith("-"):
+        return merged[:-1], True     # 去掉行尾连字符，并标记下一行无缝续接
+    return merged, False
+
+
 def rebuild_paragraphs(full_text: str, min_line_length: int = 1) -> list[str]:
     """把逐行文本重组成段落。
 
-    启发式（沿用教程思路）：长度 >= min_line_length 的行并入当前缓冲区；
-    遇到短行（通常是空行）就把缓冲区吐出一个段落。行尾连字符会被去掉。
+    判据只有一条：行的长度是否 >= min_line_length。
+      - 长行 → 并入当前缓冲区（排版换行被消除）
+      - 短行 → 断段。但要区分两种短行：
+          1) 空行 / 纯空白行 = 段落分隔 → 只断段
+          2) 段落的最后一行（有内容但短）→ 仍属当前段落 → 先并入再断段
+
+    注意：默认 min_line_length=1 时，只有【严格空行】算短行，行为等价于
+    「空行 = 段落分隔」；把 min_line_length 调大则会启用「短行 = 段落结束」启发式，
+    该启发式会双向出错（段落末行排得满→漏检；表格/标题等短行→误检），故不建议调整。
     """
     paragraphs: list[str] = []
     buf = ""
-    # 上一行以连字符结尾 → 当前行要无缝接上（exam- + ple -> example），不能补空格
     join_no_space = False
 
     for line in full_text.split("\n"):
         if len(line) >= min_line_length:
-            if join_no_space and buf:
-                buf = buf + line
+            buf, join_no_space = _absorb_line(buf, line, join_no_space)
+        else:
+            # 短行若含实际内容（段落最后一行），必须先并入缓冲区——
+            # 早期版本这里只做 flush、直接丢掉了这一行，在 min_line_length>1 时
+            # 会静默丢正文（实测同一段文字 147 字变成 142 字）。
+            if line.strip():
+                buf, join_no_space = _absorb_line(buf, line, join_no_space)
+            if buf:
+                paragraphs.append(buf)
+                buf = ""
                 join_no_space = False
-            else:
-                buf = _join(buf, line)
-            if buf.endswith("-"):
-                buf = buf[:-1]
-                join_no_space = True
-        elif buf:
-            paragraphs.append(buf)
-            buf = ""
-            join_no_space = False
 
     if buf:
         paragraphs.append(buf)

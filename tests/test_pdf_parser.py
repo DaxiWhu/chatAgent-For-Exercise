@@ -198,3 +198,133 @@ def test_load_chunks_skips_corrupt_pdf(tmp_path):
     chunks = load_chunks(str(tmp_path))
     assert chunks
     assert {c["source"] for c in chunks} == {"good.md"}
+
+
+# ---------------------------------------------------------------------------
+# 回归：容器之间必须产生空行（否则段落层永远失效）
+# ---------------------------------------------------------------------------
+def make_pdf_blocks(path, blocks):
+    """生成含多个【垂直间隔明显】文本块的 PDF，模拟多个段落。
+
+    pdfminer 会按垂直间距把它们分成多个 LTTextContainer。
+    """
+    content = "BT /F1 12 Tf\n"
+    y = 720
+    for block in blocks:
+        for ln in block:
+            content += f"1 0 0 1 72 {y} Tm ({ln}) Tj\n"
+            y -= 14
+        y -= 30                      # 块之间的大间隔 → 触发 pdfminer 分组
+    content += "ET\n"
+    cb = content.encode("latin-1")
+
+    objs = [
+        b"<</Type /Catalog /Pages 2 0 R>>",
+        b"<</Type /Pages /Kids [3 0 R] /Count 1>>",
+        b"<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Contents 4 0 R /Resources <</Font <</F1 5 0 R>>>>>>",
+        b"<</Length " + str(len(cb)).encode() + b">>stream\n" + cb + b"endstream",
+        b"<</Type /Font /Subtype /Type1 /BaseFont /Helvetica>>",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref_at = len(out)
+    n = len(objs) + 1
+    out += f"xref\n0 {n}\n".encode() + b"0000000000 65535 f \n"
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += b"trailer\n<</Size " + str(n).encode() + b" /Root 1 0 R>>\n"
+    out += b"startxref\n" + str(xref_at).encode() + b"\n%%EOF\n"
+
+    with open(path, "wb") as fh:
+        fh.write(bytes(out))
+    return path
+
+
+@pytest.fixture
+def two_block_pdf(tmp_path):
+    return make_pdf_blocks(tmp_path / "two.pdf", [
+        ["Paragraph ONE line one.", "Paragraph ONE line two."],
+        ["Paragraph TWO line one.", "Paragraph TWO line two."],
+    ])
+
+
+def test_extract_pdf_text_separates_containers_with_blank_line(two_block_pdf):
+    """回归：容器之间必须留出空行。
+
+    早期用 `"".join(parts)` 拼接，容器边界只剩一个 \\n，「空行」永远不出现，
+    段落层实际失效（整页永远合成 1 段）。
+    """
+    text = extract_pdf_text(str(two_block_pdf))
+    assert "\n\n" in text, f"容器之间没有空行：{text!r}"
+    # 空行在 split 之后应表现为空字符串元素
+    assert "" in text.split("\n")
+
+
+def test_two_block_pdf_becomes_two_paragraphs(two_block_pdf):
+    """端到端：两个容器 → rebuild_paragraphs 应得到 2 段（修复前是 1 段）。"""
+    paras = rebuild_paragraphs(extract_pdf_text(str(two_block_pdf)), 1)
+    assert len(paras) == 2, f"应切成 2 段，实际 {len(paras)} 段：{paras}"
+    assert "Paragraph ONE" in paras[0]
+    assert "Paragraph TWO" in paras[1]
+    # 两段之间不应互相污染
+    assert "Paragraph TWO" not in paras[0]
+    assert "Paragraph ONE" not in paras[1]
+
+
+def test_extract_pdf_paragraphs_on_two_blocks(two_block_pdf):
+    paras = extract_pdf_paragraphs(str(two_block_pdf))
+    assert len(paras) == 2
+
+
+# ---------------------------------------------------------------------------
+# 回归：短行有内容时不能丢
+# ---------------------------------------------------------------------------
+def test_rebuild_paragraphs_keeps_short_line_content():
+    """回归：min_line_length>1 时，被判为「短行」的那一行内容不能丢。
+
+    早期实现只 flush 缓冲区、把短行本身丢弃，实测同一段文字 147 字变 142 字。
+    """
+    text = "一段很长的正文内容凑够十五个字以上\n短行。"
+    paras = rebuild_paragraphs(text, min_line_length=15)
+    assert len(paras) == 1
+    assert "短行。" in paras[0], f"短行内容被丢弃了：{paras}"
+
+
+def test_rebuild_paragraphs_preserves_all_characters():
+    """长度守恒：重组只应改变空白，不能凭空少字。
+
+    这条断言能直接抓住「静默丢内容」类 bug。
+    """
+    text = ("梧州是广西壮族自治区下辖的地级市，位于广西东部，\n"
+            "地处西江、桂江、贺江三江汇流之处。\n"
+            "历史\n"
+            "梧州以人工宝石产业闻名。")
+    for mll in (1, 5, 15, 30):
+        paras = rebuild_paragraphs(text, min_line_length=mll)
+        src = "".join(text.split())          # 去掉所有空白后的字符数
+        out = "".join("".join(paras).split())
+        assert len(out) == len(src), (
+            f"mll={mll} 丢字了：原文 {len(src)} 字，重组后 {len(out)} 字\n{paras}"
+        )
+
+
+def test_rebuild_paragraphs_short_line_only_becomes_own_paragraph():
+    """缓冲区为空时遇到有内容的短行 → 它自己成为一段（而不是消失）。"""
+    paras = rebuild_paragraphs("正文正文正文正文正文\n短。", min_line_length=15)
+    assert len(paras) == 2
+    assert paras[1] == "短。"
+
+
+def test_whitespace_line_is_not_a_paragraph_break(tmp_path):
+    """带空格的行不算「空行」（mll=1 时其长度 ≥1，走长行分支被并入）。
+
+    「空行」必须严格为零字符。这解释了为什么「原文的空行其实带空格」时
+    整篇会被合成一段——这也是实际 PDF 抽取里很常见的坑。
+    """
+    paras = rebuild_paragraphs("第一段\n   \n第二段", min_line_length=1)
+    assert len(paras) == 1                                    # 没有被断开
+    assert "".join(paras).replace(" ", "") == "第一段第二段"    # 但内容一个不少
