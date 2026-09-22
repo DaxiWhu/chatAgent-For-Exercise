@@ -55,6 +55,21 @@ TOKENIZER_MODE = os.getenv("BGE_TOKENIZER", "hf").strip().lower()    # hf | tikt
 TOKENIZER_MODEL = os.getenv("EMBEDDING_MODEL", "").strip() or "BAAI/bge-m3"
 IMAGES_SCALE = float(os.getenv("DOCLING_IMAGES_SCALE", "2.0") or 2.0)
 
+# ---- 原页截图（供用户回溯核对）----
+# auto（默认，PDF 开）| on | off
+# 要求：**PDF 要把"从哪儿看到的"连同原图一起返回**；纯文字块不必（没必要，可靠性优先），
+# 但扫描件必须给原图 —— 扫描件上"原文"就是那张图，OCR 文字只是它的近似转写。
+# ⚠️ 代价：整页位图常驻内存（每页一张）。大文件批量灌库内存吃紧时设 off，
+# 此时引用里仍有 页码 + 坐标 + 保真文本，只是没有图。
+DOCLING_PAGE_IMAGES = os.getenv("DOCLING_PAGE_IMAGES", "auto").strip().lower()
+# 裁剪时向外扩的边距（PDF 点）。太小会把贴着 bbox 的表格边框切掉，
+# 让人对不上"这到底是原文里的哪一块"。
+CITE_IMAGE_MARGIN = float(os.getenv("RAG_CITE_IMAGE_MARGIN", "8") or 8)
+# 值得返回原图的块类型；纯文字块不返回。
+CITE_IMAGE_KINDS = {"table", "chart", "diagram", "formula"}
+# 原始 bbox 的最小可信面积（pt²）：低于它认为这个元素的位置不可信，宁可不给图
+_MIN_BBOX_AREA_PT = 4.0
+
 # ---- OCR（批次7：中文扫描件）----
 # ⚠️ **必须显式配**，不能依赖库的默认值：
 # docling 2.129 的 RapidOcrOptions.lang 默认恰好是 ['ch']，中文能"碰巧跑对"；
@@ -167,6 +182,167 @@ class _CharTokenizer:
 
     def get_tokenizer(self) -> Any:
         return None
+
+
+def _unprocessable_with_page(doc: Any, source: str, why: str,
+                             page_total: Optional[int], path: str):
+    """解析不出内容的**显式失败记录**，并且尽量带上原页图。
+
+    为什么这类记录也要给图：解析不出内容最常见的原因就是**扫描件 OCR 读不出来**
+    （歪斜、低对比、手写、纯图无文字）。这恰恰是最需要人打开原图看一眼的时候 ——
+    只回一句"未取到任何内容"，用户既不知道文件是不是坏的，也无从核对。
+    """
+    from .knowledge_chunk import unprocessable
+
+    kc = unprocessable(source, why, parser="docling", page_total=page_total)
+    if not _want_page_images():
+        return kc
+    pages = getattr(doc, "pages", None) or {}
+    try:
+        page_no = sorted(pages.keys())[0]
+        pil = _page_pil(pages[page_no])
+        if pil is None:
+            return kc
+        from .docx_media import media_dir_for
+        dest = os.path.join(media_dir_for(path), f"p{page_no:03d}_cite01.png")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        pil.save(dest, "PNG")
+        kc.page = page_no
+        kc.page_image = dest
+        logger.info("未能解析出内容，但已附上原页图供人工核对：%s → %s", source, dest)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("失败记录附原页图未成功：%s（%s）", source, exc)
+    return kc
+
+
+def _want_page_images() -> bool:
+    """是否要生成整页位图（引用里返回原图的前提）。auto/on → 开。"""
+    return DOCLING_PAGE_IMAGES not in ("off", "false", "0", "no")
+
+
+def _attach_cite_images(doc: Any, chunks: list, path: str, scanned: bool) -> int:
+    """给需要"看原图"的块裁出原页截图，写进 `page_image`。返回产出数量。
+
+    规则（对应需求的三种情况）：
+      - **扫描件**：整页原图。扫描件上原文**就是那张图**，OCR 文字只是它的近似转写；
+        按 bbox 裁一行 OCR 文本反而更难核对。
+      - **表格 / 图表 / 图片 / 公式块**：按 bbox 并集裁出该区域（含边距）。
+      - **电子版 PDF 的纯文字块**：**不返回**（用户明确说没必要）。
+
+    裁剪做错最典型的形态是**上下颠倒**：docling 的 bbox 是**左下原点**（PDF 惯例），
+    而 PIL 裁剪用的是左上原点。这里显式做一次换算，不靠"看起来对"。
+    """
+    if not chunks or not _want_page_images():
+        return 0
+
+    pages = getattr(doc, "pages", None) or {}
+    if not pages:
+        return 0
+
+    try:
+        from .docx_media import media_dir_for
+        out_dir = media_dir_for(path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("原页截图目录不可用，跳过：%s（%s）", path, exc)
+        return 0
+
+    saved = 0
+    n_on_page: dict[int, int] = {}
+    for kc in chunks:
+        page_no = getattr(kc, "page", None)
+        if not page_no or not _needs_cite_image(kc, scanned):
+            continue
+        page = pages.get(page_no)
+        if page is None:
+            continue
+        pil = _page_pil(page)
+        if pil is None:
+            logger.debug("页面无位图（未开 generate_page_images？）：%s p%s", path, page_no)
+            continue
+        img = _full_page(pil) if scanned else _crop_region(pil, kc, page)
+        if img is None:
+            continue
+        n_on_page[page_no] = n_on_page.get(page_no, 0) + 1
+        dest = os.path.join(out_dir, f"p{page_no:03d}_cite{n_on_page[page_no]:02d}.png")
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            img.save(dest, "PNG")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("原页截图写盘失败（%s）：%s", dest, exc)
+            continue
+        kc.page_image = dest
+        saved += 1
+
+    if saved:
+        logger.info("原页截图已生成：%s（%d 张，扫描件=%s → %s）",
+                    os.path.basename(path), saved, scanned, out_dir)
+    return saved
+
+
+def _needs_cite_image(kc: Any, scanned: bool) -> bool:
+    """这个块要不要给原图：扫描件全给；其余只给"非纯文字"的块。"""
+    if scanned:
+        return True
+    return (getattr(kc, "kind", "") or "") in CITE_IMAGE_KINDS
+
+
+def _page_pil(page: Any) -> Any:
+    img = getattr(page, "image", None)
+    return getattr(img, "pil_image", None) if img is not None else None
+
+
+def _full_page(pil: Any) -> Any:
+    return pil.copy()
+
+
+def _crop_region(pil: Any, kc: Any, page: Any) -> Any:
+    """按该块的 bbox 并集裁图；bbox 不可用/退化时返回 None（宁可没有图，也不给错图）。"""
+    boxes = [b for b in (getattr(kc, "bbox", None) or []) if len(b) == 4]
+    if not boxes:
+        return None
+    page_h = _page_height_pt(page, pil)
+    scale = pil.height / page_h if page_h else IMAGES_SCALE
+
+    xs0, ys0, xs1, ys1 = [], [], [], []
+    for l, t, r, b in boxes:
+        if t >= b:
+            # docling/PDF 惯例：左下原点，y 越大越靠上 → 换算成左上原点
+            top_y, bot_y = page_h - t, page_h - b
+        else:
+            # 已经是左上原点（t 是上边、b 是下边），不换算
+            top_y, bot_y = t, b
+        xs0.append(min(l, r)); xs1.append(max(l, r))
+        ys0.append(top_y); ys1.append(bot_y)
+
+    m = CITE_IMAGE_MARGIN
+    # 可信度判据看**原始 bbox 的面积**，不看加完边距的结果：
+    # 一个 0.5pt 的退化 bbox 加上 8pt 边距后会"看起来"有面积，但那块位置本身就不可信
+    # （docling 对某些行内元素会给零面积框）。宁可没图，也不能给错图。
+    raw_w = max(xs1) - min(xs0)
+    raw_h = max(ys1) - min(ys0)
+    if raw_w * raw_h < _MIN_BBOX_AREA_PT:
+        logger.debug("bbox 退化（原始面积 %.2f pt²），跳过原页截图：%s",
+                     raw_w * raw_h, getattr(kc, "chunk_id", ""))
+        return None
+
+    box = (max(0.0, min(xs0) - m) * scale, max(0.0, min(ys0) - m) * scale,
+           min(float(pil.width), (max(xs1) + m) * scale),
+           min(float(pil.height), (max(ys1) + m) * scale))
+    if box[2] - box[0] < 8 or box[3] - box[1] < 8:
+        return None
+    return pil.crop(tuple(int(round(v)) for v in box))
+
+
+def _page_height_pt(page: Any, pil: Any) -> float:
+    """页面高度（PDF 点）。拿不到就用位图高度反推（位图是按 images_scale 渲染的）。"""
+    size = getattr(page, "size", None)
+    h = getattr(size, "height", None)
+    try:
+        if h:
+            return float(h)
+    except Exception:  # noqa: BLE001
+        pass
+    return pil.height / IMAGES_SCALE if IMAGES_SCALE else float(pil.height)
 
 
 def _save_pictures(doc: Any, path: str) -> dict:
@@ -355,6 +531,8 @@ def _build_converter(ocr: bool) -> Any:
     _set(opts, "do_picture_classification", True)   # 产出 predicted_class，图片价值判定依赖它
     _set(opts, "generate_picture_images", True)     # 不显式打开就导不出裁剪图
     _set(opts, "images_scale", IMAGES_SCALE)
+    # 原页截图：打开后每页会多一张位图（内存开销），换来"引用能带原图"
+    _set(opts, "generate_page_images", _want_page_images())
     _set(opts, "artifacts_path", DOCLING_ARTIFACTS or None)   # 预下载模型 → 可离线
     # 公式转 LaTeX：每页跑公式模型，代价明显，默认关（需要时用 DOCLING_FORMULA=1）
     _set(opts, "do_formula_enrichment",
@@ -604,6 +782,12 @@ def parse_document(path: str, source: str, *, kind: str = "pdf") -> ParseOutcome
     image_paths = _save_pictures(doc, path)
     chunks = to_knowledge_chunks(doc, source, kind=kind, page_total=page_total,
                                  checksum=checksum, image_paths=image_paths)
+    # 原页截图：让引用能带"从哪儿看到的"那张图（扫描件给整页，表格/图给区域，纯文字不给）
+    try:
+        _attach_cite_images(doc, chunks, path, scanned=ocr is True)
+    except Exception as exc:  # noqa: BLE001  截图失败不该影响已解析出的内容
+        logger.warning("原页截图生成失败（不影响解析）：%s（%s: %s）",
+                       source, type(exc).__name__, exc)
 
     if not chunks:
         from .knowledge_chunk import unprocessable
@@ -617,8 +801,8 @@ def parse_document(path: str, source: str, *, kind: str = "pdf") -> ParseOutcome
                    if kind == "pdf" else "未取到任何内容")
             logger.warning("Docling 未产出内容，标记 unprocessable：%s（ocr=%s, %s）",
                            source, ocr, why)
-        return ParseOutcome(chunks=[unprocessable(source, why, parser="docling",
-                                                 page_total=page_total)],
+        return ParseOutcome(chunks=[_unprocessable_with_page(doc, source, why,
+                                                             page_total, path)],
                             status="unprocessable", reason=why, page_total=page_total)
 
     if conv.partial:

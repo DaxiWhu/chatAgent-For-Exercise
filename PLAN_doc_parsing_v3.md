@@ -310,11 +310,27 @@ vlm_input = {
 
 | 环节 | 状态 | 说明 |
 |---|---|---|
-| 每个块带完整元数据 | ✅ | 实测 25 个字段：`chunk_id` / `source` / `kind` / `parser` / `origin` / `section` / `page` / `bbox` / `para_index` / `anchor_text` / `content`（保真）/ `retrieval_text`（加工）/ `table_md` / `source_image` / `needs_vlm` / `vlm_desc` / `parent_text` … |
+| 每个块带完整元数据 | ✅ | 实测 26 个字段：`chunk_id` / `source` / `kind` / `parser` / `origin` / `section` / `page` / `bbox` / `para_index` / `anchor_text` / `content`（保真）/ `retrieval_text`（加工）/ `table_md` / `source_image` / `page_image` / `needs_vlm` / `vlm_desc` / `parent_text` … |
 | 检索把元数据带出来 | ✅ | `search()` 返回**完整块记录**（不是只返回文本） |
 | 生成层不丢 | ✅ | `retrieve` 节点现在把 `citations` 写进 state；送模型的上下文改为 **父窗 > 保真内容 > 检索文本**（此前直接用检索文本，把父子块整个绕过了） |
 | 接口层下发 | ✅ | `/chat` 与 `/review` 在正文之后、`done` 之前下发 `event: citations` |
-| 页面截图裁剪 | ❌ **未做** | 需要 PyMuPDF（未安装）。目前给的是 `page + bbox`，要"看到原文那一块"得自己渲染 |
+| **原图返回** | ✅ | `page_image`：**扫描件给整页原图**；表格/图表/图片/公式块给**按 bbox 裁出的区域**；**电子版纯文字块不给图**（用户要求：没必要，可靠性优先） |
+
+**原图（`page_image`）是怎么做的**：用 **Docling 自己的页面图像**（`generate_page_images=True` → `page.image.pil_image`），
+**不引 PyMuPDF** —— 后者是 AGPL，`COMPARE_doc_parsers.md` §3 已把它列为许可陷阱；docling 是 MIT，且已经在依赖里。
+
+| 细节 | 处理 |
+|---|---|
+| 坐标原点 | docling 的 bbox 是**左下原点**（PDF 惯例），PIL 裁剪用左上 → 显式换算 `page_h - y`；用 `t >= b` 判定原点，避免二次翻转 |
+| 混排块 | 取**所有 bbox 的并集**（表格 + 它的图注是同一个块），只取一个会裁到半张表 |
+| 边距 | 向外扩 `RAG_CITE_IMAGE_MARGIN`（默认 8pt），否则贴着 bbox 的表格边框会被切掉 |
+| bbox 不可信 | 按**原始 bbox 面积**判定（< 4pt² 视为退化）→ 宁可不给图，也不给错图。⚠️ 判据必须看原始面积：一个 0.5pt 的退化框加上 8pt 边距后会"看起来"有面积 |
+| 分辨率 | 页面按 `DOCLING_IMAGES_SCALE`（默认 2.0 ≈ 144 DPI）重新渲染。要更高清就调大（代价是内存与磁盘） |
+| 内存/磁盘 | 整页位图会常驻内存；批量灌库内存吃紧时设 `DOCLING_PAGE_IMAGES=off`（引用里仍有页码+坐标+保真文本） |
+
+**验证方式（像素级，不靠"看起来对"）**：造一张"上半白、下半黑"的假页图，bbox 声明在页面顶部（左下原点 y=80~90），
+断言裁出的像素**全是白色** —— 这直接锁住最容易犯、又最不容易被发现的错（上下颠倒）。
+端到端另有一条更硬的证据：对裁出的图跑一次 OCR，读回来的文字恰好等于该块的文本（表头 `Region/Revenue` + `East 1200` + 它的图注）。
 
 **引用记录长什么样**（实测，docx 图表命中）：
 
@@ -324,8 +340,12 @@ vlm_input = {
  "para_index": 2, "anchor_text": "下面给出各年度的销售额走势。",
  "snippet": "2019-2022 年销售额折线图\n\n| 类目 | 销售额 |\n|---|---|\n| 2021 | 138 |…",
  "table_md": "| 类目 | 销售额 |\n|---|---|\n| 2019 | 120 |\n| 2020 | 145 |\n| 2021 | 138 |\n| 2022 | 180 |",
- "alt_text": "2019-2022 年销售额折线图", "tags": ["图表", "来自XML"]}
+ "alt_text": "2019-2022 年销售额折线图", "tags": ["图表", "来自XML"],
+ "where": "报告.docx · 第 2 段附近"}
 ```
+
+PDF 命中时会多两个字段：`page_image`（原图路径）与 `where` 里的页码，例如
+`{"page": 1, "bbox": [[72.0, 719.9, 278.0, 709.7], …], "page_image": "data/.media/年报_x/p001_cite01.png", "where": "年报.pdf · 第 1 页 · 第三章 > 出口情况"}`。
 
 **两个刻意的取舍**：
 

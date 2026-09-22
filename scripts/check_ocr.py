@@ -176,6 +176,21 @@ def run_sample(kind: str, tmpdir: str) -> bool:
 
     ok = _report(text, keywords, label)
 
+    # 原页原图：扫描件的"原文"就是那张图，引用里必须能把它返回回去
+    # （纯文字块不给图是刻意的，所以这里专门验证扫描件这一路）
+    imgs = [c for c in out.chunks if getattr(c, "page_image", "")]
+    print(f"  【原图返回】带原页截图的块：{len(imgs)}/{len(out.chunks)}"
+          f"（扫描件应为整页原图；DOCLING_PAGE_IMAGES={docling_loader.DOCLING_PAGE_IMAGES}）")
+    for c in imgs[:2]:
+        try:
+            from PIL import Image
+            with Image.open(c.page_image) as im:
+                print(f"    p{c.page} {im.size[0]}x{im.size[1]} → {c.page_image}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [警告] 原图读不出来：{c.page_image}（{exc}）")
+    if not imgs:
+        print("    ⚠️ 没有产出原图：检查 DOCLING_PAGE_IMAGES 是否被设成 off")
+
     if kind == "cn":
         # 关键诊断：扫描件上的表格到底是"抽成表格"还是"抽成一行文字"。
         # 这个数字就是"要不要换 MinerU"的判据（方案 §4.2）。

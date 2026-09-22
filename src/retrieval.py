@@ -823,12 +823,39 @@ def build_citations(hits, snippet_chars=None) -> list:
             cite["table_md"] = chunk["table_md"]
         if chunk.get("source_image"):
             cite["source_image"] = chunk["source_image"]
+        if chunk.get("page_image"):
+            cite["page_image"] = chunk["page_image"]
         if chunk.get("alt_text"):
             cite["alt_text"] = chunk["alt_text"]
         if chunk.get("tags"):
             cite["tags"] = list(chunk["tags"])
+        cite["where"] = _where(chunk)
         out.append(cite)
     return out
+
+
+def _where(chunk) -> str:
+    """一句人能读懂的位置说明：文件 + 页/工作表 + 章节。
+
+    存在的理由很实际：`page=3, bbox=[...]` 对机器够用，对"我要去核对一下"的人不够用。
+    把"在哪份文件的哪里"直接写成一句话，前端可以直接显示，不必自己拼。
+    """
+    parts = [chunk.get("source") or "?"]
+    if chunk.get("page"):
+        # PDF 说"第 N 页"；xlsx/pptx 的 page 是工作表序号/幻灯片序号，含义不同
+        kind = chunk.get("kind") or ""
+        parser = (chunk.get("parser") or "").lower()
+        if parser in ("xlsx", "xlsm"):
+            parts.append(f"第 {chunk['page']} 个工作表")
+        elif parser == "pptx":
+            parts.append(f"第 {chunk['page']} 页幻灯片")
+        else:
+            parts.append(f"第 {chunk['page']} 页")
+    elif chunk.get("para_index") is not None:
+        parts.append(f"第 {chunk['para_index']} 段附近")
+    if chunk.get("section"):
+        parts.append(chunk["section"])
+    return " · ".join(parts)
 
 
 def answer(question, retriever, model):

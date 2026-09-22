@@ -70,7 +70,8 @@ class KnowledgeChunk:
     table_md: str = ""                                 # 表格保真表示（Markdown 网格）
     alt_text: str = ""                                 # 作者手写的替代文字（docx 图片/图表）
     vlm_desc: Optional[dict] = None                    # 批次6 填
-    source_image: str = ""                             # 裁剪图落盘路径（批次6 填）
+    source_image: str = ""                             # 裁剪出的插图/媒体原件路径（批次6 填）
+    page_image: str = ""                               # 原页截图（或按 bbox 裁出的区域），供用户回溯核对
     origin: str = ""                                   # docling_pdf | docling_docx | docx_zip | pdfminer
     parent_id: str = ""                                # 批次8 父子块预留
     unprocessable_reason: Optional[str] = None         # 拒绝要显式，不静默
