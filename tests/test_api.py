@@ -47,3 +47,62 @@ def test_review_revise_without_feedback_returns_400():
         "thread_id": "t", "action": "revise", "feedback": "",
     })
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# 引用事件（citations）：答案之后必须下发"依据了什么"，否则用户无法回溯
+# ---------------------------------------------------------------------------
+class _FakeGraph:
+    """替身图：只验证 **SSE 事件编排**，不触发真实检索与模型调用。"""
+
+    def __init__(self, citations, next_nodes=()):
+        self._citations = citations
+        self._next = next_nodes
+
+    async def astream(self, incoming, config, stream_mode):
+        from types import SimpleNamespace
+        yield SimpleNamespace(content="华东区 1200。"), {}
+
+    async def aget_state(self, config):
+        from types import SimpleNamespace
+        return SimpleNamespace(next=self._next,
+                               values={"citations": self._citations,
+                                       "output": "草稿", "score": 50, "feedback": "x"})
+
+
+def _collect(gen):
+    """把异步生成器收成事件列表。"""
+    import asyncio
+
+    async def run():
+        return [ev async for ev in gen]
+
+    return asyncio.run(run())
+
+
+def test_stream_emits_citations_between_tokens_and_done(monkeypatch):
+    import app.main as M
+
+    cites = [{"n": 1, "source": "年报.pdf", "page": 3, "snippet": "| 华东 | 1200 |"}]
+    monkeypatch.setattr(M, "graph", _FakeGraph(cites))
+    events = _collect(M._stream_graph({}, {}, "chat"))
+    assert [e["event"] for e in events] == ["token", "citations", "done"]
+    assert events[1]["data"] == cites
+
+
+def test_stream_skips_citations_event_when_nothing_recalled(monkeypatch):
+    """没有召回就**不要**发空引用事件：前端收到空数组会显示一个空引用区。"""
+    import app.main as M
+
+    monkeypatch.setattr(M, "graph", _FakeGraph([]))
+    events = _collect(M._stream_graph({}, {}, "chat"))
+    assert [e["event"] for e in events] == ["token", "done"]
+
+
+def test_stream_still_signals_need_review_with_citations(monkeypatch):
+    import app.main as M
+
+    monkeypatch.setattr(M, "graph", _FakeGraph([{"n": 1, "source": "a.pdf"}],
+                                               next_nodes=("human_review",)))
+    events = _collect(M._stream_graph({}, {}, "chat"))
+    assert [e["event"] for e in events] == ["token", "citations", "need_review"]

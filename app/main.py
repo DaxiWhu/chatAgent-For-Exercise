@@ -122,35 +122,51 @@ def health():
     return {"status": "ok"}
 
 
+async def _stream_graph(incoming, config, req_kind: str):
+    """把图的流式输出转成 SSE 事件。
+
+    事件类型：
+      token      —— 逐段生成的正文
+      citations  —— **可回溯的引用**（来源/页码/章节/保真原文节选/表格网格/图片路径）
+      need_review—— 需人工审核（附草稿、评分、意见）
+      done / error
+
+    citations 放在 token 之后、done 之前下发：它描述的是"上面这段回答依据了什么"，
+    顺序上必须在正文之后才有意义；同时它带着 chunk_id 与页码/坐标，
+    用户点开就能回到原文件核对，而不是只能相信模型。
+    """
+    try:
+        async for msg, _meta in graph.astream(incoming, config=config,
+                                              stream_mode="messages"):
+            if msg.content:
+                yield {"event": "token", "data": msg.content}
+
+        state = await graph.aget_state(config)
+        values = state.values
+
+        cites = values.get("citations") or []
+        if cites:
+            yield {"event": "citations", "data": cites}
+
+        if state.next and "human_review" in state.next:
+            yield {"event": "need_review", "data": {
+                "draft": values.get("output"),
+                "score": values.get("score"),
+                "feedback": values.get("feedback"),
+            }}
+        else:
+            yield {"event": "done"}
+    except Exception as e:  # noqa
+        logging.exception("%s 流异常", req_kind)
+        yield {"event": "error", "data": str(e)}
+
+
 @app.post("/chat")
 async def chat(req: ChatReq, x_api_key: str = Header(default="")):
     _check_auth(x_api_key)
     config = {"configurable": {"thread_id": req.thread_id}}
-
-    async def event_gen():
-        try:
-            async for msg, _meta in graph.astream(
-                {"messages": [HumanMessage(content=req.message)]},
-                config=config, stream_mode="messages",
-            ):
-                if msg.content:
-                    yield {"event": "token", "data": msg.content}
-            # 流结束后判断是否停在人工审核
-            state = await graph.aget_state(config)
-            if state.next and "human_review" in state.next:
-                v = state.values
-                yield {"event": "need_review", "data": {
-                    "draft": v.get("output"),
-                    "score": v.get("score"),
-                    "feedback": v.get("feedback"),
-                }}
-            else:
-                yield {"event": "done"}
-        except Exception as e:  # noqa
-            logging.exception("chat 流异常")
-            yield {"event": "error", "data": str(e)}
-
-    return EventSourceResponse(event_gen())
+    incoming = {"messages": [HumanMessage(content=req.message)]}
+    return EventSourceResponse(_stream_graph(incoming, config, "chat"))
 
 
 @app.post("/review")
@@ -166,27 +182,6 @@ async def review(req: ReviewReq, x_api_key: str = Header(default="")):
     if not (state.next and "human_review" in state.next):
         raise HTTPException(status_code=409, detail="该会话当前不在人工审核状态")
 
-    async def event_gen():
-        try:
-            async for msg, _meta in graph.astream(
-                Command(resume={"action": req.action,
-                                "feedback": req.feedback or None}),
-                config=config, stream_mode="messages",
-            ):
-                if msg.content:
-                    yield {"event": "token", "data": msg.content}
-            st = await graph.aget_state(config)
-            if st.next and "human_review" in st.next:
-                v = st.values
-                yield {"event": "need_review", "data": {
-                    "draft": v.get("output"),
-                    "score": v.get("score"),
-                    "feedback": v.get("feedback"),
-                }}
-            else:
-                yield {"event": "done"}
-        except Exception as e:  # noqa
-            logging.exception("review 流异常")
-            yield {"event": "error", "data": str(e)}
-
-    return EventSourceResponse(event_gen())
+    incoming = Command(resume={"action": req.action,
+                               "feedback": req.feedback or None})
+    return EventSourceResponse(_stream_graph(incoming, config, "review"))

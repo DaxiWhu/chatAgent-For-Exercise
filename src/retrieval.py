@@ -140,6 +140,10 @@ PARENT_MAX_CHARS = max(200, _env_int("RAG_PARENT_MAX_CHARS", 1200))
 # 这是切分侧唯一**显著花钱**的改进（每块一次 LLM 调用），所以默认关。
 CONTEXTUAL = os.getenv("RAG_CONTEXTUAL", "off").strip().lower() in ("1", "on", "true", "yes")
 
+# 引用（citations）里每条的原文节选长度。状态会被 checkpointer 持久化，
+# 塞进整块原文会让会话状态线性膨胀，所以默认只给"够定位 + 能核对"的片段。
+CITE_SNIPPET_CHARS = max(100, _env_int("RAG_CITE_SNIPPET_CHARS", 1000))
+
 # TF-IDF 分词参数：中文没有空格，默认的 word 分词会把整句当成一个 token，
 # 导致查询词与语料词表完全匹配不上（实测全部 0 命中）。改用字符 n-gram，中英文都友好。
 TFIDF_ANALYZER = "char_wb"
@@ -755,16 +759,76 @@ def build_prompt(question, contexts):
     送模型时换成命中块所在的**上下文窗口**，避免答案因为缺上文而断裂。
     没有父窗的块（如该文档只有一块）自动退回自身 text。
     """
-    blocks = []
-    for c, _ in contexts:
-        body = c.get("parent_text") or c.get("text") or ""
-        blocks.append(f"[来源: {c.get('source', '?')}]\n{body}")
+    blocks = [context_block(c) for c, _ in contexts]
     ctx = "\n\n".join(blocks)
     return (
         "你是一个严谨的问答助手。请只根据下面提供的【参考资料】回答用户问题，"
         "如果资料里没有相关信息，就如实说“资料中未提及”。不要编造。\n\n"
         f"【参考资料】\n{ctx}\n\n【用户问题】\n{question}\n\n【回答】"
     )
+
+
+def context_block(chunk) -> str:
+    """一个命中块 → 送进模型的文本块。
+
+    优先级：**父窗 > 保真内容 > 检索文本**。这个顺序不是随手定的：
+      - 父窗（parent_text）自带前后文，是批次8 在生成侧唯一生效的地方；
+      - 保真内容（content）是没有被加工过的原文（表格是原网格）；
+      - 检索文本（text）是给检索用的加工结果（表格被文字化成 `列=值`、
+        可能带上下文前缀），拿它当原文喂模型会引入"这段到底是原文还是加工品"的混淆。
+    过去 graph 路径直接取了 `text`，等于把批次8 的父子块完全绕过了。
+    """
+    body = chunk.get("parent_text") or chunk.get("content") or chunk.get("text") or ""
+    return f"[来源: {chunk.get('source', '?')}]\n{body}"
+
+
+def build_citations(hits, snippet_chars=None) -> list:
+    """检索命中 → **可回溯的引用列表**（给接口层/前端用）。
+
+    为什么必须单独做这一步：`search()` 返回的是完整块记录（实测 25 个字段），
+    但过去没有任何一层把它交出去 —— `graph.retrieve()` 只取了 `source` 与 `text`
+    拼成一段字符串。于是"这段话出自哪份文档的第几页、哪一节、原表格长什么样、
+    配图在哪"在接口层就永久丢失了。
+
+    这里的取舍：
+      - `snippet` 取 `content`（保真）而不是 `text`（加工过），否则回显出来的"原文"
+        其实是文字化之后的形态，会误导人工核对；
+      - `parent_text` **不**放进引用（那是生成用的窗口，不是原文）；
+      - 内容按 `RAG_CITE_SNIPPET_CHARS` 截断：状态会被 checkpointer 持久化，
+        把整块原文都塞进每轮状态里会随会话线性膨胀。要看全文请调大这个值，
+        或用 `chunk_id` 回原文件核对。
+    """
+    limit = CITE_SNIPPET_CHARS if snippet_chars is None else max(50, snippet_chars)
+    out = []
+    for i, (chunk, score) in enumerate(hits, start=1):
+        body = (chunk.get("content") or chunk.get("text") or "").strip()
+        cite = {
+            "n": i,
+            "source": chunk.get("source", ""),
+            "score": round(float(score), 4),
+            "chunk_id": chunk.get("chunk_id", ""),
+            "kind": chunk.get("kind", ""),
+            "parser": chunk.get("parser", ""),
+            "origin": chunk.get("origin", ""),
+            "section": chunk.get("section", ""),
+            "page": chunk.get("page"),
+            "bbox": chunk.get("bbox") or [],
+            "para_index": chunk.get("para_index"),
+            "anchor_text": chunk.get("anchor_text", ""),
+            "snippet": body[:limit] + ("…" if len(body) > limit else ""),
+            "truncated": len(body) > limit,
+        }
+        # 附件类信息只在真有的时候才带出去，避免一堆空字段把引用撑胖
+        if chunk.get("table_md"):
+            cite["table_md"] = chunk["table_md"]
+        if chunk.get("source_image"):
+            cite["source_image"] = chunk["source_image"]
+        if chunk.get("alt_text"):
+            cite["alt_text"] = chunk["alt_text"]
+        if chunk.get("tags"):
+            cite["tags"] = list(chunk["tags"])
+        out.append(cite)
+    return out
 
 
 def answer(question, retriever, model):

@@ -19,7 +19,7 @@ from langgraph.types import interrupt
 from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel, Field, ValidationError, ConfigDict
 
-from .retrieval import load_chunks, build_retriever
+from .retrieval import load_chunks, build_retriever, build_citations, context_block
 
 # ----------------------------------------------------------------------------
 # 常量
@@ -66,7 +66,8 @@ class HumanDecision(BaseModel):
 
 class OverAllState(MessagesState):
     output: str = ""
-    context: str = ""          # RAG 检索到的参考资料
+    context: str = ""          # RAG 检索到的参考资料（送模型的文本）
+    citations: list = []       # 引用的结构化来源信息（给用户回溯核对用）
     is_need_evaluate: bool = False
     score: int = 0
     feedback: str = ""
@@ -113,21 +114,29 @@ def init(state: OverAllState) -> OverAllState:
 
 
 def retrieve(state: OverAllState) -> OverAllState:
-    """RAG 检索节点：放在 generate 之前，把参考资料写入 state["context"]。
+    """RAG 检索节点：放在 generate 之前，把参考资料写入 state["context"]，
+    并把**引用信息**写入 state["citations"]。
 
     容错要求：知识库没配、语料为空、检索抛异常，都只降级为「无上下文」，
     绝不因为检索失败把整张图带崩。
+
+    为什么必须同时产出 citations：`search()` 返回的是完整块记录（页码、坐标、
+    章节路径、保真原文、表格网格、配图路径…），而"送模型的文本"只是其中一个字段。
+    过去这里把整条记录拍成一段字符串，**其余元数据在接口层就再也拿不到了** ——
+    用户看到一个答案，却无法确认它出自哪一页、原文长什么样。
     """
     try:
         query = _last_content(state["messages"])
         hits = get_retriever().search(query, top_k=TOP_K)
-        ctx = "\n\n".join(f"[来源:{c['source']}]\n{c['text']}" for c, _ in hits)
+        # 文本块优先用父窗/保真内容（见 context_block 的优先级说明）
+        ctx = "\n\n".join(context_block(c) for c, _ in hits)
+        citations = build_citations(hits)
         if not ctx:
             logging.info("RAG 未召回任何片段，按无上下文继续")
-        return {"context": ctx}
+        return {"context": ctx, "citations": citations}
     except Exception as e:  # noqa: BLE001
         logging.warning("RAG 检索失败，降级为无上下文: %s", e)
-        return {"context": ""}
+        return {"context": "", "citations": []}
 
 
 def generate(state: OverAllState) -> OverAllState:
