@@ -78,5 +78,11 @@ Desktop.ini
 chromaDB/
 examples/input/
 
+# ---- 模型权重（体积数百 MB，用 docling 的下载命令预取，不入库）----
+models/
+
+# ---- 解析时裁剪出的图片 ----
+data/.media/
+
 # ---- WorkBuddy project data (do not delete, but usually not committed) ----
 .workbuddy/

@@ -116,6 +116,20 @@ CHUNK_STRATEGY = os.getenv("RAG_CHUNK_STRATEGY", "headings").strip().lower()
 CHUNK_SIZE = _env_int("RAG_CHUNK_SIZE", 300)
 CHUNK_OVERLAP = _env_int("RAG_CHUNK_OVERLAP", 50)
 
+# 递归切分的分隔符优先级。
+# LangChain 默认只有 ["\n\n", "\n", " ", ""] —— 中文没有空格，无换行的长段落会从 " "
+# 直接掉到 "" 逐字符凑满切断，出现句中硬切。补上中文标点后，在到达字符级之前就有断点可用。
+# 注意：本常量服务的是非 PDF 的文本格式（.md/.txt/.html 等）；PDF 走 pdf_parser 的
+# 句子级打包链路，不经过这里。
+SPLIT_SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
+
+# ---------- 文档解析（Docling 为主，pdfminer 自动降级）----------
+# 解析链路见 src/docling_loader.py。PDF 的正文切分由 Docling 的 HybridChunker 负责，
+# 它按 token 计预算，与上面按字符计的 RAG_CHUNK_SIZE 是两套单位，互不覆盖。
+DOC_PARSER = os.getenv("RAG_DOC_PARSER", "docling").strip().lower()
+PDF_CHUNK_SIZE = _env_int("RAG_PDF_CHUNK_SIZE", 800)
+PDF_CHUNK_OVERLAP = _env_int("RAG_PDF_CHUNK_OVERLAP", 200)
+
 # TF-IDF 分词参数：中文没有空格，默认的 word 分词会把整句当成一个 token，
 # 导致查询词与语料词表完全匹配不上（实测全部 0 命中）。改用字符 n-gram，中英文都友好。
 TFIDF_ANALYZER = "char_wb"
@@ -143,7 +157,9 @@ def load_documents(doc_folder: str):
 
 def _make_splitter(chunk_size, chunk_overlap):
     return RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size, chunk_overlap=chunk_overlap
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=SPLIT_SEPARATORS,
     )
 
 
@@ -216,20 +232,110 @@ def _split_text(text, chunk_size, chunk_overlap):
             for p in _make_splitter(chunk_size, chunk_overlap).split_text(text)]
 
 
-def load_chunks(doc_folder, chunk_size=None, chunk_overlap=None, pdf_chunk_size=800,
-                pdf_overlap=200):
-    """语料读取总入口：目录 → [{"source","section","text"}]。
+def _parse_pdf(path, name, chunk_size, overlap):
+    """PDF 解析：Docling 优先，不可用或失败时自动回退 pdfminer。
 
-    支持格式见 src/loaders.py；.pdf 走 src/pdf_parser.py 的专门链路。
-    单个文件解析失败只跳过并告警，不影响其余语料。
+    两条链路产出同构的 dict（都经 chunk_writer.to_legacy 出边界），检索器与 graph
+    不必区分来源；dict 里的 parser / origin 字段保留线索，便于排查
+    "这份文件其实走的是降级链路"。
+    """
+    from .chunk_writer import to_legacy_many
+
+    if DOC_PARSER == "docling":
+        out = None
+        try:
+            from . import docling_loader
+            out = docling_loader.parse_document(path, name, kind="pdf")
+        except Exception as e:  # noqa: BLE001  解析层的任何意外都不该让整批语料挂掉
+            logging.error("Docling 解析异常，回退 pdfminer：%s（%s: %s）",
+                          name, type(e).__name__, e)
+        else:
+            if out.status in ("unavailable", "failed"):
+                logging.warning("Docling 不可用，回退 pdfminer：%s（%s）", name, out.reason)
+            else:
+                if out.status == "unprocessable":
+                    # 「解析不出内容」不等于「解析器坏了」：降级到 pdfminer 只会更差，
+                    # 所以不降级，而是保留这条显式失败记录，让它可被检索到。
+                    logging.warning("Docling 未解析出内容，保留失败记录：%s（%s）",
+                                    name, out.reason)
+                return to_legacy_many(out.chunks)
+
+    from .knowledge_chunk import from_pdfminer_pieces
+    from .pdf_parser import pdf_to_chunks
+
+    pieces = pdf_to_chunks(path, chunk_size=chunk_size, overlap_size=overlap)
+    return to_legacy_many(from_pdfminer_pieces(pieces, name))
+
+
+def _parse_docx(path, name, chunk_size, overlap):
+    """docx 解析：Docling 双路线优先，不可用或失败时回退 python-docx。
+
+    与 PDF 那条支路的差别在**降级的代价**：docx 本身是结构化 markup，
+    python-docx 提正文并不比 Docling 差多少；真正的差距是表格、图片、原生图表、OLE ——
+    那些只有「Docling docx 后端 + 解 zip」组合才拿得到（见 src/docx_media.py）。
+    所以这里降级损失的比 PDF 小，但语义保持一致：降级必须留痕（parser 字段 + 日志），
+    不能让"这份文件其实走的是老链路"变成一件查不出来的事。
+    """
+    from .chunk_writer import to_legacy_many
+
+    if DOC_PARSER == "docling":
+        out = None
+        try:
+            from . import docling_loader
+            out = docling_loader.parse_docx(path, name)
+        except Exception as e:  # noqa: BLE001  解析层的任何意外都不该让整批语料挂掉
+            logging.error("Docling docx 解析异常，回退 python-docx：%s（%s: %s）",
+                          name, type(e).__name__, e)
+        else:
+            if out.status in ("unavailable", "failed"):
+                logging.warning("Docling 不可用，回退 python-docx：%s（%s）", name, out.reason)
+            else:
+                if out.status == "unprocessable":
+                    # 同 PDF：降级到 python-docx 只会更差，保留显式失败记录让它可被检索到
+                    logging.warning("Docling 未解析出 docx 内容，保留失败记录：%s（%s）",
+                                    name, out.reason)
+                return to_legacy_many(out.chunks)
+
+    return _parse_docx_legacy(path, name, chunk_size, overlap)
+
+
+def _parse_docx_legacy(path, name, chunk_size, overlap):
+    """老链路：python-docx 提文本（标题转 Markdown `#`）+ 通用切分。"""
+    from .loaders import load_text
+
+    text = load_text(path) or ""
+    if not text.strip():
+        return []
+    out = []
+    for p in _split_text(text, chunk_size, overlap):
+        d = {"source": name, "section": p["section"], "text": p["text"]}
+        d["parser"] = "python-docx"      # 让 _log_load_summary 能把降级用量打出来
+        out.append(d)
+    return out
+
+
+def load_chunks(doc_folder, chunk_size=None, chunk_overlap=None, pdf_chunk_size=None,
+                pdf_overlap=None):
+    """语料读取总入口：目录 → [{"source","section","text", ...}]。
+
+    支持格式见 src/loaders.py；.pdf 走 Docling（src/docling_loader.py），
+    不可用时自动降级到 src/pdf_parser.py 的 pdfminer 链路；
+    .docx 同样走 Docling 双路线（正文 + 解 zip 取图片/图表/OLE，见 src/docx_media.py），
+    不可用时降级到 python-docx。
+    单份文件解析失败只跳过并告警，不影响其余语料；解析不出内容的文件会留下
+    kind="unprocessable" 的记录，而不是静默消失。
+
+    除 source/section/text 三个既有字段外还带 page/bbox/kind/parser 等元信息，
+    旧消费者忽略即可（出参契约见 src/chunk_writer.py）。
     """
     if not doc_folder or not os.path.isdir(doc_folder):
         return []
 
     chunk_size = CHUNK_SIZE if chunk_size is None else chunk_size
     chunk_overlap = CHUNK_OVERLAP if chunk_overlap is None else chunk_overlap
+    pdf_chunk_size = PDF_CHUNK_SIZE if pdf_chunk_size is None else pdf_chunk_size
+    pdf_overlap = PDF_CHUNK_OVERLAP if pdf_overlap is None else pdf_overlap
 
-    from .pdf_parser import pdf_to_chunks
     from .loaders import load_text, supported_extensions
 
     exts = supported_extensions()
@@ -243,14 +349,26 @@ def load_chunks(doc_folder, chunk_size=None, chunk_overlap=None, pdf_chunk_size=
         low = f.lower()
         name = os.path.basename(f)
 
-        # ---- PDF：走教程那条专门链路 ----
+        # ---- PDF：Docling 为主，pdfminer 自动降级 ----
         if low.endswith(".pdf"):
             try:
-                pieces = pdf_to_chunks(f, chunk_size=pdf_chunk_size, overlap_size=pdf_overlap)
-                chunks += [{"source": name, "section": "", "text": p} for p in pieces]
-                logging.info("PDF 解析完成：%s（%d 个片段）", name, len(pieces))
+                pdf_chunks = _parse_pdf(f, name, pdf_chunk_size, pdf_overlap)
+                chunks += pdf_chunks
+                logging.info("PDF 解析完成：%s（%d 个片段）", name, len(pdf_chunks))
             except Exception as e:  # noqa: BLE001
                 logging.warning("PDF 解析失败，跳过 %s: %s", name, e)
+            continue
+
+        # ---- docx：Docling 双路线（正文 + 媒体）为主，python-docx 自动降级 ----
+        # 单独一支而不并入下面的通用分支：docx 有专属解析链路（含图片/图表/OLE 抽取），
+        # 走 load_text 就只能拿到正文，等于白丢 Docling 那半边的能力。
+        if low.endswith(".docx"):
+            try:
+                docx_chunks = _parse_docx(f, name, chunk_size, chunk_overlap)
+                chunks += docx_chunks
+                logging.info("docx 解析完成：%s（%d 个片段）", name, len(docx_chunks))
+            except Exception as e:  # noqa: BLE001
+                logging.warning("docx 解析失败，跳过 %s: %s", name, e)
             continue
 
         # ---- 其它格式：统一走 loaders ----
@@ -271,7 +389,31 @@ def load_chunks(doc_folder, chunk_size=None, chunk_overlap=None, pdf_chunk_size=
             ", ".join(f"{e or '(无扩展名)'}×{n}" for e, n in sorted(skipped.items())),
         )
 
+    _log_load_summary(chunks)
     return chunks
+
+
+def _log_load_summary(chunks):
+    """让「走了降级链路」和「哪些文件没解析出来」在日志里一眼可见。
+
+    只看"灌进去多少块"是看不出这两件事的，而它们恰恰是最该被发现的运维信号。
+    """
+    if not chunks:
+        logging.warning("语料为空：没有读到任何内容")
+        return
+
+    by_parser = {}
+    for c in chunks:
+        key = c.get("parser") or "?"
+        by_parser[key] = by_parser.get(key, 0) + 1
+    logging.info("语料装载完成：共 %d 块（%s）", len(chunks),
+                 "，".join(f"{k}={v}" for k, v in sorted(by_parser.items())))
+
+    failed = sorted({c.get("source", "?") for c in chunks
+                     if c.get("kind") == "unprocessable"})
+    if failed:
+        logging.warning("有 %d 个文件未解析出内容（已保留记录）：%s",
+                        len(failed), " | ".join(failed))
 
 
 # ---------------------------------------------------------------------------

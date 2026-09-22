@@ -17,14 +17,24 @@ sse-starlette>=2.1
 scikit-learn>=1.4
 numpy>=1.26
 
-# ---- RAG：文档解析（src/loaders.py + src/pdf_parser.py）----
-pdfminer.six>=20231228       # .pdf
+# ---- RAG:文档解析(src/loaders.py + src/pdf_parser.py)----
+pdfminer.six>=20231228       # .pdf（降级链路，Docling 不可用时自动回退）
 python-docx>=1.1             # .docx
 openpyxl>=3.1                # .xlsx / .xlsm
 python-pptx>=0.6             # .pptx
 beautifulsoup4>=4.12         # .html / .htm
 lxml>=5.0                    # bs4 的解析后端
-# .txt/.md/.csv/.tsv/.json/.jsonl 用标准库，无需额外依赖
+# .txt/.md/.csv/.tsv/.json/.jsonl 用标准库,无需额外依赖
+
+# ---- RAG:Docling 解析层(src/docling_loader.py，.pdf/.docx 主链路)----
+# 首次运行需下载模型权重(数百 MB)。离线部署用:
+#   python -c "from pathlib import Path; from docling.utils.model_downloader import download_models; download_models(output_dir=Path('models/docling'))"
+# 之后把 DOCLING_ARTIFACTS_PATH 指向该目录即可，运行时不再联网。
+# 国内直连 huggingface.co 常超时，下载时需设 HF_ENDPOINT 走镜像。
+docling>=2.129               # 版式检测/表格识别/图片分类/OCR
+docling-core[chunking]>=2.98 # HybridChunker 结构感知切分(依赖 semchunk)
+transformers>=4.40           # 切分 tokenizer(与 embedding 模型对齐)
+tiktoken>=0.7                # 离线 tokenizer 兜底(拉不到 HF tokenizer 时用)
 
 # ---- 测试 ----
 pytest>=8.0

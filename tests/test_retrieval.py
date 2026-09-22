@@ -54,6 +54,59 @@ def test_load_and_split_roundtrip(tmp_path):
     assert "六堡茶" in chunks[0]["text"]
 
 
+# ---------------- 中文分隔符（递归切分不再句中硬切）----------------
+# 单段、无换行、共 4 句，总长 88 字，超过 chunk_size 必须被切开
+_LONG_ZH = (
+    "梧州是广西壮族自治区的一个地级市，地处广西东部，靠近广东。"
+    "梧州特产有龟苓膏、冰泉豆浆、六堡茶。"
+    "六堡茶属于黑茶，有祛湿功效，在当地很受欢迎。"
+    "梧州代表性景点有骑楼城、龙母庙和白云山。"
+)
+_SENT_END = "。！？；，"
+# 遍历多个长度：避免结论依赖"某个 size 恰好切在标点上"的巧合
+_SIZES = (30, 40, 50, 60, 70)
+
+
+def test_chinese_long_paragraph_has_no_mid_sentence_cut():
+    """回归：补上中文分隔符后，无换行的中文长段落只会在标点处切分。
+
+    判据方向说明：LangChain 的 keep_separator=True 把分隔符粘在**下一块的开头**，
+    所以「块尾是标点」并不成立；「除首块外每块以标点起头」才是正确判据，
+    它等价于「每个切点都落在句子边界上」。
+    """
+    split_seen = 0
+    for size in _SIZES:
+        pieces = R._make_splitter(size, 0).split_text(_LONG_ZH)
+        assert "".join(pieces) == _LONG_ZH, f"size={size} 时切分有损，拼接不等于原文"
+        for i, p in enumerate(pieces[1:], start=1):
+            assert p[0] in _SENT_END, (
+                f"size={size} 时第 {i} 块切在了句中：{p[:24]!r}"
+            )
+        split_seen += len(pieces) > 1
+    assert split_seen, "没有任何 size 触发切分，本用例没有验证到切分行为"
+
+
+def test_without_chinese_separators_it_would_cut_mid_sentence():
+    """反证：修复前的分隔符配置在同样这批 size 下会出现句中硬切。
+
+    显式复现旧配置而非依赖上游默认值，这样即使 LangChain 改了默认分隔符，本用例依然成立。
+    """
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    broken = []
+    for size in _SIZES:
+        old = RecursiveCharacterTextSplitter(
+            chunk_size=size, chunk_overlap=0, separators=["\n\n", "\n", " ", ""]
+        )
+        pieces = old.split_text(_LONG_ZH)
+        broken += [
+            (size, p[:24]) for p in pieces[1:] if p and p[0] not in _SENT_END
+        ]
+    assert broken, (
+        "旧配置下本应出现句中截断——若不再出现，说明 SPLIT_SEPARATORS 可能已无必要，请复核"
+    )
+
+
 # ---------------- 后端选择 ----------------
 def test_build_retriever_empty_chunks_returns_null():
     assert isinstance(build_retriever([]), NullRetriever)
@@ -184,3 +237,78 @@ def test_embedding_base_url_normalized():
         ("", ""),
     ]:
         assert R._normalize_api_base(raw) == expected
+
+
+# ---------------- docx 专属链路接线（Docling 双路线 / 降级 python-docx）----------------
+# 这里一律 monkeypatch 掉真正解析、只验证"分派与降级语义"：
+# 真跑 Docling 的代价是分钟级，那是 tests/test_docling_loader.py 的职责（且能被 skip）。
+def _write_docx(tmp_path):
+    from tests.docx_fixtures import build_minimal_docx
+    return build_minimal_docx(str(tmp_path / "report.docx"))
+
+
+def _kc(text, source="report.docx", parser="docling"):
+    from src.knowledge_chunk import KnowledgeChunk
+    return KnowledgeChunk(source=source, parser=parser, origin="docling_docx",
+                          content=text, retrieval_text=text)
+
+
+def test_docx_uses_docling_route_by_default(tmp_path, monkeypatch):
+    """docx 必须走专属链路 —— 并入通用分支（load_text）就只剩正文，
+    图片/原生图表/OLE 会一起丢掉，而它们恰恰是 docx 解析里最值钱的部分。"""
+    import src.docling_loader as DL
+
+    _write_docx(tmp_path)
+    seen = {}
+
+    def fake(path, source):
+        seen["path"] = path
+        return DL.ParseOutcome(chunks=[_kc("来自 Docling 双路线的正文")], status="ok")
+
+    monkeypatch.setattr(DL, "parse_docx", fake)
+    chunks = R.load_chunks(str(tmp_path))
+    assert seen.get("path", "").endswith("report.docx"), "docx 未走 Docling 链路"
+    assert len(chunks) == 1
+    assert "Docling 双路线" in chunks[0]["text"]
+    assert chunks[0]["parser"] == "docling"
+    assert chunks[0]["source"] == "report.docx"
+
+
+def test_docx_falls_back_to_python_docx_when_docling_unavailable(tmp_path, monkeypatch):
+    """降级要真的可用，且必须留痕（parser 字段），否则"这份文件其实走的老链路"查不出来。"""
+    import src.docling_loader as DL
+
+    _write_docx(tmp_path)
+    monkeypatch.setattr(DL, "parse_docx",
+                        lambda p, s: DL.ParseOutcome(status="unavailable", reason="docling 未安装"))
+    chunks = R.load_chunks(str(tmp_path))
+    assert chunks, "降级链路必须仍能读出正文"
+    assert all(c["parser"] == "python-docx" for c in chunks)
+    assert any("季度销售报告" in c["text"] for c in chunks)
+
+
+def test_docx_unprocessable_record_is_kept_not_downgraded(tmp_path, monkeypatch):
+    """「解析不出内容」不是「解析器坏了」：降级只会更差，
+    应保留这条显式失败记录（否则该文件在索引里凭空消失，没人知道它没被索引）。"""
+    import src.docling_loader as DL
+    from src.knowledge_chunk import unprocessable
+
+    _write_docx(tmp_path)
+    # 注意 parser 要显式传：真实生产者（docling_loader.parse_docx）就是带 parser="docling" 造的，
+    # 这里照抄它的调法，否则测的是"我的假数据"而不是"真实产物"。
+    monkeypatch.setattr(DL, "parse_docx",
+                        lambda p, s: DL.ParseOutcome(
+                            chunks=[unprocessable(s, "空文档", parser="docling")],
+                            status="unprocessable", reason="空文档"))
+    chunks = R.load_chunks(str(tmp_path))
+    assert len(chunks) == 1
+    assert chunks[0]["kind"] == "unprocessable"
+    assert chunks[0]["parser"] == "docling", "不该悄悄换成 python-docx 链路"
+
+
+def test_docx_route_can_be_disabled_by_env(tmp_path, monkeypatch):
+    """RAG_DOC_PARSER 非 docling 时必须直接走老链路（这条开关是应急回退用的）。"""
+    _write_docx(tmp_path)
+    monkeypatch.setattr(R, "DOC_PARSER", "legacy")
+    chunks = R.load_chunks(str(tmp_path))
+    assert chunks and all(c["parser"] == "python-docx" for c in chunks)
