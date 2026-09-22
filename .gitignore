@@ -52,6 +52,9 @@ langgraph_checkpoints*
 # ---- Secrets / env ----
 .env
 .env.*
+# 但模板必须入库：它是唯一能说明"有哪些配置项、为什么这么设"的地方，
+# 被 .env.* 一起忽略的话，所有配置说明就只存在于开发者本机。
+!.env.example
 *.key
 *.pem
 secrets.json
@@ -83,6 +86,11 @@ models/
 
 # ---- 解析时裁剪出的图片 ----
 data/.media/
+
+# ---- 模型产出的缓存（图片描述、上下文前缀）----
+# 都是"按内容哈希命名"的调用结果：丢了只是重新花钱调一次，不该入库。
+data/.vlm_cache/
+data/.ctx_cache/
 
 # ---- WorkBuddy project data (do not delete, but usually not committed) ----
 .workbuddy/

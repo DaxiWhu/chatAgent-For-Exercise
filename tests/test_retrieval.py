@@ -312,3 +312,79 @@ def test_docx_route_can_be_disabled_by_env(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "DOC_PARSER", "legacy")
     chunks = R.load_chunks(str(tmp_path))
     assert chunks and all(c["parser"] == "python-docx" for c in chunks)
+
+
+# ---------------- 批次8：父子块（small-to-big）----------------
+def _mk(source, text, section=""):
+    return {"source": source, "section": section, "text": text}
+
+
+def test_attach_parents_builds_a_window_around_each_chunk(monkeypatch):
+    """父窗必须**围绕命中块**，而不是"取文档开头 1200 字"。
+
+    后者最省事但没用：PDF 的 section 常为空，按节分组会退化成"永远是文档开头"，
+    命中块根本不在父窗里，语境等于没给。
+    """
+    monkeypatch.setattr(R, "PARENT_CHILD", True)
+    monkeypatch.setattr(R, "PARENT_MAX_CHARS", 120)
+    chunks = [_mk("a.pdf", "第一块" + "甲" * 30), _mk("a.pdf", "第二块" + "乙" * 30),
+              _mk("a.pdf", "第三块" + "丙" * 30)]
+    R.attach_parents(chunks)
+    for i, c in enumerate(chunks):
+        assert c["parent_text"]
+        assert c["text"] in c["parent_text"], f"第 {i} 块的父窗里居然没有它自己"
+        assert c["parent_id"].startswith("a.pdf#")
+
+
+def test_attach_parents_never_crosses_documents(monkeypatch):
+    monkeypatch.setattr(R, "PARENT_CHILD", True)
+    monkeypatch.setattr(R, "PARENT_MAX_CHARS", 500)
+    chunks = [_mk("a.pdf", "甲" * 20), _mk("b.pdf", "乙" * 20), _mk("b.pdf", "丙" * 20)]
+    R.attach_parents(chunks)
+    assert "parent_text" not in chunks[0] or "乙" not in chunks[0]["parent_text"]
+    assert "甲" not in chunks[2]["parent_text"]
+
+
+def test_attach_parents_skips_isolated_chunk(monkeypatch):
+    """一份文档只有一块时没有"父"可言，不要造一个等于自身的父块。"""
+    monkeypatch.setattr(R, "PARENT_CHILD", True)
+    chunks = [_mk("solo.txt", "只有一块")]
+    R.attach_parents(chunks)
+    assert "parent_text" not in chunks[0]
+
+
+def test_attach_parents_can_be_switched_off(monkeypatch):
+    monkeypatch.setattr(R, "PARENT_CHILD", False)
+    chunks = [_mk("a.pdf", "甲"), _mk("a.pdf", "乙")]
+    R.attach_parents(chunks)
+    assert all("parent_text" not in c for c in chunks)
+
+
+def test_build_prompt_prefers_parent_window():
+    """送模型的是父窗（含上下文），不是孤立的小块。"""
+    ctx = [(_mk("a.pdf", "命中句", section="二"), 0.9)]
+    ctx[0][0]["parent_text"] = "上一段。命中句。下一段。"
+    prompt = build_prompt("问", ctx)
+    assert "上一段。命中句。下一段。" in prompt
+
+
+def test_build_prompt_falls_back_to_text_without_parent():
+    """没有父窗时行为不变 —— 旧数据/单块文档不受影响。"""
+    prompt = build_prompt("问", [(_mk("a.pdf", "只有这一句"), 0.9)])
+    assert "只有这一句" in prompt
+
+
+def test_load_chunks_attaches_parents_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setattr(R, "PARENT_CHILD", True)
+    monkeypatch.setattr(R, "PARENT_MAX_CHARS", 200)
+    (tmp_path / "a.txt").write_text("梧州特产有六堡茶。梧州还有龟苓膏。", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("另一份文档的内容。", encoding="utf-8")
+    chunks = R.load_chunks(str(tmp_path), chunk_size=10, chunk_overlap=0)
+    assert len(chunks) > 2
+    with_parent = [c for c in chunks if c.get("parent_text")]
+    assert with_parent, "灌库时应自动挂上父窗"
+    for c in with_parent:
+        assert c["text"] in c["parent_text"]
+    # a.txt 的父窗里不能出现 b.txt 的内容
+    a = [c for c in with_parent if c["source"] == "a.txt"]
+    assert a and all("另一份文档" not in c["parent_text"] for c in a)

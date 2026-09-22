@@ -130,6 +130,9 @@
 **什么时候换 MinerU**：如果实测发现 Docling 在**你的中文语料**上表格/版面精度不够，且你能接受它的署名条款——
 那时可以只替换 `src/docling_loader.py`（方案里已经把这个设为唯一耦合点）。
 
+> **实测进展（2026-09-22）**：已经按上面这条判据测过一轮 —— 中文**扫描件**（无文字层、带框线的对账单）经 Docling + RapidOCR 后，OCR 文字与数值全部正确，且 **TableFormer 从位图重建出了表格结构**。所以**当前不引入 MinerU**（换后端要自建第二套 provenance 模型，见 `PLAN_doc_parsing_v3.md` §4.1）。
+> 遇到坏件时的旋钮顺序：先 `DOCLING_OCR_MODE=full`（全页 OCR，兜住版面漏检），仍不行再评估 MinerU。
+
 **明确避开**：
 - ❌ **pymupdf4llm** —— AGPL 传染风险
 - ❌ **Marker** —— 权重有 5M USD 营收门槛（除非你确定长期低于这个线）

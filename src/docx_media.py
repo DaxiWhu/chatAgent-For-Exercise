@@ -340,8 +340,26 @@ def _pt_values(container: Any) -> list[str]:
     return [v for _, v in pts]
 
 
+def _ref_string(container: Any) -> str:
+    """取 `c:cat/c:strRef/c:f` 这类**公式引用串**（如 `Sheet1!$B$2:$B$5`）。
+
+    ⚠️ 它**不是数据**，绝不能当成值用（这是最容易犯的错）。它的唯一用途是当缓存缺失时
+    回表去读——见 loaders 里对 xlsx 图表的重解析：openpyxl 生成的图表就只写引用、
+    不写 `c:numCache`，此时"确定性数据"其实还在工作表里。
+    """
+    if container is None:
+        return ""
+    for ref_name in ("strRef", "numRef", "multiLvlStrRef"):
+        ref = _child(container, ref_name)
+        if ref is not None:
+            f = _child(ref, "f")
+            if f is not None and f.text:
+                return f.text.strip()
+    return ""
+
+
 def _series_data(ser: Any) -> dict:
-    """单个 c:ser → {name, categories, values}。
+    """单个 c:ser → {name, categories, values, cat_ref, val_ref}。
 
     系列名有两个来源，顺序不能反：
       1. `c:tx` 下的 cache（`c:strCache/c:pt/c:v`）—— 真实 Word 写的就是这个；
@@ -350,14 +368,19 @@ def _series_data(ser: Any) -> dict:
     """
     tx = _child(ser, "tx")
     name = " ".join(_pt_values(tx)).strip() or _text_of(tx, _A)
-    cats = _pt_values(_child(ser, "cat"))
-    vals = _pt_values(_child(ser, "val"))
+    name_ref = _ref_string(tx)
+    cat_el, val_el = _child(ser, "cat"), _child(ser, "val")
+    cats = _pt_values(cat_el)
+    vals = _pt_values(val_el)
+    cat_ref, val_ref = _ref_string(cat_el), _ref_string(val_el)
     if not cats or not vals:                     # 散点图用 xVal/yVal 而非 cat/val
-        xv = _pt_values(_child(ser, "xVal"))
-        yv = _pt_values(_child(ser, "yVal"))
-        cats = cats or xv
-        vals = vals or yv
-    return {"name": name, "categories": cats, "values": vals}
+        xv, yv = _child(ser, "xVal"), _child(ser, "yVal")
+        cats = cats or _pt_values(xv)
+        vals = vals or _pt_values(yv)
+        cat_ref = cat_ref or _ref_string(xv)
+        val_ref = val_ref or _ref_string(yv)
+    return {"name": name, "categories": cats, "values": vals,
+            "cat_ref": cat_ref, "val_ref": val_ref, "name_ref": name_ref}
 
 
 def parse_chart_xml(data: bytes) -> dict:
@@ -400,7 +423,10 @@ def parse_chart_xml(data: bytes) -> dict:
     if chart_el is not None:
         for ser in _children(chart_el, "ser"):
             s = _series_data(ser)
-            if s["values"] or s["name"]:
+            # 保留判据必须把**引用**也算上：openpyxl 生成的图表只写 `c:f` 引用、
+            # 不写任何缓存，此时值/名字在 XML 层面都是空的 —— 用 "有值才保留" 会把
+            # 整个系列丢掉，下游再想回表取值也没有入口（实测踩过）。
+            if s["values"] or s["name"] or s.get("val_ref") or s.get("name_ref"):
                 info["series"].append(s)
 
     for s in info["series"]:
@@ -545,7 +571,10 @@ def _write(blob: bytes, dest_dir: str, filename: str) -> str:
 
 
 def media_dir_for(path: str, media_dir: Optional[str] = None) -> str:
-    """某份 docx 的媒体导出目录：`<根目录>/<文件名词干>_<源路径指纹>/`。
+    """某份文档的媒体导出目录：`<根目录>/<文件名词干>_<源路径指纹>/`。
+
+    同时服务两条链路：docx 解 zip 导出的图片/OLE，以及 PDF 裁剪出的插图
+    （见 docling_loader._save_pictures）—— 两者对"隔离"的需求完全一样。
 
     为什么要带指纹而不能只用文件名：`a/报告.docx` 与 `b/报告.docx` 是两份不同的
     文档，只用词干会混进同一个目录 —— 文件不会互相覆盖（_write 会自动加序号），
@@ -768,6 +797,183 @@ def _log_summary(path: str, assets: list[DocxAsset]) -> None:
     if errs:
         logger.warning("docx 媒体提取有 %d 项异常：%s", len(errs),
                        "；".join(f"{a.kind}/{a.filename or a.part}: {a.error}" for a in errs[:5]))
+
+
+# ---------------------------------------------------------------------------
+# OOXML 家族通用：xlsx / pptx 的图表与媒体
+#
+# 关键事实（决定了这里的复用是"对"而不是"省事"）：
+# **图表 XML 在 Word / Excel / PowerPoint 里是同一种格式** —— DrawingML chart，
+# 根元素都是 `c:chartSpace`，类目/数值同样放在 `c:strCache` / `c:numCache` 里。
+# 所以为 docx 写的 parse_chart_xml / chart_to_table / chart_to_text 可以**原样**
+# 用在 xlsx 与 pptx 上：三个格式共用同一套"确定性数据优先"的实现。
+#
+# 三者的差别只在**怎么找到这些部件**：
+#   docx → word/charts/…        （位置由 document.xml 的引用决定）
+#   xlsx → xl/charts/…          （锚在某个工作表上，需经 drawing 关系）
+#   pptx → ppt/charts/…         （锚在某一页上，经 slide 的 rels 即可定位）
+# ---------------------------------------------------------------------------
+_SLIDE_PART = re.compile(r"^ppt/slides/slide(\d+)\.xml$")
+_CHART_PART = re.compile(r"^(?:word|xl|ppt)/charts/chart(\d+)\.xml$")
+
+
+def _slide_parts(zf: zipfile.ZipFile) -> list[tuple[int, str]]:
+    """[(页码, 部件路径)]，按**页序**排列。
+
+    不能按字符串排序：`slide10.xml` 会排在 `slide2.xml` 前面，
+    于是"第 10 页的图"被挂到第 2 页上 —— 位置信息错得非常隐蔽。
+    """
+    out = []
+    for name in zf.namelist():
+        m = _SLIDE_PART.match(name)
+        if m:
+            out.append((int(m.group(1)), name))
+    return sorted(out)
+
+
+def extract_ooxml_charts(path: str) -> list[dict]:
+    """从 xlsx / pptx（以及 docx）包里取出所有图表 → [{part, chart, page, alt_text}]。
+
+    只做"取数据"，不做入库决策；解析不出系列的图表会被跳过（空图表进了索引也没用）。
+    """
+    if not os.path.isfile(path) or not zipfile.is_zipfile(path):
+        return []
+    out: list[dict] = []
+    try:
+        with zipfile.ZipFile(path) as zf:
+            # pptx：先建"图表部件 → 页码"的映射（这样图表能挂到正确的页上）
+            page_of: dict[str, int] = {}
+            for page, part in _slide_parts(zf):
+                for rel in _read_part_rels(zf, part).values():
+                    target = rel.get("target") or ""
+                    if target.endswith(".xml") and "/charts/" in target:
+                        page_of[target] = page
+            for name in zf.namelist():
+                if not _CHART_PART.match(name):
+                    continue
+                try:
+                    chart = parse_chart_xml(zf.read(name))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("读取图表失败（%s）：%s", name, exc)
+                    continue
+                if not chart.get("series"):
+                    continue
+                out.append({"part": name, "chart": chart,
+                            "page": page_of.get(name), "alt_text": ""})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("图表提取失败（%s）：%s", os.path.basename(path), exc)
+    return out
+
+
+def _read_part_rels(zf: zipfile.ZipFile, part: str) -> dict[str, dict]:
+    """任意部件的 .rels → {rId: {target, type}}。
+
+    与 docx 的 `_read_rels` 同理，但部件目录不同（ppt/slides/、xl/worksheets/ …），
+    所以按"同目录下 _rels/<部件名>.rels"的 OOXML 约定推导，而不是写死路径。
+
+    ⚠️ Target 必须**相对部件所在目录**解析：pptx 的图片引用写的是
+    `../media/image1.png`（相对 ppt/slides/），直接砍掉 `../` 会得到
+    `media/image1.png` —— 那个部件在包里不存在，于是图片和图表**一个都取不到**，
+    而且不会报错（实测踩过）。这里统一用 normpath 拼接，`.docx`/`.xlsx`/`.pptx` 通用。
+    """
+    folder, _, filename = part.rpartition("/")
+    rels_part = f"{folder}/_rels/{filename}.rels" if folder else f"_rels/{filename}.rels"
+    if rels_part not in zf.namelist():
+        return {}
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(zf.read(rels_part))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("解析 %s 失败：%s", rels_part, exc)
+        return {}
+
+    import posixpath
+
+    out: dict[str, dict] = {}
+    for rel in root:
+        rid = rel.get("Id") or ""
+        if not rid:
+            continue
+        target = (rel.get("Target") or "").replace("\\", "/")
+        if target.startswith("/"):                 # 包内绝对路径
+            resolved = target.lstrip("/")
+        else:
+            resolved = posixpath.normpath(f"{folder}/{target}") if folder else target
+            resolved = resolved.lstrip("./")
+        out[rid] = {"target": resolved, "type": (rel.get("Type") or "").rsplit("/", 1)[-1].lower()}
+    return out
+
+
+def extract_pptx_media(path: str, media_dir: Optional[str] = None) -> list[dict]:
+    """PPT 的图片与图表 → [{page, part, saved_path, alt_text, chart, filename}]。
+
+    位置靠页序表达（PPT 没有页码，页序是它唯一确定的位置信息），
+    替代文字沿用与 docx 相同的"挂起—认领"手法：
+    `p:cNvPr@descr` 排在它描述的 `<a:blip>` **之前**，所以遇到 cNvPr 就挂着，
+    遇到下一个媒体引用时认领。作者写的替代文字是确定性描述，免 VLM。
+    """
+    if not os.path.isfile(path) or not zipfile.is_zipfile(path):
+        return []
+    out: list[dict] = []
+    out_dir = media_dir_for(path, media_dir)
+    exported: dict[str, str] = {}
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = set(zf.namelist())
+            for page, part in _slide_parts(zf):
+                try:
+                    import xml.etree.ElementTree as ET
+                    root = ET.fromstring(zf.read(part))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("解析 %s 失败：%s", part, exc)
+                    continue
+                rels = _read_part_rels(zf, part)
+                pending_alt = ""
+
+                for el in root.iter():
+                    _, name = _split_tag(el.tag)
+                    attrs = getattr(el, "attrib", None) or {}
+                    if name == "cNvPr":
+                        pending_alt = (attrs.get("descr") or attrs.get("title")
+                                       or attrs.get("name") or "").strip() or pending_alt
+                        continue
+                    rid, kind = "", ""
+                    if name == "blip":
+                        rid, kind = _rel_attr(el, "embed"), "image"
+                    elif name == "chart":
+                        rid, kind = _rel_attr(el, "id"), "chart"
+                    if not rid:
+                        continue
+                    rel = rels.get(rid) or {}
+                    target = rel.get("target") or ""
+                    if kind == "image" and target in names:
+                        saved = exported.get(target) or _export_part(zf, target, out_dir)
+                        exported[target] = saved
+                        out.append({"page": page, "part": target, "saved_path": saved,
+                                    "alt_text": pending_alt, "chart": None,
+                                    "filename": os.path.basename(target),
+                                    "error": "" if saved else "导出失败"})
+                    elif kind == "chart" and target in names:
+                        try:
+                            chart = parse_chart_xml(zf.read(target))
+                        except Exception as exc:  # noqa: BLE001
+                            chart = {"series": [], "error": str(exc)}
+                        out.append({"page": page, "part": target, "saved_path": "",
+                                    "alt_text": pending_alt, "chart": chart,
+                                    "filename": os.path.basename(target), "error": ""})
+                    pending_alt = ""
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PPT 媒体提取失败（%s）：%s", os.path.basename(path), exc)
+    return out
+
+
+def _export_part(zf: zipfile.ZipFile, part: str, out_dir: str) -> str:
+    try:
+        return _write(zf.read(part), out_dir, _safe_name(os.path.basename(part)))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("导出 %s 失败：%s", part, exc)
+        return ""
 
 
 def summarize(assets: list[DocxAsset]) -> dict:

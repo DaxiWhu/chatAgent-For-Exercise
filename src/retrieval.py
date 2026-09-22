@@ -130,6 +130,16 @@ DOC_PARSER = os.getenv("RAG_DOC_PARSER", "docling").strip().lower()
 PDF_CHUNK_SIZE = _env_int("RAG_PDF_CHUNK_SIZE", 800)
 PDF_CHUNK_OVERLAP = _env_int("RAG_PDF_CHUNK_OVERLAP", 200)
 
+# ---------- 父子块 / Contextual Retrieval（批次8）----------
+# 检索命中的是**小块**（精度高），但送进模型的应该是它所在的**上下文窗口**，
+# 否则答案常因缺上文而断裂。这条不改召回排序，改的是"给模型看什么"。
+PARENT_CHILD = os.getenv("RAG_PARENT_CHILD", "on").strip().lower() not in ("0", "off", "false", "no")
+PARENT_MAX_CHARS = max(200, _env_int("RAG_PARENT_MAX_CHARS", 1200))
+
+# Contextual Retrieval（Anthropic）：给每块加一句"它在整篇文档里的位置与主题"前缀。
+# 这是切分侧唯一**显著花钱**的改进（每块一次 LLM 调用），所以默认关。
+CONTEXTUAL = os.getenv("RAG_CONTEXTUAL", "off").strip().lower() in ("1", "on", "true", "yes")
+
 # TF-IDF 分词参数：中文没有空格，默认的 word 分词会把整句当成一个 token，
 # 导致查询词与语料词表完全匹配不上（实测全部 0 命中）。改用字符 n-gram，中英文都友好。
 TFIDF_ANALYZER = "char_wb"
@@ -232,6 +242,37 @@ def _split_text(text, chunk_size, chunk_overlap):
             for p in _make_splitter(chunk_size, chunk_overlap).split_text(text)]
 
 
+def _split_text_texts(text, chunk_size, chunk_overlap):
+    """同 _split_text，但只返回文本片段。
+
+    供 `from_blocks` 的二次切分用：那边只关心"这一块太长，拆成几段"，
+    section/page 由块自己带着，不该被切分器覆盖掉。
+    """
+    return [p["text"] for p in _split_text(text, chunk_size, chunk_overlap)]
+
+
+def _enrich_images(chunks, name):
+    """给需要描述的图补 VLM 描述（批次 6）。默认关闭，开启后只处理"确定性来源拿不到"的图。
+
+    为什么放在这里而不是 docling_loader：这是**产物完善**步骤，与解析后端无关
+    （PDF 裁剪图与 docx 媒体走同一条），放进解析层会让后端多背一个不该有的依赖。
+    任何失败都只记日志，绝不影响已经解析出来的内容。
+    """
+    if not chunks:
+        return
+    try:
+        from . import image_describer
+
+        est = image_describer.estimate(chunks)
+        if est["needs_vlm"]:
+            # 先把"待描述总量与预估 token"打出来：按图计费，量要在日志里可见
+            logging.info("图片 VLM 待办：%s（%s）", image_describer.format_estimate(est), name)
+        image_describer.enrich(chunks)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("图片 VLM 描述步骤异常（不影响已解析内容）：%s（%s: %s）",
+                        name, type(e).__name__, e)
+
+
 def _parse_pdf(path, name, chunk_size, overlap):
     """PDF 解析：Docling 优先，不可用或失败时自动回退 pdfminer。
 
@@ -258,6 +299,7 @@ def _parse_pdf(path, name, chunk_size, overlap):
                     # 所以不降级，而是保留这条显式失败记录，让它可被检索到。
                     logging.warning("Docling 未解析出内容，保留失败记录：%s（%s）",
                                     name, out.reason)
+                _enrich_images(out.chunks, name)
                 return to_legacy_many(out.chunks)
 
     from .knowledge_chunk import from_pdfminer_pieces
@@ -294,6 +336,7 @@ def _parse_docx(path, name, chunk_size, overlap):
                     # 同 PDF：降级到 python-docx 只会更差，保留显式失败记录让它可被检索到
                     logging.warning("Docling 未解析出 docx 内容，保留失败记录：%s（%s）",
                                     name, out.reason)
+                _enrich_images(out.chunks, name)
                 return to_legacy_many(out.chunks)
 
     return _parse_docx_legacy(path, name, chunk_size, overlap)
@@ -336,7 +379,7 @@ def load_chunks(doc_folder, chunk_size=None, chunk_overlap=None, pdf_chunk_size=
     pdf_chunk_size = PDF_CHUNK_SIZE if pdf_chunk_size is None else pdf_chunk_size
     pdf_overlap = PDF_CHUNK_OVERLAP if pdf_overlap is None else pdf_overlap
 
-    from .loaders import load_text, supported_extensions
+    from .loaders import load_blocks, supported_extensions
 
     exts = supported_extensions()
     chunks: list[dict] = []
@@ -371,17 +414,24 @@ def load_chunks(doc_folder, chunk_size=None, chunk_overlap=None, pdf_chunk_size=
                 logging.warning("docx 解析失败，跳过 %s: %s", name, e)
             continue
 
-        # ---- 其它格式：统一走 loaders ----
+        # ---- 其它格式：结构化解析成块 → 同一套产物 ----
+        # 不再走"先拍成一段文本再切"：csv/xlsx/pptx/json/md 各能说清一部分结构
+        # （表头、工作表、页序、标题路径、记录边界），拍平之后就永久丢了。
         ext = os.path.splitext(low)[1]
         if ext not in exts:
             skipped[ext] = skipped.get(ext, 0) + 1
             continue
 
-        text = load_text(f)
-        if not text.strip():
+        blocks = load_blocks(f)
+        if not blocks:
             continue
-        for p in _split_text(text, chunk_size, chunk_overlap):
-            chunks.append({"source": name, "section": p["section"], "text": p["text"]})
+        from .chunk_writer import to_legacy_many
+        from .knowledge_chunk import from_blocks
+
+        kcs = from_blocks(blocks, name, parser=ext.lstrip(".") or "text",
+                          splitter=lambda t: _split_text_texts(t, chunk_size, chunk_overlap))
+        _enrich_images(kcs, name)
+        chunks += to_legacy_many(kcs)
 
     if skipped:
         logging.warning(
@@ -389,7 +439,77 @@ def load_chunks(doc_folder, chunk_size=None, chunk_overlap=None, pdf_chunk_size=
             ", ".join(f"{e or '(无扩展名)'}×{n}" for e, n in sorted(skipped.items())),
         )
 
+    # 顺序刻意是「先上下文前缀、后父块」：前缀是喂给嵌入的检索用文本，
+    # 父窗是喂给模型的生成用文本。反过来的话，父窗里就没有前缀，
+    # 于是"被检索的内容"和"被生成的内容"成了两套文本，出问题很难解释。
+    _apply_contextual(chunks)
+    attach_parents(chunks)
     _log_load_summary(chunks)
+    return chunks
+
+
+def _apply_contextual(chunks):
+    """Contextual Retrieval（批次8，默认关）。任何失败都只记日志，不影响灌库。"""
+    if not CONTEXTUAL or not chunks:
+        return chunks
+    try:
+        from . import contextualizer
+        stats = contextualizer.apply(chunks)
+        logging.info("Contextual Retrieval：%s", contextualizer.format_stats(stats))
+    except Exception as e:  # noqa: BLE001
+        logging.warning("Contextual Retrieval 步骤异常（不影响灌库）：%s（%s: %s）",
+                        type(e).__name__, e)
+    return chunks
+
+
+def attach_parents(chunks):
+    """给每个块挂上"父块文本"：同一份文档里围绕它的一段连续窗口（约 PARENT_MAX_CHARS 字）。
+
+    为什么用**连续窗口**而不是"按章节分组的整节"：PDF 的 section_path 常为空，
+    按节分组等于把整份文档当父块，再截断到 1200 字 —— 那就变成"永远是文档开头",
+    对定位毫无帮助。窗口是命中块左右的邻居，命中块必然在里面，语境才有意义。
+
+    为什么不建单独的父块索引：本项目语料规模（< 1 万块）下存副本最省事，
+    而且"父块到底是什么"变成可直接检视的事实，而不是运行时才算出来的隐式行为。
+
+    只在同一 source 内扩张：跨文档拼上下文会把别的文档的正文当成这段的语境。
+    """
+    if not PARENT_CHILD or not chunks:
+        return chunks
+
+    n = len(chunks)
+    covered = 0
+    for i, c in enumerate(chunks):
+        src = c.get("source")
+        own = c.get("text") or ""
+        budget = PARENT_MAX_CHARS - len(own)
+        lo = hi = i
+        # 左右交替扩张：先保证两侧都有机会，避免一侧的长块把预算吃光
+        while budget > 0 and (lo > 0 or hi < n - 1):
+            grew = False
+            for nxt in (lo - 1, hi + 1):
+                if nxt < 0 or nxt >= n or chunks[nxt].get("source") != src:
+                    continue
+                t = chunks[nxt].get("text") or ""
+                if len(t) > budget:
+                    continue
+                if nxt < lo:
+                    lo = nxt
+                else:
+                    hi = nxt
+                budget -= len(t)
+                grew = True
+            if not grew:
+                break
+        if hi - lo + 1 < 2:
+            continue                      # 孤立单块（该文档只有一块）没什么可"父"的
+        c["parent_id"] = f"{src}#{lo}-{hi}"
+        c["parent_text"] = "\n".join((chunks[k].get("text") or "") for k in range(lo, hi + 1))
+        covered += 1
+
+    if covered:
+        logging.info("父子块：%d/%d 块已挂上父窗（≤%d 字，同一文档内扩张）",
+                     covered, n, PARENT_MAX_CHARS)
     return chunks
 
 
@@ -629,10 +749,17 @@ def build_retriever(chunks):
 # 4. 生成
 # ---------------------------------------------------------------------------
 def build_prompt(question, contexts):
-    """contexts: [({"source","section","text"}, score), ...]"""
-    ctx = "\n\n".join(
-        f"[来源: {c['source']}]\n{c['text']}" for c, _ in contexts
-    )
+    """contexts: [({"source","section","text",...}, score), ...]
+
+    内容优先取 `parent_text`（批次8 的 small-to-big）：检索用小块保证精度，
+    送模型时换成命中块所在的**上下文窗口**，避免答案因为缺上文而断裂。
+    没有父窗的块（如该文档只有一块）自动退回自身 text。
+    """
+    blocks = []
+    for c, _ in contexts:
+        body = c.get("parent_text") or c.get("text") or ""
+        blocks.append(f"[来源: {c.get('source', '?')}]\n{body}")
+    ctx = "\n\n".join(blocks)
     return (
         "你是一个严谨的问答助手。请只根据下面提供的【参考资料】回答用户问题，"
         "如果资料里没有相关信息，就如实说“资料中未提及”。不要编造。\n\n"

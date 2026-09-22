@@ -190,6 +190,20 @@ def _predicted_class(item: Any) -> str:
     return ""
 
 
+def _image_path_of(item: Any, image_paths: Optional[dict]) -> str:
+    """取该图片元素落盘后的本地路径（见 docling_loader._save_pictures）。
+
+    找不到就返回空串 —— 上游"这张图没落盘"与"这张图不该落盘"是两件事，
+    由下游（批次6 的 VLM 步骤）显式记成"无图可取"，绝不能在这里假装有图。
+    """
+    if not image_paths or item is None:
+        return ""
+    ref = getattr(item, "self_ref", None)
+    if isinstance(ref, str) and ref in image_paths:
+        return image_paths[ref] or ""
+    return ""
+
+
 def _kind_for_items(items: list[Any]) -> str:
     """按优先级判定块类型：表格 > 图片 > 公式 > 文本。"""
     labels = {_label_of(i) for i in items}
@@ -367,11 +381,16 @@ def unprocessable(source: str, reason: str, parser: str = "",
 def from_docling_chunk(chunk: Any, doc: Any, *, chunker: Any = None,
                        source: str = "", page_total: Optional[int] = None,
                        parser: str = "docling", origin: str = "docling_pdf",
-                       file_checksum: str = "") -> KnowledgeChunk:
+                       file_checksum: str = "",
+                       image_paths: Optional[dict] = None) -> KnowledgeChunk:
     """Docling DocChunk → KnowledgeChunk。
 
     用 duck typing 读取 chunk.meta（headings / doc_items），不 import docling，
     这样未装 docling 时本模块仍可被导入与测试。
+
+    image_paths：`{self_ref: 本地图片路径}`（见 docling_loader._save_pictures）。
+    为什么要单独传进来：docling 的 `generate_picture_images=True` 只把图放在内存里，
+    **不落盘**；而下游（VLM 描述、随回答返回图片）都需要一个能读的文件。
     """
     meta = getattr(chunk, "meta", None)
     headings = list(getattr(meta, "headings", None) or [])
@@ -407,6 +426,11 @@ def from_docling_chunk(chunk: Any, doc: Any, *, chunker: Any = None,
         kc.retrieval_text = linearize_table(md, caption) or text
         if sibling:
             kc.retrieval_text = " ".join(p for p in (kc.retrieval_text, sibling) if p)
+        # 章节路径**追加在末尾**：表格数值是强信号，必须留在最前面（嵌入对开头更敏感），
+        # 但"这张表属于哪一节"对"第三章的出口数据是多少"这类问题是必需的召回线索。
+        # 其它分支（text/formula）都把 section_path 写进了检索文本，表格分支漏了 —— 补齐口径。
+        if section_path:
+            kc.retrieval_text = f"{kc.retrieval_text}（章节：{section_path}）"
         kc.tags = ["表格"]
 
     elif kind == KIND_DIAGRAM:
@@ -419,6 +443,7 @@ def from_docling_chunk(chunk: Any, doc: Any, *, chunker: Any = None,
                 caption = ""
         cls = _predicted_class(pic) if pic is not None else ""
         kc.kind, kc.needs_vlm = picture_kind(pic) if pic is not None else (KIND_DIAGRAM, True)
+        kc.source_image = _image_path_of(pic, image_paths)
         sibling = _sibling_texts(items)
         if sibling:
             # 图文混排：块里的正文才是可检索的主体，不能因为"含图片"就丢掉
@@ -473,10 +498,79 @@ class _ItemAsChunk:
         self.text = text
 
 
+def from_blocks(blocks: list, source: str, *, parser: str = "loader",
+                origin: str = "file_loader", page_total: Optional[int] = None,
+                file_checksum: str = "",
+                splitter: Optional[Any] = None) -> list[KnowledgeChunk]:
+    """`loaders.Block` → list[KnowledgeChunk]（duck typing 读属性，本模块不依赖 loaders）。
+
+    为什么其它格式需要一个专门的入口：csv/xlsx/pptx/json/md 这些格式**各自**能说清
+    一部分结构（表头、工作表、页序、标题路径、记录边界），但那部分结构只存在于
+    loaders 的 Block 里。走 `load_text` 把它们拍成一段字符串，结构就永久丢了 ——
+    "这张表属于哪个工作表""这一页讲什么"全都找不回来。
+
+    `splitter`：给超大块（例如一整个工作表）准备的二次切分回调。
+    有它就会把一个块切成多块，**并保持 section/page 不变** ——
+    切开的只是长度，归属不该变。
+    """
+    out: list[KnowledgeChunk] = []
+    if not blocks:
+        return out
+
+    for i, b in enumerate(blocks):
+        text = (getattr(b, "text", "") or "").strip()
+        section = (getattr(b, "section", "") or "").strip()
+        page = getattr(b, "page", None)
+        tags = list(getattr(b, "tags", None) or [])
+        kind = getattr(b, "kind", "") or KIND_TEXT
+        img = getattr(b, "source_image", "") or ""
+        if not text and not img:
+            continue
+
+        pieces = [text]
+        if splitter is not None and text:
+            try:
+                parts = splitter(text)
+                pieces = [p for p in parts if (p or "").strip()] or [text]
+            except Exception as exc:  # noqa: BLE001  切分失败就整块留着，绝不丢
+                logger.warning("块二次切分失败，按整块保留：%s", exc)
+
+        for j, piece in enumerate(pieces):
+            retrieval = _with_section(piece, section)
+            kc = KnowledgeChunk(
+                source=source, page=page, kind=kind, section_path=section,
+                page_total=page_total, parser=parser, origin=origin,
+                file_checksum=file_checksum, content=piece, retrieval_text=retrieval,
+                tags=tags, source_image=img,
+                needs_vlm=bool(getattr(b, "needs_vlm", False)),
+                chunk_id=make_chunk_id(source, f"block|{i}|{j}|{page}|{piece[:64]}"),
+            )
+            out.append(kc)
+    return out
+
+
+def _with_section(text: str, section: str) -> str:
+    """把标题路径并进检索文本 —— 但**只在它还没出现时**。
+
+    md / xlsx / pptx 的正文块里往往已经带了标题行或工作表名（我们刻意这么写的，
+    因为检索只嵌入 `text`）。无条件再拼一次会让同一句话在向量里出现两遍，
+    既浪费 token 又会让相似度虚高。
+    """
+    if not text:
+        return section
+    if not section:
+        return text
+    leaf = section.split(" > ")[-1].strip()
+    if leaf and leaf in text:
+        return text
+    return f"{section}；{text}"
+
+
 def from_docling_items(doc: Any, *, source: str, parser: str = "docling",
                        origin: str = "docling_pdf",
                        page_total: Optional[int] = None,
-                       file_checksum: str = "") -> list[KnowledgeChunk]:
+                       file_checksum: str = "",
+                       image_paths: Optional[dict] = None) -> list[KnowledgeChunk]:
     """按 item 逐条兜底切块。仅在两种 chunker 都产出 0 块时使用。
 
     为什么必须有这条：HybridChunker 对"通篇只有标题、没有正文 item"的文档会返回
@@ -513,6 +607,7 @@ def from_docling_items(doc: Any, *, source: str, parser: str = "docling",
                 _ItemAsChunk(item, [h for h in headings if h], text), doc,
                 source=source, parser=parser, origin=origin,
                 page_total=page_total, file_checksum=file_checksum,
+                image_paths=image_paths,
             ))
         except Exception as exc:
             logger.warning("兜底切块：单个 item 转换失败，跳过：%s", exc)

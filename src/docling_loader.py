@@ -55,6 +55,45 @@ TOKENIZER_MODE = os.getenv("BGE_TOKENIZER", "hf").strip().lower()    # hf | tikt
 TOKENIZER_MODEL = os.getenv("EMBEDDING_MODEL", "").strip() or "BAAI/bge-m3"
 IMAGES_SCALE = float(os.getenv("DOCLING_IMAGES_SCALE", "2.0") or 2.0)
 
+# ---- OCR（批次7：中文扫描件）----
+# ⚠️ **必须显式配**，不能依赖库的默认值：
+# docling 2.129 的 RapidOcrOptions.lang 默认恰好是 ['ch']，中文能"碰巧跑对"；
+# 但这个默认值不是契约，上游一旦改成 ['en']（不少 OCR 库就是英文优先），
+# 中文扫描件会**静默**退化成乱码——不会报错，只会识别出无意义的字符。
+# 另：lang/backend 必须与预取权重时一致（见 scripts/fetch_docling_models.py），
+# 否则运行时找不到对应 onnx 文件名，直接报 artifacts not found。
+_DEFAULT_OCR_LANG = "ch"
+DOCLING_OCR_LANG = [s.strip() for s in
+                    os.getenv("DOCLING_OCR_LANG", _DEFAULT_OCR_LANG)
+                    .replace(",", " ").split() if s.strip()] or [_DEFAULT_OCR_LANG]
+DOCLING_OCR_BACKEND = os.getenv("DOCLING_OCR_BACKEND", "onnxruntime").strip() or "onnxruntime"
+# OCR 区域选择：default(PDF_AWARE_LAYOUT_REGIONS) | layout | full | pdf_aware
+# 实测：合成扫描件在三种模式下都能捞回文字；但**版面模型漏检的坏件**
+# （歪斜、低对比、手写表格）只有 full 能兜住 —— 这是遇到真实坏件的第一个旋钮。
+DOCLING_OCR_MODE = os.getenv("DOCLING_OCR_MODE", "default").strip().lower()
+# 检测前放大倍数。RapidOCR 自身默认 3.0，对小字号有利但更慢；留空则用库默认。
+OCR_SCALE = os.getenv("DOCLING_OCR_SCALE", "").strip()
+DOCLING_OCR_SCALE = float(OCR_SCALE) if OCR_SCALE else None
+
+
+def _ocr_mode() -> Any:
+    """字符串 → `OcrMode` 枚举（按名字匹配，认不出就退回 DEFAULT）。"""
+    from docling.datamodel.pipeline_options import OcrMode
+
+    table = {
+        "default": OcrMode.DEFAULT,
+        "pdf_aware": OcrMode.PDF_AWARE_LAYOUT_REGIONS,
+        "layout": OcrMode.LAYOUT_REGIONS,
+        "layout_regions": OcrMode.LAYOUT_REGIONS,
+        "full": OcrMode.FULL_PAGE,
+        "full_page": OcrMode.FULL_PAGE,
+    }
+    mode = table.get(DOCLING_OCR_MODE)
+    if mode is None:
+        logger.warning("未知的 DOCLING_OCR_MODE=%r，退回 default", DOCLING_OCR_MODE)
+        return OcrMode.DEFAULT
+    return mode
+
 # 判定"有文字层"的最小字符数：低于此值视为扫描件
 _TEXT_LAYER_MIN_CHARS = 50
 
@@ -128,6 +167,76 @@ class _CharTokenizer:
 
     def get_tokenizer(self) -> Any:
         return None
+
+
+def _save_pictures(doc: Any, path: str) -> dict:
+    """把 PDF 里裁剪出的图片落盘，返回 {self_ref: 本地路径}。
+
+    为什么必须做这一步：docling 的 `generate_picture_images=True` 只是把裁剪结果
+    **放在内存**里（`PictureItem.get_image(doc)` 现取现用），**不落盘**。
+    而下游有两件事都需要一个能读的文件：
+      - 批次 6 的 VLM 描述（要读图字节）；
+      - "随回答返回图片"（要给出可引用的路径）。
+    没有这一步，"开关打开了"和"图片可用"之间就隔着一条看不见的断链 ——
+    产物里 `source_image` 永远是空的，而不会报任何错。
+
+    命名带页码与序号（`p003_fig02.png`），便于人工核对时快速定位到原文位置。
+    PDF 裁剪出来的图是位图（PIL Image），不存在 EMF/WMF 这类 VLM 读不了的矢量格式。
+    """
+    out: dict[str, str] = {}
+    pictures = list(getattr(doc, "pictures", None) or [])
+    if not pictures:
+        return out
+
+    try:
+        from .docx_media import media_dir_for
+        out_dir = media_dir_for(path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("图片落盘目录不可用，跳过图片导出：%s（%s）", path, exc)
+        return out
+
+    saved = 0
+    for i, pic in enumerate(pictures, start=1):
+        ref = getattr(pic, "self_ref", None)
+        if not isinstance(ref, str) or not ref:
+            continue
+        try:
+            img = pic.get_image(doc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("取图片失败（%s）：%s", ref, exc)
+            continue
+        if img is None:
+            # 正常情况：没开 generate_picture_images，或该图只有坐标没有像素
+            logger.debug("图片无像素数据（未开 generate_picture_images？）：%s", ref)
+            continue
+        page = _picture_page(pic)
+        name = f"p{page:03d}_fig{i:02d}.png" if page else f"fig{i:02d}.png"
+        dest = os.path.join(out_dir, name)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            # PNG 无损：图片是给模型看的，不做有损压缩以免小字号/细线丢失
+            img.save(dest, "PNG")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("图片写盘失败（%s）：%s", dest, exc)
+            continue
+        out[ref] = dest
+        saved += 1
+
+    if saved:
+        logger.info("PDF 图片已落盘：%s（%d 张 → %s）",
+                    os.path.basename(path), saved, out_dir)
+    return out
+
+
+def _picture_page(pic: Any) -> int:
+    """取图片所在页码（用于文件名）；取不到返回 0。"""
+    try:
+        prov = getattr(pic, "prov", None) or []
+        if prov:
+            return int(getattr(prov[0], "page_no", 0) or 0)
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
 
 
 def build_tokenizer() -> Any:
@@ -251,6 +360,28 @@ def _build_converter(ocr: bool) -> Any:
     _set(opts, "do_formula_enrichment",
          os.getenv("DOCLING_FORMULA", "0").strip().lower() in ("1", "true", "on", "yes"))
 
+    if ocr:
+        mode = _ocr_mode()
+        try:
+            from docling.datamodel.pipeline_options import RapidOcrOptions
+            opts.ocr_options = RapidOcrOptions(
+                lang=DOCLING_OCR_LANG,          # ★ 必须显式：中文语料不能依赖库的默认值
+                backend=DOCLING_OCR_BACKEND,
+                mode=mode,
+                **({"scale": DOCLING_OCR_SCALE} if DOCLING_OCR_SCALE else {}),
+            )
+            logger.info("OCR 显式配置：lang=%s backend=%s mode=%s scale=%s "
+                        "（lang 必须与预取权重时一致，否则文件名对不上）",
+                        DOCLING_OCR_LANG, DOCLING_OCR_BACKEND, mode, DOCLING_OCR_SCALE)
+            if DOCLING_OCR_LANG != [_DEFAULT_OCR_LANG]:
+                # 这不是错误，但极容易踩：预取脚本下的是 onnxruntime:ch 的权重，
+                # 运行时换语言（如 en）会去找另一套 onnx，报 artifacts not found。
+                logger.warning("OCR 语言为 %s，而权重是按 %r 预取的 —— 若报 artifacts not found，"
+                               "请用同一语言重跑 scripts/fetch_docling_models.py",
+                               DOCLING_OCR_LANG, _DEFAULT_OCR_LANG)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("显式配置 OCR 选项失败，退回 docling 默认：%s", exc)
+
     try:
         opts.table_structure_options.mode = TableFormerMode.ACCURATE   # 合并单元格更准
     except Exception as exc:
@@ -347,7 +478,8 @@ def _chunk_once(doc: Any, chunker: Any, kwarg: str) -> list:
 
 def to_knowledge_chunks(doc: Any, source: str, *, kind: str = "pdf",
                         page_total: Optional[int] = None,
-                        checksum: str = "") -> list:
+                        checksum: str = "",
+                        image_paths: Optional[dict] = None) -> list:
     """DoclingDocument → list[KnowledgeChunk]，四级阶梯，确保抽到的内容不被丢掉。
 
     阶梯设计的原因（实测出来的，不是假想）：
@@ -377,6 +509,7 @@ def to_knowledge_chunks(doc: Any, source: str, *, kind: str = "pdf",
                 out.append(from_docling_chunk(
                     ch, doc, chunker=chunker, source=source, parser="docling",
                     origin=origin, page_total=page_total, file_checksum=checksum,
+                    image_paths=image_paths,
                 ))
             except Exception as exc:
                 logger.warning("单个 chunk 转换失败，跳过该块：%s", exc)
@@ -393,7 +526,8 @@ def to_knowledge_chunks(doc: Any, source: str, *, kind: str = "pdf",
 
     logger.warning("两种切分器均未产出块，改按 item 逐条兜底：%s", source)
     out = from_docling_items(doc, source=source, parser="docling", origin=origin,
-                             page_total=page_total, file_checksum=checksum)
+                             page_total=page_total, file_checksum=checksum,
+                             image_paths=image_paths)
     if out:
         return out
 
@@ -467,8 +601,9 @@ def parse_document(path: str, source: str, *, kind: str = "pdf") -> ParseOutcome
     pages = getattr(doc, "pages", None) or {}
     page_total = len(pages) or None
     checksum = file_checksum(path)
-    chunks = to_knowledge_chunks(doc, source, kind=kind,
-                                 page_total=page_total, checksum=checksum)
+    image_paths = _save_pictures(doc, path)
+    chunks = to_knowledge_chunks(doc, source, kind=kind, page_total=page_total,
+                                 checksum=checksum, image_paths=image_paths)
 
     if not chunks:
         from .knowledge_chunk import unprocessable

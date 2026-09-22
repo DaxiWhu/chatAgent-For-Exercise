@@ -91,6 +91,8 @@ def main():
                     help="切分策略：headings（结构感知）| recursive（纯递归）")
     ap.add_argument("--chunk-size", type=int, default=None, help="块大小（字符）")
     ap.add_argument("--overlap", type=int, default=None, help="块间重叠（字符）")
+    ap.add_argument("--contextual", action="store_true",
+                    help="开启 Contextual Retrieval（每块一次 LLM 调用，有缓存）后再评测")
     args = ap.parse_args()
 
     # 允许命令行覆盖切分参数，便于做「改前 vs 改后」对比
@@ -110,6 +112,16 @@ def main():
 
     try:
         chunks = R.load_chunks(docs_dir)
+        # 批次8 的验收手段：Contextual Retrieval 会改变**召回排序**，所以能用同一套指标量出差别
+        # （父子块不会改排序，它改的是"送模型什么"，只能用单测与 prompt 检查验收）。
+        if args.contextual:
+            from src import contextualizer
+            R.CONTEXTUAL = True          # 命令行开关落到配置上，enabled() 的判据保持单一
+            stats = contextualizer.apply(chunks)
+            print(f"[Contextual] {contextualizer.format_stats(stats)}")
+            if not stats["prefixed"]:
+                print("  ⚠️ 一块都没加上前缀，检查 RAG_CONTEXTUAL / AGNES_API_KEY；"
+                      "下面测的仍是基线。")
         print("=" * 92)
         print(f"评测集 {args.set} | 切分策略={R.CHUNK_STRATEGY} "
               f"块大小={R.CHUNK_SIZE} 重叠={R.CHUNK_OVERLAP}")

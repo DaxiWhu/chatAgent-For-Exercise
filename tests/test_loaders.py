@@ -134,7 +134,11 @@ def test_docx_headings_paragraphs_tables(tmp_path):
     assert "# 梧州概况" in text        # 标题层级被保住
     assert "梧州位于广西东部。" in text
     assert "[表格 1]" in text
-    assert "六堡茶 | 黑茶的一种" in text
+    # 表格改成"表头感知"：每一行都带列名。
+    # 旧断言（"六堡茶 | 黑茶的一种"）只能证明值读出来了，
+    # 而列名只出现在首行 —— 切开之后那些块里没人知道每列是什么。
+    assert "表头：特产 | 说明" in text
+    assert "特产=六堡茶 | 说明=黑茶的一种" in text
 
 
 def test_xlsx_sheets(tmp_path):
@@ -149,7 +153,9 @@ def test_xlsx_sheets(tmp_path):
 
     text = load_text(str(p))
     assert "## 工作表：特产表" in text
-    assert "梧州 | 六堡茶" in text
+    # 同理改成表头感知：`城市=梧州` 才知道梧州是城市，`梧州 | 六堡茶` 不知道
+    assert "表头：城市 | 特产" in text
+    assert "城市=梧州 | 特产=六堡茶" in text
 
 
 def test_pptx_slides(tmp_path):
