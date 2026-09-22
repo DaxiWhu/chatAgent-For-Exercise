@@ -558,7 +558,85 @@ scripts/smoke_docling.py → 只 import docling_loader，.env 未加载 → 转�
 |---|---|---|
 | GPU | RTX 5060 Laptop, 8151 MiB | 存在，可跑小 VLM（3B bf16 / 7B int4） |
 | torch | `2.11.0+cpu` | **Docling 走 CPU**，每页秒级开销；要用 GPU 需重装 cu128 轮子（Blackwell / sm_120） |
-| 模型权重 | 需约 400~600 MB 磁盘 | 已 gitignore（`models/`） |
+| 模型权重 | 实际 1.5 GB（见 D2） | 已 gitignore（`models/`）；其中 **611 MB 是可选的公式模型，当前配置用不到** |
+
+### D2. 本机实际占用清单（2026-09-22 盘点）
+
+**结论先说：没有下载任何 LLM / VLM 权重。** 图片描述走 API（`agnes-2.5-pro`），
+本地只有 Docling 的**文档解析模型**，合计 1.5 GB。
+`docling/datamodel/stage_model_specs.py` 里那串 `DeepSeek-OCR-3B` / `Gemma-3-27B` /
+`Granite-Vision-4B` 等只是**注册表条目（元数据）**，不是落盘的权重。
+
+| 位置 | 内容 | 体积 | 在用？ |
+|---|---|---|---|
+| `models/docling/docling-project--CodeFormulaV2` | 公式 → LaTeX | 611 MB | ❌ `DOCLING_FORMULA=0`（默认关） |
+| `models/docling/docling-project--docling-layout-heron` | 版面检测（PyTorch） | 328 MB | ✅ 默认 `LayoutOptions` 解析到的就是这个 repo |
+| `models/docling/docling-project--docling-layout-heron-onnx` | 同上的 ONNX 版 | 164 MB | ⚠️ 在 `stage_model_specs.py` 里注册为**备选引擎**，不要凭"看着重复"就删 |
+| `models/docling/docling-project--docling-models` | TableFormer（accurate + fast） | 342 MB | ✅ 用 accurate |
+| `models/docling/docling-project--DocumentFigureClassifier-v2.5` | 图片类型分类（onnx + safetensors） | 33 MB | ✅ 图片价值判定依赖它 |
+| `models/docling/RapidOcr` | det / cls / rec 三个 onnx（中文） | 31 MB | ✅ `DOCLING_OCR=auto` |
+| `models/**/.cache/huggingface/download/*.incomplete` | **下载残留（6 个）** | **164 MB** | ❌ 垃圾，可删 |
+| `~/.cache/huggingface` | bge-m3 分词器 22 MB + 图片分类器 33 MB（与仓库里那份重复） | 54 MB | ✅ 分词器在用（切分 token 预算） |
+
+**那份 `.incomplete` 是怎么来的**：它们的大小与真权重**完全一致**，也就是"下载完成了、
+但最后一步没能收尾"。看起来是 docling **运行时**又在 artifacts 目录里走了一次 HF 下载机制
+（就是我们撞 `ProxyError 502` 那次），而 Windows（未开开发者模式）无法完成符号链接那一步，
+于是留下完整的 `.incomplete`；真正的文件随后由 `fetch_docling_models.py` 的 HTTP 直写补上。
+**要保持干净的做法**：预取完成后 `DOCLING_ARTIFACTS_PATH` 必须指对且文件齐全，
+不让 docling 再产生任何联网下载动作。
+
+**pip 侧**（装在 `D:\miniConda\envs\langchain1.2`，本次新增 32 个包）：
+大头是 `docling_parse` 37 MB（C++ PDF 解析器）、`rapidocr` 32 MB、`faker` 18 MB；
+**`torch` 481 MB / `transformers` 99 MB / `onnxruntime` 42 MB 是 7 月就装好的，本次没动**，
+也没装 CUDA 版 torch（所以 GPU 仍闲置）。
+
+**可清理项与风险**：
+
+| 项 | 可省 | 风险 |
+|---|---|---|
+| `models/**/*.incomplete` | 164 MB | 无（下载残留） |
+| `CodeFormulaV2` | 611 MB | 低 —— 只在打开 `DOCLING_FORMULA=1` 时需要，要用时重跑 fetch 脚本 |
+| `tableformer/fast` | 145 MB | 低 —— 当前用 accurate；换配置要重新下 |
+| `docling-layout-heron-onnx` | 164 MB | **中** —— 被注册为备选引擎，换 ONNX 引擎时会用到 |
+| 保守清理合计 | **164 MB** | — |
+| 激进清理合计（留 PyTorch 布局 + accurate 表格 + 图分类 + OCR） | **约 1.08 GB** | 需要时重新预取（本机下过一次，脚本已验证） |
+
+### D3. 清理执行记录（2026-09-22，已执行，含验证）
+
+**做法：先改名隔离 → 跑验证 → 确认无影响才真删**（模型/缓存这类"删了要重下"的东西，
+不该靠"看着没用"就下手）。实际释放 **1.1 GB**：`models/` 从 1.5 GB → **430 MB**。
+
+| 删除项 | 体积 | 验证结论 |
+|---|---|---|
+| `CodeFormulaV2`（公式模型） | 611 MB | ✅ 可删：见下方关键发现 |
+| `heron-onnx`（布局 ONNX 版） | 164 MB | ✅ 可删：当前引擎走 PyTorch 版；换 ONNX 引擎才需要 |
+| `tableformer/fast` | 139 MB | ✅ 可删：配置走 ACCURATE |
+| `*.incomplete` + `.cache/huggingface` 残留 + 6 个 0 字节 `tmp_*` | ~200 MB | ✅ 纯垃圾 |
+| **保留** | 430 MB | `docling-layout-heron`（PyTorch 布局，在用）、`tableformer/accurate`、`DocumentFigureClassifier`、`RapidOcr` |
+
+**验证证据（隔离状态下全部通过）**：
+
+1. `scripts/smoke_docling.py` → `len(doc.tables)=1`、`status=ok`、`to_legacy 契约 OK`
+2. `scripts/check_docx.py` → 七项确定性核对全 OK（图表数值 2019=120…2022=180）
+3. `scripts/check_ocr.py --sample cn` → 中文扫描件 18.0s 通过，表格结构重建
+4. `pytest tests/ -q` → **304 passed**（18.25s）
+
+**关键发现（决定了公式模型可以删）**：docling 的 `standard_pdf_pipeline.py` 里
+`CodeFormulaVlmModel` 是**无条件构造**的，但带着
+`enabled = do_code_enrichment or do_formula_enrichment`；
+`enabled=False` 时它**不碰权重**。定向实测：converter 构建 **1.1s**、转换 **2.5s**、`SUCCESS`、**无任何联网尝试**。
+所以"构造了模型对象"不等于"需要权重文件"——这类判断必须实测，不能靠读代码猜。
+
+**恢复方式**（需要时）：
+
+```bash
+# 公式转 LaTeX（打开 DOCLING_FORMULA=1 之前必须先把这份拉回来）
+python scripts/fetch_docling_models.py models/docling
+```
+
+**一个坑（顺带记录）**：清理验证期间一度以为"删了模型导致变慢"（烟测从 12.6s 变成 22.0s），
+其实是我同时跑了另一个 docling 进程在抢 CPU；单独复跑 18.0s（比基线 21.1s 还快）。
+**测量性能时不要让两个解析进程并行**，否则会把噪声当因果。
 
 ### E. 相关脚本
 
