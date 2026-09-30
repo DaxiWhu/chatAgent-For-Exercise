@@ -37,6 +37,8 @@ import math
 import re
 import uuid
 
+from .kb_inventory import source_key
+
 # Qdrant 集合名允许的字符集（官方约定：字母数字 + 下划线/短横线，≤255）。
 # 与 pg 的表名一样，非法值会静默写到"另一个集合"这种极难排查的问题，所以白名单校验 + 告警回退。
 _COLLECTION_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
@@ -391,6 +393,11 @@ class QdrantStore:
             payload = {
                 "tenant": self.tenant,
                 "source": str(meta.get("source", "") or ""),
+                # source_key / content_hash 是**级联删除的判定依据**（见 kb_inventory）。
+                # 顶层单列一份（而不是只藏在 chunk 里）：Qdrant 的过滤只能打到
+                # 顶层 payload 字段，要按源删点就必须能直接 match 到它。
+                "source_key": source_key(meta),
+                "content_hash": str(meta.get("content_hash", "") or ""),
                 "section": str(meta.get("section", "") or ""),
                 "chunk_id": str(meta.get("chunk_id", "") or meta.get("id", "") or ""),
                 "kind": str(meta.get("kind", "") or ""),
@@ -481,3 +488,94 @@ class QdrantStore:
             return int(info.points_count or 0)
         except Exception:  # noqa: BLE001
             return 0
+
+    # ---------- 按源维护（级联删除） ----------
+    def _scroll_rows(self, flt=None):
+        """滚一遍集合，产出 `(tenant, source_key, content_hash)` 的原始三元组。
+
+        flt: 额外的过滤条件（None = 全集合）。
+        集合不存在等异常按"空集合"处理（与 `existing_ids` 同口径），
+        并且**只 debug 记录** —— 维护脚本不该因为集合还没建就报错。
+        """
+        client = self._connect()
+        out = set()
+        offset = None
+        try:
+            while True:
+                points, offset = client.scroll(
+                    collection_name=self.collection,
+                    scroll_filter=flt,
+                    limit=512,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for p in points:
+                    pl = p.payload or {}
+                    # ⚠️ 回落顺序必须与 `kb_inventory.source_key` 一致：
+                    # 老点没有顶层 source_key（本次改造前灌的），此时用 source。
+                    key = str(pl.get("source_key") or pl.get("source") or "")
+                    out.add((str(pl.get("tenant") or ""),
+                             key.replace("\\", "/"),
+                             str(pl.get("content_hash") or "")))
+                if offset is None:
+                    break
+        except Exception as e:  # noqa: BLE001  （集合不存在 → 视为空）
+            logging.debug("Qdrant 读取源清单失败（按空处理）：%s", e)
+            return set()
+        return out
+
+    def list_rows(self):
+        """列出该租户（未设租户 = 全集合）的 `(tenant, 源标识, 内容指纹)`，去重。"""
+        return self._scroll_rows(self._tenant_filter())
+
+    def list_tenants(self):
+        """列出集合里出现过的 tenant（升序）。
+
+        Qdrant 没有 `SELECT DISTINCT`，只能滚一遍 payload 收集 —— 这是维护动作，
+        不是请求路径，可接受。
+        """
+        return sorted({t for t, _, _ in self._scroll_rows(None)})
+
+    def delete_keys(self, keys):
+        """按源标识删除点，返回**实际删除的点数**。
+
+        keys: 源标识的可迭代。空清单直接返回 0（不发请求）。
+
+        过滤用 `should`（OR）匹配两个字段，而不是只匹配 `source_key`：
+        本次改造之前灌的点**没有** `source_key` 这个 payload 字段，
+        只按它筛会对老数据**一条也删不掉**（预演说有孤儿、真删是 0）。
+        """
+        keys = sorted({str(k).strip() for k in (keys or []) if str(k).strip()})
+        if not keys:
+            return 0
+        from qdrant_client import models as qm
+
+        must = []
+        if self.tenant:
+            must.append(qm.FieldCondition(key="tenant",
+                                          match=qm.MatchValue(value=self.tenant)))
+        should = [
+            qm.FieldCondition(key=field, match=qm.MatchAny(any=list(keys)))
+            for field in ("source_key", "source")
+        ]
+        flt = qm.Filter(must=must, should=should)
+        client = self._connect()
+        # Qdrant 的 delete 不回"删了几条"（只有 operation_id），所以先按同一个过滤条件
+        # 精确 count 一次 —— 删的就是它数到的这批点。不回数会让人无法核对
+        # "预演说有 N 条、真删了多少"，而那正是这类脚本唯一的安全感来源。
+        try:
+            matched = int(client.count(collection_name=self.collection,
+                                       count_filter=flt, exact=True).count)
+        except Exception as e:  # noqa: BLE001  （集合不存在等 → 没有可删的）
+            logging.debug("Qdrant 按源计数失败（按 0 处理）：%s", e)
+            return 0
+        if not matched:
+            return 0
+        try:
+            client.delete(collection_name=self.collection,
+                          points_selector=flt, wait=True)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Qdrant 按源删除失败：%s", e)
+            return 0
+        return matched

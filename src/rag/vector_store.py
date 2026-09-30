@@ -34,6 +34,14 @@ _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 DEFAULT_TABLE = "rag_chunks"
 
+#: 源标识的 SQL 表达式：**优先 `chunk.source_path`（相对路径），回落 `source`（basename）**。
+#: 与 `kb_inventory.source_key` 的口径必须**逐字一致** —— 两处不一致时，列出与删除
+#: 会判在不同的键上（表现为"预演说有 N 条孤儿，真删却是 0 条"）。守卫见
+#: `tests/test_kb_prune.py::test_pg_and_python_agree_on_source_key`。
+#: `NULLIF(...,'')` 不能省：老数据的 jsonb 里可能**有 `source_path` 这个键但值为空串**
+#: （例如从别处导入的块），此时 COALESCE 不会回落，直接得到空串 ⇒ 判成脏行。
+SOURCE_KEY_SQL = "COALESCE(NULLIF(chunk->>'source_path', ''), source)"
+
 
 def _safe_ident(name, default=DEFAULT_TABLE):
     """把配置里的表名收敛成安全的标识符。
@@ -386,3 +394,77 @@ class PgVectorStore:
                 else:
                     cur.execute(f"SELECT count(*) FROM {self.table}")
                 return int(cur.fetchone()[0])
+
+    # ---------- 按源维护（级联删除） ----------
+    def list_rows(self):
+        """列出库里每个"源"的 (tenant, 源标识, 内容指纹) 三元组，去重。
+
+        返回 set 化之前的 list；表不存在时返回 []（与 `existing_ids` 同口径：
+        "首次灌库"不是错误）。
+
+        设了 tenant 时**只列该租户的** —— 否则会把别的租户的块算进孤儿清单，
+        接着被 `delete_keys` 删掉（跨租户误删，是最不该发生的一类事故）。
+
+        行数在此处可能大于"块数"（一份文件几十个块只贡献一行 distinct），
+        返回前用 set 去重；指纹同键不同值时保留两条，判定侧按"有一条对得上
+        就算活着"处理（见 `kb_inventory.plan_orphans`）。
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass(%s)", (self.table,))
+                if cur.fetchone()[0] is None:
+                    return []
+                sql = (
+                    f"SELECT DISTINCT tenant, {SOURCE_KEY_SQL} AS k, "
+                    "COALESCE(chunk->>'content_hash', '') AS h "
+                    f"FROM {self.table}"
+                )
+                params = []
+                if self.tenant:
+                    sql += " WHERE tenant = %s"
+                    params.append(self.tenant)
+                cur.execute(sql, params)
+                return {
+                    (str(r[0] or ""), str(r[1] or "").replace("\\", "/"), str(r[2] or ""))
+                    for r in cur.fetchall()
+                }
+
+    def list_tenants(self):
+        """列出表里出现过的 tenant（升序）；表不存在返回 []。
+
+        给运维脚本用：多租户部署下要逐个租户清理，且**必须**逐个来 ——
+        一条不限定租户的 DELETE 会把所有租户的孤儿一起删掉，那是不可逆的。
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass(%s)", (self.table,))
+                if cur.fetchone()[0] is None:
+                    return []
+                cur.execute(f"SELECT DISTINCT tenant FROM {self.table} ORDER BY tenant")
+                return [str(r[0] or "") for r in cur.fetchall()]
+
+    def delete_keys(self, keys):
+        """删除源标识命中 keys 的行，返回**实际删除的行数**（不是份数）。
+
+        keys: 源标识的可迭代（`source_key` 口径）。空/全空串时直接返回 0，
+        **不执行任何 SQL** —— `= ANY('{}')` 虽然天然匹配不到行，但"没给清单
+        却打了一条 DELETE"这件事本身在审计里说不清楚。
+
+        设了 tenant 时删除限定在该租户内（同 `list_rows`）。
+        """
+        keys = sorted({str(k).strip() for k in (keys or []) if str(k).strip()})
+        if not keys:
+            return 0
+        conds = [f"{SOURCE_KEY_SQL} = ANY(%s)"]
+        params = [keys]
+        if self.tenant:
+            conds.append("tenant = %s")
+            params.append(self.tenant)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {self.table} WHERE " + " AND ".join(conds), params
+                )
+                deleted = cur.rowcount
+            conn.commit()
+        return int(deleted or 0)

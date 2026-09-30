@@ -222,6 +222,16 @@ def task_canary(args: list[str]) -> int:
     return run("python scripts/canary_check.py" + (" " + " ".join(args) if args else ""))
 
 
+def task_kb_prune(args: list[str]) -> int:
+    """知识库级联清理：删掉源文件已不存在（或内容已变）的向量块。
+
+    **默认预演**（不加 `--apply` 不删任何东西）—— 删除不可逆，与 `retention`
+    口径一致。退出码 2 = 无法判定（语料目录扫不到文件 / 内存后端），
+    **不是"通过"**；把它当成功会让"语料没挂进容器"这种事故继续潜伏。
+    """
+    return run(["python", "scripts/kb_prune.py", *args])
+
+
 def task_up(args: list[str]) -> int:
     """起本地栈（app + pg + qdrant + redis + nginx + 告警出口）。"""
     return compose("up -d", args)
@@ -419,6 +429,7 @@ TASKS: dict[str, tuple[str, Callable[[list[str]], int]]] = {
     "backup-qdrant": ("备份 Qdrant", task_backup_qdrant),
     "drill": ("恢复演练（结果落指标，供告警消费）", task_drill),
     "canary": ("查看灰度判据（退出码即结论）", task_canary),
+    "kb-prune": ("知识库级联清理：删掉源已消失/已改的向量块（默认预演）", task_kb_prune),
     "e2e": ("端到端检查：起真实栈跑 SSE/灰度/持久化验证", task_e2e),
     "up": ("起本地栈", task_up),
     "up-observability": ("起本地栈（含监控面板）", task_up_observability),

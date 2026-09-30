@@ -54,6 +54,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from .vector_store import PgVectorStore, chunk_fingerprint
 from .qdrant_store import QdrantStore, Bm25SparseEncoder, point_id
+from .kb_inventory import stamp_source
 from .resilience import CircuitBreaker, guarded_call
 
 
@@ -571,7 +572,10 @@ def load_chunks(doc_folder, chunk_size=None, chunk_overlap=None, pdf_chunk_size=
     抽不出内容时仍是静默跳过）。
 
     除 source/section/text 三个既有字段外还带 page/bbox/kind/parser 等元信息，
-    旧消费者忽略即可（出参契约见 src/chunk_writer.py）。
+    旧消费者忽略即可（出参契约见 src/chunk_writer.py）。另有 **source_path**
+    （相对语料根目录的 POSIX 路径）与 **content_hash**（文件内容 sha256 前 16 位）
+    两个字段，供 `scripts/kb_prune.py` 做级联删除判定 —— 二者**都不参与
+    chunk_id**（见 src/kb_inventory.py 模块头）。
     收尾固定三步且顺序有讲究：_apply_contextual → attach_parents → _log_load_summary。
     """
     if not doc_folder or not os.path.isdir(doc_folder):         #检查目录
@@ -600,7 +604,10 @@ def load_chunks(doc_folder, chunk_size=None, chunk_overlap=None, pdf_chunk_size=
         if low.endswith(".pdf"):
             try:
                 pdf_chunks = _parse_pdf(f, name, pdf_chunk_size, pdf_overlap)
-                chunks += pdf_chunks
+                # 打上 source_path / content_hash（级联删除的判定依据）。
+                # **必须逐文件打**：全部解析完再按 basename 回填会在"同名不同目录"
+                # 的语料上把路径写错，而写错的后果是清理时删错块。
+                chunks += stamp_source(pdf_chunks, f, doc_folder)
                 logging.info("PDF 解析完成：%s（%d 个片段）", name, len(pdf_chunks))
             except Exception as e:  # noqa: BLE001
                 logging.warning("PDF 解析失败，跳过 %s: %s", name, e)
@@ -612,7 +619,7 @@ def load_chunks(doc_folder, chunk_size=None, chunk_overlap=None, pdf_chunk_size=
         if low.endswith(".docx"):
             try:
                 docx_chunks = _parse_docx(f, name, chunk_size, chunk_overlap)
-                chunks += docx_chunks
+                chunks += stamp_source(docx_chunks, f, doc_folder)
                 logging.info("docx 解析完成：%s（%d 个片段）", name, len(docx_chunks))
             except Exception as e:  # noqa: BLE001
                 logging.warning("docx 解析失败，跳过 %s: %s", name, e)
@@ -635,7 +642,7 @@ def load_chunks(doc_folder, chunk_size=None, chunk_overlap=None, pdf_chunk_size=
         kcs = from_blocks(blocks, name, parser=ext.lstrip(".") or "text",
                           splitter=lambda t: _split_text_texts(t, chunk_size, chunk_overlap))
         _enrich_images(kcs, name)
-        chunks += to_legacy_many(kcs)
+        chunks += stamp_source(to_legacy_many(kcs), f, doc_folder)
 
     if skipped:
         logging.warning(
