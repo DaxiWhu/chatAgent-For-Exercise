@@ -1,0 +1,33 @@
+# Docker 构建上下文排除项（构建上下文是仓库根，见 deploy/app/Dockerfile 的用法）
+# 目的：把镜像瘦下来、并且**不要把机密与本地缓存打进镜像**。
+
+# ---- 机密与本地配置（绝不入镜像）----
+.env
+.env.*
+!.env.example
+
+# ---- 版本控制 / IDE ----
+.git
+.gitignore
+.github
+.idea
+.vscode
+
+# ---- Python 缓存与虚拟环境 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 项目数据与缓存（语料可能有版权/隐私；缓存是体积大户）----
+data/
+tmp_probe/
+models/
+deploy/pgvector/
+*.md
+
+# ---- 测试与探针（镜像里不需要）----
+tests/
+notebooks/
+examples/

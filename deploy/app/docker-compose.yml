@@ -1,0 +1,930 @@
+# 自包含的应用栈 + 灰度（canary）编排
+#
+# 起停（在项目根目录执行）：
+#   docker compose --env-file .env -f deploy/app/docker-compose.yml up -d --build
+#   docker compose --env-file .env -f deploy/app/docker-compose.yml ps
+#
+# ---------------------------------------------------------------------------
+# ⚠️⚠️ `--env-file .env` 不是可选的美化，**少写它整套配置就不生效**
+# ---------------------------------------------------------------------------
+# Docker 官方行为（已核实）：**没有 `--env-file` 时，compose 从「项目目录」
+# 加载 `.env`，而项目目录 = 「第一个 `-f` 文件所在目录」**（不是当前目录）。
+# 本项目用 `-f deploy/app/docker-compose.yml` ⇒ 项目目录是 `deploy/app` ⇒
+# **仓库根目录的 `.env` 完全不参与 `${VAR}` 插值**。
+#
+# 后果全是静默的（没有任何报错，只有默认值悄悄生效）：
+#   - `ALERT_SINK_*_WEBHOOK` 为空 ⇒ alert-sink 只记日志、接口照回 200
+#     ⇒ **告警永远送不到人**，而按文档"把 webhook 填进 .env"这一步事实上没生效；
+#   - `POSTGRES_PASSWORD` 退回 `123456` ⇒ 库用弱口令，而你以为已经换了；
+#   - `BACKUP_INTERVAL_HOURS` / `BACKUP_KEEP` / `RETENTION_DAYS` 全退回默认；
+#   - `CANARY_TAG` 为空 ⇒ 发布脚本传的标签被忽略，灰度跑的还是旧镜像。
+#
+# 所以本文件里所有 `${VAR}` 的**唯一**取值途径就是 `--env-file .env`（在仓库根执行）
+# 或者 `export VAR=...`（shell 环境优先级最高）。`env_file:` 那几处是另一回事：
+# 它把变量灌进**容器**，不参与 compose 自身的插值，两者不能互相替代。
+#
+# `tests/test_doc_drift.py` 有一条守卫：文档与注释里不许再出现不带
+# `--env-file` 的短写法 —— 否则这个坑会随复制粘贴传播回来。
+#
+# 排查手法（怀疑"我配了但没生效"时，第一条就够）：
+#   docker compose --env-file .env -f deploy/app/docker-compose.yml config | grep -i webhook
+#   它会打印**插值之后**的完整配置，是唯一能自证"值到底传进去没有"的方式。
+#
+# 拓扑：
+#        :8080 ──► nginx（权重灰度 9:1）
+#                    ├── app-stable（APP_RELEASE=stable）
+#                    └── app-canary（APP_RELEASE=canary）
+#                            ├── pgvector（PG16 + vector 扩展）—— 检查点（不可再生）
+#                            ├── qdrant  （稀疏 BM25 + 稠密 embedding 同库）—— RAG 向量
+#                            └── redis   （限流/配额共享计数，多副本下必须）
+#
+#        alert-sink ◄── alertmanager ◄── prometheus ◄── /metrics
+#        backup-pg / backup-qdrant（定时循环，落 ./backups）
+#
+# 网络分三段（edge / data / monitor），见文件末尾的说明：**数据服务只接 data**，
+# 所以 Grafana / Promtail / Loki 连不到 PG / Qdrant / Redis。
+#
+# 为什么 nginx 而不是直接把两个实例都暴露：
+# 灰度要求"同一域名/端口下按权重分流"，客户端无感；直接暴露两个端口等于让
+# 调用方自己选版本，那就不是灰度而是双写。http://localhost:8080/health/live
+# 会回显 release 字段，可用来核对流量落到了哪个版本。
+#
+# 说明：本文件是**参考编排**。你实际部署用的是 Linux 上独立的 pgvector 容器时，
+# 把 app-stable/app-canary 的 DB_URL 指向那台机器，并删掉下面的 pgvector 服务即可。
+#
+# ⚠️ 优雅关闭：`stop_grace_period` 与 `GRACEFUL_SHUTDOWN_TIMEOUT` 必须联动
+# ---------------------------------------------------------------------------
+# 本服务的主接口是 SSE，一个回答可能持续几十秒。发布/重启时"能不能放完在途请求"
+# 由两个值共同决定，**改一个必须改另一个**：
+#
+#   ① app 侧：`GRACEFUL_SHUTDOWN_TIMEOUT`（app/serve.py，默认 30s）
+#        = uvicorn 等在途请求的上界。不设的话 uvicorn 默认"永远等"，
+#          一个挂住的请求能把关闭无限期拖住。
+#   ② 容器侧：`stop_grace_period`（下面两个 app 服务，45s）
+#        = docker 发 SIGTERM 后等多久再 SIGKILL。
+#        它**必须大于 ①**，否则容器会在排空还没做完时被 SIGKILL ——
+#        那才是真正"掐断在途流"的原因（不是应用代码），而且 SIGKILL 不给
+#        进程任何记账/清理的机会，日志里查不到。
+#
+# docker 的默认 `stop_grace_period` 是 **10s**，远小于一次长对话的时长 ——
+# 所以这个值不显式设置，滚动更新**必然**打断部分用户的回答。
+#
+# ---------------------------------------------------------------------------
+# ⚠️ 数据库口令（生产必须处理）
+# ---------------------------------------------------------------------------
+# 口令的唯一来源是环境变量 `POSTGRES_PASSWORD`，两个地方（PG 容器自身、
+# 以及两个 app 实例的 DB_URL）都从它取，**默认 123456 只是本机开发用的**：
+#
+#     POSTGRES_PASSWORD=$(openssl rand -hex 24) \
+#       docker compose --env-file .env -f deploy/app/docker-compose.yml up -d
+#
+# 为什么做成"单一来源"而不是在两个文件里各写一份：口令只改一处、另一处没同步时，
+# 表现是**服务连不上库**（认证失败），而排查的人往往会去怀疑网络或权限，
+# 很难想到是两处配置失配。
+#
+# 再记一个必踩的坑：`POSTGRES_PASSWORD` **只在数据卷首次初始化时生效**。
+# 数据卷已存在时改这个变量不会有任何效果（PG 只认初始化时写进
+# pg_authid 的那个口令），需要 `ALTER USER ... PASSWORD` 或删卷重来：
+#     docker compose --env-file .env -f deploy/app/docker-compose.yml exec pgvector \
+#       psql -U langgraph_app -d langgraph_checkpoints -c "ALTER USER langgraph_app PASSWORD '新口令'"
+# ---------------------------------------------------------------------------
+
+name: chatagent
+
+# ===========================================================================
+# 日志轮转（**每个服务都必须挂**，见下面的 `logging: *default-logging`）
+# ===========================================================================
+# 为什么这不是可选项：docker 的 json-file 日志驱动**默认没有任何上限**，容器
+# 把 stdout 写多少就落多少。本栈里几个组件天生话多（PG 的 WAL/checkpoint 提示、
+# Prometheus 的规则加载、nginx 的每个请求……），跑几个月后 /var/lib/docker 会被
+# 日志吃掉几十 GB 是常态。
+#
+# 它和"没有磁盘告警"合起来是一条完整的宕机路径：
+#   日志撑满盘 → PG 写不进去 → 表现为**随机 500**（而不是"磁盘满"）
+#   → 而磁盘本身没有任何告警 → 你甚至不知道去 `df -h`。
+# 所以这两件事必须一起做（DiskSpaceLow 规则见 deploy/monitoring/alerts.yml）。
+#
+# `max-file: "3"` × `max-size: 10m` = 每个容器最多 30MB。**别调大**：
+# 需要长留的日志走 Loki（observability profile），不是靠 json-file 攒着。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ---------------- 向量库（PG16 + pgvector，扩展已编进镜像）----------------
+  pgvector:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [data]
+    environment:
+      POSTGRES_USER: langgraph_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-123456}   # ⚠️ 见文件顶部说明：生产必须改
+      POSTGRES_DB: langgraph_checkpoints
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # 只绑回环：数据库没有理由监听公网网卡。默认的 "5433:5432" 等价于
+      # 0.0.0.0:5433 —— 云主机上就是"对整个互联网开放一个已知弱口令的库"。
+      # 本机开发照旧能用（.env 里连的就是 localhost:5433）。
+      - "127.0.0.1:5433:5432"            # 5433：与本机可能已有的 PG(5432) 并存
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langgraph_app -d langgraph_checkpoints"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # 资源上限：一条失控的查询 / 一次大批量灌库能吃光宿主机内存 ——
+    # 而 OOM killer 挑谁杀是不确定的（可能杀掉同机的 app 而不是它）。
+    #
+    # ⚠️ 刻意**不加 `cap_drop: [ALL]`**：PG 官方镜像启动时要 chown 数据目录、
+    # 切到 postgres 用户运行，需要 CHOWN / SETUID / DAC_OVERRIDE 等能力。
+    # 砍掉不会"更安全"，只会让容器**直接起不来**。
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { memory: 1g, cpus: "1.0", pids: 256 }
+
+  # ---------------- 向量库（Qdrant：稀疏 BM25 + 稠密 embedding 同库）----------------
+  # 与上面的 pgvector 是**职责不同、并存**的两个服务，不要二选一删掉：
+  #   pgvector = LangGraph 检查点（会话状态、审核记录）—— **不可再生**，必须留；
+  #   qdrant   = RAG 向量（稀疏 + 稠密）—— 可从语料重建，但重建要花 embedding 钱与时间。
+  #
+  # 启用：把 .env 的 RAG_VECTOR_STORE 设为 qdrant（默认 memory，不改则本服务只是空跑）。
+  # 不启用时也**不建议删掉**：删了以后想切 qdrant 又要重新加回来，而它带来的
+  # 影响只是几百 MB 内存；真要省资源可以 `docker compose stop qdrant`。
+  #
+  # ⚠️ 改 QDRANT_DIM / QDRANT_SPARSE_DIM 必须换 QDRANT_COLLECTION 名重灌 ——
+  #    维度落进集合的 schema，无法原地改（与 pgvector 换表名同一条纪律）。
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [data]
+    volumes:
+      - qdrantdata:/qdrant/storage
+    # 只绑回环给本机排查（http://localhost:6333/dashboard）。
+    # Qdrant 默认**无鉴权**：api-key 只在你显式配 QDRANT_API_KEY 时才生效，
+    # 所以绝不能把 6333 发布到公网网卡 —— 那等于"任何人对你的向量库有全权"。
+    ports:
+      - "127.0.0.1:6333:6333"
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { memory: 1g, cpus: "1.0", pids: 256 }
+    healthcheck:
+      # 官方镜像不带 curl/wget，用 bash 的 /dev/tcp 探端口（Qdrant 镜像基于 debian，有 bash）
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # ---------------- 限流 / 配额的共享后端（Redis）----------------
+  # 为什么必须有它：限流与配额都是**进程内**计数。本编排是 2 worker × 2 副本
+  # （stable + canary）= 最多 4 份独立计数 ⇒ 用户实际可用额度是配置值的约 4 倍。
+  # 这个缺陷很隐蔽：单机跑完全看不出，一上多副本就"额度和配置对不上"。
+  #
+  # 后端不可用时 app 会退到进程内计数（**不是放行**）—— 宁可暂时放宽，
+  # 也绝不因为 Redis 抖一下就把接口变成无限量。所以下面 app 服务用
+  # `service_healthy` 等它就绪：app 在**启动期** ping 不通就会整程走降级。
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [data]
+    # 必须带口令：Redis 默认无鉴权，任何能进这个网络的东西都能改写限流键
+    # （= 直接绕过限流与配额）。maxmemory + LRU 防止键无限增长吃光内存。
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:-chatagent-redis}
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - redisdata:/data
+    # ⚠️ 刻意**不发布端口**：只有本编排内的服务要用它，暴露到宿主机零收益、纯风险。
+    #    本机排查用：docker compose --env-file .env -f deploy/app/docker-compose.yml exec redis redis-cli
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits: { memory: 320m, cpus: "0.5", pids: 128 }
+    healthcheck:
+      # --no-auth-warning：否则每次探活都往日志里写一行 "Using a password with -a..."
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a ${REDIS_PASSWORD:-chatagent-redis} ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ---------------- 稳定版（承载 90% 流量）----------------
+  app-stable:
+    build:
+      context: ../..                     # 上下文必须是仓库根
+      dockerfile: deploy/app/Dockerfile
+    image: chatagent:0.2.0
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [edge,data,monitor]
+    # ⚠️ 与 GRACEFUL_SHUTDOWN_TIMEOUT 联动（见文件顶部说明）。
+    # docker stop 默认只给 10s，然后 SIGKILL —— 而本服务一个 SSE 回答可能跑几十秒，
+    # 默认值下滚动更新**必然**掐断在途流（且不留日志）。这里给 45s：
+    # 大于 serve.py 的排空上界（默认 30s），留出"排空 + 进程退出"的余量。
+    stop_grace_period: 45s
+    # 资源上限：没有它时一个内存泄漏或超大文档能把宿主机吃满，
+    # 表现成"整台机器都慢"，而不是"容器被限流"（后者才好定位）。
+    #
+    # 三项各管一类"宿主机级"故障，缺任意一项就有一类问题收敛不到容器内：
+    #   memory —— 泄漏 / 超大文档解析把整机内存吃光。注意 OOM killer 挑谁杀是
+    #             **不确定的**：它可能杀掉同机的数据库，而不是罪魁容器。
+    #   cpus   —— 一个卡死的解析任务（docling/OCR 是分钟级、CPU 密集）把 CPU 占满，
+    #             同机其它服务一起变慢。它同时也是"突发流量"的兜底。
+    #   pids   —— **fork bomb / 线程泄漏**：进程数无上限时，一个失控的子进程爆炸
+    #             会先耗尽宿主机的 PID 表（`fork: retry: Resource temporarily
+    #             unavailable`），表现成整台机器"莫名其妙起不了新进程"。
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+          pids: 512
+        reservations:
+          memory: 512m
+    # 最小权限：容器被攻破时的影响面。与本项目"非 root 运行"（Dockerfile USER appuser）
+    # 是同一层思路 —— 提权、改内核参数、raw socket 这些都不需要。
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # ⚠️ 语料目录必须挂进来 —— 镜像**刻意不打 data/**（体积大、随业务变，且不该
+    # 因为换了语料就重建镜像）。不挂的后果是**静默失败**：服务起来了、/health/live
+    # 是绿的、SSE 也能连上，只是**检索永远召回 0 条**，回答里一条引用都没有。
+    # 成因是 `load_chunks` 对不存在的目录直接返回 []（不抛异常）。
+    #
+    # 挂 rw 而非 ro：解析缓存落在 <语料目录>/.parse_cache（首次解析要写）。
+    # 语料放在别处时，改这里的源路径，或改用 `DOCS_DIR` 指到挂载点。
+    volumes:
+      - ../../data:/app/data
+    env_file:
+      - ../../.env                       # 机密（AGNES_API_KEY / EMBEDDING_* / SERVE_API_KEY）
+    environment:
+      APP_RELEASE: stable
+      # 部署场景默认 production：推导 REQUIRE_AUTH=1（无任何 Key 会**拒绝启动**）
+      # + ENABLE_DOCS=0（/docs 返回 404）。刻意放在 compose 而不是 .env ——
+      # 本地 `python -m app.serve` 读 .env 要保持 development 才不会被鉴权挡住，
+      # 两者互不干扰。
+      APP_ENV: ${APP_ENV:-production}
+      # 容器内用服务名连库（会覆盖 .env 里的 DB_URL）
+      DB_URL: postgresql://langgraph_app:${POSTGRES_PASSWORD:-123456}@pgvector:5432/langgraph_checkpoints?sslmode=disable
+      # ⚠️ 多副本/多 worker 必须配：不配时限流与配额是**进程内**计数，
+      # WEB_CONCURRENCY=2 就等于用户实际可用额度 ×2（灰度副本再叠一份）。
+      # 后端不可用时 app 会退到进程内计数（**不是放行**）。
+      REDIS_URL: redis://:${REDIS_PASSWORD:-chatagent-redis}@redis:6379/0
+      # 容器内必须用**服务名**连 Qdrant —— .env 里的 QDRANT_URL 通常是
+      # http://localhost:6333（本机开发用），在容器里 localhost 指容器自身，
+      # 会导致连不上后**静默回退 memory**（检索仍可用，但向量库等于没接上）。
+      QDRANT_URL: http://qdrant:6333
+      WEB_CONCURRENCY: "2"
+      # 信任 nginx 传来的 X-Forwarded-For，否则限流按容器网段 IP 统计（会把所有用户算成同一个）
+      TRUST_PROXY_HEADERS: "1"
+    depends_on:
+      pgvector:
+        condition: service_healthy
+      # app 在**启动期** ping 不通 Redis 就会整程退回进程内计数（之后不会自动切回），
+      # 所以必须等它就绪，而不是并行启动。
+      redis:
+        condition: service_healthy
+      # Qdrant 用 started 而非 service_healthy：健康检查失败**不应阻塞 app 启动**
+      # （RAG_VECTOR_STORE=memory 时根本用不到它），连不上会自动回退内存检索。
+      qdrant:
+        condition: service_started
+    expose:
+      - "8000"
+
+  # ---------------- 灰度版（承载 10% 流量）----------------
+  app-canary:
+    # ⚠️ 镜像引用由环境变量驱动（`deploy/release.sh` / `deploy/rollback.sh` 会设置它）
+    # —— 这是让发布/回滚变成**一条命令**的前提：脚本不必改写本文件，
+    # 只改环境变量再 up -d，天然幂等（重复执行同一版本不会有副作用）。
+    # 默认值与 `app-stable` 一致，所以"什么都没配"时行为与以前完全相同。
+    # 传完整引用（含仓库前缀）便于灰度用 CI 推到 GHCR 的镜像：
+    #     deploy/release.sh ghcr.io/<org>/chatagent:<sha>
+    image: ${CANARY_IMAGE:-chatagent:0.2.0}
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [edge,data,monitor]
+    stop_grace_period: 45s               # 同上：别让灰度先被 SIGKILL
+    # 上限与 stable 同源（memory 相同、cpus/pids 减半）：灰度只承载 10% 流量，
+    # 不该比稳定版拿更多资源 —— 否则"灰度版拖垮宿主机"会连带影响 90% 的用户。
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "1.0"
+          pids: 256
+        reservations:
+          memory: 512m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ../../data:/app/data             # 同 stable：不挂 = 检索恒空
+    env_file:
+      - ../../.env
+      - ./canary.env                     # 灰度专属覆盖（换模型 / 开关实验特性）
+    environment:
+      APP_RELEASE: canary
+      # 灰度同样跑 production 语义（否则灰度版的鉴权行为与稳定版不一致，
+      # "灰度没发现问题"就失去了意义）
+      APP_ENV: ${APP_ENV:-production}
+      DB_URL: postgresql://langgraph_app:${POSTGRES_PASSWORD:-123456}@pgvector:5432/langgraph_checkpoints?sslmode=disable
+      # 与 stable 共用同一个 Redis：若各用各的，等于额度又翻倍
+      REDIS_URL: redis://:${REDIS_PASSWORD:-chatagent-redis}@redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      WEB_CONCURRENCY: "1"
+      TRUST_PROXY_HEADERS: "1"
+    depends_on:
+      pgvector:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    expose:
+      - "8000"
+
+  # ---------------- 告警通知网关（Alertmanager → 企微/飞书/自建）----------------
+  # 为什么需要它：Alertmanager 的配置**不支持环境变量插值**，真实 webhook 凭据
+  # 只能硬编码进 alertmanager.yml（= 提交进版本库）；且机器人的 payload 与
+  # Alertmanager 原生 JSON 不同，直接填机器人 URL 会被 400 拒掉。这一层同时解决这两件事。
+  #
+  # 接线：alertmanager.yml 的四个 receiver URL 都指向
+  #     http://alert-sink:8080/alerts/<receiver 名>
+  # 真实凭据只从**项目根 .env** 插值进来（compose 的 ${VAR} 语法），不进版本库。
+  #
+  # 自检（**别省**，未配置的通道不报错、只记日志）：
+  #   docker compose --env-file .env -f deploy/app/docker-compose.yml run --rm alert-sink \
+  #     python alert_sink.py --selftest
+  alert-sink:
+    build:
+      context: ../..
+      dockerfile: deploy/monitoring/Dockerfile.alert-sink
+    image: chatagent-alert-sink:0.2.0
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [monitor]
+    # 与两个 app 服务同口径的最小权限（它只发 HTTP 请求，不需要任何特权）
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.25"
+          pids: 64
+    environment:
+      # 左 = receiver 名（**必须与 alertmanager.yml 的 URL 末段一致**），右 = 通道类型
+      #   wecom | feishu | generic（自建网关）。未在表里的 receiver 落到 default。
+      ALERT_SINK_ROUTES: ${ALERT_SINK_ROUTES:-oncall:wecom,security-oncall:wecom,cost-digest:wecom,default:wecom}
+      ALERT_SINK_WECOM_WEBHOOK: ${ALERT_SINK_WECOM_WEBHOOK:-}
+      ALERT_SINK_FEISHU_WEBHOOK: ${ALERT_SINK_FEISHU_WEBHOOK:-}
+      ALERT_SINK_GENERIC_WEBHOOK: ${ALERT_SINK_GENERIC_WEBHOOK:-}
+      # 配了则要求请求头 X-Alert-Sink-Secret 匹配（内网也建议配，防误打）
+      ALERT_SINK_SHARED_SECRET: ${ALERT_SINK_SHARED_SECRET:-}
+    ports:
+      # 只绑回环：本端口除可选的 shared secret 外**没有任何鉴权**，不该对公网开放。
+      # 绑上只是为了在本机 curl / 排查（宿主 8081 → 容器 8080）。
+      - "127.0.0.1:8081:8080"
+    healthcheck:
+      # 用 python 而不是 curl：这个镜像刻意不装任何额外包
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health/live',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # ================= 监控栈：Prometheus + Alertmanager =================
+  # 目标：让 deploy/monitoring 下那几份配置**真的跑起来**。
+  # 在此之前它们只以注释里的 `docker run` 形式存在 —— 即"配置写好了但没接电"：
+  # /metrics 有数据、规则文件齐全，但**没有任何东西在抓、在判定、在通知**。
+  #
+  # 起停：
+  #   docker compose --env-file .env -f deploy/app/docker-compose.yml up -d alertmanager prometheus
+  #
+  # 三层自检（**都别省**）：
+  #   a) http://localhost:9090/alerts    规则处于 inactive / pending / firing
+  #   b) http://localhost:9090/status    "Alertmanagers" 一节里目标为 UP
+  #   c) http://localhost:9093/#/alerts  触发后能看到；Status 页无解析错误
+  # 只做 a 是不够的 —— 规则能 firing、而 Alertmanager 状态是 DOWN 的情况很常见
+  # （服务名写错、不在同一 network），那时告警照样送不出去。
+  #
+  # 送达链路的最后一环在 alert-sink 服务（凭据取自 .env）。整条链是：
+  #   应用 /metrics → Prometheus 判定 → Alertmanager 路由 → alert-sink 转格式 → 机器人
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [monitor]
+    volumes:
+      - ../monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "127.0.0.1:9093:9093"     # 只绑回环：它自身无鉴权
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits: { memory: 256m, cpus: "0.25", pids: 128 }
+    depends_on:
+      - alert-sink
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [monitor]
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"     # 只绑回环：它自身无鉴权
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits: { memory: 512m, cpus: "0.5", pids: 256 }
+    depends_on:
+      # 不等它的话启动期会一直打 "no Alertmanager found"（无害但干扰排查）
+      - alertmanager
+
+  # ---------------- 外部探活（黑盒监控）----------------
+  # 与 prometheus 那个抓 /metrics 的 job 是**互补**关系，不是重复：
+  #   抓 /metrics  ⇒ "容器内进程活着"
+  #   探入口      ⇒ "经过 nginx 与网络后，用户真的能打通"
+  # 只有后者能发现 nginx 配置写错、端口没发布、DNS 失败、证书过期这类
+  # "内部全绿、外部不通"的故障 —— 而那正是用户最先感知到的形态。
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [edge,monitor]
+    volumes:
+      - ../monitoring/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    security_opt:
+      - no-new-privileges:true
+    # 它是纯网络探针（Go 二进制，不写任何文件），可以安全地砍掉全部能力
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits: { memory: 128m, cpus: "0.2", pids: 64 }
+
+  # ---------------- 主机指标（磁盘 / 内存 / 负载）----------------
+  # 为什么必须有它：**没有任何其它组件能提供这些指标**。
+  # 具体补上的三个盲区（每一个都对应一条告警或一次真实宕机路径）：
+  #   ① `node_filesystem_*` —— 磁盘。这是本栈最实际的一种"慢慢憋死"：
+  #      json-file 日志（现已加轮转，见文件顶部的 x-logging）+ Prometheus TSDB
+  #      + Loki 块 + backups/ 一起长。**满盘的表现是 PG 随机 500，不是"磁盘满"**，
+  #      所以没有这个指标你连方向都找不到（DiskSpaceLow 规则依赖它）。
+  #   ② 内存与 load —— 判断"整机变慢"到底是不是某个容器吃光了资源，
+  #      以及 OOM killer 有没有杀错人（它挑谁杀是不确定的）。
+  #   ③ 文件描述符与 socket —— 连接泄漏的早期信号。
+  #
+  # ⚠️ 它必须挂宿主机根目录（`/:/host:ro,rslave`）才能看到**宿主机的**文件系统，
+  #    否则看到的只是容器自己的 overlay（永远是 0.x% 占用，毫无意义）。
+  #    这个挂载确实是本栈里权限最大的一个（等价于宿主机全盘只读）——
+  #    所以：只读 + `cap_drop: ALL` + 不发布到公网网卡 + 资源上限 + 官方镜像。
+  #    它**刻意不接 `data` 网络**：它不需要碰数据库。
+  #
+  # 采集来的指标由 prometheus.yml 的 `node-exporter` job 抓走。
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    # ⚠️ 与其它服务不同：这里**不能**写 `logging: *default-logging` 之外的额外处理，
+    #    textfile collector 需要一个可读目录，见下面的 volumes。
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [monitor]
+    command:
+      # rootfs 指向挂进来的宿主机根，`/proc`、`/sys` 同源
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      # textfile collector：把"备份有没有成功"变成一个真正的指标。
+      # 目录里放的是备份循环每轮重写的 *.prom（见 backup-pg / backup-qdrant）。
+      # 为什么绕这一圈：备份容器本身不提供任何可抓取的端点，
+      # 而 `BackupLoopFailing` 必须能判定"上次成功是多少秒之前"。
+      - --collector.textfile.directory=/textfile
+      # 排除 docker 自动塞进来的 bind mount（/etc/hosts、/etc/hostname、/etc/resolv.conf）
+      # 与容器内部的 proc/sys/dev —— 它们要么是 overlay（fs 类型已过滤），
+      # 要么会让"最小可用比例"被一个假的 99% 满的挂载点拉偏。
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|etc|host/etc)($|/)
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+      # 只读挂进来给 textfile collector 读 *.prom；备份容器负责写。
+      - ../../backups:/textfile:ro
+    ports:
+      # 只绑回环：9100 上是主机全貌（挂载点、网卡、进程数），没有理由对公网开放
+      - "127.0.0.1:9100:9100"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits: { memory: 128m, cpus: "0.2", pids: 64 }
+
+  # ======================================================================
+  # 日志聚合与面板（profile: observability —— **默认不启动**）
+  # ======================================================================
+  # 起法：
+  #   docker compose --env-file .env -f deploy/app/docker-compose.yml --profile observability up -d
+  #
+  # 为什么不随默认编排启动：它会把每个容器的 stdout 全收进来，在开发机上徒增
+  # 内存与 IO，而开发时 `docker logs -f` 已经够用。
+  #
+  # 为什么不加 `cap_drop: [ALL]`（与 pgvector / nginx 同理）：这几个官方镜像
+  # 以 root 启动再写自己的数据目录，砍掉能力会让容器**直接起不来**。
+  # 它们的加固方式是"不给额外能力 + 不发布端口 + 独立卷"。
+
+  loki:
+    image: grafana/loki:2.9.8
+    profiles: ["observability"]
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [monitor]
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ../monitoring/loki.yml:/etc/loki/loki.yml:ro
+      - lokidata:/loki
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { memory: 512m, cpus: "0.5", pids: 256 }
+
+  promtail:
+    image: grafana/promtail:2.9.8
+    profiles: ["observability"]
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [monitor]
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    volumes:
+      - ../monitoring/promtail.yml:/etc/promtail/promtail.yml:ro
+      # ⚠️ 挂 docker socket = 把宿主机 Docker 控制面交给这个容器（等价 root）。
+      #    只读挂载能防误改文件，**不能阻止**通过 socket 发出的写操作。
+      #    缓解：它只在 observability profile 里，不随默认编排启动。
+      #    在 k8s / 云平台上不需要这个服务（stdout 由平台采集）。
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [monitor]
+    environment:
+      # 口令从 .env 取；默认 admin 只用于第一次本机登录，生产必须改
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      # 关掉注册与匿名访问：Grafana 面板能读到全部指标与日志，等于内网的情报面板
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      # 数据源随仓库走（见该目录下的说明：手工加的 datasource 会随容器消失）
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"     # 只绑回环：面板没有理由对公网开放
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { memory: 384m, cpus: "0.5", pids: 256 }
+    depends_on:
+      - prometheus
+      - loki
+
+  # ======================================================================
+  # 定时备份（PostgreSQL + Qdrant）
+  # ======================================================================
+  # 现状问题：`scripts/pg_backup.py drill` 本身写得很好，但**没有任何东西在定时跑**
+  # —— 靠人记着执行等于没有备份（一定会在最忙的那周被忘掉）。
+  #
+  # ⚠️ "容器在运行"不等于"备份在发生"。真正的信号是**备份文件的时间戳是今天**：
+  #     ls -lt backups/ | head
+  #   建议把这一条做进日常巡检（见 deploy/RUNBOOK.md 的"备份巡检"一节）。
+  #
+  # 备份目录用宿主机的 ./backups —— 与手工执行 pg_backup.py 落在同一处，
+  # 避免出现"两份备份，其中一份没人知道"。
+
+  backup-pg:
+    image: pgvector/pgvector:pg16      # 自带与库版本严格匹配的 pg_dump
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [data]
+    volumes:
+      - ../../backups:/backups
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-123456}
+      # ⚠️ 间隔 × 保留份数 = 实际可回溯的时间窗。改一个**必须**改另一个：
+      #    原来 24h × 14 = 14 天；把间隔压到 6h（RPO 24h→6h）而份数不动，
+      #    可回溯窗口会**静默缩到 3.5 天** —— 而那正是最容易需要"回到上周"的时候。
+      #    现在 6h × 56 = 14 天（与原来同一窗口，只是粒度更细）。
+      #    `tests/test_deploy_topology.py` 会断言这个乘积 >= 7 天。
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-6}
+      BACKUP_KEEP: ${BACKUP_KEEP:-56}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -u
+        interval=$${BACKUP_INTERVAL_HOURS:-6}
+        keep=$${BACKUP_KEEP:-56}
+        slot=$$(( interval * 3600 ))
+        echo "pg 备份循环：每 $${interval}h 一次（**与 qdrant 对齐到同一槽位**，见 deploy/RUNBOOK.md §4.1）"
+        while true; do
+          iso=$$(date -u +%Y%m%dT%H%M%SZ)
+          ts=$$(echo "$$iso" | sed 's/T/-/; s/Z//')
+          out=/backups/langgraph_checkpoints-$$ts.dump
+          echo "[$$(date -Iseconds)] backup_id=$$iso pg_dump -> $$out"
+          rc=1
+          if pg_dump -h pgvector -U langgraph_app -d langgraph_checkpoints -Fc -f "$$out"; then
+            echo "[$$(date -Iseconds)] 备份成功：$$(du -h "$$out" | cut -f1)"
+            rc=0
+          else
+            echo "[$$(date -Iseconds)] 备份失败" >&2
+            rm -f "$$out"
+          fi
+          # ---- 发布指标（node-exporter 的 textfile collector 会读走）----
+          # ⚠️ 失败时**必须保留上一次成功的值**，不能让这一行消失：
+          #    指标一旦消失，`time() - backup_last_success_timestamp_seconds`
+          #    就没有任何序列可算 ⇒ BackupLoopFailing **静默失效**。
+          #    （这正是"用缺失表达故障"的同一个陷阱：缺失不是 0，规则匹配不到。）
+          state=/backups/.backup-pg.state
+          last_ts=$$(sed -n 1p "$$state" 2>/dev/null || true)
+          last_id=$$(sed -n 2p "$$state" 2>/dev/null || true)
+          [ -n "$$last_ts" ] || last_ts=0
+          [ -n "$$last_id" ] || last_id=none
+          if [ "$$rc" -eq 0 ]; then
+            last_ts=$$(date +%s)
+            last_id="$$iso"
+            printf '%s\n%s\n' "$$last_ts" "$$last_id" > "$$state"
+          fi
+          # 写临时文件再 mv：textfile collector 可能正好在写的中途抓取，
+          # 半截文件会让它报错并**丢掉整个文件里所有指标**（原子替换可以避免）。
+          tmp=$$(mktemp /backups/.backup-pg.XXXXXX)
+          {
+            echo '# HELP backup_last_success_timestamp_seconds 上次备份成功的 Unix 时间戳'
+            echo '# TYPE backup_last_success_timestamp_seconds gauge'
+            echo "backup_last_success_timestamp_seconds{target=\"pg\",backup_id=\"$$last_id\"} $$last_ts"
+            echo '# HELP backup_last_attempt_success 最近一次尝试是否成功（1=成功）'
+            echo '# TYPE backup_last_attempt_success gauge'
+            if [ "$$rc" -eq 0 ]; then echo 'backup_last_attempt_success{target="pg"} 1';
+            else echo 'backup_last_attempt_success{target="pg"} 0'; fi
+            # pg 恒为 0。存在的意义：让告警表达式两侧的 `and on(target)` 都能匹配到，
+            # 否则会出现"某一边没有序列 ⇒ 布尔匹配为空 ⇒ **静默不告警**"。
+            echo '# HELP backup_backend_skipped 后端未启用/不可达（1=本轮跳过）'
+            echo '# TYPE backup_backend_skipped gauge'
+            echo 'backup_backend_skipped{target="pg"} 0'
+          } > "$$tmp"
+          mv "$$tmp" /backups/backup-pg.prom
+          # 只保留最近 $keep 份；刻意只匹配 *.dump，不动 .prom/.state
+          ls -1t /backups/*.dump 2>/dev/null | tail -n +$$(( keep + 1 )) | xargs -r rm -f
+          now=$$(date +%s)
+          nxt=$$(( slot - (now % slot) ))
+          echo "[$$(date -Iseconds)] 下一轮在 $${nxt}s 后（对齐到 $${interval}h 槽位，与 qdrant 同时开始）"
+          sleep $$nxt
+        done
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { memory: 256m, cpus: "0.5", pids: 64 }
+
+  backup-qdrant:
+    image: python:3.13-slim
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [data]
+    volumes:
+      - ../../scripts:/scripts:ro
+      - ../../backups:/backups
+    environment:
+      # 未启用 Qdrant 后端时它照样起得来，只是每轮明确播报"跳过"（退出码 2）——
+      # 刻意不做成"检测不到就退出"：静默退出会让人以为备份在跑。
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-rag_chunks}
+      BACKUP_DIR: /backups/qdrant
+      # 与 pg 同一口径：间隔 × 份数 = 可回溯窗口。6h × 28 = 7 天。
+      # 快照比 dump 大，所以窗口刻意比 pg 短（Qdrant 的数据可从语料重建，
+      # pg 的检查点与审核记录**不可再生**）。
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-6}
+      BACKUP_KEEP: ${QDRANT_BACKUP_KEEP:-28}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -u
+        interval=$${BACKUP_INTERVAL_HOURS:-6}
+        slot=$$(( interval * 3600 ))
+        echo "qdrant 备份循环：每 $${interval}h 一次（**与 pg 对齐到同一槽位**，见 deploy/RUNBOOK.md §4.1）"
+        while true; do
+          iso=$$(date -u +%Y%m%dT%H%M%SZ)
+          echo "[$$(date -Iseconds)] backup_id=$$iso qdrant 快照 -> $${BACKUP_DIR}"
+          python /scripts/qdrant_backup.py backup --keep "$$BACKUP_KEEP"
+          rc=$$?
+          skipped=0
+          case $$rc in
+            0) echo "[$$(date -Iseconds)] qdrant 备份完成" ;;
+            2) echo "[$$(date -Iseconds)] 跳过：Qdrant 不可达（该后端可能未启用）"; skipped=1 ;;
+            *) echo "[$$(date -Iseconds)] qdrant 备份失败 rc=$$rc" >&2 ;;
+          esac
+          # ---- 发布指标（同 pg：失败时保留上次成功的值，原子替换文件）----
+          state=/backups/.backup-qdrant.state
+          last_ts=$$(sed -n 1p "$$state" 2>/dev/null || true)
+          last_id=$$(sed -n 2p "$$state" 2>/dev/null || true)
+          [ -n "$$last_ts" ] || last_ts=0
+          [ -n "$$last_id" ] || last_id=none
+          if [ "$$rc" -eq 0 ]; then
+            last_ts=$$(date +%s)
+            last_id="$$iso"
+            printf '%s\n%s\n' "$$last_ts" "$$last_id" > "$$state"
+          fi
+          tmp=$$(mktemp /backups/.backup-qdrant.XXXXXX)
+          {
+            echo '# HELP backup_last_success_timestamp_seconds 上次备份成功的 Unix 时间戳'
+            echo '# TYPE backup_last_success_timestamp_seconds gauge'
+            echo "backup_last_success_timestamp_seconds{target=\"qdrant\",backup_id=\"$$last_id\"} $$last_ts"
+            echo '# HELP backup_last_attempt_success 最近一次尝试是否成功（1=成功）'
+            echo '# TYPE backup_last_attempt_success gauge'
+            if [ "$$rc" -eq 0 ]; then echo 'backup_last_attempt_success{target="qdrant"} 1';
+            else echo 'backup_last_attempt_success{target="qdrant"} 0'; fi
+            # 为什么要单独一个 gauge：Qdrant 未启用时这个循环会**永远 rc=2**。
+            # 若"备份失败"告警只看时间戳，就会得到一个永远不会恢复的假告警 ——
+            # 而永久存在的假告警等于没有告警（没人再看它）。
+            echo '# HELP backup_backend_skipped 后端未启用/不可达（1=本轮跳过）'
+            echo '# TYPE backup_backend_skipped gauge'
+            echo "backup_backend_skipped{target=\"qdrant\"} $$skipped"
+          } > "$$tmp"
+          mv "$$tmp" /backups/backup-qdrant.prom
+          now=$$(date +%s)
+          nxt=$$(( slot - (now % slot) ))
+          echo "[$$(date -Iseconds)] 下一轮在 $${nxt}s 后（对齐到 $${interval}h 槽位，与 pg 同时开始）"
+          sleep $$nxt
+        done
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { memory: 256m, cpus: "0.25", pids: 64 }
+
+  # ======================================================================
+  # 数据保留清理（把"表无界增长"变成一个有调度的动作）
+  # ======================================================================
+  # 为什么必须有：`scripts/retention_sweep.py` 之前**只活在 docstring 的 cron 示例里**
+  # —— 也就是说没有任何东西在跑它。而检查点表、`review_queue`、`session_owners`
+  # 三张表都是**只增不减**的：会话越多、审核越多，库越大。
+  #
+  # 这类问题属于"半年后才疼、但疼起来最难查"的一档：等到发现时，症状是
+  # VACUUM 跟不上、索引膨胀、备份窗口从分钟级变成小时级，而**没有任何一条告警**
+  # 会指向"表太大了"。
+  #
+  # 为什么用 `--days $RETENTION_DAYS` 而不是写死天数：保留期是**业务口径**，
+  # 必须与 `.env` 同源。`RETENTION_DAYS=0`（默认）时脚本会**拒绝执行并退出 2**
+  # —— 这是刻意的安全默认，别把它改成"没配就不清理"的静默分支。
+  #
+  # 为什么每天只跑一次且放在凌晨：清理是后台动作，`BATCH=500` 分批删除；
+  # 与备份错开可以避免在备份窗口里抢锁。
+  #
+  # ⚠️ 它复用 app 镜像（`chatagent:0.2.0`）—— 脚本里有 `os.chdir(ROOT)` 与
+  #    `from app import config`，所以**必须**在镜像里那个 `/app` 结构下运行。
+  #    若你还没构建过 app 镜像，先 `docker compose ... up -d --build app-stable`。
+  retention-sweep:
+    image: chatagent:0.2.0
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [data]
+    env_file:
+      - ../../.env
+    environment:
+      # 容器内用服务名连库（覆盖 .env 里指向 localhost 的写法）
+      DB_URL: postgresql://langgraph_app:${POSTGRES_PASSWORD:-123456}@pgvector:5432/langgraph_checkpoints?sslmode=disable
+      RETENTION_DAYS: ${RETENTION_DAYS:-0}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -u
+        if [ "$${RETENTION_DAYS:-0}" -le 0 ] 2>/dev/null; then
+          echo "[$$(date -Iseconds)] RETENTION_DAYS 未配置（=0）⇒ 保留清理**未启用**。"
+          echo "  这是刻意的安全默认（删数据不可逆）。要启用请在 .env 里设 RETENTION_DAYS=90。"
+          echo "  本容器会保持运行但不做任何删除；把这条日志当作'我还没配'的提示。"
+          while true; do sleep 3600; done
+        fi
+        echo "保留清理循环：每 24h 一次，保留 $${RETENTION_DAYS} 天（判定依据=最后活动时间）"
+        while true; do
+          echo "[$$(date -Iseconds)] 开始清理（--days $${RETENTION_DAYS} --apply）"
+          # 先按**最后活动时间**判定（脚本内部逻辑），删除分批进行
+          if python /app/scripts/retention_sweep.py --days "$${RETENTION_DAYS}" --apply; then
+            echo "[$$(date -Iseconds)] 清理完成"
+          else
+            echo "[$$(date -Iseconds)] 清理失败 rc=$$?（不退出循环：下一轮会重试）" >&2
+          fi
+          sleep 86400
+        done
+    depends_on:
+      pgvector:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits: { memory: 256m, cpus: "0.25", pids: 64 }
+
+  # ---------------- 入口（权重灰度 + SSE 友好的反代）----------------
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [edge]
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - app-stable
+      - app-canary
+    # 与 pgvector 同理：nginx 官方镜像以 root 启动再降权，
+    # `cap_drop: [ALL]` 会让它起不来，所以只做"能做的加固"。
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits: { memory: 128m, cpus: "0.5", pids: 128 }
+
+volumes:
+  pgdata:
+  # Qdrant 的集合数据（向量 + payload）。与 pgdata 同属"丢了要重建"的一类，
+  # 但重建成本是 embedding 费用 + 全量重灌时间，所以同样要给卷。
+  qdrantdata:
+  # Redis 的 AOF 落盘：限流/配额是"可丢失"的数据，但重启后全部归零会让
+  # 一个正在刷接口的客户端立刻重新获得满额额度 —— 落盘比重新计数便宜。
+  redisdata:
+  # Prometheus 的 TSDB：没有它，每次重启监控历史清零，
+  # SLO 的 30 天窗口与燃尽率计算全部作废。
+  promdata:
+  # Loki 的日志块与索引（保留期由 loki.yml 的 retention_period 控制）
+  lokidata:
+  # Grafana 的仪表盘与用户（数据源不在这里 —— 那个是 provisioning，随仓库走）
+  grafanadata:
+
+# ===========================================================================
+# 网络分段（**别把所有服务丢在同一个桥里**）
+# ===========================================================================
+# 默认情况下 compose 把每个服务都挂进同一个默认桥，于是
+# **任何一个容器被拿下 = 横向可达全部**：PG / Qdrant / Redis（数据）
+# 与 Grafana / Promtail / Loki（能看到全部日志与指标的面板）之间没有任何阻隔。
+# Promtail 尤其危险 —— 它挂着 docker.sock（等价 root）。
+#
+# 三段划分的依据是"谁真的需要跟谁说话"，而不是"它们同属一个系统"：
+#
+#   edge     对外入口一段：nginx ↔ app-*（反向代理），外加 blackbox-exporter
+#            （它必须从**外面**探入口，所以必须在同一段）。
+#   data     数据一段：app-* ↔ pgvector / qdrant / redis；备份与清理任务也在这一段。
+#            ⚠️ **数据服务只接这一段**（见下面各服务）—— 这是这段存在的全部意义：
+#               Grafana / Promtail / Loki 不在 data 上，它们连不到你的库。
+#   monitor  监控一段：Prometheus ↔ 各 exporter 与被抓取目标；Alertmanager ↔ alert-sink。
+#
+# 为什么 app-* 要同时挂 monitor：Prometheus 抓的是 `app-stable:8000/metrics`，
+# **抓取要求两者在同一网络里**（用宿主机端口抓会让 /metrics 走公网路径）。
+# 代价是 app 容器能连到 Prometheus/Grafana —— 它们都有口令或只读，可接受；
+# 而"PG 暴露给面板容器"这一类是真正不接受的，已经被 data 段挡住了。
+#
+# ⚠️ 改了网络之后，**原来靠默认网络名互相解析的写法会失效**。若你按注释里的
+# `docker run --network chatagent_default ...` 单独起过某个组件，要改成
+# `chatagent_monitor`（compose 会给网络加项目名前缀）。
+networks:
+  edge:
+  data:
+  monitor:

@@ -1,0 +1,143 @@
+# staging 环境叠加文件（overlay）
+#
+# 用法：
+#   # 起一套独立的 staging（与生产可以同时跑，互不干扰）
+#   docker compose --env-file .env -f deploy/app/docker-compose.yml \
+#                  -f deploy/app/docker-compose.staging.yml up -d --build
+#
+#   # 停掉
+#   docker compose --env-file .env -f deploy/app/docker-compose.yml \
+#                  -f deploy/app/docker-compose.staging.yml down
+#
+# ⚠️ 两个不可省略的点（写错任一个，staging 就不再是 staging）
+# =========================================================
+#
+# 1) `name:` 必须改。
+#    compose 的项目名默认取自目录名 —— 两个文件在同一目录 ⇒ 同一个项目名 ⇒
+#    **共用同一套命名卷与网络**。后果不是"两个环境互相干扰"这么轻：
+#    staging 起起来会直接连到**生产那个 pgvector 容器与数据卷**，
+#    你在 staging 里跑的迁移/灌库清洗会作用在生产数据上。
+#    改 name 之后卷名变成 `chatagent-staging_pgdata`，才是真正隔离的一套。
+#
+# 2) `APP_ENV` 必须显式写 `production`，**不能**写 `staging`。
+#    这不是笔误 —— `app/config.py` 里 `IS_PRODUCTION = APP_ENV in ("production", "prod")`，
+#    也就是说 `APP_ENV=staging` 会被当作**非生产**：`REQUIRE_AUTH` 默认关闭、
+#    `ENABLE_DOCS` 默认打开。
+#    于是 staging 唯一与生产不同的地方，恰好落在**鉴权与接口暴露**这一层 ——
+#    而那正是"上线前最需要验证"的部分。你会在 staging 上验证通过，
+#    然后在生产上第一次看到 401/403 或者"生产 + 无密钥拒绝启动"。
+#    ⇒ 环境标识用 `APP_RELEASE`（只影响回显/指标标签），
+#      `APP_ENV` 保持与生产同语义。
+#
+# 三档配置的分工（别混着改）
+# =========================
+#   ① `.env`（项目根，随 env_file 注入）—— 各环境**共享**的配置与凭据
+#   ② 本文件（staging overlay）      —— **环境之间**的差异
+#   ③ `canary.env`（灰度 overlay）   —— **同一环境内 stable/canary** 的差异
+# 把"环境差异"写进 `.env` 是常见错误：那样本地直跑 `python -m app.serve`
+# 会连带拿到 staging 的配置，而你以为自己在跑本机默认值。
+
+name: chatagent-staging
+
+services:
+  # ---------------- 应用 ----------------
+  app-stable:
+    # staging 复用同一镜像 tag，但用独立的 release 标识 ——
+    # 它只影响日志/指标里的标签与 /health/live 的回显，用来区分"这套是谁"
+    environment:
+      APP_RELEASE: staging
+      # ⚠️ 刻意显式写死（见文件头第 2 点）：不能沿用 ${APP_ENV:-production}，
+      #    否则部署机上只要 export 过 APP_ENV=staging 就会静默关掉鉴权。
+      APP_ENV: production
+      # 单副本 + 单 worker：staging 是"验证正确性"的环境，不是压测环境。
+      # 少开 worker 也让限流/配额在 Redis 上的行为更容易观察。
+      WEB_CONCURRENCY: "1"
+      LOG_LEVEL: ${STAGING_LOG_LEVEL:-debug}
+    image: chatagent:staging
+
+  # staging **不需要灰度分流**：它本身就是"上生产前的验证环境"。
+  # 用一个版本跑，验证通过后再去生产做灰度。
+  # 用 replicas: 0 而不是删掉服务 —— 删掉的话，将来想临时起个 canary
+  # 对照就得改文件结构；置 0 只是"不启动"，配置仍在，改回 1 即可。
+  app-canary:
+    deploy:
+      replicas: 0
+
+  # ---------------- 数据面 ----------------
+  # ⚠️ 端口必须用 `!override`，**不能**直接写 `ports:` 列表。
+  #    compose 的叠加规则里，`ports` / `expose` / `dns` / `tmpfs` 这几项是
+  #    **拼接**而不是替换 —— 直接写会变成"同时绑 5433 和 5434"，
+  #    于是 staging 依然会去抢生产的 5433 端口，报 `address already in use`。
+  #    这类报错看起来像"服务起不来"，很容易去查服务本身而不是端口。
+  pgvector:
+    ports: !override
+      - "127.0.0.1:5434:5432"
+  qdrant:
+    ports: !override
+      - "127.0.0.1:6334:6333"
+  redis:
+    # Redis 本来就不发布端口（见主文件说明），这里只需换口令，
+    # 避免与生产共用同一个口令而后被误操作到对方的实例上。
+    command:
+      - redis-server
+      - --requirepass
+      - ${STAGING_REDIS_PASSWORD:-staging-redis}
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - allkeys-lru
+
+  # ---------------- 入口 ----------------
+  nginx:
+    ports: !override
+      # 生产是 8080；staging 用 8082（8081 被 alert-sink 占着）
+      - "8082:80"
+
+  # ======================================================================
+  # 关掉的部分：监控与备份
+  # ======================================================================
+  # 理由：staging 的作用是"验证这一版能不能上"，它用的是**临时数据**，
+  # 不需要备份；它的指标也没有长期留存的价值（30 天 SLO 窗口、燃尽率
+  # 都是针对生产算的）。开着它们只会多占内存、并且让"哪套在告警"变得含糊 ——
+  # **告警必须只来自生产**，否则 staging 的错误会半夜叫醒值班的人。
+  #
+  # 需要临时观察 staging 的指标时：把对应服务改回 1，并把 prometheus 的
+  # 抓取目标指向 staging 的 app（不要与生产共用一个 Prometheus，理由同上）。
+
+  alert-sink:
+    deploy:
+      replicas: 0
+
+  alertmanager:
+    deploy:
+      replicas: 0
+
+  prometheus:
+    deploy:
+      replicas: 0
+
+  blackbox-exporter:
+    deploy:
+      replicas: 0
+
+  loki:
+    deploy:
+      replicas: 0
+
+  promtail:
+    deploy:
+      replicas: 0
+
+  grafana:
+    deploy:
+      replicas: 0
+
+  backup-pg:
+    deploy:
+      replicas: 0
+
+  backup-qdrant:
+    deploy:
+      replicas: 0

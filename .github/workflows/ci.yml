@@ -1,0 +1,463 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  # 每日全量：装齐 docling/transformers，跑一遍主流程刻意跳过的那批用例。
+  # UTC 18:00 = 北京时间次日 02:00，避开使用高峰。
+  schedule:
+    - cron: "0 18 * * *"
+  # 手动触发时可选择跑"检索质量门禁"的完整版（需要 embedding 密钥）
+  workflow_dispatch:
+    inputs:
+      full_eval:
+        description: "是否跑完整检索评测（需要 EMBEDDING_* 密钥）"
+        type: boolean
+        default: false
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1) 单元测试：**完全离线**，不需要任何密钥与网络
+  # ------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # 刻意**不装 docling/transformers**：那几个包几个 GB、CI 上装十几分钟，
+      # 而测试对它们本来就是 importorskip 的（装了才跑那些用例）。
+      # 这里装的是"跑通全部离线用例所必需"的最小集合。
+      - name: 安装最小依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "langgraph>=0.3" "langgraph-checkpoint-postgres>=2" \
+            "langchain-openai>=0.3" "langchain-community>=0.3" \
+            "langchain-text-splitters>=0.3" "psycopg[binary]>=3.2" \
+            "pydantic>=2.7" python-dotenv \
+            "fastapi>=0.110" "uvicorn>=0.30" sse-starlette \
+            "scikit-learn>=1.4" "numpy>=1.26" "pgvector>=0.3" \
+            pdfminer.six python-docx openpyxl python-pptx beautifulsoup4 lxml \
+            "pytest>=8.0" "httpx>=0.27" tiktoken
+
+      # 依赖锁定一致性：requirements.txt 声明的包必须都在 requirements.lock 里有精确版本。
+      # 放在装依赖之后、跑测试之前 —— 这样"漂移"以最明确的方式失败，
+      # 而不是等某个未锁定包在几个月后发新版才暴露。
+      #
+      # 注意这里只做**静态一致性**校验，不尝试装齐全部依赖：本 job 刻意
+      # 不装 docling/transformers（见上方注释），要求"每个包都装了"会必然失败。
+      - name: 依赖锁定一致性
+        run: python scripts/lock_requirements.py
+
+      - name: 跑全量离线测试
+        env:
+          # 明确清空外部依赖配置：确保测试走"降级/内存"路径，不偷偷连任何服务
+          DB_URL: ""
+          AGNES_API_KEY: ""
+          EMBEDDING_API_KEY: ""
+        run: pytest tests/ -q -p no:cacheprovider
+
+  # ------------------------------------------------------------------
+  # 2) 检索质量门禁：改 prompt / 换模型 / 调切分后，召回率不该悄悄掉
+  # ------------------------------------------------------------------
+  eval-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: 安装最小依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install "langchain-openai>=0.3" "langchain-text-splitters>=0.3" \
+            "scikit-learn>=1.4" "numpy>=1.26" python-dotenv "httpx>=0.27"
+
+      # 只用 bm25 后端：纯本地、零外部调用、结果确定，适合做 CI 门禁。
+      # 阈值 0.55 是**当前基线（61%）下留出余量**的值；语料/质量提升后应逐步上调，
+      # 这样门槛才真正起到"防退化"的作用。
+      # 注：换 BM25 后 Top1 基线仍是 61%（Top3 64%→68%、MRR +0.018），故阈值不变。
+      #     门禁防的是"检索质量整体退化"，**不负责识别实现被换回 TF-IDF**
+      #     （后者排序差异太小，卡不住；那是 tests/test_bm25.py 靠绝对分值钉住的职责）。
+      - name: 检索基线门禁（bm25 Top1）
+        env:
+          DB_URL: ""
+          EMBEDDING_API_KEY: ""
+          AGNES_API_KEY: ""
+        run: python scripts/eval_retrieval.py --only bm25 --fail-under 0.55
+
+      # 答案质量门禁：测的是**喂给模型的材料**（引用覆盖 / 关键点覆盖 / 可回溯），
+      # 而不是 Top1 召回。两者不能互相替代 —— 检索对不等于答案对：
+      # 召回回来的块可能压根不含回答问题需要的事实，那时模型只能漏掉或编。
+      #
+      # 同样只用 tfidf：确定性、零外部调用。模型侧的**忠实度**评测需要
+      # LLM-as-judge，那有噪声、要密钥、结果不可复现，不能当 CI 门禁。
+      #
+      # 它读的是**随仓库分发的 `data/`**（与线上语料同源）—— 语料被改坏、
+      # 文件被挪走、切分把内容切碎，都会在这里体现为覆盖率下降。
+      - name: 答案质量门禁（引用与关键点覆盖）
+        env:
+          DB_URL: ""
+          EMBEDDING_API_KEY: ""
+          AGNES_API_KEY: ""
+        run: python scripts/eval_answer.py
+
+  # ------------------------------------------------------------------
+  # 3) 全量依赖（每日定时 / 手动）：补上主流程刻意跳过的那批用例
+  # ------------------------------------------------------------------
+  # 为什么必须有这个 job
+  # -------------------
+  # 上面的 `test` job 刻意**不装** docling / transformers（那几个包几个 GB、
+  # CI 上要装十几分钟），而那批测试是 `pytest.importorskip` 的 —— 结果是
+  # **最复杂、最容易坏的解析链路（表格 / 版式 / OCR）在 CI 里一行都没跑**。
+  # "本地绿"因此不等于"CI 绿"。这里用一个慢 job 把这块补上：每天一次、
+  # 允许它慢（90 分钟超时），它红了就说明解析链路真的坏了。
+  #
+  # 本地已实测：装上 docling 2.129 + transformers 后，全量 508 个用例可全绿。
+  # 如果嫌装 torch 太慢，可在下面先装 CPU 版：
+  #   pip install torch --index-url https://download.pytorch.org/whl/cpu
+  full-deps:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: 安装全量依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 全量测试（含 docling 解析链路）
+        env:
+          # 与 test job 同口径：清空外部依赖配置，确保走降级/离线路径
+          DB_URL: ""
+          AGNES_API_KEY: ""
+          EMBEDDING_API_KEY: ""
+          HF_ENDPOINT: https://hf-mirror.com
+        run: pytest tests/ -q -p no:cacheprovider
+
+  # ------------------------------------------------------------------
+  # 4) 部署产物：镜像构建 → 冒烟启动 → 漏洞扫描
+  # ------------------------------------------------------------------
+  # 为什么必须有这个 job
+  # -------------------
+  # 上面三个 job 只验证 **Python 代码**。真正上线的东西是**镜像**，而它此前
+  # 一行都没被验证过。三类问题只有"真构建 + 真启动"才暴露：
+  #
+  #   a) `requirements.lock` 钉了一个不存在的版本 ⇒ pip 解析失败。
+  #      纯静态检查（`scripts/lock_requirements.py`）看不出这点，只有真装才知道。
+  #   b) `COPY` 少拷一个目录 / 路径写错 ⇒ 镜像**构建成功**，启动时才 ImportError。
+  #   c) 缺 `libgl1` 之类的系统库、`CMD` 写错、端口没 EXPOSE ⇒ 构建成功，容器起不来。
+  #
+  # 所以本 job 的三步是**递进**的：构建 ⇒ 起来探活 ⇒ 扫漏洞。缺任何一步都有盲区 ——
+  # 尤其是"只构建不启动"：它给人一种"产物已验证"的错觉，实际连都连不上。
+  image:
+    runs-on: ubuntu-latest
+    # 构建本身含几个 GB 的 pip 安装。没超时的话，一次卡死会白烧 6 小时 runner。
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # buildx 是 GHA 缓存的载体：pip 安装那一层几个 GB，
+      # 没缓存的话每次 push 都重装十几分钟，这个 job 很快会被绕过或删掉。
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 构建镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/app/Dockerfile
+          push: false
+          # 必须 load 到本地 docker，下一步 `docker run` 才找得到这个镜像
+          load: true
+          tags: chatagent:ci
+          # ⚠️ CI 只构建 **slim** 变体（INSTALL_DOCLING=0）：装齐
+          # docling/transformers/torch 会让构建时长与磁盘占用翻几倍，
+          # 而"重依赖能不能装、解析链路能不能跑"已由上面的 full-deps job 在
+          # Python 层覆盖。本 job 关心的是**打包与启动**（COPY / CMD / 系统库 /
+          # 依赖锁定），这与装不装 docling 无关。
+          build-args: |
+            INSTALL_DOCLING=0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 启动容器并探活
+        # 这一步不可省：`docker build` 成功只证明"层能构建"，不证明**应用能起来**。
+        # 刻意**不传任何环境变量** —— 默认配置就能启动本身就是被断言的东西
+        # （镜像不该依赖某个没写进 Dockerfile 的环境变量才能跑）。
+        run: |
+          set -eu
+          docker run -d --name chatagent-ci -p 8000:8000 chatagent:ci
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health/live >/dev/null 2>&1; then ok=1; break; fi
+            sleep 2
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::容器未能在 60 秒内通过 /health/live（看下面的容器日志定位原因）"
+            docker logs chatagent-ci || true
+            exit 1
+          fi
+          echo "探活通过：$(curl -fsS http://localhost:8000/health/live)"
+          docker logs chatagent-ci || true
+
+      - name: 漏洞扫描（镜像）
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: chatagent:ci
+          format: table
+          # 只卡 HIGH/CRITICAL：MEDIUM 及以下数量大且多数无法处置，
+          # 全开会把门禁变成"习惯性失败"，反而把真正可修的问题淹掉。
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          # 没有可用修复版本的 CVE 不该卡住 CI —— 你无法通过改代码解决它。
+          # 需要长期忽略的**可修**项，请加到仓库根的 `.trivyignore`，
+          # 并写明理由与到期日（见该文件的头部说明）。
+          ignore-unfixed: true
+
+      - name: 清理容器
+        if: always()
+        run: docker rm -f chatagent-ci || true
+
+  # ------------------------------------------------------------------
+  # 5) 代码层安全：SAST / 依赖漏洞 / 密钥扫描
+  # ------------------------------------------------------------------
+  # 为什么与上面的 image job 分开
+  # ---------------------------
+  # image job 扫的是**镜像里装好的依赖**（trivy），本 job 扫的是**仓库里的代码与声明**。
+  # 两者覆盖的东西不重叠：
+  #   - trivy 看不到"代码里写死了一个密钥"——那不是 CVE；
+  #   - pip-audit 看不到"基础镜像里的系统库漏洞"；
+  #   - 两者都不知道"有人把 .env 提交上来了"。
+  #
+  # ⚠️ 门禁强度是**刻意分级**的，不是遗漏
+  # -----------------------------------
+  #   - **gitleaks 卡门禁**（唯一 exit≠0 的）：密钥泄露永远可修（删除 + 轮换），
+  #     且代价最高 —— 凭据一旦进了仓库历史，改代码是补不回来的。
+  #   - **bandit / pip-audit 只报不卡**：两者第一次跑必然命中**存量**问题 ——
+  #     bandit 会命中 `src/rag` 里 7 处 `sha1`（那些是**内容指纹**，不是加密用途，
+  #     bandit 的 B324 规则无法区分用途）；pip-audit 会命中任何一个"尚无可用修复
+  #     版本"的传递依赖。直接卡门禁 ⇒ 第一次合入就是红的 ⇒ 接着必然被
+  #     `continue-on-error` 或删掉绕过，**比不设门禁更糟**（它给了"有防护"的错觉）。
+  #     正确顺序：先产出基线 → 逐条处置或写进带到期日的忽略清单（与
+  #     `.trivyignore` 同一套纪律）→ **再把 exit 改成 1**。
+  #     所以它们的结果以 artifact 形式留存，确保真的有人能拿到手看。
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: SAST（bandit，仅报告：先积累基线）
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip
+          pip install "bandit>=1.7"
+          # -ll = 只报 MEDIUM 及以上；LOW 里几乎全是 assert / try-except-pass 这类噪声。
+          # 跑两遍是为了同时拿到"给人看的文本"与"给机器看的 JSON"——
+          # bandit 一次只能出一种格式，而只留 JSON 等于没人会打开它。
+          bandit -r app src -ll -f json -o bandit-report.json || true
+          bandit -r app src -ll || true
+
+      - name: 依赖漏洞（pip-audit，仅报告：无修复版本的项无法靠改代码解决）
+        continue-on-error: true
+        run: |
+          pip install "pip-audit>=2.7"
+          # --no-deps：不做全量依赖解析（装齐 docling/torch 要十几分钟），只审
+          # requirements.txt 里**直接声明**的包。传递依赖的权威口径是 image job
+          # 里 trivy 扫**真实镜像**的结果 —— 那才是上线的东西。
+          pip-audit -r requirements.txt --no-deps --desc || true
+
+      - name: 密钥扫描（gitleaks，**卡门禁**）
+        run: |
+          set -eu
+          VER=8.18.4
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          # --no-git：扫**当前工作树**而不是全部 git 历史。历史里翻出的东西
+          # （早已废弃的示例凭据）只会制造噪声并让人习惯性忽略这条门禁；
+          # 而"现在还在仓库里的密钥"才是必须当场处理的。
+          # 允许清单见仓库根 .gitleaks.toml（.env.example 是**示例文件**，
+          # 里面的默认口令是刻意公开的）。
+          ./gitleaks detect --source . --no-git --redact --config .gitleaks.toml -v
+
+      - name: 上传扫描报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: bandit-report.json
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # 6) 发布：推送 registry → 生成 SBOM → 签名（**仅 main / 版本 tag**）
+  # ------------------------------------------------------------------
+  # 为什么必须有这一段
+  # -----------------
+  # 在此之前 CI 止于"构建 + 冒烟 + 扫描"，且刻意 `push: false` —— 于是
+  # **构建过的东西 ≠ 部署过的东西**：发布靠人在服务器上 `compose up --build`
+  # 重新构建一遍，那次构建用的代码/依赖/基础镜像都可能与 CI 验证过的不同，
+  # 而且事后**没有任何记录**能回答"线上跑的到底是哪个 commit"。
+  # 本 job 把"CI 验证过的那个镜像"变成唯一制品，并给它一个可验证的身份证（签名）。
+  #
+  # ⚠️ 依赖 image + test + security：**没通过冒烟、漏洞扫描或密钥扫描的镜像
+  #    不允许发布**。这是 `needs:` 的真正意义 —— 不是"顺序好看"，
+  #    而是"没验证过的东西不许出门"。少了 security 就会出现这种洞：
+  #    gitleaks 拦下了一个提交进仓库的密钥、CI 变红，而镜像**照样发出了**。
+  #
+  # 缺凭据时的行为：**跳过而非失败**
+  # ------------------------------
+  # registry 登录放在一个"预检"步骤里：登不上就只打一条 warning 并跳过后续
+  # 推送/签名，job 仍然成功。因为"仓库没启用 Packages / 组织策略禁止推送"属于
+  # **配置缺失**，不是**代码坏了** —— 把它变红只会让每个合入都挂着一条与本次
+  # 改动无关的红灯，然后被习惯性忽略。
+  #
+  # 用的是内置 `GITHUB_TOKEN`（配 `packages: write` 即可推 GHCR），
+  # 所以正常情况下**不需要额外配任何密钥**；cosign 走 keyless（OIDC），
+  # 也不需要私钥。要临时关掉发布：仓库变量 `PUBLISH_IMAGE=false`。
+  publish:
+    if: >-
+      github.event_name == 'push'
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      && vars.PUBLISH_IMAGE != 'false'
+    needs: [image, test, security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write     # 推 GHCR 需要
+      id-token: write     # cosign keyless 签名（走 OIDC，无需私钥）
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 预检 registry 可用性（不可用则跳过，不判失败）
+        id: pre
+        run: |
+          set -eu
+          IMAGE="ghcr.io/${{ github.repository }}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          if echo "${{ secrets.GITHUB_TOKEN }}" \
+               | docker login ghcr.io -u "${{ github.actor }}" --password-stdin 2>/dev/null; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+            echo "GHCR 登录成功：${IMAGE}"
+          else
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::无法登录 GHCR（仓库可能未启用 Packages，或组织策略禁止推送）。已跳过发布 —— 这是配置缺失，不是代码问题。"
+          fi
+
+      - name: 计算镜像标签
+        id: meta
+        if: steps.pre.outputs.ok == '1'
+        run: |
+          set -eu
+          IMAGE="${{ steps.pre.outputs.image }}"
+          SHA_SHORT="$(git rev-parse --short=12 HEAD)"
+          TAGS="${IMAGE}:sha-${SHA_SHORT}"
+          # main 上同时打 :main（可回退的滚动指针）；tag 事件上再打语义化版本号。
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then TAGS="${TAGS},${IMAGE}:main"; fi
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then TAGS="${TAGS},${IMAGE}:${GITHUB_REF_NAME}"; fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          # sha-<短哈希> 才是**唯一可信的定位方式**：:main 会被下一次推送覆盖，
+          # 而"线上跑的到底是哪个 commit"必须能反查 —— 这正是本 job 存在的理由。
+          echo "sha_short=${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "digest_tag=${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+
+      - name: 构建并推送镜像
+        id: push
+        if: steps.pre.outputs.ok == '1'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/app/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # 与 CI 验证的镜像**同一构建参数**（slim 变体）—— 参数不一致就等于
+          # "验证的"和"发布的"不是同一个东西，那前面所有验证都没有意义。
+          build-args: |
+            INSTALL_DOCLING=0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 生成 SBOM（软件物料清单）
+        if: steps.pre.outputs.ok == '1'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.meta.outputs.digest_tag }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          # 不自动传 GitHub Dependency Graph：那是另一套订阅（且对私有仓库有额外要求），
+          # 这里只保证**制品旁边有一份 SBOM**，供漏洞响应时判断"我受不受影响"。
+          upload-artifact: false
+
+      - name: 安装 cosign
+        if: steps.pre.outputs.ok == '1'
+        uses: sigstore/cosign-installer@v3
+
+      - name: 签名镜像（keyless，走 OIDC）
+        if: steps.pre.outputs.ok == '1'
+        run: |
+          set -eu
+          cosign sign --yes "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
+
+      - name: 附带 SBOM 到签名制品
+        if: steps.pre.outputs.ok == '1'
+        run: |
+          set -eu
+          # attach 之后 SBOM 与镜像 digest 绑定；签名已经签在 digest 上，
+          # 因此"谁改了 SBOM"同样可被 cosign verify 的证明链发现。
+          cosign attach sbom --sbom sbom.spdx.json \
+            "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
+
+      - name: 上传 SBOM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          if-no-files-found: ignore
+
+      - name: 发布摘要
+        if: always()
+        run: |
+          {
+            echo "## 发布结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 镜像 | \`${{ steps.pre.outputs.image }}\` |"
+            echo "| 标签 | \`${{ steps.meta.outputs.tags }}\` |"
+            echo "| digest | \`${{ steps.push.outputs.digest }}\` |"
+            echo "| registry 可用 | ${{ steps.pre.outputs.ok }} |"
+            echo ""
+            echo '校验签名（部署前应逐次执行，确认拿到的是本仓库签出的镜像）：'
+            echo ""
+            echo '```'
+            echo "cosign verify \\"
+            echo "  --certificate-identity-regexp 'https://github.com/${{ github.repository }}/.*' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  ${{ steps.meta.outputs.digest_tag }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+

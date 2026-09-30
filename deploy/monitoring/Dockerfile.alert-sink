@@ -1,0 +1,35 @@
+# 告警通知网关镜像
+#
+# 为什么单独一个 Dockerfile（而不是复用 deploy/app/Dockerfile）：
+#   本服务不属于业务链路 —— 它不 import src/ 与 app/，只用 Python 标准库。
+#   复用业务镜像会把整个依赖树（几百 MB）拖进来，而它实际只需要一个 .py 文件。
+#
+# 构建（**必须在仓库根目录**执行，否则 COPY 的路径不存在）：
+#   docker build -f deploy/monitoring/Dockerfile.alert-sink -t chatagent-alert-sink:0.2.0 .
+#
+# 单跑（自检，不进监听）：
+#   docker run --rm -e ALERT_SINK_WECOM_WEBHOOK='https://...' \
+#     chatagent-alert-sink:0.2.0 python alert_sink.py --selftest
+
+FROM python:3.13-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /sink
+
+# 只有这一个文件：零第三方依赖（http.server + urllib 全在标准库）
+COPY deploy/monitoring/alert_sink.py ./
+
+# 非 root 运行 —— 与业务镜像同一层思路
+RUN useradd -m sinkuser && chown -R sinkuser /sink
+USER sinkuser
+
+EXPOSE 8080
+
+# 存活探针用 python 而不是 curl：本镜像刻意不装任何额外包，
+# 装 curl 只为探活不值得（多一个可被扫的系统组件）。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health/live',timeout=3).status==200 else 1)"
+
+CMD ["python", "alert_sink.py", "--port", "8080"]

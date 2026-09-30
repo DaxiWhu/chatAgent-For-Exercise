@@ -1,0 +1,76 @@
+# 依赖锁定清单（constraints 文件）—— 保证构建可复现
+#
+# 怎么用
+# ------
+#   pip install -r requirements.txt -c requirements.lock
+#
+# 为什么是「两个文件」而不是把 requirements.txt 改成全 `==`
+# ---------------------------------------------------------
+# - `requirements.txt` 表达**意图**（要哪些包、为什么需要、哪些是可选的）。
+#   它是给人读的，改动时能看懂"为什么加这个包"。
+# - `requirements.lock` 表达**事实**（这次构建到底装哪个版本）。它是给 pip 读的。
+# 合成一个文件的代价：可读性消失（没人能从一屏 `==` 里看出包之间的关系），
+# 而且升级依赖时容易误删注释里的关键说明（如"配了 REDIS_URL 但没装客户端是静默降级"）。
+#
+# 为什么用 `-c`（约束）而不是 `-r`（替换）
+# ----------------------------------------
+# `-c` 只**限制版本**，不负责安装 —— 所以 requirements.txt 里写了什么就装什么，
+# 但每个包的版本被这里钉死。反过来（把依赖挪进这里用 `-r`）会导致
+# "requirements.txt 形同虚设、两处各有一份名单"的老问题。
+#
+# 口径说明（重要，避免期望错位）
+# -----------------------------
+# 这里钉的是**直接依赖**（requirements.txt 里列出的那些），不是完整传递闭包。
+# 直接依赖的版本漂移是最常见的故障源（主版本跳变、API 删除），钉住它已经
+# 消除绝大部分风险；而钉传递依赖需要 `pip-compile` 在**干净环境**里解析，
+# 用开发机的 freeze 结果反而会把无关包写进来。要做完整锁定请执行：
+#
+#   pip install pip-tools
+#   pip-compile requirements.txt -o requirements.full.lock    # 需在干净 venv 里跑
+#
+# 版本来源：2026-09-29 在**实际跑通全部 592 个用例**的环境里取的真实版本
+# （conda env `langchain1.2`，Python 3.13）。不是"理论上兼容"的版本。
+#
+# 更新方式：改完 requirements.txt 后跑 `python scripts/lock_requirements.py`
+# 重新生成，它会校验"清单里的包都装了"且"版本可解析"。CI 会检查两者不漂移。
+
+# ---- 核心运行时 ----
+langgraph==1.1.2
+langgraph-checkpoint-postgres==3.0.5
+langchain-openai==1.1.11
+langchain-community==0.4.1
+langchain-text-splitters==1.1.1
+psycopg[binary]==3.3.3
+pydantic==2.12.5
+python-dotenv==1.2.1
+
+# ---- 服务化 ----
+fastapi==0.135.1
+uvicorn==0.46.0
+sse-starlette==3.3.4
+redis==8.1.0
+
+# ---- RAG：检索 ----
+scikit-learn==1.8.0
+numpy==2.4.4
+pgvector==0.5.0
+qdrant-client==1.19.1
+
+# ---- RAG：文档解析（降级链路）----
+pdfminer.six==20260107
+python-docx==1.2.0
+openpyxl==3.1.5
+python-pptx==1.0.2
+beautifulsoup4==4.14.3
+lxml==6.1.0
+
+# ---- RAG：Docling 解析层 ----
+docling==2.129.0
+docling-core==2.98.0
+transformers==5.3.0
+tiktoken==0.12.0
+
+# ---- 测试 ----
+pytest==9.0.3
+httpx==0.28.1
+fakeredis==2.38.0

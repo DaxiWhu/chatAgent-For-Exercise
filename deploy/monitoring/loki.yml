@@ -1,0 +1,60 @@
+# Loki 单机配置（日志存储与检索）
+#
+# ⚠️ 这是**单机 / 小流量**配置：filesystem 存储、单副本、无对象存储。
+#    数据量大时应换成 S3/OSS 等对象存储后端并调大 chunk —— 那时改的是 storage 段，
+#    应用侧（stdout JSON）完全不用动，这正是"日志接口 = stdout"的好处。
+#
+# 为什么要把日志收起来（而不是继续 `docker logs | grep`）
+# ----------------------------------------------------
+#   1. **重启即丢**：容器一重建，上一次故障的日志就没了；而复盘往往发生在事后。
+#   2. **无法跨副本**：多副本时要挨个容器 grep，且时间线对不齐。
+#   3. **无法与指标关联**：告警说"5xx 升高"，你需要能立刻按 request_id 找到那条链路。
+#      应用侧已经打好结构化 JSON（LOG_FORMAT=json），缺的只是"有东西在收"。
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  # 调成 warn：否则 Loki 自己的 INFO 日志会和被采集的应用日志混在一起
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # ⚠️ 日志保留期（7 天）。与 `.env` 里的 RETENTION_DAYS 是**两件事**：
+  #    RETENTION_DAYS  管"业务数据的删除义务"（会话历史 / 审核记录），
+  #    retention_period 管"日志盘的容量"。
+  #    两者都设为 0 是很危险的默认：一个删不掉数据，一个写满磁盘。
+  retention_period: 168h
+  # 拒绝过老的样本：避免时钟错乱或补传时把旧数据挤进索引（会让索引膨胀且查询变慢）
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  # 单行上限：应用日志在极端情况下会带较长的片段，超限会被**整条丢弃**（不报错）。
+  max_line_size: 256kb
+
+# 保留期只有配上 compactor 才真正执行 —— 只写 limits_config 的话数据会一直留着
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem

@@ -1,0 +1,158 @@
+# Prometheus 抓取配置（chatAgent）
+#
+# 说明
+# ----
+# 本文件与 `alerts.yml`、`alertmanager.yml` 一起构成"指标真的会被人看到"的最小闭环 ——
+# 否则 `/metrics` 只是躺在那里，故障依然靠用户投诉才发现。
+#
+# ⚠️ 三者的职责边界（少任何一环，告警都送不到人）
+#   prometheus.yml    —— 抓谁、多久抓一次、规则从哪读、**把触发的事件发给谁**
+#   alerts.yml        —— 判定条件（什么算异常）
+#   alertmanager.yml  —— 路由与接收人（谁被叫醒、多快去叫、怎么降噪）
+# 只有前两个时，告警会被**触发**但不会**送达** —— 这是最容易漏的一环，
+# 因为面板上能看到 FIRING，会让人以为"已经通知过了"。
+#
+# 起法（与业务同网络）：
+#   # ① 先起告警路由（否则 Prometheus 会一直报 "no Alertmanager found"）
+#   docker run -d --name chatagent-alertmanager --network chatagent_default \
+#     -p 9093:9093 \
+#     -v "$PWD/deploy/monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro" \
+#     prom/alertmanager:v0.27.0
+#
+#   # ② 再起 Prometheus
+#   docker run -d --name chatagent-prom --network chatagent_default \
+#     -p 9090:9090 \
+#     -v "$PWD/deploy/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+#     -v "$PWD/deploy/monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro" \
+#     prom/prometheus:v2.54.1
+#
+# 怎么确认"链路真的通了"（三步，都别省）
+#   a) Prometheus  → http://localhost:9090/alerts    能看到规则处于 inactive/pending/firing
+#   b) Prometheus  → http://localhost:9090/status      "Alertmanagers" 一节里目标状态为 UP
+#   c) Alertmanager→ http://localhost:9093/#/alerts   规则触发后这里能看到，
+#                  "Status" 页无解析错误
+#   只做 a 是不够的：规则能 firing、但 /status 里 Alertmanager 是 DOWN 的情况很常见
+#   （服务名写错、没在同一个 network），那时告警照样送不出去。
+#
+# 注意 target 用的是 **docker 服务名**（app-stable / app-canary / alertmanager）。
+# 如果 Prometheus 不在同一 network 里，请换成宿主机可达的地址:端口。
+
+global:
+  # 30s 一次：本服务的指标是计数/直方图，抓太密只是浪费；抓太疏则告警延迟变长。
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+# 把触发的事件交给 Alertmanager —— 缺了这段，规则只在 Prometheus 页面里亮灯。
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # 稳定版：承载线上绝大部分流量
+  - job_name: chatagent-stable
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["app-stable:8000"]
+        labels:
+          release: stable
+
+  # 灰度版：与 stable 分开成不同 job，告警才能点名"是灰度出的问题"
+  # （这是灰度最核心的价值：出问题时能一眼区分是不是新版本引入的）
+  - job_name: chatagent-canary
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["app-canary:8000"]
+        labels:
+          release: canary
+
+  # ---------------- 外部探活（黑盒监控）----------------
+  # 与上面两个 job 是**互补**关系，不是重复：
+  #   chatagent-* 抓的是 /metrics ⇒ 证明"容器内进程活着、Prometheus 连得上它"；
+  #   本 job 探的是**入口** ⇒ 证明"经过 nginx 与网络之后，用户真的能打通"。
+  # 只有后者能发现 nginx 配置写错、端口没发布、DNS 失败、证书过期这类
+  # "内部全绿、外部不通"的故障 —— 而那正是用户最先感知到的形态。
+  #
+  # ⚠️ relabel 三件套是 blackbox 的标准接法，**少一条就静默失效**：
+  #   ① 把 target 地址搬进 __param_target（探测目标作为 URL 参数传给 exporter）；
+  #   ② 把 target 写成 instance 标签（否则指标上只能看到 blackbox-exporter 的地址）；
+  #   ③ 把请求真正发往 blackbox-exporter（不改这条，Prometheus 会去直接抓 target）。
+  #   写错的典型表现是 probe_success 全是 0，或指标上 instance 全是 exporter 自己。
+  - job_name: blackbox-chatagent
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          # 探 nginx（入口），不探 app-stable/app-canary ——
+          # 探容器只能证明容器活着，证明不了用户那条路通。
+          - http://nginx:80/health/ready
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # ---------------- TLS 入口探活（证书到期）----------------
+  # 为什么这个 job 必须**真的存在**（而不是留一段注释）：
+  #   alerts.yml 里的 `TLSCertExpiringSoon` 用 `probe_ssl_earliest_cert_expiry{job=~"blackbox-.*"}`。
+  #   当这个 job 不存在时，那条表达式**没有任何序列可匹配** ⇒ 规则永远 inactive，
+  #   而且**没有任何报错**。这就是"哑弹"：你以为有证书监控，实际上没有。
+  #   证书过期是全项目最准时的一种故障（必然发生 + 可提前 30 天发现），
+  #   把它做成哑弹是最不划算的一种省事。
+  #
+  # ⚠️ 唯一需要你替换的是下面的域名。换完执行：
+  #     docker compose --env-file .env -f deploy/app/docker-compose.yml restart prometheus
+  #     curl -s --noproxy '*' localhost:9090/api/v1/targets | python -m json.tool | grep -A3 blackbox-tls
+  #   target 为 UP 即说明证书探活生效（域名还没配好时它会是 DOWN，这在 /targets 页面上可见，
+  #   是**刻意保留的可见信号** —— 比静默失效好）。
+  - job_name: blackbox-tls
+    metrics_path: /probe
+    params:
+      module: [https_2xx]
+    static_configs:
+      - targets:
+          # ⚠️ 换成你的真实 HTTPS 入口。必须是 https://，否则 https_2xx 模块会失败。
+          - https://REPLACE-WITH-YOUR-DOMAIN/health/ready
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # ---------------- 监控栈自身的抓取目标 ----------------
+  # 存在的意义：**没有这几个 job，"监控系统自己坏了"是完全不可见的**。
+  #   - alertmanager 挂了 ⇒ 所有告警都送不出去，而 Prometheus 面板上看不出异常；
+  #   - blackbox-exporter 挂了 ⇒ probe_success **停止产出新样本**（不是变成 0），
+  #     于是 ExternalProbeFailing（`probe_success == 0`）也**不会触发** ——
+  #     外部探活彻底静默失效。这正是"用没有序列来表达故障"的陷阱。
+  #   - node-exporter 挂了 ⇒ 磁盘告警静默失效。
+  # 这三条都靠 `up{job=...} == 0` 才看得见，而 up 是 Prometheus 自己产生的，
+  # 所以这几个 job 本身是**必须**的。
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  - job_name: blackbox-exporter
+    static_configs:
+      - targets: ["blackbox-exporter:9115"]
+
+  # 如果服务是单实例部署，把下面打开并删掉上面两个 job
+  # - job_name: chatagent
+  #   static_configs:
+  #     - targets: ["host.docker.internal:8000"]

@@ -1,0 +1,45 @@
+# blackbox-exporter 探测模块定义
+#
+# 它做的事很小但很关键：**从服务外面**发一个 HTTP 请求，把"通不通、多快、状态码是多少、
+# 证书还有几天到期"变成指标（probe_success / probe_duration_seconds / probe_ssl_earliest_cert_expiry）。
+#
+# 为什么必须有它（而不是只靠 Prometheus 抓 /metrics）
+# ------------------------------------------------
+# 抓 /metrics 成功只证明两件事：容器内进程活着、Prometheus 能连上它。
+# 它**发现不了**下面这些故障 —— 而这几种恰恰是用户最先感知到的形态：
+#   - nginx 配置写错（upstream 名字拼错、proxy_pass 少了路径）；
+#   - 端口没发布 / 安全组没开 / DNS 解析失败；
+#   - TLS 证书过期（浏览器直接拦截，而内部一切正常）；
+#   - 请求进了入口但被限流/被 WAF 拦（内部看是"零错误"，外部看是"全失败"）。
+#
+# 探谁：探**入口**（nginx），不探 app 容器 —— 我们要验证的是"用户走的那条路"。
+# 探什么路径：/health/ready。它会真去查依赖（llm / db / vector_store / checkpointer），
+# 所以这条探活同时覆盖"链路通"和"依赖可用"两件事。
+
+modules:
+  # 明文 HTTP：探内网入口（compose 里的 nginx:80）
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      # 只接受 200。刻意**不用**默认的 2xx 宽泛匹配：
+      # /health/ready 在依赖不健康时返回 **503**，那正是"这个实例不该接流量"的信号，
+      # 把它算成成功等于把探活的意义抹掉。
+      valid_status_codes: [200]
+      preferred_ip_protocol: ip4
+      # 不跟随重定向：重定向本身就该在告警里看得见（通常意味着入口配错了）
+      follow_redirects: false
+
+  # HTTPS + 证书有效期：生产入口（nginx.tls.conf 的 443）用这个。
+  # ssl_earliest_cert_expiry 会被 prometheus.yml 里的证书到期规则用上 ——
+  # 证书过期是最"准时"的故障：它一定会在某个时刻发生，且完全可以提前 30 天发现。
+  https_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      valid_status_codes: [200]
+      preferred_ip_protocol: ip4
+      follow_redirects: false
+      tls: true

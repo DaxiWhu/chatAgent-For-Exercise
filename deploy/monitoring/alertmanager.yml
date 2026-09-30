@@ -1,0 +1,201 @@
+# chatAgent 告警路由（Alertmanager）
+#
+# 存在的意义
+# ----------
+# 只有 `alerts.yml`（规则）+ `prometheus.yml`（抓取）时，告警**会被触发但没人收到** ——
+# Prometheus 只负责"判定条件成立"，把消息送出去是 Alertmanager 的事。
+# 缺了这一层，前面所有指标与规则都只是"躺在面板里"，故障仍然靠用户投诉才发现。
+#
+# 路由设计：按"该谁被叫醒、多快被叫醒"分四级
+# -------------------------------------------
+#   security      → 立刻（group_wait 10s，repeat 1h）。这类指标平时恒为 0，
+#                   一旦非 0 就是**正在被攻击**，不能等聚合窗口。
+#   availability  → 尽快（group_wait 30s，repeat 1h）。服务不可用，立刻处理。
+#   slo           → 快点（critical 30s / warning 5m）。错误预算在按异常速度燃尽
+#                   （定义见 SLO.md）。与 availability 分开是因为**处置动作不同**：
+#                   availability 是"现在坏了，去修"；SLO 燃尽还多一个选项
+#                   ——"要么修，要么正式下调 SLO 承诺"，后者需要能改承诺的人。
+#   cost          → 攒批（group_wait 5m，repeat 24h）。额度/成本异常当天处理即可，
+#                   每条都秒推会让人对告警脱敏（这是最贵的代价）。
+#   platform      → 平台自身（监控栈挂了、备份断了、磁盘满了）。分两条：
+#                   **Watchdog 单独一条**（恒 firing，repeat 24h = 每日心跳，
+#                   "没收到"本身就是故障信号）；其余走 oncall。
+#
+# 为什么按 `category` 而不是按 `severity` 路由
+# -------------------------------------------
+# severity 只有两档，`security` 组和 `availability` 组的 critical 会撞在一起；
+# 而它们的处置方式完全不同（一个要查攻击来源，一个要查依赖健康）。
+# `category` 标签在 `alerts.yml` 里逐条标注，就是为了让这个区分可路由。
+#
+# 怎么用
+# ------
+#   docker run -d --name chatagent-alertmanager --network chatagent_default \
+#     -p 9093:9093 \
+#     -v "$PWD/deploy/monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro" \
+#     prom/alertmanager:v0.27.0
+#
+#   # 自检（这一步别省：配置写错时 Alertmanager 会启动失败或静默丢路由）
+#   docker logs chatagent-alertmanager | grep -i "Completed loading"
+#   # 浏览器打开 http://localhost:9093 看 "Status" 里有没有解析错误
+#
+# ⚠️ 下面的 URL 指向**本仓库自带的告警网关**（`alert_sink.py`），**不是外部服务的占位符**。
+#
+# 为什么不直接把企业微信 / 飞书的机器人 URL 填在这里 —— 两个硬约束：
+#   ① **Alertmanager 的配置不支持环境变量插值**（不像 compose 有 `${VAR}`）。
+#      真实 webhook 地址含 key，填在这里等于把凭据提交进版本库，
+#      而且换一个接收端就要改本文件 + 重启 Alertmanager。
+#   ② **机器人的 payload 与 Alertmanager 原生 JSON 不同**。直接填机器人 URL 会被
+#      对方返回 400，Alertmanager 重试几次后放弃 —— 表现成"配置看起来全对，但没人收到"。
+#
+# 网关把这两件事一起解决：凭据只存在于网关的环境变量里（见 compose 的 alert-sink 服务，
+# 从项目根 `.env` 插值），格式转换在网关内完成。
+#
+# 接线约定：**URL 末段 = receiver 名**，网关据此选通道
+#   （`/alerts/oncall` → ALERT_SINK_ROUTES 里的 `oncall` 键）。
+#   换接收端不需要动本文件，只改 `.env` 里的 ALERT_SINK_ROUTES / ALERT_SINK_*_WEBHOOK。
+#
+# 怎么确认真的通了（**别省这一步**）：
+#   python deploy/monitoring/alert_sink.py --selftest
+# 它会构造一条假告警走完 渲染 → 格式转换 → 发送，并提示你去机器人里确认收到。
+# 只跑网关的 /health/live 是不够的 —— 那只能证明进程活着，证明不了消息能送达。
+
+alertmanager: v0.27
+
+global:
+  # 告警自己也需要超时，否则一个挂住的接收端会把通知队列堵死
+  resolve_timeout: 5m
+
+route:
+  # 兜底接收人：**必须存在**，且要能真的收到东西。
+  # 如果只想用下面的分级路由，也建议把它指向同一个值班通道 ——
+  # 否则"漏配了某条路由"的表现就是安静地丢告警（最难发现的一类故障）。
+  receiver: default
+  # 按 类别 + 告警名 聚合：同一次故障里同类告警合并成一条消息，
+  # 而不是 20 条独立的推送。带上 instance 是为了区分多副本。
+  group_by: ["category", "alertname"]
+  group_wait: 30s       # 首次触发后等多久，攒够同类告警再发（降噪）
+  group_interval: 5m    # 同一组里"有新成员加入"时，多久发一次更新
+  repeat_interval: 4h   # 未恢复时多久重复提醒（兜底值，各子路由会覆盖）
+
+  routes:
+    # ① 安全：不做任何等待，立刻叫醒
+    - matchers:
+        - category = "security"
+      receiver: security-oncall
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 1h
+
+    # ② 可用性：服务不可用/错误率失控
+    - matchers:
+        - category = "availability"
+        - severity = "critical"
+      receiver: oncall
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 1h
+
+    - matchers:
+        - category = "availability"
+        - severity = "warning"
+      receiver: oncall
+      group_wait: 1m
+      group_interval: 10m
+      repeat_interval: 12h
+
+    # ③ SLO 错误预算：多窗口多燃尽率告警（定义见同目录 SLO.md）
+    #    复用 oncall —— 处置的人相同（先看是不是故障），只是"该多急"由 severity 区分。
+    - matchers:
+        - category = "slo"
+        - severity = "critical"
+      receiver: oncall
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 1h
+
+    - matchers:
+        - category = "slo"
+        - severity = "warning"
+      receiver: oncall
+      group_wait: 5m
+      group_interval: 30m
+      repeat_interval: 12h
+
+    # ④ 成本：攒批，每天提醒一次就够
+    - matchers:
+        - category = "cost"
+      receiver: cost-digest
+      group_wait: 5m
+      group_interval: 30m
+      repeat_interval: 24h
+
+    # ⑤ 平台自身：监控栈坏了 / 备份断了 / 磁盘满了。
+    #    ⚠️ Watchdog 必须**单独一条路由且放在最前**（下面这条必须在通配的
+    #    category=platform 之前 —— Alertmanager 是"首个匹配生效"）。
+    #    它永远 firing，所以 repeat_interval 就是"你多久该收到一次心跳"：
+    #    24h ⇒ 一天一次。**收不到心跳 = 链路断了**，这是唯一能穿透
+    #    "Alertmanager 自己挂了"这个死角的信号。
+    - matchers:
+        - category = "platform"
+        - alertname = "Watchdog"
+      receiver: default
+      group_wait: 0s
+      group_interval: 24h
+      repeat_interval: 24h
+
+    - matchers:
+        - category = "platform"
+      receiver: oncall
+      group_wait: 1m
+      group_interval: 15m
+      repeat_interval: 1h
+
+# 抑制规则：**这层是防"告警风暴"的关键**
+# 没有它时，一台实例挂掉会同时触发 Down + 错误率 + 延迟 + 断连 五条告警，
+# 值班的人要自己判断"哪条是根因"。抑制规则把这个判断固化下来。
+inhibit_rules:
+  # 实例已经抓不到（Down）时，同实例的错误率/延迟告警都是它的**后果**，不必重复叫人。
+  # equal: [instance] 很重要 —— 否则副本 A 挂掉会顺带压制副本 B 的告警，
+  # 那才是真正危险的（把"另一台也出问题"这个信号吃掉）。
+  - source_matchers:
+      - alertname = "ChatAgentDown"
+    target_matchers:
+      - category = "availability"
+    equal: ["instance"]
+
+  # 错误率已经很高时，延迟告警大概率是同一原因（上游慢 → 超时 → 5xx），
+  # 先看根因那条。
+  - source_matchers:
+      - alertname = "HighErrorRate"
+    target_matchers:
+      - alertname = "HighLatencyP95"
+    equal: ["instance"]
+
+# 接收人定义
+# ----------
+# 三个通道分开是刻意的：安全告警要发给"能处置攻击的人"，成本告警发给
+# "管预算的人"。全都塞进一个群的结果是所有人都以为自己不用管。
+receivers:
+  # ⚠️ URL 末段（default / security-oncall / oncall / cost-digest）= Alertmanager 的
+  #    receiver 名，网关据此选通道 ⇒ 必须与 `.env` 里 ALERT_SINK_ROUTES 的键对得上。
+  #    对不上的后果是**该通道的告警只落进网关日志、不发出去**（有 ERROR 日志，
+  #    但不跑 --selftest 很难发现）。tests/test_monitoring_config.py 会钉住这个对应关系。
+  - name: default
+    webhook_configs:
+      - url: "http://alert-sink:8080/alerts/default"
+        send_resolved: true
+
+  - name: security-oncall
+    webhook_configs:
+      - url: "http://alert-sink:8080/alerts/security-oncall"
+        send_resolved: true
+
+  - name: oncall
+    webhook_configs:
+      - url: "http://alert-sink:8080/alerts/oncall"
+        send_resolved: true
+
+  - name: cost-digest
+    webhook_configs:
+      - url: "http://alert-sink:8080/alerts/cost-digest"
+        send_resolved: true

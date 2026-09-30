@@ -1,0 +1,497 @@
+# chatAgent 告警规则
+#
+# 分四组，按"该谁被叫醒"划分：
+#   availability —— 服务没了/错误率失控，立刻处理（critical）
+#   slo          —— 错误预算燃尽过快，按 SLO 承诺处置（见同目录 SLO.md）
+#   cost         —— 额度与成本异常，当天处理（warning）
+#   security     —— 越权尝试，**任何一次都值得看**（critical）
+#
+# 每条都带 runbook：告警最怕的不是响，而是响了没人知道下一步做什么。
+#
+# ⚠️ 标签值的**书写格式**必须与 `app/metrics.py` 实际渲染出来的一致
+#    （例：桶边界渲染成 `le="1.0"` 而不是 `le="1"`）。PromQL 的正则与相等匹配
+#    都是全串匹配，写错一个字符的后果是**告警永远不触发**且没有任何报错 ——
+#    `tests/test_monitoring_config.py` 里有专门一条断言把这个格式钉住了。
+
+groups:
+  # =========================================================================
+  # 可用性
+  # =========================================================================
+  - name: chatagent-availability
+    rules:
+      - alert: ChatAgentDown
+        # up 是 Prometheus 自带的"抓取是否成功"。持续 2 分钟才算，
+        # 避免一次抓取抖动就叫人起床。
+        expr: up{job=~"chatagent-.*"} == 0
+        for: 2m
+        labels:
+          category: availability
+          severity: critical
+        annotations:
+          summary: "实例 {{ $labels.instance }}（{{ $labels.release }}）抓取失败"
+          description: "服务无响应或 /metrics 不可达，已持续 2 分钟。"
+          runbook: "1) docker logs 看进程是否活着；2) curl /health/live 区分'进程死'与'只是 /metrics 被拒'; 3) 若进程活着但探针失败，看 /health/ready 的 checks 明细。"
+
+      - alert: ChatAgentReadinessDegraded
+        # readiness 失败只会摘流量、不重启容器 —— 但如果一直摘着，
+        # 说明实例实际上没在服务（可能被 LB 剔除了却没人注意）。
+        expr: increase(http_errors_total{status="503"}[10m]) > 3
+        for: 5m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "就绪探针持续返回 503"
+          description: "10 分钟内出现 {{ $value }} 次 503，说明 /health/ready 的某个依赖不健康。"
+          runbook: "curl localhost:8000/health/ready | python -m json.tool，看 checks 里哪一项 ok=false（llm / db / vector_store / checkpointer）。"
+
+      - alert: HighErrorRate
+        # 用 uptime 做分母保护：0 流量时不报警（否则重启后必误报）
+        expr: |
+          rate(http_errors_total[5m])
+          / clamp_min(rate(http_requests_total[5m]), 0.001) > 0.05
+        for: 5m
+        labels:
+          category: availability
+          severity: critical
+        annotations:
+          summary: "5xx 比例过高（> 5%）"
+          description: "当前错误率 {{ $value | humanizePercentage }}，受影响路由见 error 指标明细。"
+          runbook: "按 path 标签定位路由，再查结构化日志里的 request_id 串起整条链路（日志已带 request_id，可直接 grep）。"
+
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+          ) > 10
+        for: 10m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "P95 延迟超过 10 秒"
+          description: "当前 P95 = {{ $value }}s。注意 SSE 长连接会天然拉高尾部延迟，请结合 llm_tokens_per_request 判断是不是生成变慢了。"
+          runbook: "若同时 llm_tokens_per_request 上升 ⇒ 模型产出变长/变慢；若只有延迟高 ⇒ 查数据库与检索（rerank 熔断是否打开）。"
+
+      - alert: StreamErrorsHigh
+        expr: rate(chat_stream_errors_total[5m]) > 0.2
+        for: 5m
+        labels:
+          category: availability
+          severity: critical
+        annotations:
+          summary: "SSE 流式生成频繁报错（kind={{ $labels.kind }}）"
+          description: "chat/review 流在中途抛异常。典型成因：检查点后端故障、模型超时或配额被拒。"
+          runbook: "查日志里的 '流异常' 与堆栈；重点看 DB_URL 连通性与 AGNES_API_* 是否可用。"
+
+      - alert: ExternalProbeFailing
+        # 黑盒探活：blackbox-exporter 从**外部**请求入口（见 prometheus.yml 的
+        # blackbox-chatagent job）。与 ChatAgentDown 的分工很关键：
+        #   ChatAgentDown      —— Prometheus 抓不到 /metrics ⇒ "容器内进程可能死了"
+        #   ExternalProbeFailing —— 外部探入口失败      ⇒ "用户那条路断了"
+        # 后者才覆盖 nginx 配置错、端口没发布、DNS 失败、被限流拦在外面的情形 ——
+        # 那时 ChatAgentDown **不会**触发（容器好好的、Prometheus 抓得到），
+        # 但用户已经完全用不了了。
+        expr: probe_success{job="blackbox-chatagent"} == 0
+        for: 2m
+        labels:
+          category: availability
+          severity: critical
+        annotations:
+          summary: "外部探活失败（{{ $labels.instance }}）"
+          description: "从 blackbox-exporter 侧发起的 HTTP 探测连续 2 分钟失败，说明**外部访问链路**（入口/网络/端口）有问题，而不是应用内部。"
+          runbook: "1) 先在服务外手工 `curl -i <入口>/health/ready` 复核，确认不是探测侧问题；2) 对比 `curl localhost:8000/health/ready` 的 checks 明细 —— 内部正常而外部失败 ⇒ 一定是入口/网络层；3) 查 nginx 容器日志与最近一次入口配置变更（nginx.conf / 端口映射 / 安全组）。"
+
+      - alert: TLSCertExpiringSoon
+        # 证书过期是最"准时"的故障：必然发生，且可以提前几十天发现。
+        # probe_ssl_earliest_cert_expiry 是 blackbox 给出的**到期时间戳**，
+        # 减 now() 得到剩余秒数。只在启用 https_2xx 探活后才有数据 ——
+        # 没有该 job 时这条规则永远 inactive（不是故障，是还没开 TLS 探活）。
+        expr: probe_ssl_earliest_cert_expiry{job=~"blackbox-.*"} - time() < 30 * 24 * 3600
+        for: 1h
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "入口 TLS 证书将在 30 天内到期"
+          description: "{{ $labels.instance }} 的证书剩余时间不足 30 天。若不处理，到期当天全站会被浏览器直接拦截（内部指标一切正常）。"
+          runbook: "1) 确认证书签发方式（Let's Encrypt 自动续期 / 手工上传）；2) 自动续期的话先查续期任务是否失败（这是最常见的原因）；3) 手工证书则走一次替换流程，并用 `openssl s_client -connect <域名>:443 2>/dev/null | openssl x509 -noout -dates` 复核。"
+
+  # =========================================================================
+  # SLO 与错误预算（定义见 SLO.md，本组的表达式与那份文档一一对应）
+  # =========================================================================
+  # 与上面"可用性"组的区别
+  # ----------------------
+  #   availability 回答"**此刻**是不是坏了" —— 瞬时错误率过阈值就响。
+  #   slo          回答"照这个速度烧下去，月底的错误预算还够不够" —— 靠**燃尽率**判定。
+  # 两者都要有：瞬时阈值对"慢刀子"（错误率 6% 但一直 6%）几乎无感，
+  # 而纯燃尽率对"刚发生的尖峰"反应太慢。
+  #
+  #   燃尽率（burn rate）= 实际错误率 / (1 - SLO 目标)
+  #     燃尽率 = 1     ⇒ 不快不慢，刚好在窗口末用完预算
+  #     燃尽率 = 14.4  ⇒ 1 小时烧掉 30 天预算的 2%（约 8.6 小时烧光，必须立刻处置）
+  #
+  # 为什么必须"长窗口 + 短窗口"同时成立（多窗口多燃尽率）
+  # ------------------------------------------------
+  # 只看长窗口：已经过去的尖峰会让告警继续挂很久（恢复慢、误报长）。
+  # 只看短窗口：30 秒抖动就能把人叫醒（噪音，很快被忽略）。
+  # 一个 `and` 同时要求两者 ⇒ 既证明"长期确实在烧"，也证明"此刻还在烧"。
+  #
+  # SLI 口径的一个易错点：**分母/分子用 `http_requests_total{status=~"5.."}`，
+  # 不要用 `http_errors_total`** —— 后者只在**未捕获异常**时自增
+  # （见 `app/middleware.py`），503 这类"正常返回的失败"不计入，
+  # 拿它当分子会系统性低估错误率，SLO 看着永远达标。
+  - name: chatagent-slo
+    rules:
+      # ---- 可用性 SLO：30 天 99.5%（错误预算 0.5%） ----
+      - alert: SLOAvailabilityBurnFast
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[1h]))
+            / clamp_min(sum(rate(http_requests_total[1h])), 0.001)
+            > 14.4 * (1 - 0.995)
+          and
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(http_requests_total[5m])), 0.001)
+            > 14.4 * (1 - 0.995)
+        for: 2m
+        labels:
+          category: slo
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "可用性错误预算高速燃尽（1h 燃尽率 > 14.4x，slo=availability）"
+          description: "近 5 分钟 5xx 比例 > 7.2%（= 14.4 × 0.5% 错误预算）。按此速度 30 天预算约 8.6 小时烧光。"
+          runbook: "1) 看 HighErrorRate / StreamErrorsHigh 是否同时 firing（是则同一根因，按那条处置）；2) 用 path 标签定位到具体路由；3) 在结构化日志里按 request_id 串起整条链路；4) 无法快速定位就回滚最近一次发布（release 标签可区分 stable/canary）。"
+
+      - alert: SLOAvailabilityBurnMedium
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[6h]))
+            / clamp_min(sum(rate(http_requests_total[6h])), 0.001)
+            > 6 * (1 - 0.995)
+          and
+          sum(rate(http_requests_total{status=~"5.."}[30m]))
+            / clamp_min(sum(rate(http_requests_total[30m])), 0.001)
+            > 6 * (1 - 0.995)
+        for: 15m
+        labels:
+          category: slo
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "可用性错误预算持续燃尽（6h 燃尽率 > 6x，slo=availability）"
+          description: "近 30 分钟 5xx 比例 > 3%（= 6 × 0.5%）。半天内已烧掉预算的 5%，属于持续性的稳定出错，比尖峰更容易被忽视。"
+          runbook: "1) 这类告警通常对应一个**长期存在**的错误源（如某个上游偶尔超时），先看 6 小时内的错误按 path 分布是否集中在单一路由；2) 结合 llm_tokens_per_request 判断是不是模型侧退化；3) 定位后要么修，要么正式调整 SLO（改 SLO.md 与表达式，别只改一处）。"
+
+      - alert: SLOAvailabilityBurnSlow
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[3d]))
+            / clamp_min(sum(rate(http_requests_total[3d])), 0.001)
+            > 1 * (1 - 0.995)
+          and
+          sum(rate(http_requests_total{status=~"5.."}[6h]))
+            / clamp_min(sum(rate(http_requests_total[6h])), 0.001)
+            > 1 * (1 - 0.995)
+        for: 1h
+        labels:
+          category: slo
+          severity: warning
+          slo: availability
+        annotations:
+          summary: "可用性错误预算匀速燃尽（3d 燃尽率 > 1x，slo=availability）"
+          description: "3 天内平均 5xx 比例 > 0.5%。不紧急，但若不处理，月末必然违约 —— 这条告警的作用就是提前一周发现问题。"
+          runbook: "1) 排期处理，不必立刻叫人；2) 若确认是常态（如某个低价值路由天然易错），应把它从 SLI 口径里排除或正式下调 SLO，而不是让告警长期挂着；3) 复核 SLO.md 里的错误预算余额。"
+
+      # ---- 延迟 SLO：99% 的**非流式**请求在 1 秒内完成（预算 1%） ----
+      # 为什么排除 /v1/chat.*：那两个路由是 SSE 长连接，耗时等于整段生成的时长
+      # （秒到几十秒），把它算进来会让延迟 SLI 恒不达标，等于没有这个指标。
+      # 阈值取 `le="1.0"`：这是 `app/metrics.py` 实际渲染出的格式，
+      # 写成 `le="1"` 会因为全串不匹配而**永不触发**。
+      - alert: SLOLatencyBurnFast
+        expr: |
+          1 - (
+            sum(rate(http_request_duration_seconds_bucket{path!~"/v1/chat.*",le="1.0"}[1h]))
+              / clamp_min(sum(rate(http_request_duration_seconds_count{path!~"/v1/chat.*"}[1h])), 0.001)
+          ) > 14.4 * (1 - 0.99)
+          and
+          1 - (
+            sum(rate(http_request_duration_seconds_bucket{path!~"/v1/chat.*",le="1.0"}[5m]))
+              / clamp_min(sum(rate(http_request_duration_seconds_count{path!~"/v1/chat.*"}[5m])), 0.001)
+          ) > 14.4 * (1 - 0.99)
+        for: 5m
+        labels:
+          category: slo
+          severity: warning
+          slo: latency
+        annotations:
+          summary: "非流式接口延迟预算高速燃尽（1h 燃尽率 > 14.4x）"
+          description: "近 5 分钟有 > 14.4% 的非流式请求超过 1 秒（= 14.4 × 1% 预算）。"
+          runbook: "1) 按 path 标签看是哪个路由变慢（/v1/reviews 慢 ⇒ 查审核队列表与 PG；/health/* 慢 ⇒ 查依赖探针是否在等待外部服务）；2) 若同时 HighLatencyP95 firing，按那条的 runbook 走。"
+
+      - alert: SLOLatencyBurnSlow
+        expr: |
+          1 - (
+            sum(rate(http_request_duration_seconds_bucket{path!~"/v1/chat.*",le="1.0"}[3d]))
+              / clamp_min(sum(rate(http_request_duration_seconds_count{path!~"/v1/chat.*"}[3d])), 0.001)
+          ) > 1 * (1 - 0.99)
+          and
+          1 - (
+            sum(rate(http_request_duration_seconds_bucket{path!~"/v1/chat.*",le="1.0"}[6h]))
+              / clamp_min(sum(rate(http_request_duration_seconds_count{path!~"/v1/chat.*"}[6h])), 0.001)
+          ) > 1 * (1 - 0.99)
+        for: 1h
+        labels:
+          category: slo
+          severity: warning
+          slo: latency
+        annotations:
+          summary: "非流式接口延迟预算匀速燃尽（3d 燃尽率 > 1x）"
+          description: "3 天内平均有 > 1% 的非流式请求超过 1 秒。"
+          runbook: "排期优化（典型是 PG 查询缺索引或探针串行等待）；若 1 秒的目标本身定得不合理，改 SLO.md 与表达式两处。"
+
+  # =========================================================================
+  # 成本与配额
+  # =========================================================================
+  - name: chatagent-cost
+    rules:
+      - alert: RateLimitSurging
+        expr: rate(rate_limited_total[5m]) > 1
+        for: 10m
+        labels:
+          category: cost
+          severity: warning
+        annotations:
+          summary: "限流频繁触发（scope={{ $labels.scope }}）"
+          description: "持续 10 分钟每秒有 >1 次限流。要么有客户端在刷，要么阈值配得太紧伤了正常用户。"
+          runbook: "看 scope：ip ⇒ 单来源刷量；session ⇒ 某会话多开或循环重试。确认是攻击则保持限流，是误伤则调 RATE_LIMIT_*。"
+
+      - alert: QuotaExhausted
+        expr: increase(quota_exceeded_total[1h]) > 5
+        for: 5m
+        labels:
+          category: cost
+          severity: warning
+        annotations:
+          summary: "多个租户触发日配额上限"
+          description: "1 小时内 {{ $value }} 次配额拒绝。可能是业务增长（该加额度），也可能是被刷（该查 TENANT_KEYS 是否泄漏）。"
+          runbook: "查日志 '配额拒绝：tenant=xxx'，看是几个租户、集中在谁身上。"
+
+      - alert: AbnormalTokenBurn
+        expr: |
+          sum(rate(llm_tokens_total[15m])) > 100
+        for: 15m
+        labels:
+          category: cost
+          severity: warning
+        annotations:
+          summary: "Token 消耗速率异常（>100 token/s 持续 15 分钟）"
+          description: "当前消耗速率 {{ $value | humanize }} token/秒，持续 15 分钟，请核对是否符合预期。"
+          runbook: "结合 llm_budget_exceeded_total 判断是'单请求失控'（预算该收紧）还是'请求量涨了'（正常）。"
+
+      - alert: BudgetExceededFrequent
+        expr: increase(llm_budget_exceeded_total[30m]) > 10
+        for: 5m
+        labels:
+          category: cost
+          severity: warning
+        annotations:
+          summary: "单请求 token 预算频繁被顶到"
+          description: "说明 LLM_MAX_TOKENS_PER_REQUEST 配得偏紧，回答常被截断（用户体验受损）。"
+          runbook: "看 llm_tokens_per_request 的分布，把预算调到覆盖 P95。"
+
+      - alert: ReviewBacklog
+        # 这是 Gauge（抓取时刷新），不是计数器 —— 它表达"现在还压着多少"
+        expr: review_pending > 20
+        for: 30m
+        labels:
+          category: cost
+          severity: warning
+        annotations:
+          summary: "人工审核队列积压 {{ $value }} 条"
+          description: "待审内容超过 20 条且持续 30 分钟没人处理 —— 对业务来说等于工单积压。"
+          runbook: "1) GET /v1/reviews 看具体内容；2) 检查 REVIEW_NOTIFY_WEBHOOK 是否失效（通知没到人手里就会一直积压）。"
+
+      - alert: FrequentClientDisconnects
+        expr: rate(client_disconnected_total[10m]) > 0.5
+        for: 10m
+        labels:
+          category: cost
+          severity: warning
+        annotations:
+          summary: "客户端频繁中途断开"
+          description: "每秒 >0.5 次断连。服务侧已及时止损（不再计费），但用户没拿到回答 —— 通常是首字节太慢或前端超时设置过短。"
+          runbook: "看 HighLatencyP95 与检索耗时；检查前端 fetch 的超时配置。"
+
+  # =========================================================================
+  # 安全：这些指标平时恒为 0，一旦非 0 就是有人在试探
+  # =========================================================================
+  - name: chatagent-security
+    rules:
+      - alert: TenantMismatchDetected
+        # 单条即告警：正常客户端不会拿着 A 的 Key 自称 B。
+        expr: increase(tenant_mismatch_total[15m]) > 0
+        labels:
+          category: security
+          severity: critical
+        annotations:
+          summary: "检测到租户冒用尝试（{{ $value }} 次）"
+          description: "有客户端用某个租户的 API Key，却声明了另一个租户的 X-Tenant-Id。已按 403 拒绝，但这说明有人在探测越权。"
+          runbook: "1) 查日志 '租户自报与 Key 不符' 定位来源 IP；2) 若来自内部服务 ⇒ 是配置写错；若来自外部 ⇒ 该轮换对应的 Key（TENANT_KEYS）。"
+
+      - alert: SessionOwnershipViolation
+        expr: increase(session_owner_mismatch_total[15m]) > 0
+        labels:
+          category: security
+          severity: critical
+        annotations:
+          summary: "检测到跨租户读取会话的尝试"
+          description: "有请求试图用别的租户的 thread_id 续跑会话（典型是猜/撞 id）。已按 403 拒绝。"
+          runbook: "查日志 '会话归属不符'，确认 thread_id 是否可枚举（若是自增/时间戳，应改为带随机段的 id）。"
+
+      - alert: ClientDisconnectsSurging
+        expr: rate(client_disconnected_total[5m]) > 5
+        for: 5m
+        labels:
+          category: security
+          severity: warning
+        annotations:
+          summary: "断连速率异常偏高"
+          description: "每秒 >5 次断连。可能是有人在用'连上就断'的方式探测接口（也是一种低成本 DoS 尝试）。"
+          runbook: "结合 rate_limited_total{scope='ip'} 看是否同源；必要时收紧 nginx 层 limit_req。"
+
+  # =========================================================================
+  # 平台自身（监控栈 + 备份）—— 这一类回答的是"**谁来发现监控坏了**"
+  # =========================================================================
+  # 为什么必须有这一组
+  # ----------------
+  # 上面四组监控的都是**业务**（服务活没活、错误率高不高、有没有人在攻击）。
+  # 缺了这一组时会出现一种最糟糕的状态：**整个告警链路安静地失效，而你以为一切正常**。
+  # 具体是这几条路径：
+  #   - Alertmanager 挂掉 ⇒ 21 条规则照样 firing（面板上灯全亮），但一条都送不出去；
+  #   - alert-sink 的通道没配 / 全部失败 ⇒ Alertmanager 记 `notifications_failed_total`，
+  #     而**没有任何规则在看这个指标**；
+  #   - blackbox-exporter 挂掉 ⇒ `probe_success` 停止产出（不是变成 0），
+  #     ExternalProbeFailing 因此**不触发** —— 外部探活静默死亡；
+  #   - 备份循环失败 ⇒ 没有人知道，只能靠人记得去 `ls -lt backups/`；
+  #   - 日志撑满磁盘 ⇒ PG 写不进去 ⇒ 随机 500，而**磁盘本身没有告警**。
+  #
+  # ⚠️ 一个必须讲明的**固有局限**（别指望这一组能覆盖它）
+  # --------------------------------------------------
+  # `MonitoringStackDown` 这条规则**由 Prometheus 自己求值**，所以：
+  #   - **Prometheus 自己挂了** ⇒ 没有东西在求值 ⇒ 这条规则不会响。这是自我指涉的死角，
+  #     单实例 Prometheus 无法靠自身解决，只能用"外部探活"或"心跳缺失"来发现；
+  #   - **Alertmanager 挂了** ⇒ 这条规则会 firing，但它**要经过 Alertmanager 才能送达**
+  #     ⇒ 同样送不出来。
+  # 真正能穿透这两层死角的是 `Watchdog`（下面第一条）：它**永远处于 firing**，
+  # 靠的是"**该来的心跳没来**"这个**缺失**信号，而不是"某条规则响了"。所以：
+  #   → 约定：值班的人**每 24 小时应该收到一次 Watchdog 心跳**。收不到，就是链路断了，
+  #     此时任何告警（包括"链路断了"这一条）都不可信。
+  - name: chatagent-platform
+    rules:
+      - alert: Watchdog
+        # 恒真表达式 ⇒ 永远处于 firing。它的价值**不在"响"，而在"持续到达"**。
+        # 这是监控系统唯一能自证"我还活着"的手段：因为它是**必须到达**的，
+        # 所以"没到达"本身就是一个可观测信号。
+        # 没有它时，"今天没收到告警"永远分不清是 ① 真没故障，还是 ② 链路早断了。
+        expr: vector(1)
+        labels:
+          category: platform
+          severity: none
+        annotations:
+          summary: "心跳（这条告警永远 firing，用来证明告警链路本身是活的）"
+          description: "它**必须一直在 firing**，且按 repeat_interval 定期到达值班通道。若某一天没有收到它，说明采集/判定/路由/送达的某一环断了 —— 此时其它告警是否响起都不可信（因为那些告警走的是同一条链路）。"
+          runbook: "收到它 ⇒ 什么都不用做。**没收到** ⇒ 按 `deploy/RUNBOOK.md` §3.5 的『心跳缺失』逐环排查：① `localhost:9090/targets` 看 chatagent-* 是否 UP；② `localhost:9090/alerts` 看 Watchdog 是否 firing；③ `localhost:9090/status` 看 Alertmanager 是否 UP；④ `docker logs alertmanager` 与 `docker logs alert-sink` 看投递是否失败；⑤ 检查 alert-sink 的通道是否配置（`--selftest`）。"
+
+      - alert: MonitoringStackDown
+        # 只列**由 Prometheus 直接抓取**的目标。刻意不写 `job="prometheus"` 的自我保护语义
+        # —— 它确实列在这里，但要知道 Prometheus 自己挂了就没有求值者（见本组顶部说明）。
+        expr: up{job=~"prometheus|alertmanager|node-exporter|blackbox-exporter"} == 0
+        for: 5m
+        labels:
+          category: platform
+          severity: critical
+        annotations:
+          summary: "监控栈组件不可达（{{ $labels.job }} @ {{ $labels.instance }}）"
+          description: "**这一条本身可能送不出去**（Alertmanager 挂了时）。它的首要用途是 `up` 面板与告警历史里的留痕，以及配合 Watchdog 的心跳缺失来定位断在哪一环。"
+          runbook: "1) 按 job 定位：alertmanager ⇒ 告警从此发不出（先恢复它，再补发）；blackbox-exporter ⇒ ExternalProbeFailing 也**不会触发**（`probe_success` 停止产出而不是变 0，这是最隐蔽的一种失效）；node-exporter ⇒ 磁盘告警静默失效；2) `docker compose --env-file .env -f deploy/app/docker-compose.yml ps` + `logs` 看是崩了还是资源被限；3) 恢复后**核对这段时间的业务是否真的有故障** —— 监控盲区里的故障只能从用户侧或日志里补回来。"
+
+      - alert: AlertDeliveryFailing
+        # Alertmanager 自己暴露的投递失败计数。它回答的问题是
+        # "**告警在响，但发不出去**" —— 这正是本项目当前（通道未配）所处的状态，
+        # 也是所有监控里最需要一个探测器的地方。
+        #
+        # ⚠️ 它同样受"自我指涉"限制：这条告警也要经过 Alertmanager 才能送达。
+        #    它真正有效的场景是**部分失败**（某个 receiver 坏了、另一个还能用），
+        #    以及事后诊断与面板留痕。全链路失败只能靠 Watchdog 缺失发现。
+        expr: rate(alertmanager_notifications_failed_total[10m]) > 0
+        for: 10m
+        labels:
+          category: platform
+          severity: critical
+        annotations:
+          summary: "Alertmanager 投递失败（integration={{ $labels.integration }}）"
+          description: "近 10 分钟持续有通知投递失败。最常见的两种成因：① alert-sink 的通道**未配置**（按设计只记日志、接口仍回 200，所以只是静默丢消息）；② 通道配了但机器人 URL 失效 / 被对方限频。"
+          runbook: "1) `docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 alert-sink | grep -i '未配置\\|失败'`；2) 若日志说『未配置通道』⇒ 去 `.env` 填 `ALERT_SINK_*_WEBHOOK`（见 `PRODUCTION_CONFIG.md` §一）；3) 若日志说投递失败 ⇒ 用 `python alert_sink.py --selftest` 复现并看对方返回体；4) 在 `http://localhost:9093/#/status` 的 failed notifications 里看原始错误。"
+
+      - alert: BackupLoopFailing
+        # 数据来源：backup-pg / backup-qdrant 循环每轮把"上次成功时间"写进
+        # `<backups>/backup-<target>.prom`（node-exporter 的 textfile collector 读走）。
+        # 为什么不用"容器在跑"来判断：见 RUNBOOK §4.1 —— **容器在运行不等于备份在发生**。
+        # 阈值 54000s = 15h：默认间隔 6h，给两个周期 + 3 小时余量；
+        # 改 `BACKUP_INTERVAL_HOURS` 时要同步改这里（否则会稳定误报/漏报）。
+        #
+        # ⚠️ `and on(target) (backup_backend_skipped != 1)` 这一句不是装饰：
+        #    Qdrant 未启用时那个循环会**永远** rc=2（明确播报"跳过"），
+        #    若只看时间戳就会得到一个**永不恢复的假告警** —— 而长期存在
+        #    的假告警等于没有告警（所有人都会忽略它）。
+        expr: |
+          (time() - backup_last_success_timestamp_seconds > 54000)
+          and on(target)
+          (backup_backend_skipped != 1)
+        for: 30m
+        labels:
+          category: platform
+          severity: warning
+        annotations:
+          summary: "备份已超过 15 小时没有成功过（target={{ $labels.target }}）"
+          description: "`backup_last_success_timestamp_seconds` 太久没更新，且最近一轮并非\"后端未启用\"（否则会被 `backup_backend_skipped` 排除）。持续下去等于**没有备份**，而这只有在真要恢复时才会被发现。"
+          runbook: "1) `docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=100 backup-pg backup-qdrant` 看失败原因（PG 连不上 / Qdrant 报错 / 磁盘满）；2) `ls -lt backups/ | head` 看最后一次成功文件的时间；3) 手工补一次：`python scripts/pg_backup.py backup`（它同时会更新指标文件）；4) 恢复后**必须**跑一次 `python scripts/pg_backup.py drill` —— 没恢复过的备份不算备份。"
+
+      - alert: BackupMetricsMissing
+        # 与上一条的分工：上一条管"指标说很久没成功"，这一条管"**指标本身不见了**"。
+        # 后者的成因是链路断在更前面：备份容器没起 / textfile 目录没挂对 /
+        # node-exporter 的 `--collector.textfile.directory` 写错。
+        # 为什么必须单独一条：`absent()` 与"数值超标"是两种完全不同的故障，
+        # 塞进同一条表达式会让人分不清该去查备份还是查 exporter。
+        expr: absent(backup_last_success_timestamp_seconds)
+        for: 30m
+        labels:
+          category: platform
+          severity: warning
+        annotations:
+          summary: "备份指标完全不存在（textfile 链路断了）"
+          description: "Prometheus 里找不到任何 `backup_last_success_timestamp_seconds` 序列。也就是说：**备份是否在跑，已经完全不可观测**。此时 BackupLoopFailing 也一定不会触发（它依赖同一个指标）。"
+          runbook: "1) `docker compose --env-file .env -f deploy/app/docker-compose.yml ps` 看 backup-pg / backup-qdrant / node-exporter 是否都在运行；2) `ls -la backups/*.prom` 看循环有没有写出指标文件（没有 ⇒ 循环没走到写文件那步，看它的日志）；3) `curl -s localhost:9100/metrics | grep backup_` 看 node-exporter 有没有读到（读不到 ⇒ textfile 目录挂载或参数不对）；4) 三处依次修，别跳过第 3 步 —— 它是唯一能区分『没写』与『没读到』的检查。"
+
+      - alert: DiskSpaceLow
+        # 为什么这条必须有：compose 里每个容器的 json-file 日志默认**无上限**，
+        # 加上 Prometheus TSDB、Loki 块、backups/ 一起长。合起来是一条完整的宕机路径：
+        #   日志撑满盘 → PG 写不进去 → 表现成随机 500 → 而**没有任何告警**。
+        # 因此它和监督日志轮转是一对，只做一半仍然漏。
+        #
+        # 用 `min by (instance)` + fstype 过滤而不是写死 mountpoint：
+        # 不同发行版/容器里根挂载点的标签写法不一致，写死会得到"规则永不匹配"。
+        expr: |
+          min by (instance) (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|autofs"}
+            /
+            node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|autofs"}
+          ) < 0.15
+        for: 15m
+        labels:
+          category: platform
+          severity: critical
+        annotations:
+          summary: "磁盘可用空间低于 15%（{{ $labels.instance }}）"
+          description: "当前最小可用比例 {{ $value | humanizePercentage }}。低于临界后 PG 会先变成只读、随后写失败，表现是**随机 500** 与检查点丢失，而原因看不出来。"
+          runbook: "1) `df -h` 定位是哪个挂载点；2) 最常见的是容器日志（`docker system df -v` 看 LOGS 一列）—— 确认各服务的 `logging` 轮转生效；3) 其次是 `promdata`（Prometheus TSDB 保留期）与 `backups/`（`BACKUP_KEEP` 没生效）；4) 清理后**核对告警是否自动恢复**（`send_resolved`），并回头看这段时间是否有被掩盖的写入失败。"
+

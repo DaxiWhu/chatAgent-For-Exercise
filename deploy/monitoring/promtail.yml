@@ -1,0 +1,56 @@
+# Promtail 采集配置：把 docker 容器的 stdout 收进 Loki
+#
+# ⚠️ 平台差异（重要，别照抄到 k8s）
+# ------------------------------
+# 本配置靠 **docker socket 发现容器**，只适用于"直接跑 docker / compose"的宿主机。
+# 在 k8s、ECS、Cloud Run 等平台上**不需要 promtail** —— 那里 stdout 会被平台
+# 自动采集，你只要在平台侧开一个日志服务并把应用日志打进去即可。
+#
+# ⚠️ 安全代价：挂 docker socket 等于把宿主机 Docker 控制面交给这个容器（等价 root）。
+#   只读挂载能防误改文件，**不能阻止**通过 socket 发出的写操作。
+#   缓解措施是"它只在 observability profile 里、不随默认编排启动"。
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+# 记录"读到哪了"。放在容器内 /tmp 意味着容器重建后会从头重读一段 ——
+# 代价是少量重复日志，可以接受（换成持久卷反而会让新容器跳过已有日志）。
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    # Loki 短暂不可用时重试而不是丢日志：日志的价值在故障期间最高，
+    # 而那正是 Loki 最可能被重启的时刻。
+    backoff_config:
+      min_period: 500ms
+      max_period: 5m
+      max_retries: 10
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+    relabel_configs:
+      # 容器名前面会被 compose 加一个 "/"，去掉它才好看
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: container
+      # stdout / stderr —— 排查时能区分"正常输出"和"错误输出"
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: stream
+      # compose 服务名（app-stable / app-canary / alert-sink …）。
+      # 有它才能写出 `{service="app-canary"}` 这样的查询，把灰度与稳定版分开看。
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: service
+    pipeline_stages:
+      # 只做 docker 的日志格式解析（去掉 docker 自己加的流前缀）。
+      #
+      # 刻意**不在采集侧解析 JSON**：应用的 LOG_FORMAT=json 已经是一行一 JSON，
+      # 采集侧再解析只会把原始行改掉（json stage 默认会用解析结果替换日志内容），
+      # 一旦字段名变了就静默丢内容。查询时用 LogQL 解析更安全、也更灵活：
+      #   {service="app-stable"} | json | request_id="<id>"
+      - docker: {}
