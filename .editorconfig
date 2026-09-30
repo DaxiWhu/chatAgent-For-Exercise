@@ -1,0 +1,41 @@
+# 编辑器规范 —— 让"保存"这一步不会产出仓库不想要的内容
+#
+# 与 .gitattributes 的分工
+# ------------------------
+# `.gitattributes` 管**入库**时怎么处理（git 层面的转换）；
+# `.editorconfig` 管**编辑器保存**时写成什么（IDE 层面的约定）。
+#
+# 两者必须一致，否则每次保存都会产生一次转换：编辑器写 CRLF → git 入库转 LF，
+# 于是工作区与索引永远对不上，`git status` 反复显示"已修改"而 diff 是空的，
+# 或者反过来 —— diff 里整个文件被标红。所以下面 end_of_line 与
+# `.gitattributes` 的 `* text=auto eol=lf` 保持一致（有守卫钉住这一点）。
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+
+# YAML / JSON：本项目通篇 2 空格（compose、Grafana 面板、CI 都是）
+[*.{yml,yaml,json}]
+indent_size = 2
+
+# Markdown：行尾两个空格是**有语义的**（强制换行），不能清掉
+[*.md]
+trim_trailing_whitespace = false
+
+# Makefile 的 recipe 行必须是 TAB —— 用空格会报 "missing separator"，
+# 而且这个错误只在真正跑 make 时才出现（没有 make 的机器永远发现不了）
+[Makefile]
+indent_style = tab
+
+[*.{sh,bash}]
+indent_size = 4
+
+# Windows 专用脚本（与 .gitattributes 一致）
+[*.{bat,cmd,ps1}]
+end_of_line = crlf

@@ -1,0 +1,55 @@
+# 行尾与文本判定
+# ==============
+#
+# 为什么需要这个文件（仓库此前只有本机的 core.autocrlf=true）
+# ----------------------------------------------------------
+# `core.autocrlf` 是**本机配置**，不是仓库的一部分：
+#
+# - 换台机器（或 CI 的 Linux runner）行为就可能不同，而"我的机器上没问题"；
+# - 它只保证**入库**是 LF，**工作区**那一侧仍是 CRLF（Windows 默认），
+#   于是同一份代码在两台机器上的字节内容不同。具体表现：
+#     · 明明只改了一行，`git diff` 却显示整个文件被改动；
+#     · 按字节比对的断言（本项目多处使用）在别人机器上莫名失败；
+#     · `.sh` 被检出成 CRLF 后，容器里报 `/bin/bash^M: bad interpreter`。
+#
+# 这里的取舍：**入库与工作区统一 LF**，让仓库里的字节与容器 / CI 完全一致。
+# Windows 侧的编辑器（VS Code / PyCharm / Git Bash）都原生支持 LF；
+# 唯一例外是需要 CRLF 的 Windows 专用脚本，见下。
+#
+# ⚠️ `.gitattributes` 的优先级**高于** `core.autocrlf`：设了 eol=lf 之后，
+# 即使本机 autocrlf=true，检出也会是 LF。这正是我们要的效果。
+
+* text=auto eol=lf
+
+# Windows 专用脚本必须 CRLF（cmd.exe 对 LF 的处理有坑）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 契约快照：`tests/test_openapi_contract.py` 按**字节**比对它，
+# 行尾不一致会让这条守卫无意义地失败。显式写出来是提醒，不是必需。
+tests/snapshots/openapi.json text eol=lf
+
+# 二进制：绝不转换、也不做 diff。
+# 仓库当前没有这类文件，但规则先放在这里 —— 等哪天加了图片或模型权重才想起，
+# 那批文件已经带着被转换过的内容入库了，而这类破坏是静默的（图片能打开、
+# 只是某些字节被改过，问题要到很久以后才暴露）。
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.ico     binary
+*.webp    binary
+*.pdf     binary
+*.docx    binary
+*.xlsx    binary
+*.pptx    binary
+*.zip     binary
+*.gz      binary
+*.pt      binary
+*.bin     binary
+*.npy     binary
+*.parquet binary
+*.woff    binary
+*.woff2   binary
+*.ttf     binary

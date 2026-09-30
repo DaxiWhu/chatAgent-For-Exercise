@@ -92,6 +92,37 @@ pytest tests/ -q
 >
 > 入口是 `app.main:app`（旧命令 `uvicorn serve:app` 已随文件迁移失效）。
 
+## 常用命令
+
+任务入口是 `scripts/tasks.py`（纯标准库、跨平台），`Makefile` 只是它的一层薄转发
+（给 CI / Linux / WSL 用）。**为什么不是只用 Makefile**：`make` 在 Windows 上默认
+不存在，而本项目主力开发环境就是 Windows —— 只写 Makefile 等于让人靠记忆敲长命令，
+而"记不住就跳过"正是所有运维动作衰减的起点（RUNBOOK 里那句"每季度演练一次"
+就是这么失效的）。
+
+下面用 `tasks` 代指 `python scripts/tasks.py`：
+
+| 目的 | 命令 |
+|------|------|
+| 看全部任务 | `tasks help` |
+| 跑测试 / 只重跑上次失败的 | `tasks test` / `tasks test-fast` |
+| **提交前门禁** | `tasks check` |
+| 起本地栈 / 含监控 / 停 | `tasks up` / `tasks up-observability` / `tasks down` |
+| 看服务状态 / 跟日志 | `tasks ps` / `tasks logs`（`tasks logs -- app-stable` 只看一个） |
+| 备份 / **恢复演练** | `tasks backup-pg` / `tasks drill` |
+| 灰度发布 / 回滚 | `tasks release -- <镜像tag> --dry-run` / `tasks rollback -- <镜像tag>` |
+| 看灰度判据 | `tasks canary`（退出码即结论：0 推进 / 1 回滚 / 2 数据不足转人工） |
+| 改版本号 | 改 `VERSION` → `tasks sync-version` → 在 `CHANGELOG.md` 补一条 |
+| 刷新契约快照 / 依赖锁 | `tasks openapi` / `tasks lock` |
+| 清构建缓存 | `tasks clean`（默认只列出，加 `--yes` 才删） |
+
+参数透传用 `--`：`tasks test -- -k version`。有 `make` 的环境里等价写法是
+`make check`、`make up`、`make drill`…，参数走 `ARGS`：`make test ARGS="-- -k version"`。
+
+`tasks check` 与 CI 的 `test` job **等价**（版本号副本一致 → 依赖锁未漂移 → 全量测试）。
+两边一旦漂移 —— 尤其是 CI 加了步骤而这里没跟上，导致"本地全绿、推上去才红" ——
+`tests/test_tasks_entrypoint.py` 会红。
+
 ## 接口
 
 | 方法 | 路径 | 说明 |
