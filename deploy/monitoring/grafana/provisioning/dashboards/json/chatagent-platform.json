@@ -1,0 +1,254 @@
+{
+  "uid": "chatagent-platform",
+  "title": "chatAgent · 平台自身",
+  "description": "回答「谁来发现监控坏了」。这一组的数据来自 Prometheus 的 up / blackbox 探活 / node-exporter / 备份脚本发布的 textfile 指标 —— 刻意不用业务指标，因为业务指标恰恰是「平台坏了」时最先消失的那个。",
+  "tags": ["chatagent", "platform"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "监控栈存活数",
+      "description": "prometheus / alertmanager / node-exporter / blackbox-exporter 四个自监控 job 中 up==1 的个数。少于 4 就是「负责报警的东西自己先坏了」。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(up{job=~\"prometheus|alertmanager|node-exporter|blackbox-exporter\"} == 1)",
+          "legendFormat": "存活"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 3 },
+              { "color": "green", "value": 4 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "最近备份距今（小时）",
+      "description": "由备份容器发布到 node-exporter 的 textfile 指标。> 15h（= 2.5 个备份周期）说明备份循环卡住了。⚠️ 备份存在不等于能恢复 —— 演练见 RUNBOOK §4.1。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(time() - max(backup_last_success_timestamp_seconds)) / 3600",
+          "legendFormat": "小时"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 12 },
+              { "color": "red", "value": 15 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "告警投递失败速率",
+      "description": "Alertmanager 发不出去的通知速率。非 0 就是「告警产生了但没送到人」。这一条对应 AlertDeliveryFailing 告警。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(alertmanager_notifications_failed_total[10m]))",
+          "legendFormat": "失败/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.0001 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "最低磁盘可用率",
+      "description": "所有挂载点里最紧的那个的可用比例。磁盘满是最不体面的故障（写不进日志、库里写不进去、备份失败一起发生）。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min(min by (instance) (node_filesystem_avail_bytes{fstype!~\"tmpfs|overlay|squashfs|ramfs|autofs\"} / node_filesystem_size_bytes{fstype!~\"tmpfs|overlay|squashfs|ramfs|autofs\"}) * 100)",
+          "legendFormat": "可用 %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 15 },
+              { "color": "green", "value": 30 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "所有抓取目标 up",
+      "description": "按 job 展开。某条突然掉到 0 就是那个 exporter 或服务挂了 —— 与 MonitoringStackDown 告警同源。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        { "refId": "A", "expr": "up", "legendFormat": "{{job}} · {{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["min", "lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "外部探活（blackbox）",
+      "description": "probe_success：1=通过。含 http_2xx 与 https_2xx 两个探针 —— 后者是唯一能发现「证书过期 / 只走 HTTP 也看起来正常」的信号。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "probe_success",
+          "legendFormat": "{{job}} · {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 0 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["min", "lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "磁盘可用率（按挂载点）",
+      "description": "排除 tmpfs / overlay 等伪文件系统 —— 它们要么是内存要么是只读层，纳进来会让告警永远在响。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min by (instance, mountpoint) (node_filesystem_avail_bytes{fstype!~\"tmpfs|overlay|squashfs|ramfs|autofs\"} / node_filesystem_size_bytes{fstype!~\"tmpfs|overlay|squashfs|ramfs|autofs\"}) * 100",
+          "legendFormat": "{{instance}} {{mountpoint}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["min", "lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "asc" }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "备份循环指标",
+      "description": "backup_backend_skipped=1 表示该后端没启用（此时「备份很旧」是正常的，不该报警）；配合 backup_last_success_timestamp_seconds 一起看才能区分「没启用」和「启用了但坏了」。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - backup_last_success_timestamp_seconds",
+          "legendFormat": "{{target}} 距上次成功(s)"
+        },
+        {
+          "refId": "B",
+          "expr": "backup_backend_skipped",
+          "legendFormat": "{{target}} skipped"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    }
+  ]
+}

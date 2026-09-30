@@ -1,0 +1,219 @@
+{
+  "uid": "chatagent-limits",
+  "title": "chatAgent · 限流、配额与安全",
+  "description": "这一组全是「被拒绝的请求」——它们不产生 5xx，所以不在服务总览里露头，但每一条都代表一个真实的用户被挡在门外，或一次可疑的越权尝试。",
+  "tags": ["chatagent", "security", "cost"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "限流（近 1 小时）",
+      "description": "被限流窗口拒绝的次数。持续上升先确认是「有人在刷」还是「阈值定得太紧」（后者会误伤正常用户）。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum(increase(rate_limited_total[1h]))", "legendFormat": "次" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "配额超限（近 1 小时）",
+      "description": "日额度用尽被拒的次数。注意配额是 claim→settle 两阶段的，这里的数字是「真正的拒绝」，不是预占。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum(increase(quota_exceeded_total[1h]))", "legendFormat": "次" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "请求体积被拒（近 1 小时）",
+      "description": "phase=rejected 是「声明就超限」直接拒；phase=after_response 是「边读边计量时发现超限」。后者非 0 说明有客户端在用 chunked 绕过 Content-Length。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum(increase(request_body_rejected_total[1h]))", "legendFormat": "次" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "待人工审核队列",
+      "description": "human-in-the-loop 的积压深度。持续 > 0 意味着有人在等，且没有通知渠道时不会有任何提醒（REVIEW_NOTIFY_WEBHOOK 未配时只有 ReviewBacklog 告警兜底）。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "refId": "A", "expr": "review_pending", "legendFormat": "待审" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "限流速率（按 scope）",
+      "description": "scope 区分是全局桶还是某条路由/某个租户被限。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (scope) (rate(rate_limited_total[5m]))",
+          "legendFormat": "{{scope}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "体积拒收速率（按 phase）",
+      "description": "after_response 出现即说明有客户端绕过了 Content-Length 声明 —— 值得单独看一眼来源。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (phase) (rate(request_body_rejected_total[5m]))",
+          "legendFormat": "{{phase}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "客户端断连速率（按 kind）",
+      "description": "用户等到一半关掉了页面。若与 P95 延迟同步抬高，说明是「太慢所以走了」，而不是网络抖动。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (rate(client_disconnected_total[5m]))",
+          "legendFormat": "{{kind}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "安全与降级事件",
+      "description": "tenant_mismatch = 自报租户与 Key 绑定的租户不符（403）；session_owner_mismatch = 读别人的 thread_id（404，fail-closed）；shared_backend_errors = Redis 不可用退回进程内计数（此时多副本下的配额不再精确）。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(tenant_mismatch_total[5m]))",
+          "legendFormat": "tenant_mismatch"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(session_owner_mismatch_total[5m]))",
+          "legendFormat": "session_owner_mismatch"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(shared_backend_errors_total[5m]))",
+          "legendFormat": "shared_backend_errors"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(session_deleted_total[5m]))",
+          "legendFormat": "session_deleted"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    }
+  ]
+}

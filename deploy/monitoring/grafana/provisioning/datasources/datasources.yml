@@ -12,7 +12,11 @@
 apiVersion: 1
 
 datasources:
+  # `uid` 是**显式**给的，不是让 Grafana 自动生成：面板 JSON 里要按 uid 引用数据源，
+  # 自动生成的 uid 每次重建都会变 ⇒ 面板全部报 "datasource not found"。
+  # 钉住 uid 之后，"面板引用数据源"这件事就随仓库进版本管理了。
   - name: Prometheus
+    uid: prometheus
     type: prometheus
     access: proxy
     url: http://prometheus:9090
@@ -23,6 +27,7 @@ datasources:
       timeInterval: 30s
 
   - name: Loki
+    uid: loki
     type: loki
     access: proxy
     url: http://loki:3100

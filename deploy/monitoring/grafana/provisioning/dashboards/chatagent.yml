@@ -1,0 +1,28 @@
+# Grafana 面板自动加载
+#
+# 为什么面板也要 provisioning：手工在 UI 里建的面板只存在于 `grafanadata` 卷里，
+# 容器一重建就没了 —— 而"面板没了"的表现是**值班时一片空白**，排查的人会先去
+# 怀疑 Prometheus 挂了。写进仓库就跟版本走，"哪一版有哪些面板"是可回答的。
+#
+# ⚠️ `options.path` 必须是**容器内**路径：
+#   本目录被 compose 挂载为 /etc/grafana/provisioning，
+#   所以这里的 json/ 子目录在容器内是 /etc/grafana/provisioning/dashboards/json。
+#   该映射由 tests/test_grafana_dashboards.py 校验 —— 改挂载点时必须同步改这里，
+#   否则 Grafana 会静默加载不到任何面板（日志里只有一行 level=error，很容易漏）。
+
+apiVersion: 1
+
+providers:
+  - name: chatagent
+    orgId: 1
+    folder: chatAgent
+    type: file
+    # 面板以仓库为准。`allowUiUpdates: false` 让 UI 里的改动无法保存 ——
+    # 这是刻意的：允许 UI 改会制造"看起来生效了、重启后回滚"的假象，
+    # 而那正是最难查的一类漂移。要改就改这里的 JSON。
+    allowUiUpdates: false
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
+      foldersFromFilesStructure: false

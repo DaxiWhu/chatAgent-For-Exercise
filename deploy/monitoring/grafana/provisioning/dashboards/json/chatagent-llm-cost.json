@@ -1,0 +1,193 @@
+{
+  "uid": "chatagent-llm-cost",
+  "title": "chatAgent · LLM 与成本",
+  "description": "钱花在哪、回答有没有在退化。token 吞吐与每请求 token 分布是成本的主因；流式错误与超时是「用户那边看到的中断」。",
+  "tags": ["chatagent", "cost"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "token 速率",
+      "description": "每秒消耗的 token（含输入输出）。这是成本曲线的斜率。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(llm_tokens_total[5m]))", "legendFormat": "token/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1 }, "overrides": [] },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "近 1 小时 token",
+      "description": "用 increase 而不是 rate × 3600：前者按实际样本区间积分，跨重启/补抓时更稳。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum(increase(llm_tokens_total[1h]))", "legendFormat": "token" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "预算超限（近 1 小时）",
+      "description": "命中单请求 / 日额度上限的次数。持续非 0 说明额度定得太紧（用户在正常使用中被挡），要去看 QUOTA_* 配置而不是去怪用户。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum(increase(llm_budget_exceeded_total[1h]))", "legendFormat": "次" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "每请求 token（P95）",
+      "description": "单次回答的 token 消耗 P95。突然抬高通常是检索召回了过多上下文，或是模型开始啰嗦。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(llm_tokens_per_request_bucket[5m])))",
+          "legendFormat": "P95"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "token 消耗速率（按实例）",
+      "description": "按 instance 拆开，用于判断是「某个副本异常放大」还是「整体增长」。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (rate(llm_tokens_total[5m]))",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "每请求 token 分位",
+      "description": "P50 稳定而 P99 抬高 ⇒ 长尾（少数请求喂了很长的上下文）。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(llm_tokens_per_request_bucket[5m])))",
+          "legendFormat": "P50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(llm_tokens_per_request_bucket[5m])))",
+          "legendFormat": "P95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(llm_tokens_per_request_bucket[5m])))",
+          "legendFormat": "P99"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "流式错误（按 kind）",
+      "description": "「已经连上、流到一半断了」的次数。用户看到的是回答戛然而止，所以这一条比 5xx 更贴近体感。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (rate(chat_stream_errors_total[5m]))",
+          "legendFormat": "{{kind}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "请求超时（按 kind）",
+      "description": "超时与「客户端主动断开」要分开看：超时是服务端/上游慢，断开是用户等不下去了。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (rate(request_timeout_total[5m]))",
+          "legendFormat": "{{kind}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    }
+  ]
+}

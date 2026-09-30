@@ -42,6 +42,7 @@
 
 ```bash
 # ① 三层面板都看一眼
+open http://localhost:3000             # Grafana：四个面板（见下表）
 open http://localhost:9090/targets     # 两个 chatagent job + blackbox 都是 UP
 open http://localhost:9090/status      # Alertmanagers 一节是 UP
 open http://localhost:9093/#/status    # 无配置解析错误
@@ -58,6 +59,21 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml start app-canary
 ```
 
 第 ③ 步是唯一能证明"告警送得到人"的方法。上面两步只能证明链路"看起来接好了"。
+
+Grafana 要在 `chatAgent` 文件夹下看到这四个面板（它们随仓库走，不是手工建的；
+`--profile observability` 才会起）：
+
+| 面板 | 什么时候看 |
+|---|---|
+| chatAgent · 服务总览 | 值班第一眼：现在有没有在出错 |
+| chatAgent · LLM 与成本 | 钱花在哪、回答有没有在退化 |
+| chatAgent · 限流、配额与安全 | 被拒绝的请求 —— 它们不产生 5xx，所以不会在总览里露头 |
+| chatAgent · 平台自身 | "谁来发现监控坏了" |
+
+一个都加载不出来时：先看 Grafana 日志里的 provisioning 报错，再核
+`deploy/monitoring/grafana/provisioning/dashboards/chatagent.yml` 的 `options.path`
+—— 它必须是**容器内**路径。写错时 Grafana 只记一行 error，界面上就是"文件夹是空的"。
+
 
 ### 1.3 事件分级
 
