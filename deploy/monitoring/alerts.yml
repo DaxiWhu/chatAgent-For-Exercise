@@ -145,6 +145,38 @@ groups:
           description: "{{ $labels.instance }} 的证书剩余时间不足 30 天。若不处理，到期当天全站会被浏览器直接拦截（内部指标一切正常）。"
           runbook: "1) 确认证书签发方式（Let's Encrypt 自动续期 / 手工上传）；2) 自动续期的话先查续期任务是否失败（这是最常见的原因）；3) 手工证书则走一次替换流程，并用 `openssl s_client -connect <域名>:443 2>/dev/null | openssl x509 -noout -dates` 复核。"
 
+      - alert: IndexIdentityMismatch
+        # 库里存着的向量与当前 `EMBEDDING_MODEL` **不是同一个模型灌的**。
+        # 最隐蔽的一种是"换了模型但维度没变"（1024 → 1024）：旧向量还在、
+        # 新查询用新模型编码，两者落在**不同的向量空间**里，检索命中当场变形，
+        # 而 QPS / 延迟 / 错误率**全部正常** —— 没有任何别的信号能反映它。
+        # 指标由启动自检写（`app/main.py::_report_index_identity`），
+        # 判定逻辑在 `src/rag/index_identity.py`。
+        expr: rag_index_identity_ok == 0
+        for: 5m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "向量库的索引身份与当前 embedding 模型不一致"
+          description: "启动自检发现库里既有向量是用**另一个** embedding 模型（模型名或维度不同）灌的，而当前 `EMBEDDING_MODEL` 指向新模型。旧向量与新查询不在同一个向量空间 ⇒ 检索命中明显变差、答案开始答非所问，但吞吐与错误率一切正常。`/health/ready` 的 vector_store 明细里有库里的与当前的模型名、维度。"
+          runbook: "1) 看启动日志里 `索引身份自检：status=mismatch` 那一行，它分别打印**库里的**与**当前的**模型名与维度；2) 若确实换过模型：把 `QDRANT_COLLECTION` / `PGVECTOR_TABLE` 改成一个新名字后重新灌库（旧集合/表**先保留**，以便比对与回滚），灌完确认 `rag_index_identity_ok` 变回 1；3) 若是误报（只是模型名写法变了，如大小写/前缀）：把库里 `embedding_fingerprint` 那条记录改成当前指纹即可。⚠️ **不要**为了让告警消失而直接删掉那条记录 —— 那等于把这项检查永久关掉。"
+
+      - alert: IndexIdentityNeverReported
+        # "没检出问题"与"根本没检查"必须能区分开 —— 这是本项目反复踩的一类假绿。
+        # 用持久化向量后端（pg / qdrant）时，启动自检**必然**会写下这个指标；
+        # 它缺席就说明那次自检没有跑成（抛异常、或后端参数错到读不了库）。
+        # 条件里的第二项只为不误报：只在"确实有实例被抓取着"时才说这件事。
+        expr: absent(rag_index_identity_ok) and on() (count(up{job=~"chatagent-.*"} == 1) > 0)
+        for: 15m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "索引身份自检从未上报过结果"
+          description: "没有任何 `rag_index_identity_ok` 序列，但有实例正在被抓取（`up == 1`）。持久化向量后端下启动自检一定会写这个指标 —— 它缺席意味着**这项检查根本没在跑**，于是上一条 `IndexIdentityMismatch` 永远不会响，而外观全绿。"
+          runbook: "1) 在启动日志里搜 `索引身份自检`：**完全没有这一行** ⇒ `app/main.py::_report_index_identity` 没被调或抛异常（它会打 WARNING，一并看）；2) **有这一行**但 `status=unknown` ⇒ 表/集合还没建（首次灌库之前属正常，灌完就会变成 recorded）；`status=error` ⇒ 自检读不到向量库，按日志里的异常修连接参数；3) 确认 `RAG_VECTOR_STORE` 不是 `memory` —— 内存后端天然没有索引身份，生产不该用它。"
+
   # =========================================================================
   # SLO 与错误预算（定义见 SLO.md，本组的表达式与那份文档一一对应）
   # =========================================================================

@@ -26,6 +26,21 @@
   超限返回 `503 + Retry-After`；`/health/*` 与 `/metrics` 豁免（被拒会让编排重启
   实例、让 Prometheus 在最该看数据时没有数据）；饱和率与拒绝速率进面板，
   配 `ConcurrencySaturated` / `ConcurrencyShedding` 两条告警。
+- **向量索引身份校验**（`src/rag/index_identity.py` + 启动自检）。
+  `EMBEDDING_MODEL` 是环境变量，而 Qdrant 的 collection 名 / pg 的表名是**固定**的：
+  换模型时"维度变了"会被 `ensure_schema` 拦住，但**维度没变、语义空间变了**
+  （例如 1024 维换成另一个 1024 维模型）**完全静默** —— 旧向量还在库里、
+  新查询用新模型编码，两者不在同一个向量空间，检索质量当场崩掉，
+  而 QPS / 延迟 / 错误率全部正常。
+  现在启动时记录"库里的向量是哪个模型、多少维灌的"，并在每次启动重判；
+  不一致就 ERROR 日志 + `rag_index_identity_ok=0`，配 `IndexIdentityMismatch`
+  与 `IndexIdentityNeverReported` 两条告警（后者专门区分"没查出问题"与"根本没检查"）。
+  ⚠️ 维度取自**库里实际存的维度**（pg 读 `pg_attribute.atttypmod`、qdrant 读
+  collection 的 `size`）：校验必须发生在 `_sync` 的"库已最新、零 embedding 调用"
+  **早退之前** —— 换完模型重启走的恰好是那条路径，校验挂在写入之后的话，
+  最该报的一次永远不会报。
+  刻意**不**自动把 collection/表名带上指纹：那会把"答案质量差"换成"检索恒空"
+  外加"旧数据被静默弃用"，对已上线的部署比报警更贵。名字保持稳定，指纹只作记录。
 
 ## [0.2.0] - 2026-09-30
 

@@ -395,6 +395,74 @@ class PgVectorStore:
                     cur.execute(f"SELECT count(*) FROM {self.table}")
                 return int(cur.fetchone()[0])
 
+    # ---------- 索引身份（embedding 指纹） ----------
+    @property
+    def meta_table(self):
+        """存索引身份的元数据表名：**跟随主表**（`<表>_meta`）。
+
+        跟随主表而不是共用一张固定的元数据表：换 embedding 模型时的推荐做法是
+        换 `PGVECTOR_TABLE`（如 `rag_chunks_d1024`），两张表的身份记录必须各存一份，
+        否则"新表写进去的身份被旧表读出来"，一次正常的换表会被判成不匹配。
+
+        不额外做长度截断：PG 标识符上限 63 字节，超出会被**静默截断**；但表名已过
+        `_safe_ident` 的字符白名单，实际长度远低于该上限（`rag_chunks_meta` = 15）。
+        """
+        return f"{self.table}_meta"
+
+    def index_dim(self):
+        """读主表 `embedding` 列的实际维度；表/列不存在时返回 0。
+
+        **只读**：不建表、不写数据、不算 embedding —— 它是启动自检的入口，
+        自检绝不能有副作用（否则"检查一下"本身会改库）。
+
+        复用模块级 `embedding_dim`（"维度探测的唯一实现"）：两处各写一遍 SQL 时，
+        很容易一处改了另一处没改，于是"自检说 1024、建表说 768"这种自相矛盾的
+        状态能长期存在。
+        """
+        with self._connect() as conn:
+            return embedding_dim(conn, self.table)
+
+    def get_meta(self, key):
+        """读一条元数据；表不存在或键不存在都返回 None（= 没记录过，不是错误）。
+
+        "表不存在"必须走 `to_regclass` 显式判掉，而不是靠捕获异常：首次灌库之前
+        这张表本来就不存在，如果让它抛 UndefinedTable 再由上层吞掉，日志里会留下
+        一条看起来像故障的 WARNING。
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass(%s)", (self.meta_table,))
+                if cur.fetchone()[0] is None:
+                    return None
+                cur.execute(f"SELECT value FROM {self.meta_table} WHERE key = %s",
+                            (str(key),))
+                row = cur.fetchone()
+                return None if not row else str(row[0])
+
+    def set_meta(self, key, value):
+        """写一条元数据（表不存在则建）。
+
+        单独一张表而不是塞进主表：主表每行都带 `embedding` 列，往里面插一行
+        "只有元数据、没有向量"的记录，会让所有 `count(*)` 与 HNSW 索引都多出一个
+        假块（而假块的向量是 NULL，检索时没有任何排序依据，行为不可预期）。
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"CREATE TABLE IF NOT EXISTS {self.meta_table} ("
+                    "  key        text PRIMARY KEY,"
+                    "  value      text NOT NULL,"
+                    "  updated_at timestamptz NOT NULL DEFAULT now()"
+                    ")"
+                )
+                cur.execute(
+                    f"INSERT INTO {self.meta_table} (key, value) VALUES (%s, %s) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "
+                    "updated_at = now()",
+                    (str(key), str(value)),
+                )
+            conn.commit()
+
     # ---------- 按源维护（级联删除） ----------
     def list_rows(self):
         """列出库里每个"源"的 (tenant, 源标识, 内容指纹) 三元组，去重。

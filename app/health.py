@@ -64,20 +64,58 @@ def _check_db() -> tuple[bool, str]:
     return True, "ok"
 
 
-def _check_vector_store() -> tuple[bool, str]:
-    """探向量后端：RAG_VECTOR_STORE=pg 时检查 vector 扩展是否已装。
+def _index_identity_note() -> str:
+    """把"启动时校验过的索引身份"拼成一句可读明细（没校验过则返回空串）。
 
-    只读探测，不建表。未启用 pg 时视为通过（内存后端无外部依赖）。
+    只读**进程内缓存**（`index_identity.last_status()`），**零 IO** —— 就绪探针
+    每几秒被调一次，它绝不能去打库（否则健康检查本身变成对一个外部服务的负载）。
+
+    没校验过时返回空串而不是"未知"：空串的意思是"这次没话说"，
+    不该被读成一个"身份未知"的结论。
+    """
+    from src.rag import index_identity as ii
+
+    got = ii.last_status()
+    status = got.get("status")
+    if not status:
+        return ""
+    if status == "mismatch":
+        rec = got.get("recorded") or {}
+        return (
+            f"；⚠️ 索引身份不一致：库里向量是 EMBEDDING_MODEL={rec.get('model')!r}"
+            f"（{rec.get('dim')} 维）灌的，当前配置是 {got.get('model')!r}"
+            f"（{got.get('dim')} 维）—— 检索质量会明显下降而各项指标正常，"
+            "处置见 deploy/RUNBOOK.md"
+        )
+    return f"；索引身份={status}"
+
+
+def _check_vector_store() -> tuple[bool, str]:
+    """探向量后端（pg 查 vector 扩展 / qdrant 查配置），并回显索引身份校验结论。
+
+    只读探测：**绝不建表、绝不连 Qdrant** —— 连上就是 IO，而就绪探针每几秒一次，
+    那会把它变成一个稳定的外部负载。所以 qdrant 分支只查"地址配没配"
+    （也顺手补上了此前 qdrant 分支完全没有任何检查的缺口）。
+
+    ⚠️ **索引身份不一致不判失败**：那是**数据问题**（库里灌的是旧模型的向量），
+    不是这个实例的问题 —— 摘流量、重启都解决不了它，只会额外制造一次停机。
+    但它必须**可见**（这就是回显的目的），否则这条链路等于没有告警。
     """
     from src.rag import vector_store as vs
     from src.rag import retrieval as R
 
-    if (R.VECTOR_STORE or "memory") != "pg":
-        return True, f"backend={R.VECTOR_STORE or 'memory'}（无外部依赖）"
+    ident = _index_identity_note()
+    backend = (R.VECTOR_STORE or "memory").strip().lower()
+    if backend == "qdrant":
+        if not R.QDRANT_URL:
+            return False, f"RAG_VECTOR_STORE=qdrant 但 QDRANT_URL 未配置{ident}"
+        return True, f"backend=qdrant（集合={R.QDRANT_COLLECTION}）{ident}"
+    if backend != "pg":
+        return True, f"backend={R.VECTOR_STORE or 'memory'}（无外部依赖）{ident}"
     if not R.DB_URL:
-        return False, "RAG_VECTOR_STORE=pg 但 DB_URL 未配置"
+        return False, f"RAG_VECTOR_STORE=pg 但 DB_URL 未配置{ident}"
     ok = vs.vector_available(R.DB_URL, connect_timeout=config.HEALTH_READY_TIMEOUT)
-    return (ok, "vector 扩展可用" if ok else "vector 扩展不可用/连不上")
+    return (ok, ("vector 扩展可用" if ok else "vector 扩展不可用/连不上") + ident)
 
 
 def _check_checkpointer() -> tuple[bool, str]:

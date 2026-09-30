@@ -484,6 +484,67 @@
           "sort": "desc"
         }
       }
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "索引身份（1=一致 0=不一致）",
+      "description": "库里存着的向量，是不是用**当前**的 EMBEDDING_MODEL 灌的。最危险的情形是换了模型而维度没变（1024 → 1024）：旧向量还在库里、新查询用新模型编码，两者不在同一个向量空间，检索质量当场崩掉，而 QPS / 延迟 / 错误率**全部正常**。面板**没有数据**不等于「没问题」—— 那说明启动自检没跑（对照告警 IndexIdentityNeverReported）。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 28
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rag_index_identity_ok",
+          "legendFormat": "identity ok"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "max": 1,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "不一致",
+                  "color": "red",
+                  "index": 1
+                },
+                "1": {
+                  "text": "一致",
+                  "color": "green",
+                  "index": 0
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
     }
   ]
 }

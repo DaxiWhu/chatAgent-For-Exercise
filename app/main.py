@@ -142,6 +142,37 @@ async def _async_checkpointer(dsn):
         yield cp
 
 
+def _report_index_identity():
+    """启动自检：核对"库里向量的身份"与当前 `EMBEDDING_MODEL`，并上报指标。
+
+    为什么必须在**启动时主动跑一次**，而不是等就绪探针去读：
+      - 就绪探针读的是 `index_identity.last_status()` 这份**进程内缓存**，
+        没跑过校验的进程读出来是空的 —— 于是"检查过、没问题"与"根本没检查"
+        在探针里长得一模一样，而那正是这条链路最该防的失败模式；
+      - 启动日志是唯一能在事后回答"这个实例起来时索引身份对不对"的地方。
+
+    为什么只在这里写指标：`src/rag/` 是纯库层（CLI 也直接跑它），不该反向依赖
+    `app/metrics`。RAG 侧把结论缓存在 `last_status()`，由这一处读后上报。
+
+    为什么不报 `ok is None` 的情况（内存后端 / 库里还没有向量 / 读库失败）：
+    那些都**无从判断**，上报 0 会把"还没建库"记成一次真实的"索引不可用"。
+    """
+    try:
+        from src.rag import retrieval as R
+        got = R.selfcheck_index_identity()
+    except Exception as e:  # noqa: BLE001  （自检失败不该拦住启动）
+        logging.warning("索引身份自检未能执行（不影响启动）：%s", e)
+        return
+    logging.info("索引身份自检：status=%s backend=%s %s",
+                 got.get("status"), got.get("backend"), got.get("detail"))
+    if got.get("ok") is None:
+        return
+    ok = bool(got["ok"])
+    metrics.set_gauge("rag_index_identity_ok", 1 if ok else 0)
+    if not ok:
+        metrics.inc("rag_index_identity_mismatch_total")
+
+
 @asynccontextmanager
 async def lifespan(_app):
     """应用生命周期：启动时装异步检查点，关闭时释放资源。
@@ -151,6 +182,9 @@ async def lifespan(_app):
     """
     global graph
     stack = AsyncExitStack()
+    # 向量索引身份自检放在最前：它与检查点无关，且无论 DB 通不通都要在启动日志里
+    # 留下一条明确结论（"没检出问题"与"根本没检查"必须能区分开）。
+    _report_index_identity()
     dsn = os.getenv("DB_URL", DB_URL)
     if not dsn:
         logging.info("未设置 DB_URL，使用内存 checkpointer（重启丢状态）")

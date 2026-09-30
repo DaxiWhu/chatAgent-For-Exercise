@@ -55,6 +55,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from .vector_store import PgVectorStore, chunk_fingerprint
 from .qdrant_store import QdrantStore, Bm25SparseEncoder, point_id
 from .kb_inventory import stamp_source
+from . import index_identity
 from .resilience import CircuitBreaker, guarded_call
 
 
@@ -981,6 +982,7 @@ class PgVectorRetriever:
 
         无参数、无返回。缺失集为空时直接返回（零 API 调用）。
         """
+        _check_index_identity(self.store, "pgvector")
         existing = self.store.existing_ids()
         missing = [(cid, c) for cid, c in self.by_id.items() if cid not in existing]
         if not missing:
@@ -998,6 +1000,9 @@ class PgVectorRetriever:
         ]
         n = self.store.upsert(rows)
         logging.info("pgvector 增量写入 %d 块（库内原有 %d 块）", n, len(existing))
+        # 再判一次：入口那次表可能还不存在（维度未知 → unknown，不记录）。
+        # 建表之后维度才第一次可知，此刻才是"把身份落定"的正确时机。
+        _check_index_identity(self.store, "pgvector")
 
     def search(self, query, top_k=TOP_K):
         """返回 top_k 命中 [(chunk, score), ...]。
@@ -1071,6 +1076,8 @@ class QdrantRetriever:
 
     def _sync(self):
         """增量同步：只为集合里没有的块算向量（稠密 + 稀疏）并写入。"""
+        # 同 pgvector：身份校验必须在早退之前（"库已最新"正是换模型后重启的路径）
+        _check_index_identity(self.store, "qdrant")
         self.store.ensure_schema(QDRANT_DIM)
         existing = self.store.existing_ids()
         missing = [(fp, c) for fp, c in self.by_id.items()
@@ -1097,6 +1104,8 @@ class QdrantRetriever:
             rows.append((point_id(fp), c, (c.get("text") or ""), vec, s_idx, s_val))
         n = self.store.upsert(rows)
         logging.info("Qdrant 增量写入 %d 块（该租户原有 %d 块）", n, len(existing))
+        # 集合刚建出来时入口那次读不到维度（unknown），这里补判一次把身份落定
+        _check_index_identity(self.store, "qdrant")
 
     def search_dense(self, query, top_k=TOP_K):
         """稠密检索（供 semantic 单路后端直接用；hybrid 走 self.dense 适配器）。"""
@@ -1330,6 +1339,86 @@ def embedding_configured() -> bool:
     EmbeddingRetriever 时报错。
     """
     return bool(EMBEDDING_API_KEY and EMBEDDING_MODEL)
+
+
+def _check_index_identity(store, backend):
+    """核对"库里向量的身份"与当前 `EMBEDDING_MODEL`；只读 + 至多写一条元数据。
+
+    store: 向量库句柄（需有 `index_dim` / `get_meta` / `set_meta`）。
+    backend: `pgvector` / `qdrant`，只进日志与状态。
+
+    返回 `index_identity.verify` 的状态 dict；任何异常都吞掉并只记 WARNING ——
+    这是**观测**，不该让灌库失败（与项目"降级不崩"的口径一致）。
+
+    为什么维度取自 `store.index_dim()`（库里的**实际**维度）而不是配置：pg 侧根本
+    没有"维度"这个配置项，而且从库里读才不需要任何 embedding 调用 —— 这很关键，
+    因为 `_sync` 在"库已最新"时会**零调用提前返回**，而换完模型重启走的正是这条
+    路径。校验若依赖 embedding 调用，最该报的那一次永远不会报。
+
+    为什么不在这里写指标：`src/rag/` 是纯库层（CLI 也直接跑它），不该反向依赖
+    `app/metrics`。结论缓存在 `index_identity.last_status()`，由 app 层读后上报。
+    """
+    try:
+        return index_identity.verify(
+            store, model=EMBEDDING_MODEL, dim=store.index_dim(),
+            query_prefix=EMBEDDING_QUERY_PREFIX, backend=backend,
+        )
+    except Exception as e:  # noqa: BLE001
+        logging.warning("索引身份自检失败（不影响灌库）：%s", e)
+        return None
+
+
+def open_vector_store(tenant=None):
+    """按当前配置**只打开**向量库句柄（不建表、不灌库、不算 embedding）。
+
+    tenant: 租户 id（None = 沿用模块级 RAG_TENANT）。
+    返回 `(store, backend)`；后端为内存时返回 `(None, "memory")` —— 没有持久化
+    向量库就没有"索引身份"可言。
+
+    为什么不复用 `build_retriever`：它会**灌库**（缺块时调 embedding API 并按量
+    计费）。启动自检必须快、且绝不能因为"检查一下"就产生副作用（改库 / 烧钱）。
+    QdrantClient 与 psycopg 都是懒连接，所以这个函数本身不发任何请求。
+    """
+    if VECTOR_STORE == "qdrant":
+        return QdrantStore(
+            QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION,
+            tenant=resolve_tenant(tenant), timeout=QDRANT_TIMEOUT,
+            hnsw_m=QDRANT_HNSW_M, hnsw_ef_construct=QDRANT_HNSW_EF_CONSTRUCT,
+            on_disk=QDRANT_ON_DISK,
+        ), "qdrant"
+    if VECTOR_STORE == "pg":
+        return PgVectorStore(
+            DB_URL, PGVECTOR_TABLE, PGVECTOR_INDEX, tenant=resolve_tenant(tenant)
+        ), "pgvector"
+    return None, "memory"
+
+
+def selfcheck_index_identity(tenant=None):
+    """启动自检：比对"库里向量的身份"与当前 `EMBEDDING_MODEL`，返回状态 dict。
+
+    tenant: 租户 id（None = 沿用模块级 RAG_TENANT）。
+
+    返回 `index_identity.verify` 的状态（`status` / `ok` / `detail` / `backend`…）；
+    未配置持久化后端时返回 `status="skipped"`。**不抛异常** —— 自检失败不该拦住
+    启动（服务本身仍可用），但必须被大声记下来（`verify` 里 mismatch 走 ERROR 日志）。
+    """
+    store, backend = open_vector_store(tenant)
+    if store is None:
+        return {
+            "status": "skipped",
+            "ok": None,
+            "backend": backend,
+            "detail": "当前未使用持久化向量后端（memory），没有可校验的索引身份",
+        }
+    got = _check_index_identity(store, backend)
+    if got is None:
+        return {
+            "status": "error",
+            "ok": None,
+            "backend": backend,
+            "detail": "索引身份自检未完成（读取向量库失败，详见日志）",
+        }
+    return got
 
 
 def _make_dense_retriever(chunks, tenant=None):

@@ -260,6 +260,52 @@ openssl s_client -connect <域名>:443 </dev/null 2>/dev/null | openssl x509 -no
 ```
 自动续期（Let's Encrypt）时先查**续期任务本身**是否失败 —— 这比证书本身常见得多。
 
+#### `IndexIdentityMismatch`（warning，5m）
+库里存着的向量与当前 `EMBEDDING_MODEL` **不是同一个模型灌的**。
+最隐蔽的是"换了模型而维度恰好没变"（1024 → 1024）：旧向量还在库里、新查询用
+新模型编码，两者落在**不同的向量空间**里 —— 检索命中当场变形、答案开始答非所问，
+而 **QPS / 延迟 / 错误率全都正常**。这是本项目里唯一一条"答案质量掉了、
+却没有任何别的信号"的故障，所以它必须自己报出来。
+
+```bash
+# 1) 库里的身份 vs 当前的 —— 启动日志那一行会同时打印两边的模型名与维度
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs app-stable | grep '索引身份自检'
+# 2) 就绪探针的明细里也回显（零 IO，读的是启动时算出来的结论）
+curl -s localhost:8000/health/ready | python -m json.tool
+# 3) 指标：1=一致、0=不一致
+curl -s 'localhost:9090/api/v1/query?query=rag_index_identity_ok' | python -m json.tool
+```
+
+处置顺序（**先分清"真换过模型"还是"只是名字写法变了"**）：
+
+1. **真换过模型** ⇒ 这是**数据**问题，不是实例问题（摘流量、重启都解决不了）：
+   把 `QDRANT_COLLECTION` / `PGVECTOR_TABLE` 改成新名字（如 `<原名>_d1024`）后
+   重新灌库；**旧集合/表先保留**，用于比对与回滚。灌完确认 `rag_index_identity_ok` 变回 `1`。
+   > ⚠️ 不要"就地清空再灌"：中途失败时你既没有新数据、也丢掉了旧数据。
+2. **只是写法变了**（大小写、组织前缀）⇒ 把库里 `embedding_fingerprint` 那条记录
+   改成当前指纹即可。
+   > ⚠️ **不要为了让告警消失而直接删掉那条记录** —— 删掉等于把这项检查永久关掉，
+   > 下一次真换模型时它不会再响。
+3. 仍不放心就人工核对一遍：`EMBEDDING_MODEL` 与语料当初入库时用的是不是同一个
+   （本次改造之前灌的库只有 `recorded`、证明不了历史，见 PRODUCTION_CONFIG 第 35 项）。
+
+#### `IndexIdentityNeverReported`（warning，15m）
+"没查出问题"与"根本没检查"长得一模一样，这条专门用来区分它们。
+用持久化后端（pg / qdrant）时，启动自检**一定会**写下 `rag_index_identity_ok`；
+它缺席 ⇒ 那次自检没跑成，于是 `IndexIdentityMismatch` 永远不会响，而外观全绿。
+
+```bash
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs app-stable | grep '索引身份'
+```
+
+1. **日志里完全没有这一行** ⇒ `app/main.py::_report_index_identity` 没被调用或抛了异常
+   （它会打 WARNING，一并搜）；确认启动走的确实是 `python -m app.serve` 那条路径。
+2. **有这一行但 `status=error`** ⇒ 自检读不到向量库（连接参数错 / 权限不足），
+   按日志里的异常先把连接修好。
+3. **`status=unknown`** ⇒ 表/集合还没建（首次灌库之前属正常，灌完会变成 `recorded`）。
+4. 确认 `RAG_VECTOR_STORE` 不是 `memory` —— 内存后端天然没有索引身份，
+   "没有这个指标"是**预期**；生产不该用内存后端。
+
 ### 3.2 SLO 与错误预算（category: slo）
 
 先读 `deploy/monitoring/SLO.md` 的处置表，这里只给补充：

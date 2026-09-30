@@ -37,6 +37,7 @@ import math
 import re
 import uuid
 
+from .index_identity import META_FLAG
 from .kb_inventory import source_key
 
 # Qdrant 集合名允许的字符集（官方约定：字母数字 + 下划线/短横线，≤255）。
@@ -477,7 +478,14 @@ class QdrantStore:
 
     # ---------- 维护 ----------
     def count(self):
-        """返回集合里该租户的点数（近似，来自集合统计）。"""
+        """返回集合里该租户的点数（近似，来自集合统计）。
+
+        ⚠️ **未设租户时会多算索引身份的元数据点（+1）**：meta 点的 payload 里
+        **没有 `tenant` 字段**，所以走 tenant 过滤的精确计数天然数不到它；
+        而不带过滤的 `points_count` 是集合级统计，会把它算进去。
+        这是刻意接受的：`count` 的用途只是"库里有多少块"的量级判断，±1 不影响任何
+        决策；而为了减掉它去付一次 `exact=True` 全扫，在百万级集合上是得不偿失的。
+        """
         client = self._connect()
         try:
             info = client.get_collection(self.collection)
@@ -488,6 +496,65 @@ class QdrantStore:
             return int(info.points_count or 0)
         except Exception:  # noqa: BLE001
             return 0
+
+    # ---------- 索引身份（embedding 指纹） ----------
+    def index_dim(self):
+        """读集合里 dense 命名向量的实际维度；集合不存在时返回 0。
+
+        **只读**：不建集合、不写点、不算 embedding —— 启动自检的入口不能有副作用。
+        复用 `ensure_schema` 用的 `_dense_dim`（同一套取维度的逻辑）。
+        """
+        return self._dense_dim(self._connect())
+
+    @staticmethod
+    def _meta_point_id(key):
+        """元数据点的 id：在 id 空间里**与真实块刻意隔离**。
+
+        真实块的 id 是 `point_id(chunk_fingerprint)`（sha1 十六进制串）；
+        这里先拼上 `META_FLAG:` 前缀再 uuid5，两者不可能撞 ——
+        "元数据点被当成某个块"是本设计里最坏的一类事故（会污染增量判定与检索）。
+        """
+        return point_id(f"{META_FLAG}:{key}")
+
+    def get_meta(self, key):
+        """读一条元数据；集合/点不存在都返回 None（= 没记录过，不是错误）。"""
+        client = self._connect()
+        try:
+            got = client.retrieve(
+                collection_name=self.collection,
+                ids=[self._meta_point_id(key)],
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as e:  # noqa: BLE001  （集合不存在 → 视为没记录）
+            logging.debug("Qdrant 读取索引身份失败（按未记录处理）：%s", e)
+            return None
+        if not got:
+            return None
+        value = (got[0].payload or {}).get("value")
+        return None if value is None else str(value)
+
+    def set_meta(self, key, value):
+        """写一条元数据点（**不带向量**）。
+
+        Qdrant 的命名向量集合允许点不带向量（`vector={}`）。这类点**永远不出现在
+        向量检索结果里**（没有向量可比），所以不会污染召回；代价是"滚一遍集合"的
+        维护类接口会看到它 —— 因此凡是遍历 payload 的地方都必须识别并跳过
+        （见 `_scroll_rows`），否则它会变成一条 `("", "", "")` 的脏行，
+        进而把"某个源是孤儿"判错。
+        """
+        from qdrant_client import models as qm
+
+        client = self._connect()
+        client.upsert(
+            collection_name=self.collection,
+            points=[qm.PointStruct(
+                id=self._meta_point_id(key),
+                vector={},
+                payload={META_FLAG: True, "key": str(key), "value": str(value)},
+            )],
+            wait=True,
+        )
 
     # ---------- 按源维护（级联删除） ----------
     def _scroll_rows(self, flt=None):
@@ -512,6 +579,12 @@ class QdrantStore:
                 )
                 for p in points:
                     pl = p.payload or {}
+                    if pl.get(META_FLAG):
+                        # 索引身份的元数据点：不是块，**必须**跳过。留着它会被
+                        # `plan_orphans` 看成一条 source 为空的脏行，级联删除据此
+                        # 报出的孤儿清单就不可信了（这条链路只用来做删除决策，
+                        # 一个假输入就足以让人误删）。
+                        continue
                     # ⚠️ 回落顺序必须与 `kb_inventory.source_key` 一致：
                     # 老点没有顶层 source_key（本次改造前灌的），此时用 source。
                     key = str(pl.get("source_key") or pl.get("source") or "")

@@ -61,7 +61,7 @@ _HIST_SUFFIXES = ("_bucket", "_sum", "_count")
 # 用它把"该由代码证明存在"的名字圈出来 —— 外部 exporter 的指标不适用这条。
 _APP_PREFIXES = (
     "http_", "llm_", "chat_stream_", "client_", "review_", "quota_",
-    "rate_limited", "request_", "session_", "tenant_", "shared_backend_",
+    "rag_", "rate_limited", "request_", "session_", "tenant_", "shared_backend_",
 )
 
 
