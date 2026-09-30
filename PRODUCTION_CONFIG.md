@@ -27,7 +27,7 @@
 | `REQUEST_TIMEOUT_SECONDS` | ✅ `180` | 单请求**总时限**已装。注意 `_MODEL` 上的 `timeout=30` 只管**单次调用**，而一次请求可以跑多轮（自评审不通过会再来一轮）⇒ 没有它总时长无上界，而且 **`GRACEFUL_SHUTDOWN_TIMEOUT` 的排空上界会形同虚设**（它等的是在途请求，而在途请求自己不会结束）。超时会下发结构化 `timeout` 事件后收流，**已产出的正文照常交付** | `120`（保守可给 `180`） |
 | `TRUST_PROXY_HEADERS` | ✅ `0` | 直连场景下 `0` 是**正确**的。但**一旦部署到 Nginx/网关后面**必须改 `1`：否则限流按**代理 IP** 统计，全体用户共用一个计数桶 ⇒ 要么集体误伤、要么被单人吃满。compose 里已为两个 app 服务注入 `TRUST_PROXY_HEADERS: "1"`（它们确实在 nginx 后面） | 反代后设 `1`；直连保持 `0` |
 | `ALERT_SINK_WECOM_WEBHOOK` 等三个通道 | ⚠️ **全部为空**（当前**最紧的一个待办**） | 告警转发的出口。**不填 ⇒ `alert-sink` 只把事件记进日志**（这是刻意设计：没配通道不阻塞、不报错），于是 Prometheus 里的 FIRING 永远变不成一条发到人手里的消息。30 条规则 + 五级路由全都写好了，差的只有这一步。<br>⚠️ **两个坑**：① 填完必须用 `docker compose --env-file .env ... config \| grep -i webhook` 自证值真的传进去了（**漏 `--env-file` 时它静默不生效**，见本文档开头的说明）；② `alert_sink.py --selftest` 只能证明网关进程活着，**必须再真触发一次告警**（停 `app-canary` 让 `ChatAgentDown` 响）才算闭环 | 填企业微信/飞书机器人 URL；自建网关填 `ALERT_SINK_GENERIC_WEBHOOK` |
-| `ALERT_SINK_SHARED_SECRET` | ⚠️ 为空 | 为空时网关**不校验来源** —— 任何能连到 `:8081` 的人都能伪造一条告警。内网可接受，但建议配上（同时是"误打"的刹车） | `openssl rand -hex 16` |
+| `ALERT_SINK_SHARED_SECRET` | ⚠️ 为空 —— **刻意保持为空，别单独填它** | 网关的来源校验：非空时要求每个 POST 带 `X-Alert-Sink-Secret` 头且匹配，否则回 **403**。⚠️ **陷阱就在这里**：`alertmanager.yml` 的四个 receiver **没有** `http_config`，**根本不会送这个头** ⇒ 你填了这个变量，等于**把全部告警打成 403**（Alertmanager 重试几次后放弃，表现成"配置全对但没人收到"，网关日志里只有一行 403）。要用它必须**两处一起改**：给四个 receiver 补 `http_config: http_headers: X-Alert-Sink-Secret: [...]` —— 而 Alertmanager **不支持 `${VAR}` 插值**，密钥只能写进配置文件，又回到"凭据进版本库"（这正是本网关要避免的事）。<br>**当前实际暴露面本就有限**：宿主机端口是回环绑定（`127.0.0.1:8081:8080`），仅剩"同 compose 网络内其它容器可伪造告警"，那更适合用部署侧网络隔离解决 | **留空**。确实要开 ⇒ 两处一起改，并接受密钥进配置文件 |
 | `REDIS_PASSWORD` / `POSTGRES_PASSWORD` / `GRAFANA_PASSWORD` | ✅ `REDIS_PASSWORD` 已生成；另两个走 compose 默认值 | 编排层口令（由 compose 从 `.env` 插值，`app` 不读）。**`POSTGRES_PASSWORD` 仍是默认 `123456`** —— 上生产前必须换，且注意它**只在数据卷首次初始化时生效**（详见 `deploy/SECRETS.md` §4.3）。密钥管理的整体方案见 `deploy/SECRETS.md` | 见 `deploy/SECRETS.md` |
 
 > ⚠️ `TRUST_PROXY_HEADERS` 两个方向都是真实故障：**直连却设 1**，客户端加一个
@@ -192,6 +192,25 @@ curl -s localhost:8000/health/ready | python -m json.tool
 - `AsyncPostgresSaver（已持久化）` ← 正常
 - `InMemorySaver（内存，重启丢状态！）` ← 降级了，回看启动日志里的 warning（会点名原因）
 
+## 七、告警邮件通道（可选，**默认关闭**）
+
+邮件**不是** `alert-sink` 的通道之一（那个网关只认 wecom / feishu / generic 三种，
+见 `deploy/monitoring/alert_sink.py` 里定义通道类型的那一行）。所以**邮箱地址不填在 `.env` 里**，
+走的是 **Alertmanager 原生 `email_configs`**：配置在 `deploy/monitoring/alertmanager.yml`，
+**启用步骤（5 步）与四个必踩的坑写在该文件末尾**那一节（`片段①/②/③`），照着做即可。
+
+这里只重复三条最关键的：
+
+| 要点 | 说明 |
+|---|---|
+| **密码不进版本库** | 用 `smtp_auth_password_file`（v0.27 支持，与 `smtp_auth_password` **互斥**）。密码文件放 `deploy/monitoring/secrets/`，该目录已进 `.gitignore`，并由 `tests/test_monitoring_config.py::test_smtp_password_can_never_be_committed` 用 **`git check-ignore` 实测**钉住。之所以能做到这点：Alertmanager 虽然**不支持 `${VAR}` 插值**，但它给了 `_file` 这条路 |
+| **为什么默认是关的** | ① 邮件发不出去会让 `AlertDeliveryFailing`（**critical**）长鸣 —— 长期不消失的 critical 等于没有告警；② `_file` 是**装配期**读取：密码文件不存在时 Alertmanager **拒绝启动**。默认打开 = "不用邮件的人起不来 + 永久假告警" |
+| **收不到「已恢复」** | `email_configs.send_resolved` 默认 **false**，必须显式写 `true`（现有 `webhook_configs` 都写了，别漏这一处） |
+
+⚠️ 启用后自检**两步都要做**：`logs alertmanager \| grep "Completed loading"` 只证明
+**配置装载成功**；必须再**真触发一次告警**（`stop app-canary`）确认邮箱收到 ——
+因为邮件是唯一不经 `alert-sink` 的通道，`alert_sink.py --selftest` 全绿证明不了它能到。
+
 ## 上线前自检清单
 
 **配置与鉴权**
@@ -220,6 +239,12 @@ curl -s localhost:8000/health/ready | python -m json.tool
 12. [ ] 数据库端口仍是 `127.0.0.1:5433:5432` 这个**回环绑定**（不要改成 `5433:5432`，
        那等于把库发布到 0.0.0.0"）
 13. [ ] 对外入口走 `nginx.tls.conf`（443 + HSTS），而不是只开 8080 明文
+       ⚠️ 同时把 `deploy/monitoring/prometheus.yml` 里 `blackbox-tls` 的
+       `https://REPLACE-WITH-YOUR-DOMAIN/health/ready` 换成**同一个真实域名**。
+       它是 PromQL 里的普通字符串，**写错不会报任何错**，只会让该 target 的
+       `probe_success` 停在 0 ⇒ `ExternalProbeFailing` 恒响（狼来了，久了就没人看）；
+       更糟的一种是探针自身没产出序列时那条规则**根本不触发**（见 `RUNBOOK.md`
+       §3 那张表："用没有序列表达故障"）。两种都要靠这一步避免。
 14. [ ] **`docker compose ... config` 自证插值生效**（2026-09-30 新增，最容易被跳过的一条）：
        ```bash
        docker compose --env-file .env -f deploy/app/docker-compose.yml config | grep -iE 'webhook|POSTGRES_PASSWORD'
@@ -268,3 +293,14 @@ curl -s localhost:8000/health/ready | python -m json.tool
 29. [ ] `.trivyignore` 里没有**无到期日**的忽略项。没到期日的忽略 = 永久忽略 =
        悄悄把这条规则删掉（CI 已开 `ignore-unfixed`，无补丁的 CVE 本来就不卡 CI，
        所以这里只该放"可修但暂不升"的项）
+
+**告警邮件（可选通道，只在启用它之后才需要勾）**
+
+30. [ ] `docker compose ... logs alertmanager` 里能看到 `Completed loading`，
+       且 `片段①/②/③` **要么三处都取消注释、要么一处都没有**（只放开一半的表现是
+       `failed notifications` 里出现 `integration=email`，而你看不出少了哪一半）
+31. [ ] `deploy/monitoring/secrets/smtp_password` 存在、权限 `600`，且
+       `git check-ignore deploy/monitoring/secrets/smtp_password` **返回 0**
+       （返回 1 就说明 `git add -A` 会把 SMTP 密码提交进版本库）
+32. [ ] **邮箱里真的收到过一封告警**，并且触发它的那次故障恢复后**也收到了「已恢复」**
+       （后者专门验证 `send_resolved: true` 没漏）

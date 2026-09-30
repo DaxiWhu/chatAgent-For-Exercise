@@ -21,6 +21,8 @@
 from __future__ import annotations
 
 import re
+import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -676,6 +678,136 @@ def test_backup_failure_threshold_tracks_the_configured_interval(alerts_cfg):
         f"备份告警阈值 {threshold_h}h 与备份间隔 {interval_h}h 不成比例："
         f"要求落在 [{2 * interval_h}h, {4 * interval_h}h]。"
         "太小 ⇒ 单周期抖动就误报；太大 ⇒ 连续漏掉多轮才响。"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 邮件通道（默认关闭）—— 启用说明在 alertmanager.yml 末尾，这里是它的守卫
+# ---------------------------------------------------------------------------
+# 为什么需要单独一节：邮件配置**默认是注释状态**，所以它不会被 YAML 解析、
+# 也就不会被上面任何一条断言覆盖。而它恰恰是最容易写错的部分
+# （`send_resolved` 默认 false、密码必须走 `_file`、挂载路径三处必须一致）。
+# 把注释里的片段当配置解析，是唯一能让它"坏掉就变红"的办法。
+
+ALERTMANAGER = MON / "alertmanager.yml"
+
+#: 密码文件的**容器内**路径。三处必须一致：alertmanager.yml 的
+#: `smtp_auth_password_file`、compose 的挂载目标、以及下面的断言。
+#: 不一致时 Alertmanager 在**装配期**读不到文件而拒绝启动 —— fail loud 是好事，
+#: 但报错只有一句 "no such file"，很难判断是哪一处写错了。
+PASSWORD_IN_CONTAINER = "/etc/alertmanager/smtp_password"
+
+#: 宿主侧路径（相对仓库根），必须被 git 忽略。
+PASSWORD_ON_HOST = "deploy/monitoring/secrets/smtp_password"
+
+
+def _fragment(tag: str) -> str:
+    """取出 `# --- 片段X ---` 与 `# --- 片段X结束 ---` 之间被注释掉的 YAML。
+
+    剥掉注释符后交给调用方按 YAML 解析 —— 这样"片段里的字段名写错/缩进错"
+    会直接变成解析失败，而不是等到某天有人照抄时才炸。
+    """
+    text = ALERTMANAGER.read_text(encoding="utf-8")
+    start = re.search(rf"(?m)^\s*#\s*---\s*片段{tag}\s*---\s*$", text)
+    assert start, f"alertmanager.yml 里找不到『片段{tag}』的起始标记 —— 启用说明被删了？"
+    tail = text[start.end():]
+    end = re.search(rf"(?m)^\s*#\s*---\s*片段{tag}结束\s*---\s*$", tail)
+    assert end, f"『片段{tag}』没有结束标记，它后面的注释会被一起当成配置"
+
+    lines: list[str] = []
+    for raw in tail[: end.start()].splitlines():
+        if not raw.strip():
+            continue
+        assert raw.strip().startswith("#"), (
+            f"『片段{tag}』里混进了一行**未注释**的内容：{raw!r} —— "
+            "它会被 Alertmanager 当成真实配置生效（而这些片段本该是关闭状态）"
+        )
+        lines.append(re.sub(r"^\s*#\s?", "", raw))
+    assert lines, f"『片段{tag}』是空的"
+    return textwrap.dedent("\n".join(lines))
+
+
+def test_email_setup_fragments_are_valid_yaml():
+    """三个片段必须是合法 YAML，且结构与其粘贴位置匹配。
+
+    片段②③ 粘进的是**列表**（`receivers:` / `route.routes:`），片段① 是**映射**
+    （`global:`）。结构不对时人一照抄就得到一个非法配置 —— 而
+    "照抄文档"正是这类片段唯一的用法。
+    """
+    assert isinstance(yaml.safe_load(_fragment("①")), dict), "片段① 不是映射（要粘进 global:）"
+    for tag in ("②", "③"):
+        got = yaml.safe_load(_fragment(tag))
+        assert isinstance(got, list), f"片段{tag} 不是列表（要粘进 receivers:/routes:）"
+
+
+def test_email_global_fragment_covers_every_required_smtp_key():
+    """`global` 片段必须给全，且密码只能以 `_file` 形式出现。"""
+    got = yaml.safe_load(_fragment("①"))
+    for key in ("smtp_smarthost", "smtp_from", "smtp_auth_username",
+                "smtp_auth_password_file", "smtp_require_tls"):
+        assert key in got, f"片段① 缺少 {key}"
+    assert got["smtp_auth_password_file"] == PASSWORD_IN_CONTAINER, (
+        f"片段① 的 smtp_auth_password_file 是 {got['smtp_auth_password_file']!r}，"
+        f"与 compose 挂载的目标 {PASSWORD_IN_CONTAINER!r} 不一致"
+    )
+    assert "smtp_auth_password" not in got, (
+        "片段① 用了 `smtp_auth_password`（内联明文）—— 它会被提交进版本库。"
+        "Alertmanager 不支持 ${VAR} 插值，所以只能走 `smtp_auth_password_file`"
+    )
+
+
+def test_email_receiver_fragment_sends_resolved_and_has_a_recipient():
+    """两处最容易漏的：`to` 必填、`send_resolved` 默认 false。"""
+    (rx,) = yaml.safe_load(_fragment("②"))
+    assert rx["name"] == "email", f"片段② 的 receiver 名是 {rx['name']!r}"
+    (cfg,) = rx["email_configs"]
+    assert cfg.get("to"), "email_configs 的 `to` 是必填项，漏了 Alertmanager 直接拒绝启动"
+    assert cfg.get("send_resolved") is True, (
+        "email_configs 没有显式 `send_resolved: true` —— 它的默认值是 **false**，"
+        "于是你**永远收不到「已恢复」**（而现有 webhook_configs 都显式写了 true）"
+    )
+    assert "auth_password" not in cfg, "收件人配置里出现了内联 auth_password，密码不该进版本库"
+
+
+def test_email_route_fragment_uses_continue():
+    """旁路路由必须 `continue: true`，否则会把所有分级路由吃掉。"""
+    (route,) = yaml.safe_load(_fragment("③"))
+    assert route["receiver"] == "email"
+    assert route.get("continue") is True, (
+        "email 路由没有 `continue: true` —— Alertmanager 是**首个匹配生效**，"
+        "这条「匹配所有告警」的旁路会把下面各分级路由全部吃掉，"
+        "安全告警再也不会送到能处置攻击的人"
+    )
+
+
+def test_compose_mounts_the_password_file_at_the_same_path():
+    """compose 的挂载目标必须与配置里的 `smtp_auth_password_file` 逐字一致。"""
+    text = COMPOSE.read_text(encoding="utf-8")
+    m = re.search(r"\.\./monitoring/(secrets[/\\]smtp_password)\s*:\s*(\S+?):ro", text)
+    assert m, (
+        "compose 的 alertmanager 服务里找不到 smtp_password 的挂载行 —— "
+        "启用邮件时密码文件没挂进容器，Alertmanager 会在启动阶段失败"
+    )
+    assert m.group(2) == PASSWORD_IN_CONTAINER, (
+        f"compose 把密码挂到 {m.group(2)!r}，而配置读的是 {PASSWORD_IN_CONTAINER!r}"
+    )
+    assert m.group(1).replace("\\", "/") == "secrets/smtp_password"
+
+
+def test_smtp_password_can_never_be_committed():
+    """密码文件必须**真的**被 git 忽略 —— 用 `git check-ignore` 实测。
+
+    查 `.gitignore` 里有没有那一行是弱断言：忽略语义涉及反选（`!`）、
+    上级目录、`.git/info/exclude` 等，读一行文本判断不了。真正要保证的是
+    "这个路径不会被 `git add` 进去"，那就直接问 git。
+    """
+    if not (ROOT / ".git").exists():
+        pytest.skip("不在 git 仓库里（源码打包场景），跳过行为级校验")
+    proc = subprocess.run(["git", "check-ignore", "-q", PASSWORD_ON_HOST],
+                          cwd=ROOT, capture_output=True)
+    assert proc.returncode == 0, (
+        f"{PASSWORD_ON_HOST} 没有被 git 忽略 —— 一次 `git add -A` 就会把 SMTP "
+        "密码提交进版本库。请确认 `.gitignore` 覆盖了 `deploy/monitoring/secrets/`"
     )
 
 

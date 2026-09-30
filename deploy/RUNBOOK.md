@@ -28,6 +28,7 @@
 | Alertmanager 收不到 | `/status` 页里 Alertmanagers 一节是 DOWN | 服务名/网络不对；`prometheus.yml` 少了 `alerting.alertmanagers` |
 | 送到了但没转 | Alertmanager 里能看到 FIRING，机器人没消息 | `docker compose logs alert-sink` 看是否有转换失败 |
 | 通道没配 | alert-sink 日志里只有"未配置通道，仅记日志" | `.env` 里 `ALERT_SINK_*_WEBHOOK` 为空 |
+| 邮件没收到（仅在启用邮件后） | 群/机器人正常，邮箱一封都没有 | 看 `logs alertmanager` 里的投递失败；重点查 `smtp_smarthost` 的**端口写法**（465 需配 `force_implicit_tls`）与密码文件**是否真的挂进容器** —— 见 §3.5 |
 | **链路整体死了** | **该来的 `Watchdog` 心跳没来** | 见 §3.5 —— 这是唯一能穿透"Alertmanager 自己挂了"的信号 |
 
 > ⚠️ 最常见的误判：**在 Prometheus 页面看到 FIRING 就以为"已经通知过了"**。
@@ -59,6 +60,12 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml start app-canary
 
 # ④ 端到端自检（**改过 nginx / compose / 依赖之后必做**）
 python scripts/tasks.py e2e             # 起栈 → 等就绪 → 检查 → 收栈；加 --keep 保留现场
+
+# ⑤ 邮件通道（**只在启用了它之后**做；启用步骤见 alertmanager.yml 末尾）
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs alertmanager \
+  | grep -i "Completed loading"          # 配置装载成功（含 SMTP 段语法）
+#    然后**真收一封**：把 app-canary 停一下让 ChatAgentDown 走完全链路
+#    收到后注意 `AlertDeliveryFailing` 应停止增长（它统计的是所有通道的投递失败）
 ```
 
 第 ③ 步是唯一能证明"告警送得到人"的方法。上面两步只能证明链路"看起来接好了"。
@@ -72,6 +79,10 @@ python scripts/tasks.py e2e             # 起栈 → 等就绪 → 检查 → �
   这是唯一能自证"那 10% 流量真的进了新版本"的检查；
 - **检查点是否真的落了库** —— 退回内存时服务照常工作、回答照常出，**只在容器重启后
   丢状态**（`/health/ready` 的 `checkpointer` 明细是唯一能看出它的地方）。
+
+第 ⑤ 步只在启用了邮件时才有意义，但那时它**不能省**：邮件是唯一**不经 alert-sink** 的
+通道（走 Alertmanager 原生 `email_configs`），两条链路在 Alertmanager 里就分叉了 ——
+所以 `alert_sink.py --selftest` 全绿**证明不了邮件能送达**。
 
 它要起一整套容器（几分钟），所以刻意不放进每次 CI 的 push 上，而是手动 / 每晚定时
 （`ci.yml` 的 `e2e` job）。
@@ -349,6 +360,19 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 
 python deploy/monitoring/alert_sink.py --selftest     # 真发一条，看对方返回体
 ```
 原始错误在 `http://localhost:9093/#/status` 的 **failed notifications** 一节。
+
+**若 `failed notifications` 里的 `integration` 是 `email`**（即启用了邮件通道），
+按这三条查 —— 都是"配置看着对、但没人收到"：
+
+| 现象 | 根因 | 确认方式 |
+|---|---|---|
+| `no such host` / 连接超时 | `smtp_smarthost` 写错端口：**465 是 implicit TLS**，需要额外 `smtp_force_implicit_tls: true`；587 才是 STARTTLS | `openssl s_client -connect <host>:465 </dev/null \| head -1` |
+| 认证失败 | 密码文件没挂进容器，或 `smtp_from` 与 `smtp_auth_username` 不一致（多数邮件服务要求两者相同） | `docker compose ... exec alertmanager cat /etc/alertmanager/smtp_password`（**只在排障时**，别把输出粘进工单） |
+| 对方拒收 | 收件人被机器人/网关列入拒收名单、或进了垃圾箱 | 看 `failed notifications` 里 SMTP 的原始错误码 |
+
+> 邮件**默认是关闭的**（启用步骤与四个坑写在 `alertmanager.yml` 末尾）。如果你从没启用过
+> 却看到 `integration=email` 在失败，说明有人放开了一半：检查 `片段①/②/③` 是否只取消注释了
+> 一部分，以及 compose 里那行 `smtp_password` 的 volume 是否也放开了。
 
 #### `BackupLoopFailing`（warning，15h 未成功）
 ```bash

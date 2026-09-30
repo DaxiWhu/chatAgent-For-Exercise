@@ -458,6 +458,11 @@ services:
     networks: [monitor]
     volumes:
       - ../monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # 邮件通道的 SMTP 密码文件（**默认关闭**；启用步骤见 alertmanager.yml 末尾）。
+      # ⚠️ 宿主侧路径已进 .gitignore，权限 600；路径必须与 alertmanager.yml 里
+      #    的 `smtp_auth_password_file` 一致 —— 不一致时 Alertmanager 在**启动阶段**
+      #    读不到文件而拒绝启动（fail loud，但报错信息只说 "no such file"）。
+      # - ../monitoring/secrets/smtp_password:/etc/alertmanager/smtp_password:ro
     ports:
       - "127.0.0.1:9093:9093"     # 只绑回环：它自身无鉴权
     security_opt:

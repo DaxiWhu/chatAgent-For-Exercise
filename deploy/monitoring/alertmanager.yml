@@ -64,6 +64,8 @@ alertmanager: v0.27
 global:
   # 告警自己也需要超时，否则一个挂住的接收端会把通知队列堵死
   resolve_timeout: 5m
+  # 邮件（SMTP）相关设置默认**关闭** —— 启用步骤与四个必踩的坑在本文件**末尾**
+  # 那一节（`片段①` 就粘贴到这里）。
 
 route:
   # 兜底接收人：**必须存在**，且要能真的收到东西。
@@ -175,6 +177,15 @@ inhibit_rules:
 # ----------
 # 三个通道分开是刻意的：安全告警要发给"能处置攻击的人"，成本告警发给
 # "管预算的人"。全都塞进一个群的结果是所有人都以为自己不用管。
+#
+# ⚠️ 若在 `.env` 里设了 `ALERT_SINK_SHARED_SECRET`，**必须同时**在每个
+#    `webhook_configs` 下补：
+#      http_config:
+#        http_headers:
+#          X-Alert-Sink-Secret: {values: ["<同一个密钥>"]}
+#    否则网关会对**每一个**请求回 403（它只认这个头），Alertmanager 重试几次
+#    后放弃 —— 表现成"配置看起来全对，但没有任何消息送达"。
+#    （注：Alertmanager 不支持 `${VAR}` 插值，所以这个密钥只能写在本文件里。）
 receivers:
   # ⚠️ URL 末段（default / security-oncall / oncall / cost-digest）= Alertmanager 的
   #    receiver 名，网关据此选通道 ⇒ 必须与 `.env` 里 ALERT_SINK_ROUTES 的键对得上。
@@ -199,3 +210,75 @@ receivers:
     webhook_configs:
       - url: "http://alert-sink:8080/alerts/cost-digest"
         send_resolved: true
+
+# ===========================================================================
+# 邮件通道（默认关闭）—— 启用步骤 + 四个必踩的坑
+# ---------------------------------------------------------------------------
+# 为什么默认关闭（三个理由都成立才敢默认打开）：
+#   ① 未填时会产生"永远响的假告警" —— 邮件发不出去会让
+#      `alerts.yml::AlertDeliveryFailing` 持续 firing，而它是 **critical**。
+#      一条长期不消失的 critical 等于没有告警（所有人都会开始忽略它）。
+#   ② `_file` 是**装配期**读取的：密码文件不存在时 Alertmanager **拒绝启动**
+#      （这本身是好事，fail loud）——但默认打开就等于让不用邮件的人起不来。
+#   ③ 这个仓库要能被别人直接部署，邮件并非人人都要。
+#
+# 启用步骤（5 步，缺任一步都会静默失效）
+#   1) 建密码文件（`deploy/monitoring/secrets/` 已进 .gitignore，不会入库）
+#        mkdir -p deploy/monitoring/secrets
+#        printf '%s' '<你的 SMTP 密码>' > deploy/monitoring/secrets/smtp_password
+#        chmod 600 deploy/monitoring/secrets/smtp_password
+#   2) `片段①` 取消注释 + 填值  → 粘到上面 `global:` 下
+#   3) `片段②` 取消注释 + 填收件地址 → 粘到上面 `receivers:` 下
+#   4) `片段③` 取消注释         → 粘到上面 `route.routes:` 的**最前面**
+#   5) 取消 `deploy/app/docker-compose.yml` 里 alertmanager 服务下那一行
+#      注释掉的 `smtp_password` volume（把密码文件挂进容器）
+#
+# 填完必须自证（两步，缺一不可）
+#   docker compose --env-file .env -f deploy/app/docker-compose.yml up -d alertmanager
+#   docker compose --env-file .env -f deploy/app/docker-compose.yml logs alertmanager | grep -i "Completed loading"
+#   # 再**真触发一次告警**（停 app-canary 让 ChatAgentDown 响），确认邮箱里
+#   # 真的收到 —— "配置装载成功"证明不了"能送达"。
+#
+# ⚠️ 四个坑（全都不报错，只表现为"没人收到"）
+#   1. `to` 是**必填**（漏了会直接拒绝启动，反而好发现）；而 `send_resolved`
+#      默认 **false** ⇒ 不显式写 true 就**收不到"已恢复"**（现有
+#      webhook_configs 都显式写了 true，别漏这一处）。
+#   2. `smtp_require_tls` 默认就是 **true**：587 走 STARTTLS；**465 是
+#      implicit TLS**，需要额外 `smtp_force_implicit_tls: true`，否则连接超时。
+#   3. 多数邮件服务要求 `smtp_from` 与 `smtp_auth_username` **完全一致**，
+#      否则被拒投、或在收件人侧直接进垃圾箱。
+#   4. 密码**只能**走 `smtp_auth_password_file`。写成
+#      `smtp_auth_password: "明文"` 等于把密码提交进版本库 ——
+#      Alertmanager 不支持 ${VAR} 插值，所以没有第三条路（这也正是本仓库要把
+#      机器人凭据放进 alert-sink 环境变量、而不是这里的原因）。
+#
+# 只想让部分告警进邮箱？在 `片段③` 下补一行 matchers 即可
+# （如 `matchers: [- category = "security"]`）——但**必须保留 `continue: true`**，
+# 否则它会把下面各分级路由全部吃掉（Alertmanager 首个匹配生效）。
+#
+# 心跳说明：`片段③` 是一条"匹配所有告警"的旁路，所以 Watchdog 也会按
+# `repeat_interval` 进邮箱。想让它每天只来一封，就给 `alertname = "Watchdog"`
+# 单独加一条更靠前的 email 路由。
+
+# --- 片段① ---
+#   smtp_smarthost: "smtp.example.com:587"
+#   smtp_from: "alert@example.com"
+#   smtp_auth_username: "alert@example.com"
+#   smtp_auth_password_file: /etc/alertmanager/smtp_password
+#   smtp_require_tls: true
+# --- 片段①结束 ---
+
+# --- 片段② ---
+#   - name: email
+#     email_configs:
+#       - to: "oncall@example.com"
+#         send_resolved: true
+# --- 片段②结束 ---
+
+# --- 片段③ ---
+#     - receiver: email
+#       continue: true
+#       group_wait: 30s
+#       group_interval: 5m
+#       repeat_interval: 4h
+# --- 片段③结束 ---

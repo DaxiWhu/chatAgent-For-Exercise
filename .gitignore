@@ -109,5 +109,14 @@ data/.parse_cache/
 # 每次跑测试都会重新生成；probe_*.py 是排障用的临时脚本。
 tmp_probe/
 
+# ---- 告警邮件的 SMTP 密码（**绝不能入库**）----
+# Alertmanager 的配置不支持环境变量插值，邮件密码只能以 `_file` 形式提供；
+# 这个目录就是那个文件的家（compose 以只读方式挂进容器，见
+# deploy/app/docker-compose.yml 的 alertmanager 服务）。
+# 之所以现在就把整目录忽略掉：等真去配邮件时才加，多半就晚了 ——
+# 那时文件已经在工作区里，一次 `git add -A` 就进去了。
+# ⚠️ 别在这个目录里放 .gitkeep（那等于给"密码文件"留了个入库的口子）。
+deploy/monitoring/secrets/
+
 # ---- WorkBuddy project data (do not delete, but usually not committed) ----
 .workbuddy/
