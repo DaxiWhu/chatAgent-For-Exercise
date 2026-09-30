@@ -108,6 +108,7 @@ pytest tests/ -q
 | 跑测试 / 只重跑上次失败的 | `tasks test` / `tasks test-fast` |
 | **提交前门禁** | `tasks check` |
 | 起本地栈 / 含监控 / 停 | `tasks up` / `tasks up-observability` / `tasks down` |
+| **端到端自检**（真起栈） | `tasks e2e`（SSE 分帧 / 灰度权重 / 持久化检查点；`--keep` 保留现场） |
 | 看服务状态 / 跟日志 | `tasks ps` / `tasks logs`（`tasks logs -- app-stable` 只看一个） |
 | 备份 / **恢复演练** | `tasks backup-pg` / `tasks drill` |
 | 灰度发布 / 回滚 | `tasks release -- <镜像tag> --dry-run` / `tasks rollback -- <镜像tag>` |

@@ -237,6 +237,61 @@ jobs:
             || { echo "::error::缺 backup_drill_last_success_timestamp_seconds"; exit 1; }
 
   # ------------------------------------------------------------------
+  # 3.6) 端到端：真起一套栈，验证**进程内测不到**的三件事
+  # ------------------------------------------------------------------
+  # 为什么值得花几分钟起整套容器
+  # -------------------------
+  # `tests/` 里其余用例都是**进程内**的（TestClient / 直接调函数），下面三件事
+  # 它们原理上就覆盖不到，而这三件恰好都是"告警不响、只是体验悄悄变差"的类型：
+  #
+  #   a) nginx 漏写 `proxy_buffering off` ⇒ 流式回答变成"卡十几秒再一次性吐出来"。
+  #      进程内测试压根不经过 nginx，永远看不出来。
+  #   b) 灰度权重没生效（写错位置 / upstream 里没有 canary）⇒ 发新版时那句
+  #      "10% 流量"其实全打在旧版本上，整个发布验证等于白做。
+  #   c) 检查点退回内存（DB_URL 没传进容器 / 异步连接落到不支持的事件循环上）
+  #      ⇒ 服务照常工作、回答照常出，**只在容器重启后丢状态**。
+  #
+  # 触发刻意收窄到「手动 + 每晚定时」：起全套容器要几分钟，而它防住的不是
+  # "这次改动错了"（那是 test job 的活），而是"部署面悄悄漂了"—— 按天发现足够。
+  e2e:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # 只需要能跑 `scripts/tasks.py`（纯标准库）+ pytest
+      - name: 安装最小依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install "pytest>=8.0"
+
+      # 栈从 .env 读配置，示例值即可：
+      #   · AGNES_API_KEY 是**非空占位符** ⇒ /health/ready 的 llm 检查通过
+      #     （它只查"配置在不在"，不发请求）。真去调 LLM 会失败并回 `error` 事件，
+      #     而 SSE 用例接受的正是"合法帧"—— 见 tests/test_e2e_stack.py 的说明。
+      #   · SERVE_API_KEY 非空 ⇒ 鉴权用例自动切到「必须拒绝未授权」那个分支
+      #     （两个分支都有断言，没有 skip）。
+      - name: 准备 .env
+        run: cp .env.example .env
+
+      # 一条命令包办：构建 → 起栈 → 等就绪 → 跑检查 → 失败时打印容器日志 → 收栈
+      - name: 起栈并跑端到端检查
+        run: python scripts/tasks.py e2e --build
+
+      # tasks.py 已在失败时打过 app-stable 与 nginx 的尾部日志；这里补全量，
+      # 好让"哪个容器没起来"一眼可见。
+      - name: 失败时导出全部容器日志
+        if: failure()
+        run: |
+          docker compose --env-file .env -f deploy/app/docker-compose.yml ps || true
+          docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=300 || true
+
+  # ------------------------------------------------------------------
   # 4) 部署产物：镜像构建 → 冒烟启动 → 漏洞扫描
   # ------------------------------------------------------------------
   # 为什么必须有这个 job

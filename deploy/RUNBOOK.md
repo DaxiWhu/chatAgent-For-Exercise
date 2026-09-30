@@ -56,9 +56,25 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml run --rm alert-s
 docker compose --env-file .env -f deploy/app/docker-compose.yml stop app-canary
 #    收到后立刻恢复：
 docker compose --env-file .env -f deploy/app/docker-compose.yml start app-canary
+
+# ④ 端到端自检（**改过 nginx / compose / 依赖之后必做**）
+python scripts/tasks.py e2e             # 起栈 → 等就绪 → 检查 → 收栈；加 --keep 保留现场
 ```
 
 第 ③ 步是唯一能证明"告警送得到人"的方法。上面两步只能证明链路"看起来接好了"。
+
+第 ④ 步检查的是**进程内测试原理上覆盖不到**的三件事，而它们全都是"告警不响、
+只是体验悄悄变差"的类型：
+
+- **SSE 经 nginx 之后是否仍然一帧一帧地到达** —— 漏写 `proxy_buffering off` 时，
+  流式回答会变成"卡十几秒然后一次性吐出来"，而进程内测试压根不经过 nginx；
+- **灰度权重是否真的生效** —— 靠 `/health/live` 的 `release` 字段分布判断。
+  这是唯一能自证"那 10% 流量真的进了新版本"的检查；
+- **检查点是否真的落了库** —— 退回内存时服务照常工作、回答照常出，**只在容器重启后
+  丢状态**（`/health/ready` 的 `checkpointer` 明细是唯一能看出它的地方）。
+
+它要起一整套容器（几分钟），所以刻意不放进每次 CI 的 push 上，而是手动 / 每晚定时
+（`ci.yml` 的 `e2e` job）。
 
 Grafana 要在 `chatAgent` 文件夹下看到这四个面板（它们随仓库走，不是手工建的；
 `--profile observability` 才会起）：

@@ -247,7 +247,9 @@ def test_run_uses_the_current_interpreter(monkeypatch):
     class _Done:
         returncode = 0
 
-    monkeypatch.setattr(tasks.subprocess, "run", lambda argv, cwd=None: seen.append(list(argv)) or _Done())
+    monkeypatch.setattr(
+        tasks.subprocess, "run", lambda argv, cwd=None, env=None: seen.append(list(argv)) or _Done()
+    )
 
     tasks.run("python scripts/sync_version.py --check")
     tasks.run("pytest tests/ -q -p no:cacheprovider")
@@ -265,7 +267,7 @@ def test_run_reports_failure_without_raising(monkeypatch, capsys):
     class _Fail:
         returncode = 3
 
-    monkeypatch.setattr(tasks.subprocess, "run", lambda argv, cwd=None: _Fail())
+    monkeypatch.setattr(tasks.subprocess, "run", lambda argv, cwd=None, env=None: _Fail())
     assert tasks.run("python -c pass") == 3
     assert "退出码 3" in capsys.readouterr().err
 

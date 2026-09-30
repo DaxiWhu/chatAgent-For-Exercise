@@ -31,7 +31,7 @@ ARGS ?=
 .DEFAULT_GOAL := help
 
 .PHONY: help setup test test-fast check version sync-version openapi lock \
-        backup-pg backup-qdrant drill canary up up-observability down ps logs \
+        backup-pg backup-qdrant drill canary e2e up up-observability down ps logs \
         release rollback clean
 
 help:
@@ -72,6 +72,9 @@ drill:
 
 canary:
 	@$(PYTHON) $(TASKS) canary $(ARGS)
+
+e2e:
+	@$(PYTHON) $(TASKS) e2e $(ARGS)
 
 up:
 	@$(PYTHON) $(TASKS) up

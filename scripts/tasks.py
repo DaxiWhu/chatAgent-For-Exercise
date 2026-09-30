@@ -28,10 +28,14 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
@@ -70,11 +74,18 @@ DRILL_STEPS: tuple[tuple[str, str], ...] = (
     ("Qdrant：快照 → 校验（无服务时跳过）", "python scripts/qdrant_backup.py drill"),
 )
 
+# 端到端检查需要的最小服务集。
+# 刻意**不**用 `up -d` 起全部：备份循环与监控栈（prometheus/grafana/alertmanager）
+# 对这里的检查没有贡献，却会明显拖慢启动、占用内存，还可能因为缺配置而起不来 ——
+# 那会让"E2E 失败"看起来像是业务代码坏了。
+E2E_SERVICES = "pgvector qdrant redis app-stable app-canary nginx"
+E2E_DEFAULT_BASE = "http://127.0.0.1:8080"
+
 
 # --------------------------------------------------------------------------
 # 执行辅助
 # --------------------------------------------------------------------------
-def run(cmd: str | list[str]) -> int:
+def run(cmd: str | list[str], *, env: dict[str, str] | None = None) -> int:
     """打印并执行一条命令，返回退出码。
 
     ⚠️ 用列表形式传给 subprocess（`shell=False`）：命令里含路径与用户输入，
@@ -87,7 +98,7 @@ def run(cmd: str | list[str]) -> int:
         elif argv[0] in _MODULE_ALIASES:
             argv = [PY, "-m", argv[0], *argv[1:]]
     print(f"\n$ {cmd if isinstance(cmd, str) else ' '.join(argv)}", flush=True)
-    rc = subprocess.run(argv, cwd=ROOT).returncode
+    rc = subprocess.run(argv, cwd=ROOT, env=env).returncode
     if rc != 0:
         print(f"\n✗ 命令失败（退出码 {rc}）", file=sys.stderr, flush=True)
     return rc
@@ -236,6 +247,107 @@ def task_logs(args: list[str]) -> int:
     return compose("logs -f --tail=100", args)
 
 
+def _dotenv_value(key: str) -> str | None:
+    """从仓库根的 `.env` 读一个键（只取字面值，不做 `${VAR}` 插值）。"""
+    try:
+        for raw in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip() == key:
+                return v.strip().strip("'\"")
+    except OSError:
+        return None
+    return None
+
+
+def _e2e_api_key() -> str | None:
+    """推断这个栈用的是哪个 Key，好让 E2E 的鉴权用例自动变成"验证拒未授权"。
+
+    优先 `TENANT_KEYS` 的第一个（形如 `acme:<key>,globex:<key>`），其次 `SERVE_API_KEY`；
+    都取不到就返回 None —— 此时那条用例会断言"**应当放行**"（两个方向都有断言，没有 skip）。
+    """
+    tenant_keys = _dotenv_value("TENANT_KEYS")
+    if tenant_keys:
+        first = tenant_keys.split(",")[0]
+        if ":" in first:
+            return first.split(":", 1)[1].strip() or None
+    return _dotenv_value("SERVE_API_KEY") or None
+
+
+def _wait_ready(base: str, timeout: float) -> bool:
+    """轮询 `/health/live` 直到 200。
+
+    等**存活**探针而不是就绪探针：刚 `up` 完时 PG 往往还在初始化，就绪探针会失败，
+    但"HTTP 服务已经起来了"才是这里要等的；依赖到底通没通，交给 E2E 自己的就绪用例去报
+    （那条报错才有明细可看）。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(base + "/health/live", timeout=3) as resp:
+                if resp.status == 200:
+                    return True
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+        time.sleep(2)
+    return False
+
+
+def task_e2e(args: list[str]) -> int:
+    """端到端检查：起真实栈 → 等就绪 → 跑 `tests/test_e2e_stack.py` → 收栈。
+
+    ⚠️ 需要 docker，并会占用 8080（nginx）等端口。跑完**默认收栈**；
+    要保留现场排障就加 `--keep`。
+    检查内容见 `tests/test_e2e_stack.py` 的模块文档（SSE 分帧 / 灰度权重 / 持久化检查点）。
+    """
+    if not require(
+        "docker",
+        "端到端检查要起真实栈，需要 Docker Desktop（或 WSL 里的 docker）且 `docker` 在 PATH 里。",
+    ):
+        return 127
+
+    keep = "--keep" in args
+    build = "--build" in args
+    base = os.environ.get("E2E_BASE_URL") or E2E_DEFAULT_BASE
+    wait = float(os.environ.get("E2E_WAIT", "240"))
+
+    # `--build` 让"镜像构建失败"与"起栈失败"分开定位 —— CI 里首次跑必然要构建，
+    # 若不显式 build，构建错误会混在 `up` 的输出里，看起来像"服务起不来"。
+    print(f"[e2e] 起栈：{E2E_SERVICES}{'（先构建镜像）' if build else ''}", flush=True)
+    if compose(f"up -d{' --build' if build else ''} {E2E_SERVICES}", []) != 0:
+        return 1
+
+    print(f"[e2e] 等待 {base}/health/live 就绪（最多 {wait:.0f}s）…", flush=True)
+    if not _wait_ready(base, wait):
+        print("[e2e] ✗ 栈没有在预期时间内起来。app-stable 日志尾部：", file=sys.stderr, flush=True)
+        compose("logs --tail=60 app-stable", [])
+        if not keep:
+            compose("down", [])
+        return 1
+
+    env = dict(os.environ, E2E_BASE_URL=base)
+    key = os.environ.get("E2E_API_KEY") or _e2e_api_key()
+    if key:
+        env["E2E_API_KEY"] = key
+        print("[e2e] 检测到该栈要求鉴权，已自动带上 E2E_API_KEY", flush=True)
+
+    print("[e2e] 跑检查：tests/test_e2e_stack.py", flush=True)
+    rc = run(["pytest", "tests/test_e2e_stack.py", "-q", "-m", "e2e"], env=env)
+
+    if rc != 0:
+        print("[e2e] 检查未通过。app-stable / nginx 日志尾部：", file=sys.stderr, flush=True)
+        compose("logs --tail=60 app-stable nginx", [])
+
+    if keep:
+        print(f"[e2e] --keep：栈保留着（{base}）。收栈用 `python scripts/tasks.py down`", flush=True)
+    else:
+        print("[e2e] 收栈…", flush=True)
+        compose("down", [])
+    return rc
+
+
 def _bash_script(rel: str, args: list[str]) -> int:
     if not require("bash", "这两个脚本是 bash 写的，需要 Git Bash 或 WSL 环境。"):
         return 127
@@ -307,6 +419,7 @@ TASKS: dict[str, tuple[str, Callable[[list[str]], int]]] = {
     "backup-qdrant": ("备份 Qdrant", task_backup_qdrant),
     "drill": ("恢复演练（结果落指标，供告警消费）", task_drill),
     "canary": ("查看灰度判据（退出码即结论）", task_canary),
+    "e2e": ("端到端检查：起真实栈跑 SSE/灰度/持久化验证", task_e2e),
     "up": ("起本地栈", task_up),
     "up-observability": ("起本地栈（含监控面板）", task_up_observability),
     "down": ("停本地栈", task_down),
