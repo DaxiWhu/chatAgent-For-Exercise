@@ -16,7 +16,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src import docling_loader  # noqa: E402
+from src.rag import docling_loader  # noqa: E402
 
 
 def build_test_pdf(path: str) -> str:
@@ -120,16 +120,16 @@ def main() -> int:
           f"耗时 {time.perf_counter() - t0:.2f}s")
 
     # --- 第三步：完整链路 ---
-    print("\n[3/3] 走 parse_document 完整链路 ...")
+    print("\n[3/3] 走 parse_pdf 完整链路 ...")
     t0 = time.perf_counter()
-    out = docling_loader.parse_document(pdf, os.path.basename(pdf), kind="pdf")
+    out = docling_loader.parse_pdf(pdf, os.path.basename(pdf))
     t_parse = time.perf_counter() - t0
     print(f"  status={out.status}｜pages={out.page_total}｜chunks={len(out.chunks)}"
           f"｜耗时 {t_parse:.1f}s")
     if out.reason:
         print(f"  reason={out.reason}")
 
-    from src.chunk_writer import format_summary, to_legacy
+    from src.rag.chunk_writer import format_summary, to_legacy
     print(f"  汇总：{format_summary(_as_summary(out.chunks))}")
 
     for i, kc in enumerate(out.chunks, start=1):
@@ -153,7 +153,7 @@ def main() -> int:
 
 
 def _as_summary(chunks) -> dict:
-    from src.chunk_writer import summarize
+    from src.rag.chunk_writer import summarize
     return summarize(chunks)
 
 

@@ -1,0 +1,116 @@
+{
+  "_comment": "答案质量评测集：针对随仓库分发的知识库（data/）。每个用例的 key_points 必须是**语料里真实出现的术语**（子串匹配），不是近义词 —— 改了语料就要跑 python scripts/eval_answer.py --show-miss 同步核对。选点的原则是『回答这个问题，材料里必须有这些事实』，而不是『答案里最好提到这些词』。",
+  "docs_dir": "data",
+  "cases": [
+    {
+      "q": "服务有哪些端点",
+      "expect_sources": ["01-服务概览与接口.md"],
+      "key_points": ["/v1/chat", "/v1/review", "/health"]
+    },
+    {
+      "q": "流式对话会下发哪些事件",
+      "expect_sources": ["01-服务概览与接口.md"],
+      "key_points": ["token", "citations", "need_review", "done"]
+    },
+    {
+      "q": "怎么启动服务和为什么不能用 uvicorn 直接起",
+      "expect_sources": ["01-服务概览与接口.md", "02-部署与配置.md"],
+      "key_points": ["app.serve"]
+    },
+    {
+      "q": "如何鉴权，请求头要带什么",
+      "expect_sources": ["01-服务概览与接口.md"],
+      "key_points": ["X-API-Key"]
+    },
+    {
+      "q": "worker 数量从哪里读取",
+      "expect_sources": ["02-部署与配置.md"],
+      "key_points": ["APP_WORKERS"]
+    },
+    {
+      "q": "部署在反向代理后面要注意什么配置",
+      "expect_sources": ["02-部署与配置.md"],
+      "key_points": ["TRUST_PROXY_HEADERS"]
+    },
+    {
+      "q": "容器被停止时怎么保证在途请求不被掐断",
+      "expect_sources": ["02-部署与配置.md"],
+      "key_points": ["stop_grace_period"]
+    },
+    {
+      "q": "语料目录是哪个配置项控制的",
+      "expect_sources": ["02-部署与配置.md", "03-检索与引用链路.md"],
+      "key_points": ["DOCS_DIR"]
+    },
+    {
+      "q": "语料是怎么遍历和切分的",
+      "expect_sources": ["03-检索与引用链路.md"],
+      "key_points": ["glob"]
+    },
+    {
+      "q": "引用为什么可以回溯到原文件",
+      "expect_sources": ["03-检索与引用链路.md"],
+      "key_points": ["chunk_id"]
+    },
+    {
+      "q": "多租户的知识库是怎么隔离的",
+      "expect_sources": ["03-检索与引用链路.md"],
+      "key_points": ["租户"]
+    },
+    {
+      "q": "限流的判定值是怎么算出来的",
+      "expect_sources": ["04-限流与配额.md"],
+      "key_points": ["上一窗口", "加权"]
+    },
+    {
+      "q": "被限流后 Retry-After 是怎么定的",
+      "expect_sources": ["04-限流与配额.md"],
+      "key_points": ["Retry-After"]
+    },
+    {
+      "q": "配额为什么要先预占再结算",
+      "expect_sources": ["04-限流与配额.md"],
+      "key_points": ["claim", "settle"]
+    },
+    {
+      "q": "Redis 挂掉之后配额和限流还能工作吗",
+      "expect_sources": ["04-限流与配额.md"],
+      "key_points": ["进程内"]
+    },
+    {
+      "q": "指标直方图为什么要用固定桶",
+      "expect_sources": ["05-可观测与SLO.md"],
+      "key_points": ["固定桶", "内存"]
+    },
+    {
+      "q": "SLO 的可用性目标是多少",
+      "expect_sources": ["05-可观测与SLO.md"],
+      "key_points": ["99.5"]
+    },
+    {
+      "q": "告警是怎么路由到不同接收人的",
+      "expect_sources": ["05-可观测与SLO.md"],
+      "key_points": ["category"]
+    },
+    {
+      "q": "怎么备份和恢复数据库",
+      "expect_sources": ["06-运维手册.md"],
+      "key_points": ["备份"]
+    },
+    {
+      "q": "上线前要检查哪些东西",
+      "expect_sources": ["06-运维手册.md"],
+      "key_points": ["自检"]
+    },
+    {
+      "q": "回答里没有任何引用应该怎么排查",
+      "expect_sources": ["06-运维手册.md", "03-检索与引用链路.md"],
+      "key_points": ["引用"]
+    },
+    {
+      "q": "SSE 连上了但一个 token 都没吐是什么原因",
+      "expect_sources": ["06-运维手册.md"],
+      "key_points": ["检查点", "token"]
+    }
+  ]
+}

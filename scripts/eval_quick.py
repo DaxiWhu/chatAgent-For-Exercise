@@ -16,10 +16,8 @@ sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 
 import numpy as np
-import src.retrieval as R
+import src.rag.retrieval as R
 from langchain_openai import OpenAIEmbeddings
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 EN = "Represent this sentence for searching relevant passages: "
 SET = json.load(open(os.path.join("scripts", "eval_set.json"), encoding="utf-8"))
@@ -90,8 +88,10 @@ for strategy, csize in [("recursive", 500), ("headings", 300)]:
     shutil.rmtree(tmp, ignore_errors=True)
 
     texts = [c["text"] for c in chunks]
-    tv = TfidfVectorizer(analyzer=R.TFIDF_ANALYZER, ngram_range=R.TFIDF_NGRAM_RANGE)
-    M = tv.fit_transform(texts)
+    # 稀疏路**直接复用生产实现**（BM25Retriever），不再在这里内联一套 TF-IDF 余弦：
+    # 内联副本一旦和生产漂移，这个脚本就会用"另一套算法"报出好看的数，比没有评测更危险。
+    sparse = R.BM25Retriever(chunks)
+    idx_of = {id(c): i for i, c in enumerate(chunks)}   # 同一批 dict 对象，按 id 反查下标
     D = norm(np.array(emb.embed_documents(texts)))
 
     print(f"\n### 切分策略 = {strategy} / chunk={csize} → {len(chunks)} 个片段")
@@ -101,14 +101,13 @@ for strategy, csize in [("recursive", 500), ("headings", 300)]:
         Q = norm(np.array(emb.embed_documents([prefix + q["q"] for q in QUERIES])))
         tf, de, hy = [], [], []
         for i, q in enumerate(QUERIES):
-            tsim = cosine_similarity(tv.transform([q["q"]]), M)[0]
+            tr = [idx_of[id(c)] for c, _ in sparse.search(q["q"], top_k=10)]
             dsim = D @ Q[i]
-            tr = list(np.argsort(tsim)[::-1][:10])
             dr = list(np.argsort(dsim)[::-1][:10])
             tf.append(tr[:3])
             de.append(dr[:3])
             hy.append(rrf([tr, dr])[:3])
-        report(f"tfidf {pname}", tf, chunks)
+        report(f"bm25 {pname}", tf, chunks)
         report(f"semantic {pname}", de, chunks)
         report(f"hybrid {pname}", hy, chunks)
         print()

@@ -25,8 +25,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src import docling_loader  # noqa: E402
-from src.chunk_writer import to_legacy  # noqa: E402
+from src.rag import docling_loader  # noqa: E402
+from src.rag.chunk_writer import to_legacy  # noqa: E402
 
 
 def _build_sample(path: str) -> str:

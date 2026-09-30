@@ -36,7 +36,10 @@ logger = logging.getLogger(__name__)
 try:
     from dotenv import load_dotenv
 
-    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # 项目根 = 上溯 3 层（src/rag/x.py → src/rag → src → 根）。少一层会指向
+    # src/.env（并不存在）而让加载静默失效；下面用 `_ROOT` 解析相对媒体目录，
+    # 若算错会把 data/.media 落到 src/data/.media 里（2026-09-28 迁入 src/rag/ 时踩过）。
+    _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     load_dotenv(dotenv_path=os.path.join(_ROOT, ".env"))
 except Exception:  # noqa: BLE001  （dotenv 是可选依赖）
     pass
@@ -144,6 +147,12 @@ class DocxAsset:
 # XML 小工具：一律按 (命名空间集合, local-name) 匹配
 # ---------------------------------------------------------------------------
 def _split_tag(tag: Any) -> tuple[str, str]:
+    """`{ns}local` → (ns, local)；没有命名空间前缀时 ns 返回空串。
+
+    tag: ElementTree 的 tag 值。**它不保证是字符串**——注释节点 / 处理指令的 tag
+        是函数对象；此时返回 ("", "")，让调用方按"local-name 不匹配"自然跳过，
+        免得每个调用点都要判一次类型。
+    """
     if not isinstance(tag, str):
         return "", ""
     if tag.startswith("{"):
@@ -153,18 +162,38 @@ def _split_tag(tag: Any) -> tuple[str, str]:
 
 
 def _local(tag: Any) -> str:
+    """取 local-name（丢掉命名空间前缀），是命名空间无关匹配的基础原语。
+
+    tag: ElementTree 的 tag 值；非字符串时返回 ""（见 _split_tag）。
+    """
     return _split_tag(tag)[1]
 
 
 def _in(ns: str, group: set[str]) -> bool:
+    """判断命名空间是否属于某个集合（Strict 与 Transitional 两种 URI 都要认）。
+
+    ns: 待判定的命名空间 URI（通常来自 _split_tag 的第一个返回值）。
+    group: 允许的 URI 集合，如模块级 _W / _R / _A / _C。
+    """
     return ns in group
 
 
 def _children(el: Any, local: str) -> list:
+    """取**直接子元素**中 local-name 等于 local 的全部元素（同名子元素都返回）。
+
+    el: 父元素。
+    local: 目标 local-name（不带命名空间前缀，如 "pt"、"ser"）。
+    """
     return [c for c in list(el) if _local(c.tag) == local]
 
 
 def _child(el: Any, local: str):
+    """取**第一个**直接子元素中 local-name 等于 local 的；没有则返回 None。
+
+    el: 父元素。
+    local: 目标 local-name。只取第一个是有意的：这些位置（tx / cat / val）在
+        OOXML 里约定唯一，取多个反而要把"哪个才算"的选择题往下游推。
+    """
     for c in list(el):
         if _local(c.tag) == local:
             return c
@@ -172,6 +201,12 @@ def _child(el: Any, local: str):
 
 
 def _descendants(el: Any, local: str) -> list:
+    """取**所有后代**（含自身）中 local-name 等于 local 的元素，遍历整棵子树。
+
+    el: 子树根元素。
+    local: 目标 local-name（如 "pt"、"v"）。用在结构层次不固定的地方——
+        pt 有时在 strCache 直下、有时还嵌一层，所以按后代而非直接子元素取。
+    """
     return [d for d in el.iter() if _local(d.tag) == local]
 
 
@@ -180,6 +215,10 @@ def _rel_attr(el: Any, name: str) -> str:
 
     OOXML 里同一个元素上 r: 命名空间的属性前缀写法五花八门，
     按"命名空间 ∈ _R 且 local-name 相等"取，比按前缀取稳。
+
+    el: 待取属性的元素。
+    name: 目标属性的 **local-name**（如 "embed" / "id"），**不带 r: 前缀**；
+        没有该属性时返回 ""。
     """
     for k, v in (getattr(el, "attrib", None) or {}).items():
         ns, local = _split_tag(k)
@@ -189,7 +228,12 @@ def _rel_attr(el: Any, name: str) -> str:
 
 
 def _text_of(el: Any, ns_group: set[str]) -> str:
-    """把元素下某命名空间的 t 节点文字拼起来（兼容 rich text 被拆成多个 run）。"""
+    """把元素下某命名空间的 t 节点文字拼起来（兼容 rich text 被拆成多个 run）。
+
+    el: 子树根元素；None 直接返回 ""。
+    ns_group: 目标命名空间集合——Word 文字传 _W、DrawingML 文字传 _A。同一棵子树里
+        两种命名空间的 `t` 都可能存在，必须靠它区分，否则会串字。
+    """
     if el is None:
         return ""
     parts = []
@@ -208,6 +252,8 @@ def _read_rels(zf: zipfile.ZipFile) -> dict[str, dict]:
 
     target 一律解析成**包内绝对路径**（如 word/media/image1.png），
     这样后面找 part 不用再关心相对谁。
+
+    zf: 已打开的 docx zip 容器。缺 rels 部件或解析失败时返回 {}（只告警、不抛）。
     """
     out: dict[str, dict] = {}
     if _DOC_RELS not in zf.namelist():
@@ -250,6 +296,8 @@ def _scan_document(zf: zipfile.ZipFile) -> list[dict]:
     总是排在它描述的 `<a:blip/>` **之前**，所以按文档流顺序遇到 docPr 就"挂起"，
     遇到下一个媒体元素时认领。这是作者手写的说明文字，**确定性、免 VLM**，
     对图片召回的价值比任何生成式描述都高，不能漏。
+
+    zf: 已打开的 docx zip 容器。缺 document.xml 或解析失败时返回 []（只告警、不抛）。
     """
     if _MAIN_DOC not in zf.namelist():
         return []
@@ -321,6 +369,10 @@ def _pt_values(container: Any) -> list[str]:
           <c:strCache><c:ptCount val="4"/>
             <c:pt idx="0"><c:v>2019</c:v></c:pt> …
     `c:f` 只是"公式引用串"（如 Sheet1!$A$2），**不是数据**，绝不能拿它当值。
+
+    container: 含 `c:pt` 的容器元素（如 `c:strCache` / `c:numCache`）；None 返回 []。
+        返回值按 pt 的 `idx` **升序**排列，与 XML 书写顺序无关（缺失的 idx 直接跳过，
+        不做补位）——这样类目与数值两侧的序号口径一致。
     """
     if container is None:
         return []
@@ -346,6 +398,9 @@ def _ref_string(container: Any) -> str:
     ⚠️ 它**不是数据**，绝不能当成值用（这是最容易犯的错）。它的唯一用途是当缓存缺失时
     回表去读——见 loaders 里对 xlsx 图表的重解析：openpyxl 生成的图表就只写引用、
     不写 `c:numCache`，此时"确定性数据"其实还在工作表里。
+
+    container: 含 strRef / numRef / multiLvlStrRef 的元素（如 cat / val / tx）；
+        None 或找不到引用节点时返回 ""。
     """
     if container is None:
         return ""
@@ -359,12 +414,16 @@ def _ref_string(container: Any) -> str:
 
 
 def _series_data(ser: Any) -> dict:
-    """单个 c:ser → {name, categories, values, cat_ref, val_ref}。
+    """单个 c:ser → {name, categories, values, cat_ref, val_ref, name_ref}。
 
     系列名有两个来源，顺序不能反：
       1. `c:tx` 下的 cache（`c:strCache/c:pt/c:v`）—— 真实 Word 写的就是这个；
       2. `c:tx` 下的富文本（`a:p/a:r/a:t`）—— 手写/某些工具会走这条。
     ⚠️ 别去读 `c:tx/c:strRef/c:f`，那是公式串（如 `Sheet1!$B$1`）而不是名字。
+
+    ser: 一个 `c:ser` 元素。散点图用 xVal/yVal 而非 cat/val，这里会把它**归一**成
+        categories/values（以及对应的 ref 字段），所以调用方不必按图表类型分支。
+        返回的 cat_ref / val_ref / name_ref 供缓存缺失时回表取值用。
     """
     tx = _child(ser, "tx")
     name = " ".join(_pt_values(tx)).strip() or _text_of(tx, _A)
@@ -388,6 +447,10 @@ def parse_chart_xml(data: bytes) -> dict:
 
     返回值可能为空壳，调用方据此决定要不要退回 VLM —— 这是"确定性优先"的落点：
     只有 XML 里真的没有数据时，才轮到生成式模型。
+
+    data: `chart*.xml` 的**原始字节**（不是文件路径、也不是已解析的 Element）。
+        返回 {chart_type, type_cn, title, series, categories, error}；解析失败或
+        找不到任何系列时 error 非空、series 为空列表。
     """
     info: dict = {"chart_type": "", "type_cn": "", "title": "", "series": [],
                   "categories": [], "error": ""}
@@ -444,6 +507,10 @@ def chart_to_table(chart: dict) -> str:
 
     用 Markdown 而不是自造格式：knowledge_chunk 里表格的保真表示和文字化都
     已经围着 Markdown 建好了，走同一条路能直接复用那套容错。
+
+    chart: parse_chart_xml 产出的 chart dict（或经 loaders._resolve_chart_refs
+        回表补值后的版本）。没有 series 时返回 ""；类目长度与数值长度不一致时用
+        "第 N 项" 占位，不裁齐。
     """
     if not chart or not chart.get("series"):
         return ""
@@ -471,6 +538,9 @@ def chart_to_text(chart: dict) -> str:
     为什么不能只留 Markdown：二维网格在向量空间里离自然语言问题很远，
     用户问"2021 年销售额是多少"不会命中 `| 2021 | 180 |`。
     把类目和数值显式写成"X=Y、X=Y"，才能被召回。
+
+    chart: 同 chart_to_table。没有 series 时返回 ""；某系列无值时写成
+        "系列「名」无数据"（保留系列存在的事实，而不是整段省略）。
     """
     if not chart or not chart.get("series"):
         return ""
@@ -494,7 +564,12 @@ def chart_to_text(chart: dict) -> str:
 # OLE：导出原件，并尽力取出内层文件
 # ---------------------------------------------------------------------------
 def _sniff_ext(blob: bytes) -> str:
-    """按文件头猜内层类型。返回扩展名，猜不出返回空串。"""
+    """按文件头猜内层类型。返回扩展名，猜不出返回空串。
+
+    blob: 待判定的文件字节。识别 ZIP（再按内部首条目细分 xlsx/pptx/docx）、
+        PDF、XML；认不出返回 ""——调用方据此决定是否再尝试 CFB/OLE 解包，
+        所以"猜不出"必须是空串而不能随便给个 .bin。
+    """
     if blob.startswith(_MAGIC_ZIP):
         try:
             import io
@@ -522,6 +597,9 @@ def extract_ole_payload(blob: bytes) -> tuple[bytes, str]:
     绝不让缺一个可选依赖把整条 docx 解析带崩。
     有些工具（如某些转换器）会直接把 xlsx 塞进 embeddings，这时文件头就是 PK，
     所以先探测再解包。
+
+    blob: `word/embeddings/*.bin` 的原始字节。返回值第二项为扩展名：解出内层时是
+        真实扩展名，解不出时是空串（此时第一项仍是原字节，调用方按 .bin 导出保底）。
     """
     ext = _sniff_ext(blob)
     if ext:
@@ -546,14 +624,25 @@ def extract_ole_payload(blob: bytes) -> tuple[bytes, str]:
 # 导出
 # ---------------------------------------------------------------------------
 def _safe_name(name: str) -> str:
-    """去掉路径成分与危险字符，保留原文件名便于人工核对。"""
+    """去掉路径成分与危险字符，保留原文件名便于人工核对。
+
+    name: 原始文件名（可能含路径成分与 Windows 非法字符，也可能为空）。
+        返回仅保留 basename、非法字符替换成 `_`、去掉首尾点与空格的名字；
+        结果为空时回退成 "asset"。
+    """
     base = os.path.basename((name or "").replace("\\", "/"))
     base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", base).strip(". ")
     return base or "asset"
 
 
 def _write(blob: bytes, dest_dir: str, filename: str) -> str:
-    """写文件，重名自动加序号。返回落盘路径，失败返回空串。"""
+    """写文件，重名自动加序号。返回落盘路径，失败返回空串。
+
+    blob: 要写入的字节内容。
+    dest_dir: 目标目录；不存在会被创建。
+    filename: 期望的文件名。**重名时自动追加 `_2` / `_3`…**，所以返回的路径才是
+        权威（调用方不要自己拼路径）。写入失败返回 ""（只告警、不抛）。
+    """
     try:
         os.makedirs(dest_dir, exist_ok=True)
         stem, ext = os.path.splitext(filename)
@@ -581,6 +670,11 @@ def media_dir_for(path: str, media_dir: Optional[str] = None) -> str:
     但"这个图属于哪份文档"就再也说不清了，人工核对时是灾难。
     指纹取自**绝对路径**，所以同一份文档重复解析仍落在同一目录，
     增量重建时不会堆出一堆副本。
+
+    path: 源文档路径。其**绝对路径**（Windows 下先转小写）被哈希成 8 位指纹，
+        保证"同文档同目录、异文档异目录"。
+    media_dir: 媒体根目录覆盖项；None 时用模块级 MEDIA_DIR（可由环境变量
+        RAG_MEDIA_DIR 配置）。相对路径按项目根 `_ROOT` 解析成绝对路径。
     """
     root = media_dir or MEDIA_DIR
     if not os.path.isabs(root):
@@ -599,6 +693,11 @@ def extract(path: str, *, media_dir: Optional[str] = None) -> list[DocxAsset]:
 
     失败（不是 zip、文件损坏）返回空列表并告警：docx 支路整体不因媒体提取失败而中断，
     正文仍由 Docling（路线 A）提供。
+
+    path: 待解析的 .docx 路径。文件不存在、不是 zip、或打开失败均返回 [] 并告警
+        （旧式 .doc 也会走到这里，日志会提示先转换）。
+    media_dir: 媒体导出根目录覆盖项，透传给 media_dir_for。**仅关键字传参**，
+        避免与 path 的位置参数混淆。
     """
     if not os.path.isfile(path):
         logger.warning("docx 媒体提取：文件不存在 %s", path)
@@ -673,6 +772,9 @@ def _mark_ole_previews(assets: list[DocxAsset]) -> None:
       2. **同段落里那个 OLE 的正文确实解析出来了**（ole_text 非空）。
     第 2 条是关键：原件没解出来时（内层是 Visio 等我们不认识的格式），
     预览图可能就是唯一的视觉线索，那时保留它才是对的。
+
+    assets: extract 产出的资产列表。**就地**把命中的图片标的 is_ole_preview 置 True 并
+        清空其 error；无返回值、不新增/删除元素。
     """
     by_para: dict[int, DocxAsset] = {}
     for a in assets:
@@ -696,6 +798,14 @@ def _mark_ole_previews(assets: list[DocxAsset]) -> None:
 
 
 def _build_chart(zf, part: str, ref: dict) -> DocxAsset:
+    """把一个 chart 部件读成 kind="chart" 的 DocxAsset（数据来自 parse_chart_xml）。
+
+    zf: 已打开的 docx zip 容器。
+    part: 图表部件在包内的路径（如 word/charts/chart1.xml）。
+    ref: _scan_document 产出的一条引用记录，提供 rel_id / para_index / para_text /
+        anchor_text / alt / form 等位置与标注信息。读取失败时返回的资产 error 非空、
+        chart 为 None（调用方据此决定是否退 VLM）。
+    """
     asset = DocxAsset(kind="chart", rel_id=ref["rel_id"], part=part,
                       filename=os.path.basename(part),
                       para_index=ref["para_index"], para_text=ref["para_text"],
@@ -715,6 +825,17 @@ def _build_chart(zf, part: str, ref: dict) -> DocxAsset:
 
 def _build_blob(zf, part: str, ref: dict, out_dir: str, exported: dict,
                 *, kind: str) -> DocxAsset:
+    """把任意部件导出成文件并生成 DocxAsset（图片、OLE 与"其它"共用这一条路径）。
+
+    zf: 已打开的 docx zip 容器。
+    part: 部件在包内的路径。
+    ref: _scan_document 产出的一条引用记录，提供位置信息与 ProgID。
+    out_dir: 媒体导出目录（由 media_dir_for 得出）。
+    exported: **去重表** {part: 落盘路径}，跨调用共享；命中则不重复写盘，直接把已有
+        路径填进资产。新增项由本函数回写。
+    kind: 资产类型（"image" / "ole" / "other"）。**仅关键字传参**。kind=="ole" 时
+        额外解内层原件、按真实扩展名导出，并抽取内层正文摘要到 ole_text。
+    """
     asset = DocxAsset(kind=kind, rel_id=ref["rel_id"], part=part,
                       filename=os.path.basename(part),
                       para_index=ref["para_index"], para_text=ref["para_text"],
@@ -757,6 +878,10 @@ def _ole_inner_text(saved_path: str, ext: str) -> str:
     为什么值得做：内嵌的 Excel 里往往是**整张数据表**，用 loaders 直接解析
     比识别一张截图准得多，而且是确定性的。截断到 OLE_TEXT_LIMIT，
     避免一份几十页的嵌入表把检索索引冲淡。
+
+    saved_path: OLE 内层原件已落盘的路径（会被交给 loaders 解析）。
+    ext: 内层扩展名（**含点**，如 ".xlsx"）。空串或不在 loaders 支持范围内时返回 ""
+        （外层 loaders 是可选依赖链，这里不做兜底转换）；解析异常时也只告警返回 ""。
     """
     if not ext:
         return ""
@@ -779,6 +904,10 @@ def _log_summary(path: str, assets: list[DocxAsset]) -> None:
 
     只看"解析了多少块"看不出图表/OLE 有没有被漏掉，而这两类恰恰是 Docling
     完全拿不到、丢了也没人报错的部分。
+
+    path: 源 docx 路径（日志里只打 basename）。
+    assets: 本次提取出的全部资产。只读，不改动它们；数量、图表可读数、导出数、
+        OLE 预览数与异常项都会汇总成一行（异常项最多列前 5 条）。
     """
     counts: dict[str, int] = {}
     for a in assets:
@@ -822,6 +951,9 @@ def _slide_parts(zf: zipfile.ZipFile) -> list[tuple[int, str]]:
 
     不能按字符串排序：`slide10.xml` 会排在 `slide2.xml` 前面，
     于是"第 10 页的图"被挂到第 2 页上 —— 位置信息错得非常隐蔽。
+
+    zf: 已打开的 pptx（或任何含 ppt/slides/ 的）zip 容器。返回按幻灯片号从 1 起的
+        升序列表；没有幻灯片时返回 []（不抛）。
     """
     out = []
     for name in zf.namelist():
@@ -835,6 +967,9 @@ def extract_ooxml_charts(path: str) -> list[dict]:
     """从 xlsx / pptx（以及 docx）包里取出所有图表 → [{part, chart, page, alt_text}]。
 
     只做"取数据"，不做入库决策；解析不出系列的图表会被跳过（空图表进了索引也没用）。
+
+    path: xlsx / pptx / docx 文件路径。文件不存在或不是 zip 时返回 []。pptx 的图表
+        会带上所属页码（page），xlsx/docx 的 page 为 None。
     """
     if not os.path.isfile(path) or not zipfile.is_zipfile(path):
         return []
@@ -875,6 +1010,10 @@ def _read_part_rels(zf: zipfile.ZipFile, part: str) -> dict[str, dict]:
     `../media/image1.png`（相对 ppt/slides/），直接砍掉 `../` 会得到
     `media/image1.png` —— 那个部件在包里不存在，于是图片和图表**一个都取不到**，
     而且不会报错（实测踩过）。这里统一用 normpath 拼接，`.docx`/`.xlsx`/`.pptx` 通用。
+
+    zf: 已打开的 OOXML zip 容器（docx / xlsx / pptx 通用）。
+    part: 需要读关系文件的部件路径（如 ppt/slides/slide1.xml）。对应的 rels 部件不
+        存在或解析失败时返回 {}。
     """
     folder, _, filename = part.rpartition("/")
     rels_part = f"{folder}/_rels/{filename}.rels" if folder else f"_rels/{filename}.rels"
@@ -911,6 +1050,9 @@ def extract_pptx_media(path: str, media_dir: Optional[str] = None) -> list[dict]
     替代文字沿用与 docx 相同的"挂起—认领"手法：
     `p:cNvPr@descr` 排在它描述的 `<a:blip>` **之前**，所以遇到 cNvPr 就挂着，
     遇到下一个媒体引用时认领。作者写的替代文字是确定性描述，免 VLM。
+
+    path: .pptx 文件路径。文件不存在或不是 zip 时返回 []；单页解析失败只跳过该页。
+    media_dir: 媒体导出根目录覆盖项，透传给 media_dir_for；不传时用模块默认。
     """
     if not os.path.isfile(path) or not zipfile.is_zipfile(path):
         return []
@@ -969,6 +1111,13 @@ def extract_pptx_media(path: str, media_dir: Optional[str] = None) -> list[dict]
 
 
 def _export_part(zf: zipfile.ZipFile, part: str, out_dir: str) -> str:
+    """把一个部件原样导出到 out_dir。返回落盘路径，失败返回 ""。
+
+    zf: 已打开的 zip 容器。
+    part: 部件在包内的路径。
+    out_dir: 导出目录（由 media_dir_for 得出）。文件名经 _safe_name 过滤，重名由
+        _write 自动加序号。
+    """
     try:
         return _write(zf.read(part), out_dir, _safe_name(os.path.basename(part)))
     except Exception as exc:  # noqa: BLE001
@@ -977,7 +1126,13 @@ def _export_part(zf: zipfile.ZipFile, part: str, out_dir: str) -> str:
 
 
 def summarize(assets: list[DocxAsset]) -> dict:
-    """供脚本与测试使用：把结果排成可直接打印的结构。"""
+    """供脚本与测试使用：把结果排成可直接打印的结构。
+
+    assets: DocxAsset 列表（extract 的产物）。返回按类别分组的统计 dict：
+        total / by_kind / charts_with_data / charts_no_data / saved /
+        ole_previews / errors（后四项装的是**资产对象本身**，便于打印细节）。
+        只读，不改动传入的资产。
+    """
     counts: dict[str, int] = {}
     for a in assets:
         counts[a.kind] = counts.get(a.kind, 0) + 1

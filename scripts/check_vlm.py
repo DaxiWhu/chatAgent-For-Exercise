@@ -25,7 +25,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src import image_describer as D  # noqa: E402
+from src.rag import image_describer as D  # noqa: E402
 
 # 画一张"带数字的柱状图"。必须真有几个数字与标题：
 # 没有数字就无法验证"数值回查"这条防幻觉规则是否真的在工作。
@@ -83,7 +83,7 @@ def main() -> int:
     print(f"测试图：{img_path}（{size_kb:.1f} KB）")
 
     # 组装一个"像真产物一样"的块：有章节与前后文，但**没有 caption**（所以需要 VLM）
-    from src.knowledge_chunk import KnowledgeChunk
+    from src.rag.knowledge_chunk import KnowledgeChunk
     chunk = KnowledgeChunk(
         source="demo.pdf", page=3, kind="diagram", section_path="第三章 > 出口情况",
         content="", retrieval_text="第三章 > 出口情况", needs_vlm=True,

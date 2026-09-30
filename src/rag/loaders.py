@@ -47,6 +47,12 @@ KIND_DIAGRAM = "diagram"
 
 
 def _env_int(name: str, default: int) -> int:
+    """读一个整数型环境变量，读不到或格式不对就返回默认值。
+
+    name: 环境变量名（如 "RAG_MAX_BLOCKS"）。
+    default: 缺省值。变量不存在、为空串、或不是合法整数时原样返回它。
+        **兜底而非报错**是有意的：一个配错的环境变量不该让整条解析链路起不来。
+    """
     try:
         return int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
@@ -91,9 +97,18 @@ _BLOCK_LOADERS: dict[str, Callable[[str], list[Block]]] = {}
 
 
 def register(*exts):
-    """把函数注册为某些扩展名的块解析器（函数需返回 list[Block]）。"""
+    """把函数注册为某些扩展名的块解析器（函数需返回 list[Block]）。
+
+    *exts: 一个或多个扩展名字符串，**必须带前导点**（如 ".md"、"*.txt" 里的
+        ".txt"）。内部统一转小写后作为 _BLOCK_LOADERS 的键；同一扩展名被重复
+        注册时，后注册的覆盖先注册的（模块级顺序决定最终归属）。
+    """
 
     def deco(fn):
+        """把 fn 登记到 *exts 的每个扩展名下，并原样返回它（便于继续叠加装饰）。
+
+        fn: 被装饰的函数，签名约定为 fn(path) -> list[Block]。
+        """
         for e in exts:
             _BLOCK_LOADERS[e.lower()] = fn
         return fn
@@ -106,11 +121,16 @@ def supported_extensions() -> set:
 
 
 def load_blocks(path: str) -> list[Block]:
-    """任意受支持格式 → list[Block]。失败返回 [] 并告警。"""
+    """任意受支持格式 → list[Block]。失败返回 [] 并告警。
+
+    path: 待解析文件的路径。扩展名（小写）决定走哪个块解析器；未注册的扩展名
+        一律按纯文本处理（_blocks_plain），**不报错**。整体异常被吞掉并降级为
+        空列表，以保证单份文件失败不中断整批语料。
+    """
     ext = os.path.splitext(path)[1].lower()
-    fn = _BLOCK_LOADERS.get(ext)
+    fn = _BLOCK_LOADERS.get(ext)        #拿到对应的块解析器
     try:
-        blocks = fn(path) if fn is not None else _blocks_plain(path)
+        blocks = fn(path) if fn is not None else _blocks_plain(path)        #没有就当纯文本读取
     except Exception as e:  # noqa: BLE001
         logger.warning("解析失败，跳过 %s：%s", os.path.basename(path), e)
         return []
@@ -129,6 +149,9 @@ def load_text(path: str) -> str:
 
     与历史行为保持一致：过去每个格式各自产出一段文本，现在统一由块拼出来，
     所以"能读出来什么"不变，只是结构信息也一并留在了 load_blocks 里。
+
+    path: 待读取文件的路径。分派与兜底规则与 load_blocks 完全一致（同一套
+        扩展名映射），只是把结果拼成一段字符串返回。
     """
     return _blocks_to_text([b.text for b in load_blocks(path)])
 
@@ -140,7 +163,12 @@ _ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "utf-16", "latin-1")
 
 
 def _read_text_file(path: str) -> str:
-    """按常见编码逐个尝试读取，覆盖中文 Windows 常见的 GBK/GB18030 文件。"""
+    """按常见编码逐个尝试读取，覆盖中文 Windows 常见的 GBK/GB18030 文件。
+
+    path: 待读取的文本文件路径。以二进制打开后按 _ENCODINGS 顺序试解，第一个
+        不抛 UnicodeDecodeError 的编码胜出；全部失败时用 utf-8 + errors="ignore"
+        兜底（宁可丢几个无法解码的字符，也不让整份文件读不出来）。
+    """
     raw = open(path, "rb").read()
     for enc in _ENCODINGS:
         try:
@@ -151,11 +179,21 @@ def _read_text_file(path: str) -> str:
 
 
 def _blocks_to_text(blocks) -> str:
-    """块级内容用空行分隔（正好对上递归切分器的第一优先级分隔符 \\n\\n）。"""
+    """块级内容用空行分隔（正好对上递归切分器的第一优先级分隔符 \\n\\n）。
+
+    blocks: 任意可迭代的**字符串**序列（注意不是 Block 对象——调用方传的是
+        [b.text ...]）。每个元素先 strip，空串丢弃，再用空行连接；传入空序列返回 ""。
+    """
     return "\n\n".join(b for b in (x.strip() for x in blocks) if b)
 
 
 def _cell(v: Any) -> str:
+    """单元格值 → 去空白字符串（表格类解析的统一取数口）。
+
+    v: 任意单元格原始值（None / int / float / datetime / str 皆可）。None 归一成
+        空串，其余 str() 后 strip —— 这样"空"在本模块里只有一种表示，下游的
+        `if v` / `any(...)` 判断不会因 None 与 "" 混用而出错。
+    """
     return ("" if v is None else str(v)).strip()
 
 
@@ -165,6 +203,11 @@ def _row_to_kv(header: list[str], row: list) -> str:
     为什么所有表格类格式都要走这一步：二维网格里"值"的含义由**列位置**承担，
     而列名通常只出现在首行。切开之后，后面那些块里就只剩 `服务器采购 | 50000` ——
     没人知道 50000 是金额还是数量。把列名写进每一行是这个问题的唯一确定性解法。
+
+    header: 表头字符串列表，第 i 个元素作 row 第 i 列的列名。长度允许短于 row，
+        不足处回退成 "列{i+1}"（表头缺列时不至于把值丢掉）。
+    row: 一行的原始值序列（未转字符串，内部逐格过 _cell）。空值格会被跳过，
+        因此返回串里的列数是"非空列数"而非 row 的长度。
     """
     pairs = []
     for i, v in enumerate(row):
@@ -183,6 +226,10 @@ def _looks_like_header(row: list[str], next_row: Optional[list[str]] = None) -> 
     在中文表格里"城市/特产/气候"与"梧州/六堡茶/亚热带"都是文本，猜错就会把数据行当表头，
     整张表的列名全错且不会报错。所以默认 **第一行即表头**（这是 CSV/XLSX 的通行约定），
     只有在该行为空时才向后找第一行非空。
+
+    row: 待判定的行（已转成字符串列表）。
+    next_row: 下一行。**当前实现未使用它**，仅保留签名以承接"将来想用上下文判断"
+        的扩展点；不传与被传入真实下一行，返回值完全相同。
     """
     return any(c.strip() for c in row)
 
@@ -192,15 +239,37 @@ def _looks_like_header(row: list[str], next_row: Optional[list[str]] = None) -> 
 # ---------------------------------------------------------------------------
 @register(".txt", ".log", ".rst", ".text")
 def _blocks_plain(path) -> list[Block]:
-    """按空行分段成块。
+    """纯文本：整篇一个块，切分完全交给下游的递归切分器。
 
-    为什么要分段而不是整篇一个块：块边界越靠后的切分器决定，越容易在奇怪的地方断开；
-    空行分段是这个格式**自己**能说清的结构，交给切分器当硬边界最稳。
+    为什么不再按空行预分段（2026-09-27 改）：
+    `\\n\\n` 本来就是递归切分器的**第一优先级分隔符**（`retrieval.py` 的
+    `SPLIT_SEPARATORS[0]`），所以按空行预分段**没有提供切分器不知道的信息**，
+    却废掉了它的两件事：① 把相邻小段**合并**到接近 `chunk_size` —— `from_blocks`
+    对每个 Block 单独调 splitter，而 splitter 只切不并（`split_by_headings` 是
+    `splitter.split_text(content) if len(content) > chunk_size else [content]`）；
+    ② 跨块 overlap —— 段与段之间完全没有重叠。
+
+    实测（20 段 / 1400 字符 / chunk_size=300 / overlap=50）：
+      预分段          → 20 块，平均 68 字符（预算的 23%）
+      整篇一个块      →  5 块，平均 278 字符
+      直接调 splitter →  5 块，平均 278 字符（与上一行**逐字一致** → 预分段是纯损耗）
+
+    ⚠️ 本函数只填 `text`，其余 6 个 Block 字段全是默认值 —— 这正是"可以整篇交给
+    切分器"的前提（没有结构信息可丢）。`.md`（标题路径）/ `.csv`（重复表头）/
+    `.xlsx`（工作表号）/ `.pptx`（幻灯片号）的 Block 带**切分器看不见的结构标注**，
+    那里必须保留预分段，**不要把这个结论推广过去**。
+
+    另注：CRLF 文件不需要先做换行归一化 —— `\\r\\n\\r\\n` 虽然匹配不上 `\\n\\n`，
+    但会退到 `\\n` 优先级断开，且切分器默认 `strip_whitespace=True` 会把 `\\r` 去掉，
+    实测结果与 LF 版**逐字一致**。
+
+    path: 纯文本文件路径。编码由 _read_text_file 兜底（GBK/GB18030 也能正确读）；
+        内容全为空白时返回 []。
     """
     text = _read_text_file(path)
     if not text.strip():
         return []
-    return [Block(text=part.strip()) for part in re.split(r"\n\s*\n", text) if part.strip()]
+    return [Block(text=text.strip())]
 
 
 _FENCE = re.compile(r"^\s*(```|~~~)")
@@ -216,6 +285,8 @@ def _blocks_markdown(path) -> list[Block]:
          检索回来的是半截代码 —— 而且断点处看起来"很自然"，没人会发现。
       2. **front-matter（`---` YAML 头）是元数据不是正文**，混进正文会污染检索；
          单独成块并打标签，需要时可按标签取用。
+
+    path: Markdown 文件路径。编码兜底同纯文本。
     """
     text = _read_text_file(path)
     if not text.strip():
@@ -233,6 +304,12 @@ def _blocks_markdown(path) -> list[Block]:
     fence: Optional[str] = None
 
     def flush(kind: str = KIND_TEXT, tags=None):
+        """把当前缓冲区收口成一块并清空缓冲（区块切分的统一出口）。
+
+        kind: 该块的 kind；正文与代码块都用 KIND_TEXT，靠 tags 区分。
+        tags: 该块的标签列表；传 None 视为空列表。**只在 body 非空时才会落块**，
+            空缓冲不产生块（避免空白块进索引）。
+        """
         body = "\n".join(buf).strip()
         buf.clear()
         if body:
@@ -283,6 +360,9 @@ def _blocks_csv(path) -> list[Block]:
     为什么必须重复表头：切分器按大小切，第一块带着表头，第 5 块就只剩数值行了。
     实测过这个后果——查询"金额是多少"召回的往往是不含列名的那几行，
     命中率直接掉一半。重复表头是零成本且确定性的修法。
+
+    path: CSV/TSV 文件路径。`.tsv` 后缀强制用制表符分隔，其余交给 csv.Sniffer
+        在 ",;\t|" 里猜（猜不出回退逗号）。
     """
     text = _read_text_file(path)
     if not text.strip():
@@ -325,6 +405,15 @@ def _blocks_csv(path) -> list[Block]:
 # JSON / JSONL
 # ---------------------------------------------------------------------------
 def _flatten_json(obj, prefix="", out=None):
+    """把嵌套 JSON 递归压成 "路径: 值" 的字符串列表（值的位置不再丢失）。
+
+    obj: 当前层对象（dict / list / 标量）。dict 按键展开、list 按 [i] 展开、
+        标量落成一条 "prefix: 值"。
+    prefix: 当前层的路径前缀（如 "a.b[0]"），根调用留空；由递归逐层拼装，调用方
+        通常不必传。
+    out: 累积结果的列表。**传入同一个 list 可实现跨层累计**（递归时靠它传递）；
+        不传则新建一个，此时返回值才是唯一入口。长度达到 MAX_BLOCKS 即停止展开。
+    """
     if out is None:
         out = []
     if len(out) >= MAX_BLOCKS:          # 扁平化本身也要有上限
@@ -346,6 +435,12 @@ def _record_block(rec: Any, index: int, tags: list) -> Block:
     为什么 JSON 要按记录成块（而不是整份扁平化成一大段）：
     记录是这个格式**天然的最小语义单位**——一块里通常正好一条记录，
     检索命中后送进 LLM 的上下文是完整的一条，而不是"上一条的尾巴 + 下一条的开头"。
+
+    rec: 一条记录的原始对象（通常是 dict，也可能是标量）。
+    index: 该记录在文件中的序号（**0 起**），会写进文本首行 "记录 N"，便于人工
+        定位；**不参与任何 id 计算**，所以改它不影响引用。
+    tags: 附到块上的标签列表（如 ["记录"]）。内部 list() 复制一份，避免与调用方
+        的可变列表共享引用。记录扁平化后为空时不产生块，返回 text="" 的 Block。
     """
     lines = _flatten_json(rec)
     text = f"记录 {index}\n" + "\n".join(lines) if lines else ""
@@ -354,6 +449,13 @@ def _record_block(rec: Any, index: int, tags: list) -> Block:
 
 @register(".json")
 def _blocks_json(path) -> list[Block]:
+    """JSON → 块：顶层是数组则**一条记录一块**，否则整份扁平化成一块。
+
+    记录数超过 JSON_MAX_RECORDS 会截断，并追加一条显式的截断标记块（不静默丢）。
+
+    path: JSON 文件路径。内容不是合法 JSON 时由外层 load_blocks 捕获异常并返回
+        空列表——本函数自身不做兜底。
+    """
     data = json.loads(_read_text_file(path))
     if isinstance(data, list) and data:
         blocks = [_record_block(rec, i, ["记录"]) for i, rec in enumerate(data)]
@@ -369,6 +471,13 @@ def _blocks_json(path) -> list[Block]:
 
 @register(".jsonl", ".ndjson")
 def _blocks_jsonl(path) -> list[Block]:
+    """JSONL/NDJSON → 块：逐行解析，一行一条记录。
+
+    某行不是合法 JSON 时**按原文保留**并打 "非法JSON行" 标签（宁可多一块，
+    也不静默丢内容）——这是与 _blocks_json 的关键差别。
+
+    path: JSONL 文件路径。空行直接跳过；行序号用**原始行号**（跳过空行不影响编号）。
+    """
     blocks = []
     for i, line in enumerate(_read_text_file(path).splitlines()):
         line = line.strip()
@@ -400,6 +509,10 @@ def _blocks_html(path) -> list[Block]:
     过去这里把 `td/th` 也当成独立块标签，结果是：一行 5 列被拆成 5 个互不相关的块，
     "城市=梧州" 与 "特产=六堡茶" 天各一方，行关系彻底丢失。
     表格必须**按行**处理，并把表头写进每一行 —— 与 CSV/XLSX 同一套做法。
+
+    path: HTML 文件路径。用 lxml 解析；先按 _HTML_DROP_TAGS 与 ARIA 角色
+        （navigation/banner/contentinfo/search）删掉导航、页脚、脚本等页面级家具，
+        再依次抽标题、正文与表格。
     """
     from bs4 import BeautifulSoup
 
@@ -434,7 +547,12 @@ def _blocks_html(path) -> list[Block]:
 
 
 def _html_table_blocks(table_el, section: str) -> list[Block]:
-    """一个 <table> → 若干"表头 + 行"的块。"""
+    """一个 <table> → 若干"表头 + 行"的块。
+
+    table_el: 一个 BeautifulSoup 的 <table> 元素对象。
+    section: 该表所处的标题路径（" > " 连接），直接写进产出块的 section 字段，
+        使表格可回溯到它在文档中的位置。表格为空（无任何非空单元格）时返回 []。
+    """
     grid: list[list[str]] = []
     for tr in table_el.find_all("tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
@@ -459,6 +577,13 @@ def _html_table_blocks(table_el, section: str) -> list[Block]:
 # ---------------------------------------------------------------------------
 @register(".docx")
 def _blocks_docx(path) -> list[Block]:
+    """Word 降级链路：python-docx 读段落（按 Heading 样式建标题路径）+ 表格成块。
+
+    主链路的 docx 走 docling（A+C 双路线），本函数只在 docling 不可用时兜底，
+    因此能力刻意做薄：够把正文与表格读出来即可，不追求版式还原。
+
+    path: .docx 文件路径。标题级别从样式名 "Heading N" 解析并夹到 1–6 之间。
+    """
     from docx import Document
 
     doc = Document(path)
@@ -512,6 +637,9 @@ def _blocks_xlsx(path) -> list[Block]:
          表现是"文件明明有内容，解析出来是空的"——必须显式告诉人，不能当成空文件。
       4. **一个文件里有多个独立文档**（多工作表），甚至还有隐藏表、图表、图片。
          Word/PDF 是单一线性流，这里必须自己决定"哪些表要，按什么顺序"。
+
+    path: .xlsx / .xlsm 文件路径。用 openpyxl 且 `data_only=True` 读**缓存值**——
+        这直接决定了上面第 3 条（未计算过公式的文件读出来是空的）。
     """
     import openpyxl
 
@@ -569,6 +697,11 @@ def _xlsx_chart_blocks(path: str, wb) -> list[Block]:
     openpyxl 生成的图表只写 `c:f`（如 `Sheet1!$B$2:$B$3`）而不写缓存。
     此时"图表没数据"是假象：**数据就在工作表里**。
     所以按引用回表取一次，把它变成确定性数值 —— 这比"读不到就算了"或者"送 VLM 看图"都正确。
+
+    path: 源 xlsx 路径（用于日志与定位同目录的 docx_media）。
+    wb: **已打开的、与 path 同一份**的 openpyxl workbook 对象；回表取引用数值需要
+        它，所以调用方必须在 `wb.close()` 之前调用本函数。取图表失败时返回 []
+        并告警，绝不影响正文。
     """
     try:
         from .docx_media import chart_to_table, chart_to_text, extract_ooxml_charts
@@ -591,7 +724,13 @@ _RANGE_REF = re.compile(r"^(?:'([^']+)'|([^!]+))!\$?([A-Z]+)\$?(\d+)(?::\$?([A-Z
 
 
 def _resolve_chart_refs(chart: dict, wb) -> dict:
-    """给缺缓存值的系列回表取值（引用形如 `'明细'!$B$2:$B$3`）。"""
+    """给缺缓存值的系列回表取值（引用形如 `'明细'!$B$2:$B$3`）。
+
+    chart: extract_ooxml_charts 产出的 chart dict（含 "series" 列表）。**原地修改
+        并返回同一对象**；chart 为空或无 series 时原样返回。回表仍取不到值时，
+        会把 chart["error"] 置为说明文字（下游据此决定是否退 VLM）。
+    wb: 已打开的 openpyxl workbook，用于按 `Sheet1!$B$2:$B$3` 这类引用读单元格值。
+    """
     if not chart or not chart.get("series"):
         return chart
     for s in chart["series"]:
@@ -621,7 +760,13 @@ def _resolve_chart_refs(chart: dict, wb) -> dict:
 
 
 def _values_from_ref(wb, ref: str) -> list[str]:
-    """`Sheet1!$B$2:$B$3` → ["120", "145"]。解析不出就返回空。"""
+    """`Sheet1!$B$2:$B$3` → ["120", "145"]。解析不出就返回空。
+
+    wb: 已打开的 openpyxl workbook，按工作表名取 cell 的缓存值。
+    ref: Excel 区域引用串。仅支持"单工作表 + 连续区"的形式（A1、A1:B3、'明细'!$A$1），
+        解析失败、工作表不存在、或区域内全空时一律返回 []（空列表代表"没取到"，
+        调用方据此决定是否保留原引用）。
+    """
     m = _RANGE_REF.match((ref or "").strip())
     if not m:
         return []
@@ -642,7 +787,18 @@ def _values_from_ref(wb, ref: str) -> list[str]:
 
 
 def _col_span(first: str, last: str) -> list[int]:
+    """列字母区间 → 1 起的列号列表（闭区间）。
+
+    first: 起始列字母（如 "B"）。
+    last: 结束列字母（如 "D"）；与 first 顺序颠倒也能正确处理（内部取 min/max）。
+
+    返回值的列号是 **openpyxl 的 1 起口径**（A=1），与 `ws.cell(column=...)` 对齐。
+    """
     def idx(s: str) -> int:
+        """列字母 → 1 起的列号（A→1、Z→26、AA→27）。
+
+        s: 列字母串，需为大写；空串返回 0（调用处不会出现该情形）。
+        """
         n = 0
         for ch in s:
             n = n * 26 + (ord(ch) - ord("A") + 1)
@@ -659,6 +815,10 @@ def _sheet_rows(ws) -> list[list[str]]:
       - **只在数据行横向填**（跨列合并）：值铺到该行被合并的各列 —— 这才是"合并"的语义；
       - **表头行不横向填**：否则 `A1:B1` 合并的标题会把列名变成两个一样的
         （实测后果：`采购明细=服务器 | 采购明细=3`，列名全错且不报错）。
+
+    ws: 一个 openpyxl 工作表对象。读值用 `values_only=True`；随后按 merged_cells
+        填充合并区、删掉全空行与尾部整列皆空的"幽灵列"。返回的网格每格都是去空白
+        字符串（经 _cell）。
     """
     grid: list[list[str]] = [[_cell(v) for v in row]
                              for row in ws.iter_rows(values_only=True)]
@@ -705,6 +865,9 @@ def _blocks_pptx(path) -> list[Block]:
       4. **表格/图表/图片都是嵌进包里的对象**（本格式也是 zip）：
          表格要按行+表头处理，图表数据在 `ppt/charts/chart*.xml`（与 Word 同一种格式），
          图片在 `ppt/media/`。这些 Docling 一个都给不了。
+
+    path: .pptx 文件路径。页序从 1 起（`page` 字段），图表/图片块通过同包的
+        docx_media 提取（取不到时只影响图表，正文照常解析）。
     """
     from pptx import Presentation
 
@@ -764,7 +927,11 @@ def _blocks_pptx(path) -> list[Block]:
 
 
 def _pptx_table_text(table) -> str:
-    """PowerPoint 表格 → 表头 + "列=值" 行（与 CSV/Excel 同一套表示）。"""
+    """PowerPoint 表格 → 表头 + "列=值" 行（与 CSV/Excel 同一套表示）。
+
+    table: python-pptx 的表格对象（即 `shape.table`）。空表返回 ""；首行按约定
+        当表头（PPT 表格无 th 概念）。
+    """
     grid = []
     for row in table.rows:
         cells = [_cell(c.text) for c in row.cells]
@@ -778,6 +945,11 @@ def _pptx_table_text(table) -> str:
 
 
 def _pptx_notes(slide) -> str:
+    """取一张幻灯片的演讲者备注文字；没有备注或对象损坏时返回 ""。
+
+    slide: python-pptx 的 slide 对象。内部对 `has_notes_slide` 与 `notes_text_frame`
+        均做判空与异常兜底（损坏的 pptx 常取不到备注），因此本函数不抛异常。
+    """
     try:
         if not slide.has_notes_slide:
             return ""
@@ -803,6 +975,9 @@ def _blocks_image(path) -> list[Block]:
     也绕过了开关、上限、缓存与失败可见性。
     **没开 VLM 时它会以 needs_vlm=True 的姿态留在索引里**：检索不到内容，但你能按标签
     把它筛出来，知道"这些图还没被描述" —— 这比静默跳过好。
+
+    path: 图片文件路径。会**原样**作为块的 `source_image` 落进产物（下游据此读图 /
+        送 VLM），所以传入的应是可再次访问的稳定路径。
     """
     return [Block(text=f"[图片文件] {os.path.basename(path)}",
                   kind=KIND_DIAGRAM, tags=["图片", "待VLM"],
@@ -810,7 +985,11 @@ def _blocks_image(path) -> list[Block]:
 
 
 def _ooxml_chart_blocks(path: str) -> list[Block]:
-    """从 xlsx / pptx 包里取图表（`chart XML` 与 Word 是同一种格式）。"""
+    """从 xlsx / pptx 包里取图表（`chart XML` 与 Word 是同一种格式）。
+
+    path: xlsx 或 pptx 文件路径（二者都是 zip 包，图表 XML 同格式）。取不到图表时
+        返回 [] 并告警，**不影响正文解析**。
+    """
     try:
         from .docx_media import chart_to_table, chart_to_text, extract_ooxml_charts
 
@@ -830,7 +1009,11 @@ def _ooxml_chart_blocks(path: str) -> list[Block]:
 
 
 def _pptx_media_index(path: str) -> dict:
-    """{幻灯片号: [媒体资产]}。取不到就返回空（正文照常解析）。"""
+    """{幻灯片号: [媒体资产]}。取不到就返回空（正文照常解析）。
+
+    path: .pptx 文件路径。媒体资产由 docx_media.extract_pptx_media 提取；无 `page`
+        字段的资产归到键 0（不丢资产，只是无法定位到页）。
+    """
     try:
         from .docx_media import extract_pptx_media
 

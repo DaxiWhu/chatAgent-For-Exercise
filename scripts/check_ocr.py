@@ -28,7 +28,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src import docling_loader  # noqa: E402
+from src.rag import docling_loader  # noqa: E402
 
 # OCR 应当能认出来的样本文本。用英文短句：手头没有可直接嵌入的 CJK 字体时，
 # 画中文会变成方块，测的就不是 OCR 而是字体缺失了。
@@ -146,23 +146,24 @@ def run_sample(kind: str, tmpdir: str) -> bool:
     print(f"\n=== {label}样本：{pdf}（{os.path.getsize(pdf) / 1024:.1f} KB）===")
 
     # --- 前置检查：确认它真的没有文字层，否则下面测的还是老链路 ---
-    from src.pdf_parser import extract_pdf_text
-    raw = (extract_pdf_text(pdf) or "").strip()
-    print(f"文字层探测：pdfminer 抽出 {len(raw)} 字符 —— "
-          f"{'OK 无文字层（等价扫描件）' if not raw else '[失败] 仍有文字层，测不出 OCR'}")
-    if raw:
+    from src.rag.pdf_parser import pdf_page_text_chars
+    chars = pdf_page_text_chars(pdf)
+    total = sum(chars.values())
+    print(f"文字层探测：pdfminer 按页抽出 {chars}（合计 {total} 字符）—— "
+          f"{'OK 无文字层（等价扫描件）' if not total else '[失败] 仍有文字层，测不出 OCR'}")
+    if total:
         return False
 
-    want = docling_loader._want_ocr(pdf, "pdf")
+    want = docling_loader._want_ocr(chars)
     print(f"DOCLING_OCR={docling_loader.DOCLING_OCR} → want_ocr={want}"
           f"（lang={docling_loader.DOCLING_OCR_LANG} mode={docling_loader.DOCLING_OCR_MODE}）")
     if not want:
         print("[失败] auto 模式下无文字层文件却不开 OCR，扫描件会解析成空。")
         return False
 
-    print("走 parse_document 完整链路（CPU 上 1 页 OCR 约数十秒）...")
+    print("走 parse_pdf 完整链路（CPU 上 1 页 OCR 约数十秒）...")
     t0 = time.perf_counter()
-    out = docling_loader.parse_document(pdf, os.path.basename(pdf), kind="pdf")
+    out = docling_loader.parse_pdf(pdf, os.path.basename(pdf))
     elapsed = time.perf_counter() - t0
     print(f"  status={out.status}｜pages={out.page_total}｜chunks={len(out.chunks)}"
           f"｜耗时 {elapsed:.1f}s")

@@ -34,13 +34,21 @@ logger = logging.getLogger(__name__)
 try:
     from dotenv import load_dotenv
 
-    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # 项目根 = 上溯 3 层（src/rag/x.py → src/rag → src → 根）。少一层会指向
+    # src/.env（并不存在）而让加载静默失效；下面用 `_ROOT` 解析相对缓存目录，
+    # 若算错会把 data/.ctx_cache 落到 src/data/.ctx_cache 里（2026-09-28 迁入 src/rag/ 时踩过）。
+    _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     load_dotenv(dotenv_path=os.path.join(_ROOT, ".env"))
 except Exception:  # noqa: BLE001
     pass
 
 
 def _env_int(name: str, default: int) -> int:
+    """读环境变量并转 int，转不动就用默认值（本模块内多处配置共用）。
+
+    name: 环境变量名。
+    default: 未设置或值不是合法整数时的回退值。
+    """
     try:
         return int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
@@ -71,6 +79,10 @@ CTX_PREFIX_MAX = max(20, _env_int("RAG_CTX_PREFIX_MAX", 60))
 # 按这个速率 1000 块要十几小时 —— 这个功能等于不可用。
 # 每个块的前缀只依赖它自己的文本，天然可并行，所以用受控并发（默认 4，保守防限流）。
 CTX_WORKERS = max(1, _env_int("RAG_CTX_WORKERS", 4))
+# 限流告警里最多点名几个来源文件。`limited` 的 append 不去重（同一份文件的多个块
+# 并发命中会各写一条），所以先 set 去重；大语料下来源可能上百，全打出来会把一行日志撑爆，
+# 故只列前 N 个并附上总数。
+CTX_LIMITED_SHOWN = max(1, _env_int("RAG_CTX_LIMITED_SHOWN", 5))
 
 _PROMPT = """<文档>
 {doc}
@@ -85,6 +97,12 @@ _PROMPT = """<文档>
 
 
 def enabled() -> tuple[bool, str]:
+    """总开关体检：返回 (是否启用, 原因文案)，原因会直接进日志。
+
+    无参数。判两件事：retrieval 模块的 CONTEXTUAL 开关（环境变量 RAG_CONTEXTUAL）
+    与 CTX_API_KEY 是否配置。任一条不满足都返回 False —— 调用方据此跳过，
+    并把这个原因原样打进日志，避免"为什么没生效"要靠翻环境变量。
+    """
     from . import retrieval
 
     if not getattr(retrieval, "CONTEXTUAL", False):
@@ -96,6 +114,11 @@ def enabled() -> tuple[bool, str]:
 
 def _doc_text(chunks: list, source: str, focus: int) -> str:
     """给模型的"整篇文档"参考文本。
+
+    chunks: 候选块列表（list[dict]，读 "text" 与 "source" 两个键）。
+    source: 目标块的来源文件名 —— 只取同 source 的块拼成"整篇文档"，
+        所以多文件语料下不会串台。
+    focus: 命中块在 chunks 中的索引。用于超长时定位"附近"，取不到时该段留空。
 
     为什么要限长：一份几百页的文档全文塞进去，光输入 token 就够买好几张 VLM 描述。
     超出上限时取「文档头部 + 命中块附近」——头部给文档主题，附近给局部位置，
@@ -113,7 +136,15 @@ def _doc_text(chunks: list, source: str, focus: int) -> str:
 
 
 def _cache_path(source: str, text: str) -> str:
-    """缓存键 = 模型 + 源文件 + 块文本 + **前缀长度上限**。
+    """缓存文件的绝对路径。
+
+    source: 来源文件名（参与键）。
+    text: 块正文（参与键）—— 用内容而不是块 id，保证"同一段文字换个文件切"也能复用。
+        ⚠️ **读、写两侧必须传同口径的 text**（本模块在 `apply` 里两处都已 strip）。任一侧
+        少了 strip，带首尾空白的块就会"写进去一个键、读的时候算另一个键"——缓存静默永久失效。
+        另注：source 也参与键，所以**跨文件并不共享**，同一段文字出现在两个文件里仍要付两次。
+
+    缓存键 = 模型 + 源文件 + 块文本 + **前缀长度上限**。
 
     为什么要把长度上限也算进键里：它就是 prompt 的一部分（"不超过 N 字"）。
     改了这个参数却复用旧前缀，会得到一个"看起来测了新参数、其实用的是旧结果"的假结论 ——
@@ -128,6 +159,14 @@ def _cache_path(source: str, text: str) -> str:
 
 
 def _read_cache(source: str, text: str) -> Optional[str]:
+    """读缓存的前缀，未命中或读取失败返回 None。
+
+    source: 来源文件名，透传 _cache_path 参与算键。
+    text: 块正文，同上。
+
+    读盘异常（权限/编码）只记 warning 并按未命中处理 —— 缓存是省钱手段，
+    不能因为它坏了就阻断灌库。
+    """
     p = _cache_path(source, text)
     if not os.path.isfile(p):
         return None
@@ -141,6 +180,14 @@ def _read_cache(source: str, text: str) -> Optional[str]:
 
 
 def _write_cache(source: str, text: str, value: str) -> None:
+    """把生成好的前缀写进缓存文件（自动建目录）。
+
+    source: 来源文件名，透传 _cache_path 参与算键。
+    text: 块正文，同上。
+    value: 要缓存的前缀文本。
+
+    写盘失败只记 warning：本次结果仍会被 _attach 用上，只是下次要重新付费。
+    """
     try:
         p = _cache_path(source, text)
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -151,6 +198,15 @@ def _write_cache(source: str, text: str, value: str) -> None:
 
 
 def _call_api(prompt: str) -> str:
+    """默认的前缀生成实现（OpenAI 兼容 chat.completions，温度 0.1）。
+
+    prompt: 已填好 doc / chunk / limit 的完整 prompt（见 _PROMPT）。
+
+    返回 strip 后的正文。**空正文会主动抛 RuntimeError**，并把 finish_reason 与
+    usage 带进消息 —— 因为"模型返回空"若被上层记成普通失败，最难的排查就此开始
+    （实测：推理型模型把 max_tokens 全用在推理上时正文为空且不报错）。
+    调用方 apply 支持注入 call 替换本函数，测试不必真连 API。
+    """
     from openai import OpenAI
 
     client = OpenAI(api_key=CTX_API_KEY, base_url=CTX_API_BASE, timeout=60)
@@ -174,6 +230,11 @@ def _call_api(prompt: str) -> str:
 def _clean(text: str, limit: Optional[int] = None) -> str:
     """把模型输出收拾成"一行前缀"。
 
+    text: 模型原始输出。None / 空串都会走到空串返回。
+    limit: 截断长度上限。None 时取模块级 CTX_PREFIX_MAX —— 显式传值主要用于
+        测试与调参；注意它不参与缓存键（键里固定用 CTX_PREFIX_MAX），
+        所以改这个参数做实验时请改成环境变量。
+
     模型偶尔会加引号、换行、"这句话是："之类的前后缀 —— 这些进入嵌入文本只会是噪声，
     所以统一剥掉。剥完为空则返回空串（调用方据此视为失败，不写前缀）。
     """
@@ -181,13 +242,25 @@ def _clean(text: str, limit: Optional[int] = None) -> str:
     t = (text or "").strip().strip('"“”\'`').replace("\n", " ").strip()
     for prefix in ("上下文：", "上下文:", "这句话是：", "说明："):
         if t.startswith(prefix):
-            t = t[len(prefix):].strip()
+            t = t[len(prefix):].strip()         #prompt里面对应写了上限了，所以这里一般来说不会意外切断
     return t[:limit].strip()
 
 
 def apply(chunks: list, *, call: Optional[Callable[[str], str]] = None,
           max_chunks: Optional[int] = None, workers: Optional[int] = None) -> dict:
     """就地为每块加 `ctx_prefix`，并把前缀拼到 `text` 前面（嵌入输入即带上下文）。
+
+    chunks: 待处理的块列表（list[dict]，**就地改写**，不是返回值）。实现读
+        "text" / "source" / "ctx_prefix" 三个键。
+    call: 可注入的前缀生成函数，签名 (prompt) -> str。None 时用 _call_api。
+        测试与离线场景传假实现即可，不必真连 API。
+    max_chunks: 本次最多生成的块数（超出的计入 skipped_limit）。None 时取
+        环境变量 CTX_MAX_CHUNKS（默认 500）—— 防止误开时把整库刷完。
+    workers: 并发线程数。None 时取 CTX_WORKERS（默认 4）；传 1 则走串行分支
+        （不建线程池，便于调试与对比）。
+
+    返回统计 dict：total / prefixed / cached / skipped_empty / skipped_limit / failed。
+    调用方用 format_stats 打日志。
 
     为什么拼进 `text` 而不是只存字段：检索层只认 `text`（见 chunk_writer 的契约），
     前缀只有真的进了 `text` 才会被向量化 —— 存成旁路字段等于没做。
@@ -246,6 +319,14 @@ def apply(chunks: list, *, call: Optional[Callable[[str], str]] = None,
     limited: list = []
 
     def _work(item):
+        """线程池里的单块任务，返回 (索引, 源, 前缀, 错误信息)。
+
+        item: (索引, 源, prompt) 三元组，由上面 todo 构造。
+
+        不抛异常：任何失败都折叠成第 4 位的错误字符串。若是限流则顺带
+        置位 stop 事件（让尚未开跑的 worker 立刻放弃）并记下来源，
+        供 apply 末尾统一告警。
+        """
         idx, source, prompt = item
         if stop.is_set():
             return idx, source, "", "限流后跳过"
@@ -269,34 +350,58 @@ def apply(chunks: list, *, call: Optional[Callable[[str], str]] = None,
             stats["failed"] += 1
             logger.warning("上下文生成失败（%s）：%s", source, err or "模型返回空")
             continue
-        _write_cache(source, chunks[idx].get("text") or "", prefix)
+        # 与读侧同口径：第一趟取 text 时先 strip 再查缓存（见上面的 text = ...strip()），
+        # 这里若传未 strip 的原文，带首尾空白的块写进去的键与下次读取的键就不同 ——
+        # 缓存静默永久失效（不报错、不告警，只是每次都重新付费）。
+        _write_cache(source, (chunks[idx].get("text") or "").strip(), prefix)
         _attach(chunks[idx], prefix)
         stats["prefixed"] += 1
 
     if limited:
+        # 去重后再展示：同一份文件的多个块会各自 append 一次（append 不做去重），
+        # 直接打出来会有大量重复项；超出上限的只报总数，避免大语料把一行日志撑爆。
+        # 点名来源是必需的 —— 否则多文件灌库时只看到一个总块数，查不出是哪份文档撞的配额。
+        srcs = sorted(set(limited))
+        shown = "、".join(srcs[:CTX_LIMITED_SHOWN])
+        if len(srcs) > CTX_LIMITED_SHOWN:
+            shown += f" 等 {len(srcs)} 个文件"
         logger.warning(
-            "Contextual Retrieval 被限流打断（%d 块未做）。已成功的前缀**已写入缓存**，"
+            "Contextual Retrieval 被限流打断（%d 块未做，来源：%s）。已成功的前缀**已写入缓存**，"
             "补齐后重跑即可只跑缺的那些。建议：调小 RAG_CTX_WORKERS（当前 %d）分多次跑，"
             "或升级 API 套餐 / 换一个不受限的 OpenAI 兼容服务（CONTEXTUAL_MODEL 与 "
-            "AGNES_API_BASE 可分别指定）。", stats["failed"], n_workers)
+            "AGNES_API_BASE 可分别指定）。", stats["failed"], shown, n_workers)
     return stats
 
 
 def _is_rate_limited(msg: str) -> bool:
     """限流判定。各家的措辞不同（429 / rate limit / too many requests / quota），
-    所以按关键词匹配而不是认某个异常类 —— 换服务商时不必改代码。"""
+    所以按关键词匹配而不是认某个异常类 —— 换服务商时不必改代码。
+
+    msg: 异常的类型名 + 描述拼成的字符串（_work 里构造）。
+        空串 / None 返回 False（不会误判为限流）。
+    """
     low = (msg or "").lower()
     return any(k in low for k in ("429", "rate limit", "ratelimit",
                                   "too many requests", "quota"))
 
 
 def _attach(chunk: dict, prefix: str) -> None:
-    """前缀拼到 text **最前面**：嵌入时它离查询词最近，影响力最大。"""
+    """前缀拼到 text **最前面**：嵌入时它离查询词最近，影响力最大。
+
+    chunk: 单个块 dict，**就地改写** —— 写 ctx_prefix，并把 text 改成 "前缀\\n原文"。
+    prefix: 前缀文本。为空串时仍会写入（text 变成 "\\n原文"），
+        但调用方 apply 已在写回前过滤掉空前缀。
+    """
     chunk["ctx_prefix"] = prefix
     chunk["text"] = f"{prefix}\n{chunk.get('text') or ''}"
 
 
 def format_stats(stats: dict) -> str:
+    """把 apply 的统计 dict 排成一行日志。
+
+    stats: apply() 的返回值，六个键**都硬取**（缺任一个会 KeyError）——
+        也就是说只能传 apply 的原样返回，不能手工拼一个残缺 dict。
+    """
     return (f"已加前缀 {stats['prefixed']}/{stats['total']} 块"
             f"（缓存命中 {stats['cached']}）；未做：空块 {stats['skipped_empty']}"
             f" / 超上限 {stats['skipped_limit']} / 失败 {stats['failed']}")

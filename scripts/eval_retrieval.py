@@ -30,7 +30,7 @@ if ROOT not in sys.path:
 
 os.chdir(ROOT)
 
-import src.retrieval as R  # noqa: E402
+import src.rag.retrieval as R  # noqa: E402
 
 EN_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
@@ -83,7 +83,7 @@ def main():
     ap = argparse.ArgumentParser(description="RAG 检索质量评测")
     ap.add_argument("--set", default=os.path.join("scripts", "eval_set.json"))
     ap.add_argument("--only", default=None,
-                    help="只跑指定后端：tfidf / semantic / hybrid")
+                    help="只跑指定后端：bm25 / semantic / hybrid")
     ap.add_argument("--top-k", type=int, default=3)
     ap.add_argument("--show-miss", action="store_true")
     ap.add_argument("--no-rerank", action="store_true", help="禁用 rerank 组合")
@@ -93,6 +93,11 @@ def main():
     ap.add_argument("--overlap", type=int, default=None, help="块间重叠（字符）")
     ap.add_argument("--contextual", action="store_true",
                     help="开启 Contextual Retrieval（每块一次 LLM 调用，有缓存）后再评测")
+    ap.add_argument("--gate-backend", default="bm25",
+                    help="CI 门禁用的后端（默认 bm25：纯本地、不依赖外部服务）")
+    ap.add_argument("--fail-under", type=float, default=None,
+                    help="CI 门禁阈值：指定后端的整体 Top1 低于该值（0~1）时**退出码非 0**，"
+                         "让流水线变红。不传则永远退出 0（保持原行为）。")
     args = ap.parse_args()
 
     # 允许命令行覆盖切分参数，便于做「改前 vs 改后」对比
@@ -115,7 +120,7 @@ def main():
         # 批次8 的验收手段：Contextual Retrieval 会改变**召回排序**，所以能用同一套指标量出差别
         # （父子块不会改排序，它改的是"送模型什么"，只能用单测与 prompt 检查验收）。
         if args.contextual:
-            from src import contextualizer
+            from src.rag import contextualizer
             R.CONTEXTUAL = True          # 命令行开关落到配置上，enabled() 的判据保持单一
             stats = contextualizer.apply(chunks)
             print(f"[Contextual] {contextualizer.format_stats(stats)}")
@@ -135,7 +140,7 @@ def main():
             f"{s}×{n}" for s, n in sorted(Counter(c["source"] for c in chunks).items())))
 
         combos = [
-            ("tfidf", "", False),
+            ("bm25", "", False),
             ("semantic", "", False),
             ("semantic", EN_INSTRUCTION, False),
             ("hybrid", "", False),
@@ -196,6 +201,20 @@ def main():
                       f"{' + rerank' if use_rerank else ''}] 未命中：")
                 for q, qtype, got in misses:
                     print(f"   ✗ [{qtype:10s}] {q}   实得：{got}")
+
+        # ---- CI 门禁：改 prompt / 换模型 / 调切分后，召回率不该悄悄掉下去 ----
+        if args.fail_under is not None:
+            cand = [r for r in results if r[0] == args.gate_backend]
+            if not cand:
+                print(f"\n❌ 门禁失败：没有跑 {args.gate_backend} 后端的结果")
+                sys.exit(2)
+            got_top1 = cand[0][3]["all"]["top1"]
+            if got_top1 + 1e-9 < args.fail_under:
+                print(f"\n❌ 门禁失败：{args.gate_backend} 整体 Top1 "
+                      f"{got_top1:.0%} < 阈值 {args.fail_under:.0%}")
+                sys.exit(1)
+            print(f"\n✅ 门禁通过：{args.gate_backend} 整体 Top1 "
+                  f"{got_top1:.0%} ≥ 阈值 {args.fail_under:.0%}")
     finally:
         if is_temp:
             shutil.rmtree(workdir, ignore_errors=True)
