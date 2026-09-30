@@ -11,8 +11,8 @@ import zipfile
 
 import pytest
 
-from src import docx_media
-from src.docx_media import (
+from src.rag import docx_media
+from src.rag.docx_media import (
     DocxAsset,
     chart_to_table,
     chart_to_text,

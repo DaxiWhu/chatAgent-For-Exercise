@@ -1,0 +1,679 @@
+{
+  "components": {
+    "schemas": {
+      "ChatReq": {
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "message"
+        ],
+        "title": "ChatReq",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ResumeReq": {
+        "description": "续跑请求体：只有 thread_id —— 要跑的内容早已在检查点里。",
+        "properties": {
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id"
+        ],
+        "title": "ResumeReq",
+        "type": "object"
+      },
+      "ReviewReq": {
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "feedback": {
+            "default": "",
+            "title": "Feedback",
+            "type": "string"
+          },
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "action"
+        ],
+        "title": "ReviewReq",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "RAG 问答服务：检索 → 生成 → 自评审 → 人工审核（human-in-the-loop）",
+    "title": "chatAgent API"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/chat": {
+      "post": {
+        "deprecated": true,
+        "description": "兼容旧路径的 /chat（等价于 /v1/chat）。",
+        "operationId": "chat_legacy_chat_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Api-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Chat Legacy"
+      }
+    },
+    "/health": {
+      "get": {
+        "description": "兼容旧路径的健康检查：**只回 `{\"status\":\"ok\"}`**（等价于存活探针）。\n\n刻意不再往这里加东西 —— 已有客户端把它当\"进程活着\"的信号，\n语义变更会让上游误判。",
+        "operationId": "health_compat_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health Compat"
+      }
+    },
+    "/health/live": {
+      "get": {
+        "description": "存活探针：只反映本进程，不查任何外部依赖（失败才应重启容器）。",
+        "operationId": "health_live_health_live_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health Live"
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "description": "就绪探针：真探 LLM 配置 / 数据库 / 向量后端；不健康时回 503 摘流量。",
+        "operationId": "health_ready_health_ready_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health Ready"
+      }
+    },
+    "/metrics": {
+      "get": {
+        "description": "Prometheus 文本指标（文本格式，抓取器直接消费）。",
+        "operationId": "metrics_endpoint_metrics_get",
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Metrics Endpoint"
+      }
+    },
+    "/review": {
+      "post": {
+        "deprecated": true,
+        "description": "兼容旧路径的 /review（等价于 /v1/review）。",
+        "operationId": "review_legacy_review_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Api-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Review Legacy"
+      }
+    },
+    "/v1/chat": {
+      "post": {
+        "description": "POST /v1/chat：启动一轮 SSE 流式对话。\n\nreq: 请求体 ChatReq —— thread_id 串起多轮与后续人工审核，message 是用户输入。\nx_api_key: 请求头 X-API-Key。配了 TENANT_KEYS 时由它**反查租户**；否则校验 SERVE_API_KEY。\nx_tenant_id: 请求头 X-Tenant-Id，多租户模式下**仅用于核对**（与 Key 不符返回 403）。\n\n内部把 message 包成 HumanMessage 作为图输入；若图停在 human_review，\n流里会下发 need_review 事件（草稿 + 评分 + 意见），由前端调 /review 续跑。\n请求处理前会过\"限流 → 配额 → 会话归属\"三道闸门。",
+        "operationId": "chat_v1_v1_chat_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Api-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Chat V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/chat/resume": {
+      "post": {
+        "description": "POST /v1/chat/resume：续跑一条**中途断掉**的会话（SSE，事件与 /v1/chat 相同）。\n\nreq: 请求体 ResumeReq，只有 thread_id —— 要跑的内容早就在检查点里了。\nx_api_key / x_tenant_id: 同 /v1/chat。\n\n语义（实测确认，不是推测）：检查点停在**当前未完成的那个节点之前**，\n所以续跑是**重新执行该节点**，而不是\"接上上次的半个 token\"。\n对客户端而言是\"从头把这次回答重新流一遍\"，拿到的是完整、自洽的正文。\n对账时注意：这会**再花一次**该节点的 token（但省掉了前面已完成的检索与迭代）。\n\n三种状态各自该走哪条路：\n    next 含 human_review  → 409，提示调 POST /v1/review（需要人的决定，不是续跑）；\n    next 空               → 409，本轮已收尾，没有可续的内容；\n    其余（next 非空）      → 200 + SSE，用 `astream(None, ...)` 从检查点继续。\n\n⚠️ 为什么不做成\"自动判断后用一条接口搞定一切\"：把\"要人的决定\"和\"机器能自己跑完\"\n混在一个接口里，客户端就无法区分\"我需要弹审核界面\"和\"我可以直接继续\" ——\n而这正是 human-in-the-loop 里唯一必须由人做的分支。宁可让客户端多判断一次。",
+        "operationId": "chat_resume_v1_v1_chat_resume_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Api-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResumeReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Chat Resume V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/review": {
+      "post": {
+        "description": "POST /v1/review：人工审核 resume，续跑被 interrupt 挂起的图。\n\nreq: 请求体 ReviewReq。thread_id 用于定位会话；action 只允许 accept / revise；\n    feedback 在 revise 时必填（accept 时可留空）。\nx_api_key / x_tenant_id: 同 /v1/chat。\n\n三道前置校验，任一条不过都不进入图：\n  - action 非 accept/revise → 400；\n  - revise 但 feedback 全空白 → 400；\n  - 该 thread 当前并不停在 human_review（如已完成、或从未触发）→ 409。\n通过后把队列里的记录标记为已处理（accepted / revised）。",
+        "operationId": "review_v1_v1_review_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Api-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Review V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/reviews": {
+      "get": {
+        "description": "GET /v1/reviews：列出待人工审核的会话（默认 50 条，按时间倒序）。\n\n给\"审核工作台\"用：没有它，待审内容只存在于 checkpoint 里，无人知晓。",
+        "operationId": "list_reviews_v1_reviews_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Api-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Reviews",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/sessions/{thread_id}": {
+      "delete": {
+        "description": "DELETE /v1/sessions/{thread_id}：**履行删除请求**（合规要求，此前无处可做）。\n\n删三类数据，缺一类都算不上\"删干净\"：\n\n  1. **检查点** —— 完整对话历史、所有中间草稿、评分与引用。数据主体；\n  2. **审核队列记录** —— 待审/已审的草稿正文与审核意见。它独立存表，\n     只删检查点会留下一份\"幽灵草稿\"；\n  3. **归属登记行** —— 不删会让同一个 thread_id 永久挂在旧租户名下：\n     归属表只增不减，且该 id 之后谁也再用不了（新租户来会被判 403）。\n\n为什么必须做归属校验（而不是\"有合法 Key 就能删\"）\n----------------------------------------------\n`thread_id` 是**客户端提供的**。只要能猜到别人的 id 就能删掉那条会话 ——\n这比\"读\"严重一个量级：读是泄露，删是**不可逆的破坏**。所以这里复用\n`_assert_session_readable` 的 fail-closed 语义：多租户下归属不符 403、\n查不到属主 404（两种情况分开，是因为处置方式不同：前者是攻击信号，\n后者是\"id 不存在\"）。\n\n为什么单租户下删不存在的会话也返回成功\n------------------------------------\n返回 404 会把端点变成\"这个 thread_id 存在吗\"的探针。删除本身是幂等的，\n`deleted` 明细已经如实告诉调用方每一项到底删掉没有。\n\n为什么不做成\"软删除\"\n------------------\n软删除（打标记）保住的是\"万一删错了还能恢复\"，但对合规诉求毫无帮助 ——\n数据仍在库里。真要可恢复应该靠备份，而不是让线上库长期留着已承诺删除的内容。",
+        "operationId": "session_delete_v1_v1_sessions__thread_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Api-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Session Delete V1",
+        "tags": [
+          "v1"
+        ]
+      },
+      "get": {
+        "description": "GET /v1/sessions/{thread_id}：取会话的**持久化状态快照**（断点续传的基础）。\n\nthread_id: 会话 id（路径参数）。\nx_api_key / x_tenant_id: 同 /v1/chat。\n\n返回（全部字段都是 JSON 原生类型）：\n    status            unknown | awaiting_review | incomplete | completed\n    resumable         true 时请调 POST /v1/chat/resume 续跑\n    draft             最新草稿全文（断流后\"已经生成到哪了\"就是它）\n    messages          完整对话历史，[{role, content}]，role ∈ user/assistant/system/tool\n    citations         上一轮的引用（来源/页码/节选，供回溯核对）\n    score / feedback  评审分数与意见\n    pending_review    待人工审核时的 {draft, score, feedback, error}，否则 null\n\n为什么是 GET + 纯读：客户端重连后第一件事就是\"我刚才进行到哪了\"，\n这个动作必须幂等、无副作用，才能安全重试。",
+        "operationId": "session_state_v1_v1_sessions__thread_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Api-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Session State V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    }
+  }
+}

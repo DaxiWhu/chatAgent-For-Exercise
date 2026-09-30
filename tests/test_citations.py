@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 from langchain_core.messages import AIMessage
 
 from src.graph import retrieve
-from src.retrieval import build_citations, context_block
+from src.rag.retrieval import build_citations, context_block
 
 # 一个"像真产物一样"的命中：保真 content 与加工过的 text 明显不同
 _GRID = "| 地区 | 销售额 |\n|---|---|\n| 华东 | 1200 |\n| 华南 | 980 |"
@@ -53,6 +53,38 @@ def test_citation_carries_position_and_identity():
     assert c["chunk_id"] == "abc123" and c["kind"] == "table"
     assert c["parser"] == "docling" and c["origin"] == "docling_pdf"
     assert c["bbox"] == [[1.0, 2.0, 3.0, 4.0]], "PDF 的坐标要留给'裁原页截图'用"
+
+
+def test_where_shows_the_full_page_span():
+    """跨页块要报出真实范围，而不是只报起始页。
+
+    之前只有 `page` 一个字段，跨页正文会显示成"第 3 页"，去核对的人在那一页
+    只看得到一半 —— 而且不知道还有后半段。
+    """
+    hit = dict(_TABLE_HIT, page=3, pages=[3, 4, 5])
+    c = _cites([(hit, 0.5)])[0]
+    assert c["pages"] == [3, 4, 5]
+    assert "第 3–5 页" in c["where"]
+
+
+def test_where_lists_pages_when_the_span_is_not_contiguous():
+    """跳页不能写成区间 —— 那会让人以为中间那页也有内容。"""
+    hit = dict(_TABLE_HIT, page=3, pages=[3, 5])
+    assert "第 3、5 页" in _cites([(hit, 0.5)])[0]["where"]
+
+
+def test_where_falls_back_to_single_page_without_pages_field():
+    """旧数据（没有 pages）行为不变 —— 新增字段不能让存量数据先迁移才能用。"""
+    c = _cites([(_TABLE_HIT, 0.5)])[0]
+    assert "第 3 页" in c["where"]
+
+
+def test_where_keeps_sheet_and_slide_wording_across_pages():
+    """xlsx / pptx 的单位说法要跟着范围一起走，不能一律说成"页"。"""
+    xlsx = dict(_TABLE_HIT, source="台账.xlsx", parser="xlsx", page=2, pages=[2, 3])
+    assert "第 2–3 个工作表" in _cites([(xlsx, 0.5)])[0]["where"]
+    pptx = dict(_TABLE_HIT, source="汇报.pptx", parser="pptx", page=4, pages=[4, 5])
+    assert "第 4–5 页幻灯片" in _cites([(pptx, 0.5)])[0]["where"]
 
 
 def test_table_md_is_passed_through_verbatim():

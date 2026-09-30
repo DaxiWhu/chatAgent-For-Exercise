@@ -1,17 +1,17 @@
 """chunk_writer 兼容层测试：全部离线。
 
-这里守的是**兼容红线**——检索层（TfidfRetriever / EmbeddingRetriever / HybridRetriever）
+这里守的是**兼容红线**——检索层（BM25Retriever / EmbeddingRetriever / HybridRetriever）
 与 graph 的 retrieve 节点只认 c["text"]、c["source"]，多个既有测试也断言
 set(chunk) >= {"source","text"}。引入 Docling 后产物字段变多，但旧字段语义不能变。
 """
-from src.chunk_writer import (
+from src.rag.chunk_writer import (
     LEGACY_REQUIRED,
     format_summary,
     summarize,
     to_legacy,
     to_legacy_many,
 )
-from src.knowledge_chunk import (
+from src.rag.knowledge_chunk import (
     KIND_TABLE,
     KIND_TEXT,
     KnowledgeChunk,

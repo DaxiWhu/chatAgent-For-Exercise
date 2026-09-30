@@ -10,7 +10,7 @@ import io
 
 import pytest
 
-from src.pdf_parser import (
+from src.rag.pdf_parser import (
     extract_pdf_text,
     extract_pdf_paragraphs,
     rebuild_paragraphs,
@@ -20,7 +20,7 @@ from src.pdf_parser import (
     pdf_to_chunks,
     guess_lang,
 )
-from src.retrieval import load_chunks
+from src.rag.retrieval import load_chunks
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +64,90 @@ def make_pdf(path, lines):
 @pytest.fixture
 def sample_pdf(tmp_path):
     return make_pdf(tmp_path / "sample.pdf", ["Hello PDF World", "Second line here"])
+
+
+def make_pdf_pages(path, pages):
+    """生成多页 PDF：`pages` 是"每页的行列表"，空列表 = 空白页。
+
+    为什么需要它：按页判文字层必须能造出**某一页没有文字**的文件 —— 单页 PDF
+    永远走不到"混合文档"（部分页扫描、部分页电子）这条路径。
+    空白页在 pdfminer 眼里就是"没有 LTTextContainer"，与扫描页在判据上等价
+    （区分二者的是页上有没有位图，而文字层判据只看文字），所以空白页够用。
+
+    对象编号固定为：1=Catalog、2=Pages，之后每页占两个（Page + Contents），
+    最后一个是 Font —— 上面的 `font_no` 就是这个布局的闭式表达。
+    """
+    n = len(pages)
+    font_no = 3 + 2 * n
+    kids = " ".join(f"{3 + 2 * i} 0 R" for i in range(n))
+    objs = [
+        b"<</Type /Catalog /Pages 2 0 R>>",
+        f"<</Type /Pages /Kids [{kids}] /Count {n}>>".encode(),
+    ]
+    for lines in pages:
+        content = "BT /F1 12 Tf 72 720 Td 14 TL\n"
+        for ln in lines:
+            content += f"({ln}) Tj T*\n"
+        content += "ET\n"
+        cb = content.encode("latin-1")
+        objs.append(
+            f"<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            f"/Contents {len(objs) + 2} 0 R "
+            f"/Resources <</Font <</F1 {font_no} 0 R>>>>>>".encode()
+        )
+        objs.append(b"<</Length " + str(len(cb)).encode() + b">>stream\n" + cb + b"endstream")
+    objs.append(b"<</Type /Font /Subtype /Type1 /BaseFont /Helvetica>>")
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+
+    xref_at = len(out)
+    n_obj = len(objs) + 1
+    out += f"xref\n0 {n_obj}\n".encode() + b"0000000000 65535 f \n"
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += b"trailer\n<</Size " + str(n_obj).encode() + b" /Root 1 0 R>>\n"
+    out += b"startxref\n" + str(xref_at).encode() + b"\n%%EOF\n"
+
+    with open(path, "wb") as fh:
+        fh.write(bytes(out))
+    return path
+
+
+# ---------------------------------------------------------------------------
+# 按页文字层探测（混合文档判据的原料）
+# ---------------------------------------------------------------------------
+def test_pdf_page_text_chars_reports_every_page(tmp_path):
+    """**空白页也要出现在结果里**（值为 0）——"这页没有文字"本身就是判据，
+    从结果里消失就等于这页不存在，混合文档直接判不出来。"""
+    from src.rag.pdf_parser import pdf_page_text_chars
+
+    p = make_pdf_pages(tmp_path / "mixed.pdf", [
+        ["A full electronic page with plenty of extractable text on it."],
+        [],
+    ])
+    chars = pdf_page_text_chars(p)
+    assert set(chars) == {1, 2}, f"页码键应为 1 基且每页都在：{chars}"
+    assert chars[1] >= 50, "有文字层的页不该被判成图像页"
+    assert chars[2] == 0, "空白页应报 0，而不是从结果里消失"
+
+
+def test_pdf_page_text_chars_sees_no_text_on_a_rasterized_page(tmp_path):
+    """栅格化的页（文字全在位图里）必须是 0 —— 这就是"扫描页被看见"的前提。"""
+    pytest.importorskip("PIL")
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "scripts"))
+    from check_ocr import build_scanned_pdf
+    from src.rag.pdf_parser import pdf_page_text_chars
+
+    chars = pdf_page_text_chars(build_scanned_pdf(str(tmp_path / "scanned.pdf")))
+    assert chars, "探测不该返回空"
+    assert all(n == 0 for n in chars.values()), f"栅格化页里不该有文字层：{chars}"
 
 
 # ---------------------------------------------------------------------------

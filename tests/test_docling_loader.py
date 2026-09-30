@@ -10,8 +10,8 @@ import pytest
 
 pytest.importorskip("docling")
 
-from src import docling_loader  # noqa: E402
-from src.chunk_writer import to_legacy  # noqa: E402
+from src.rag import docling_loader  # noqa: E402
+from src.rag.chunk_writer import to_legacy  # noqa: E402
 from tests.test_pdf_parser import make_pdf  # noqa: E402  复用手搓 PDF 的手法
 
 # 只认"权重缺失"。列得越窄越好——放太宽会把真实回归也一起 skip 掉。
@@ -55,7 +55,7 @@ def parsed(available, simple_pdf):
     注意本样本文字层不足 50 字符，DOCLING_OCR=auto 会判为扫描件而开 OCR，
     因此这条链路天然覆盖了 RapidOCR，权重缺失时会在这里暴露。
     """
-    out = docling_loader.parse_document(simple_pdf, "simple.pdf", kind="pdf")
+    out = docling_loader.parse_pdf(simple_pdf, "simple.pdf")
     if out.status == "unavailable":
         pytest.skip(f"docling 不可用：{out.reason}")
     if out.status == "failed" and _env_not_ready(out.reason):
@@ -67,7 +67,7 @@ def test_docling_available(available):
     assert docling_loader.docling_available() is True
 
 
-def test_parse_document_succeeds(parsed):
+def test_parse_pdf_succeeds(parsed):
     assert parsed.status in ("ok", "partial"), f"status={parsed.status} reason={parsed.reason}"
     assert parsed.chunks
     assert parsed.page_total == 1
@@ -98,30 +98,49 @@ def test_tokenizer_implements_required_interface(available):
 
 
 def test_auto_ocr_decision_follows_text_layer(available, simple_pdf, tmp_path, monkeypatch):
-    """auto 模式的判据是"文字层是否够厚"：薄了当扫描件开 OCR，厚了不开。
+    """auto 模式的判据是"**某一页**的文字层是否够厚"：薄了当图像页开 OCR，厚了不开。
 
     这条不打模型，只锁行为——阈值或判据被改坏时显式失败，
-    避免"给正常电子版 PDF 白跑 OCR"或反过来"扫描件漏了 OCR"。
+    避免"给正常电子版 PDF 白跑 OCR"或反过来"扫描页漏了 OCR"。
     """
     monkeypatch.setattr(docling_loader, "DOCLING_OCR", "auto")
-    assert docling_loader._want_ocr(simple_pdf, "pdf") is True, "本样本文字层很薄，应判为需 OCR"
+    # 本样本单页且文字很薄 → 该页判为图像页 → 开 OCR
+    assert docling_loader._want_ocr(docling_loader._text_layer_pages(simple_pdf)) is True
 
     long_pdf = make_pdf(tmp_path / "long.pdf", [
         "This paragraph is deliberately long enough to exceed the fifty",
         "character threshold used by the text layer probe, so OCR is not",
         "needed at all for this particular electronic document.",
     ])
-    assert docling_loader._want_ocr(long_pdf, "pdf") is False
+    assert docling_loader._want_ocr(docling_loader._text_layer_pages(long_pdf)) is False
 
 
-def test_ocr_never_enabled_for_docx(available, monkeypatch):
-    """docx 是 markup 格式，文字是结构化的，任何模式下都不该走 OCR。"""
+def test_auto_ocr_opens_when_any_single_page_lacks_a_text_layer(available, monkeypatch):
+    """**混合文档**：10 页电子 + 1 页扫描，也必须开 OCR。
+
+    这是本模块最容易静默丢内容的一处：原先按"整份文本量"判，总字符数会被电子页
+    淹掉 → 不开 OCR → 那一页（可能整章）的文字永久抽不出来，而整份文档非空、
+    chunks 非空、status=ok，一条 warning 都不会有。
+    """
     monkeypatch.setattr(docling_loader, "DOCLING_OCR", "auto")
-    assert docling_loader._want_ocr("whatever.docx", "docx") is False
+    chars = {p: 800 for p in range(1, 11)}     # 10 页电子版
+    chars[11] = 0                              # 1 页扫描
+    assert docling_loader._scanned_pages(chars) == {11}
+    assert docling_loader._want_ocr(chars) is True
+
+
+def test_explicit_ocr_switch_overrides_the_page_probe(available, monkeypatch):
+    """显式 on/off 优先级高于页级探测；探测失败（空 dict）按"都有文字层"处理。"""
+    monkeypatch.setattr(docling_loader, "DOCLING_OCR", "on")
+    assert docling_loader._want_ocr({1: 800}) is True       # 全电子也强制开
+    monkeypatch.setattr(docling_loader, "DOCLING_OCR", "off")
+    assert docling_loader._want_ocr({1: 0}) is False        # 全扫描也不开（调用方会告警）
+    monkeypatch.setattr(docling_loader, "DOCLING_OCR", "auto")
+    assert docling_loader._want_ocr({}) is False, "探测失败不该给正常文件白加 OCR 开销"
 
 
 def test_missing_file_reports_failure(available, tmp_path):
-    out = docling_loader.parse_document(str(tmp_path / "nope.pdf"), "nope.pdf")
+    out = docling_loader.parse_pdf(str(tmp_path / "nope.pdf"), "nope.pdf")
     assert out.status == "failed"
     assert not out.chunks
 
@@ -144,11 +163,11 @@ def test_scanned_pdf_text_is_recovered_by_ocr(available, tmp_path, monkeypatch):
     scanned = build_scanned_pdf(str(tmp_path / "scanned.pdf"))
 
     # 前置断言：确认真的没有文字层了，否则这条用例测的还是老链路
-    from src.pdf_parser import extract_pdf_text
+    from src.rag.pdf_parser import extract_pdf_text
     assert not (extract_pdf_text(scanned) or "").strip(), "栅格化后不该残留文字层"
-    assert docling_loader._want_ocr(scanned, "pdf") is True
+    assert docling_loader._want_ocr(docling_loader._text_layer_pages(scanned)) is True
 
-    out = docling_loader.parse_document(scanned, "scanned.pdf", kind="pdf")
+    out = docling_loader.parse_pdf(scanned, "scanned.pdf")
     assert out.status in ("ok", "partial"), f"status={out.status} reason={out.reason}"
     text = " ".join(c.retrieval_text for c in out.chunks)
     low = text.lower()
@@ -158,7 +177,7 @@ def test_scanned_pdf_text_is_recovered_by_ocr(available, tmp_path, monkeypatch):
 def test_doc_parser_override_disables_docling(available, simple_pdf, monkeypatch):
     """RAG_DOC_PARSER=pdfminer 时应直接判 unavailable，让调用方走降级链路。"""
     monkeypatch.setattr(docling_loader, "DOC_PARSER", "pdfminer")
-    out = docling_loader.parse_document(simple_pdf, "simple.pdf")
+    out = docling_loader.parse_pdf(simple_pdf, "simple.pdf")
     assert out.status == "unavailable"
     assert "pdfminer" in out.reason
 
@@ -173,7 +192,7 @@ def test_doc_parser_override_disables_docling(available, simple_pdf, monkeypatch
 @pytest.fixture(scope="module")
 def parsed_docx(available, tmp_path_factory):
     pytest.importorskip("openpyxl")            # 夹具里的 OLE 内层是真 xlsx
-    from src import docx_media
+    from src.rag import docx_media
     from tests.docx_fixtures import build_minimal_docx
 
     docx_media.MEDIA_DIR = str(tmp_path_factory.mktemp("docx_media"))

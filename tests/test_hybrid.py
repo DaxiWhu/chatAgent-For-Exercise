@@ -4,8 +4,8 @@
 """
 import pytest
 
-import src.retrieval as R
-from src.retrieval import (
+import src.rag.retrieval as R
+from src.rag.retrieval import (
     HybridRetriever,
     RerankClient,
     build_retriever,
@@ -214,7 +214,7 @@ def test_build_retriever_hybrid_without_embedding_falls_back(monkeypatch):
     monkeypatch.setattr(R, "EMBEDDING_API_KEY", "")
     monkeypatch.setattr(R, "EMBEDDING_MODEL", "")
     chunks = [_chunk("s", "梧州特产有六堡茶。")]
-    assert isinstance(build_retriever(chunks), R.TfidfRetriever)
+    assert isinstance(build_retriever(chunks), R.BM25Retriever)
 
 
 def test_build_retriever_selects_hybrid(monkeypatch):

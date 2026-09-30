@@ -11,8 +11,8 @@ import os
 
 import pytest
 
-from src import image_describer as D
-from src.knowledge_chunk import KIND_DIAGRAM
+from src.rag import image_describer as D
+from src.rag.knowledge_chunk import KIND_DIAGRAM
 
 
 @pytest.fixture
@@ -33,7 +33,7 @@ def emf(tmp_path):
 
 
 def _chunk(**kw):
-    from src.knowledge_chunk import KnowledgeChunk
+    from src.rag.knowledge_chunk import KnowledgeChunk
     kw.setdefault("kind", KIND_DIAGRAM)
     kw.setdefault("source", "a.pdf")
     kw.setdefault("needs_vlm", True)

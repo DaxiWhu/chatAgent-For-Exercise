@@ -10,8 +10,8 @@ import json
 
 import pytest
 
-from src.loaders import load_blocks, load_text
-from src.retrieval import load_chunks
+from src.rag.loaders import load_blocks, load_text
+from src.rag.retrieval import load_chunks
 
 
 def _texts(blocks):
@@ -167,7 +167,7 @@ def test_xlsx_chart_data_comes_from_the_same_chart_xml_as_word(tmp_path):
 
 
 def test_xlsx_row_truncation_is_explicit(tmp_path, monkeypatch):
-    from src import loaders as L
+    from src.rag import loaders as L
 
     openpyxl, wb, p = _xlsx(tmp_path)
     ws = wb.active
@@ -288,7 +288,7 @@ def test_pptx_slide_order_follows_page_numbers_not_strings(tmp_path):
 # ---------------------------------------------------------------------------
 def test_csv_every_block_repeats_the_header(tmp_path, monkeypatch):
     """不重复表头的话，切分后的第 2 块起就只剩数值行，列名永久丢失。"""
-    from src import loaders as L
+    from src.rag import loaders as L
 
     p = tmp_path / "d.csv"
     p.write_text("城市,特产\n" + "\n".join(f"城市{i},特产{i}" for i in range(5)),
@@ -327,7 +327,7 @@ def test_jsonl_keeps_invalid_lines(tmp_path):
 
 
 def test_json_record_cap_is_explicit(tmp_path, monkeypatch):
-    from src import loaders as L
+    from src.rag import loaders as L
 
     p = tmp_path / "d.json"
     p.write_text(json.dumps([{"i": i} for i in range(30)]), encoding="utf-8")

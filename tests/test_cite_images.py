@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from src import docling_loader as L
+from src.rag import docling_loader as L
 
 pytest.importorskip("docling")
 
@@ -37,9 +37,10 @@ class _FakePage:
 
 
 class _FakeChunk:
-    def __init__(self, bbox, kind="table"):
+    def __init__(self, bbox, kind="table", page=1):
         self.bbox = bbox
         self.kind = kind
+        self.page = page
         self.chunk_id = "c"
 
 
@@ -105,25 +106,41 @@ def test_crop_region_clips_to_page_bounds():
 
 
 # ---------------------------------------------------------------------------
-# 规则：哪些块给图（纯文字不给；扫描件给整页）
+# 规则：哪些块给图（纯文字不给；扫描页给整页）
 # ---------------------------------------------------------------------------
 def test_only_non_text_kinds_get_a_crop():
-    assert L._needs_cite_image(_FakeChunk([], kind="table"), scanned=False) is True
-    assert L._needs_cite_image(_FakeChunk([], kind="chart"), scanned=False) is True
-    assert L._needs_cite_image(_FakeChunk([], kind="diagram"), scanned=False) is True
-    assert L._needs_cite_image(_FakeChunk([], kind="text"), scanned=False) is False
+    """电子页（不在 scanned_pages 里）：只有表/图/公式给裁剪图，纯文字不给。"""
+    electronic: set = set()
+    assert L._needs_cite_image(_FakeChunk([], kind="table"), electronic) is True
+    assert L._needs_cite_image(_FakeChunk([], kind="chart"), electronic) is True
+    assert L._needs_cite_image(_FakeChunk([], kind="diagram"), electronic) is True
+    assert L._needs_cite_image(_FakeChunk([], kind="text"), electronic) is False
 
 
-def test_scanned_documents_always_get_the_full_page():
-    """扫描件上"原文"就是那张图，OCR 文字只是近似转写 —— 按 bbox 裁一行反而更难核对。"""
-    assert L._needs_cite_image(_FakeChunk([], kind="text"), scanned=True) is True
+def test_scanned_pages_always_get_the_full_page():
+    """扫描页上"原文"就是那张图，OCR 文字只是近似转写 —— 按 bbox 裁一行反而更难核对。"""
+    assert L._needs_cite_image(_FakeChunk([], kind="text", page=3), {3}) is True
+
+
+def test_mixed_document_judges_page_by_page():
+    """**混合文档**：同一份文件里电子页和扫描页两种规则要同时生效。
+
+    判据必须看块自己那一页，不能用"整份是不是扫描件"一个布尔 —— 那种写法必然
+    有一边错：要么扫描页的纯文字块拿不到整页图，要么电子页的每个块都被塞一张整页图。
+    """
+    scanned = {2, 3}
+    # 第 2 页是扫描页：连纯文字块也要整页图
+    assert L._needs_cite_image(_FakeChunk([], kind="text", page=2), scanned) is True
+    # 第 1 页是电子页：纯文字块不给图，表格块照旧给裁剪
+    assert L._needs_cite_image(_FakeChunk([], kind="text", page=1), scanned) is False
+    assert L._needs_cite_image(_FakeChunk([], kind="table", page=1), scanned) is True
 
 
 def test_page_images_can_be_switched_off(monkeypatch):
     monkeypatch.setattr(L, "DOCLING_PAGE_IMAGES", "off")
     assert L._want_page_images() is False
     # 关掉之后连入口都不该进（大文件批量灌库时的内存保护）
-    assert L._attach_cite_images(None, [_FakeChunk([[0, 0, 1, 1]])], "x.pdf", False) == 0
+    assert L._attach_cite_images(None, [_FakeChunk([[0, 0, 1, 1]])], "x.pdf", set()) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +149,7 @@ def test_page_images_can_be_switched_off(monkeypatch):
 @pytest.fixture(scope="module")
 def media_dir(tmp_path_factory, ):
     """媒体目录改到临时目录，别往仓库里写。"""
-    from src import docx_media
+    from src.rag import docx_media
     d = tmp_path_factory.mktemp("cite_media")
     docx_media.MEDIA_DIR = str(d)
     return str(d)
@@ -148,7 +165,7 @@ def _table_pdf(tmp_path):
 
 def test_table_chunk_gets_a_cropped_image(tmp_path, media_dir):
     """电子版 PDF 的表格块 → 有原页截图，且**不是整页**（是裁出的区域）。"""
-    out = _skip_or_fail(L.parse_document(_table_pdf(tmp_path), "table.pdf", kind="pdf"))
+    out = _skip_or_fail(L.parse_pdf(_table_pdf(tmp_path), "table.pdf"))
     tables = [c for c in out.chunks if c.kind == "table"]
     assert tables, "没有解析出表格块"
     img = tables[0].page_image
@@ -166,7 +183,7 @@ def test_pure_text_chunk_gets_no_image(tmp_path, media_dir):
     from tests.test_pdf_parser import make_pdf
     p = make_pdf(str(tmp_path / "plain.pdf"),
                  ["Wuzhou exports liubao tea to Guangzhou.", "Plain text page."])
-    out = _skip_or_fail(L.parse_document(p, "plain.pdf", kind="pdf"))
+    out = _skip_or_fail(L.parse_pdf(p, "plain.pdf"))
     assert out.chunks
     assert all(c.kind == "text" for c in out.chunks)
     assert all(not c.page_image for c in out.chunks), "纯文字块不该产出原页截图"
@@ -174,9 +191,9 @@ def test_pure_text_chunk_gets_no_image(tmp_path, media_dir):
 
 def test_citation_carries_image_and_human_readable_where(tmp_path, media_dir):
     """引用里要同时有"图"和"人话位置" —— 光有坐标不足以让人去核对。"""
-    from src.retrieval import build_citations
+    from src.rag.retrieval import build_citations
 
-    out = _skip_or_fail(L.parse_document(_table_pdf(tmp_path), "table.pdf", kind="pdf"))
+    out = _skip_or_fail(L.parse_pdf(_table_pdf(tmp_path), "table.pdf"))
     hit = next(c for c in out.chunks if c.kind == "table")
     cite = build_citations([(hit.to_dict() | {"text": hit.retrieval_text}, 0.9)])[0]
     assert cite["page"] == 1 and cite["where"].startswith("table.pdf")
@@ -194,8 +211,8 @@ def test_scanned_pdf_returns_the_whole_page(tmp_path, media_dir):
     from check_ocr import build_scanned_pdf
     from PIL import Image
 
-    out = _skip_or_fail(L.parse_document(build_scanned_pdf(str(tmp_path / "s.pdf")),
-                                        "s.pdf", kind="pdf"))
+    out = _skip_or_fail(L.parse_pdf(build_scanned_pdf(str(tmp_path / "s.pdf")),
+                                   "s.pdf"))
     chunks = [c for c in out.chunks if c.page_image]
     assert chunks, "扫描件没有产出原图"
     with Image.open(chunks[0].page_image) as im:
@@ -222,7 +239,7 @@ def test_unprocessable_scan_still_returns_the_page_image(tmp_path, media_dir):
     p = str(tmp_path / "bars.pdf")
     pages[0].save(p, "PDF", save_all=True, append_images=pages[1:], resolution=150)
 
-    out = _skip_or_fail(L.parse_document(p, "bars.pdf", kind="pdf"))
+    out = _skip_or_fail(L.parse_pdf(p, "bars.pdf"))
     assert out.status == "unprocessable", f"预期解析不出内容，实得 {out.status}"
     kc = out.chunks[0]
     assert kc.kind == "unprocessable"

@@ -6,6 +6,7 @@
 
 需要 `httpx`（FastAPI TestClient 依赖）；缺失时整个模块自动跳过。
 """
+import json
 import os
 
 import pytest
@@ -87,7 +88,12 @@ def test_stream_emits_citations_between_tokens_and_done(monkeypatch):
     monkeypatch.setattr(M, "graph", _FakeGraph(cites))
     events = _collect(M._stream_graph({}, {}, "chat"))
     assert [e["event"] for e in events] == ["token", "citations", "done"]
-    assert events[1]["data"] == cites
+    # data 必须是**已序列化的 JSON 字符串**，不能是 list 本身：
+    # sse_starlette 的 encode 对 data 走 `str(...)`，直接给 list 会发出 Python repr
+    # （单引号、None/True），JS/Go 客户端解析不了。详见 app.main._sse_json 的注释。
+    # 旧断言 `== cites` 只覆盖到序列化之前，是这类 bug 长期漏测的原因。
+    assert isinstance(events[1]["data"], str), "data 应是 JSON 字符串（交给 SSE 层前已 dumps）"
+    assert json.loads(events[1]["data"]) == cites
 
 
 def test_stream_skips_citations_event_when_nothing_recalled(monkeypatch):

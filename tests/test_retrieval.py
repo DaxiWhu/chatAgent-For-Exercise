@@ -1,7 +1,9 @@
 """RAG 检索层测试：全部离线，不调用任何外部服务。"""
-import src.retrieval as R
-from src.retrieval import (
-    TfidfRetriever,
+import logging
+
+import src.rag.retrieval as R
+from src.rag.retrieval import (
+    BM25Retriever,
     NullRetriever,
     build_retriever,
     build_prompt,
@@ -17,18 +19,19 @@ CHUNKS = [
 ]
 
 
-# ---------------- TF-IDF 中文检索（回归）----------------
-def test_tfidf_chinese_retrieval_works():
+# ---------------- 稀疏检索（BM25）中文召回（回归）----------------
+# 打分公式本身的测试在 tests/test_bm25.py；这里守的是"中文能不能召回"这个端到端前提。
+def test_bm25_chinese_retrieval_works():
     """回归：默认 word 分词在中文上实测 0 命中；改用字符 n-gram 后必须能召回。"""
-    r = TfidfRetriever(CHUNKS)
+    r = BM25Retriever(CHUNKS)
     for q in ["梧州有什么特产？", "六堡茶是什么茶？", "骑楼城", "梧州的气候怎么样"]:
         hits = r.search(q, top_k=1)
         assert hits, f"查询 {q!r} 未召回任何片段"
         assert hits[0][1] > 0
 
 
-def test_tfidf_picks_most_relevant_chunk():
-    r = TfidfRetriever(CHUNKS)
+def test_bm25_picks_most_relevant_chunk():
+    r = BM25Retriever(CHUNKS)
     hits = r.search("六堡茶", top_k=1)
     assert hits
     assert "六堡茶" in hits[0][0]["text"]
@@ -112,17 +115,31 @@ def test_build_retriever_empty_chunks_returns_null():
     assert isinstance(build_retriever([]), NullRetriever)
 
 
-def test_build_retriever_default_is_tfidf(monkeypatch):
-    monkeypatch.setattr(R, "EMBEDDING_BACKEND", "tfidf")
-    assert isinstance(build_retriever(CHUNKS), TfidfRetriever)
+def test_build_retriever_default_is_bm25(monkeypatch):
+    monkeypatch.setattr(R, "EMBEDDING_BACKEND", "bm25")
+    assert isinstance(build_retriever(CHUNKS), BM25Retriever)
 
 
 def test_build_retriever_semantic_without_config_falls_back(monkeypatch):
-    """选了 semantic 但 EMBEDDING_* 没填 → 自动回退 TF-IDF，不抛异常。"""
+    """选了 semantic 但 EMBEDDING_* 没填 → 自动回退 BM25，不抛异常。"""
     monkeypatch.setattr(R, "EMBEDDING_BACKEND", "semantic")
     monkeypatch.setattr(R, "EMBEDDING_API_KEY", "")
     monkeypatch.setattr(R, "EMBEDDING_MODEL", "")
-    assert isinstance(build_retriever(CHUNKS), TfidfRetriever)
+    assert isinstance(build_retriever(CHUNKS), BM25Retriever)
+
+
+def test_build_retriever_accepts_tfidf_as_legacy_alias(monkeypatch, caplog):
+    """历史配置值 `RAG_EMBEDDING=tfidf` 仍要能用，**且必须留下告警**。
+
+    契约点：这个值写在存量 .env 里。删掉别名的后果不是报错，而是它悄悄落进"其余值 →
+    兜底"分支 —— 行为恰好一样，所以谁也不会发现，只是日志语义从此说不清。
+    告警是那条"你该改配置了"的唯一出口。
+    """
+    monkeypatch.setattr(R, "EMBEDDING_BACKEND", "tfidf")
+    with caplog.at_level(logging.WARNING):
+        r = build_retriever(CHUNKS)
+    assert isinstance(r, BM25Retriever)
+    assert any("tfidf" in rec.message for rec in caplog.records), "别名路径必须告警"
 
 
 def test_build_retriever_semantic_with_config_uses_embedding(monkeypatch):
@@ -248,7 +265,7 @@ def _write_docx(tmp_path):
 
 
 def _kc(text, source="report.docx", parser="docling"):
-    from src.knowledge_chunk import KnowledgeChunk
+    from src.rag.knowledge_chunk import KnowledgeChunk
     return KnowledgeChunk(source=source, parser=parser, origin="docling_docx",
                           content=text, retrieval_text=text)
 
@@ -256,7 +273,7 @@ def _kc(text, source="report.docx", parser="docling"):
 def test_docx_uses_docling_route_by_default(tmp_path, monkeypatch):
     """docx 必须走专属链路 —— 并入通用分支（load_text）就只剩正文，
     图片/原生图表/OLE 会一起丢掉，而它们恰恰是 docx 解析里最值钱的部分。"""
-    import src.docling_loader as DL
+    import src.rag.docling_loader as DL
 
     _write_docx(tmp_path)
     seen = {}
@@ -276,7 +293,7 @@ def test_docx_uses_docling_route_by_default(tmp_path, monkeypatch):
 
 def test_docx_falls_back_to_python_docx_when_docling_unavailable(tmp_path, monkeypatch):
     """降级要真的可用，且必须留痕（parser 字段），否则"这份文件其实走的老链路"查不出来。"""
-    import src.docling_loader as DL
+    import src.rag.docling_loader as DL
 
     _write_docx(tmp_path)
     monkeypatch.setattr(DL, "parse_docx",
@@ -290,8 +307,8 @@ def test_docx_falls_back_to_python_docx_when_docling_unavailable(tmp_path, monke
 def test_docx_unprocessable_record_is_kept_not_downgraded(tmp_path, monkeypatch):
     """「解析不出内容」不是「解析器坏了」：降级只会更差，
     应保留这条显式失败记录（否则该文件在索引里凭空消失，没人知道它没被索引）。"""
-    import src.docling_loader as DL
-    from src.knowledge_chunk import unprocessable
+    import src.rag.docling_loader as DL
+    from src.rag.knowledge_chunk import unprocessable
 
     _write_docx(tmp_path)
     # 注意 parser 要显式传：真实生产者（docling_loader.parse_docx）就是带 parser="docling" 造的，

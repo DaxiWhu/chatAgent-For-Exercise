@@ -12,10 +12,39 @@ python-dotenv>=1.0
 fastapi>=0.110
 uvicorn>=0.30
 sse-starlette>=2.1
+# httpx 同时供 rerank 客户端、审核通知（app/review_queue.py）与 TestClient 使用，
+# 它在下面的"测试"段声明；这里不重复列出。
+
+# ---- 服务化：生产化横切能力 ----
+# 多实例共享限流 / 配额计数（REDIS_URL）。**不装则退化为进程内计数**
+# （单实例部署够用）；多副本部署时不配 REDIS_URL，每个副本各算各的，
+# 实际额度 = 配置值 × 副本数。
+#
+# ⚠️ 这里列成硬依赖而不是注释掉，原因是**"配了 REDIS_URL 但没装客户端"是一次静默降级**：
+# 代码只在 try/except 里回退内存，服务照常起来、日志里一行 warning，
+# 运维看到配置项已填就以为共享生效了。启动配置回显现在会分别打印
+# `shared_configured`（打算用）与 `backend`（实际在用），二者不一致会打 ERROR。
+# 装成硬依赖可以直接消灭这一整类误配（纯 python，无编译依赖）。
+redis>=5.0
+# LLM 链路 tracing（二选一即可）。不装则完全不上报，行为与没有这层代码一致。
+# langfuse>=2.0
+# LangSmith 走 LangChain 原生环境变量，只需 langchain 本身（已在上面）。
+# 指标：app/metrics.py 自带 Prometheus 文本输出，**无需** prometheus-client。
 
 # ---- RAG：检索（src/retrieval.py）----
 scikit-learn>=1.4
 numpy>=1.26
+# 稠密向量落 PostgreSQL（RAG_VECTOR_STORE=pg，见 src/vector_store.py）。
+# ⚠️ 这只是 python 客户端适配器；**服务端还需安装 vector 扩展**（CREATE EXTENSION vector）。
+# psycopg 连接驱动已在上面 (langgraph-checkpoint-postgres 依赖)。
+pgvector>=0.3
+
+# 向量库 Qdrant（RAG_VECTOR_STORE=qdrant，见 src/qdrant_store.py）：
+# **稀疏 BM25 + 稠密 embedding 同库**，一个 collection 两路召回（融合仍由 rrf_fuse 完成）。
+# 需要外部运行一个 Qdrant 服务（本地可 docker run qdrant/qdrant）。
+# 不装 / 不配则完全不影响其它后端（qdrant_client 在方法内延迟导入）。
+# ⚠️ 需 >=1.10：代码用的是 query_points 这一现代 API（旧版只有 search）。
+qdrant-client>=1.10
 
 # ---- RAG:文档解析(src/loaders.py + src/pdf_parser.py)----
 pdfminer.six>=20231228       # .pdf（降级链路，Docling 不可用时自动回退）
@@ -39,6 +68,10 @@ tiktoken>=0.7                # 离线 tokenizer 兜底(拉不到 HF tokenizer �
 # ---- 测试 ----
 pytest>=8.0
 httpx>=0.27                  # fastapi.testclient（tests/test_api.py）依赖
+# 进程内假 Redis：让共享后端（限流/配额）的代码路径**在没有真实 Redis 的环境里也能被断言**。
+# 这正是它长期"从未实测"的原因 —— 依赖一个需要在 CI 里额外起容器/服务的前提。
+# fakeredis 也支持多客户端共享同一个 FakeServer，因此能验证"两个实例共享计数"这个核心语义。
+fakeredis>=2.20
 
 # ---- 可选：装了更准，不装也能跑（自动回退标点正则）----
 # nltk>=3.8                  # 英文断句更准；未安装/无 punkt 数据时回退正则

@@ -3,8 +3,8 @@ import os
 
 import pytest
 
-from src.loaders import load_text, supported_extensions
-from src.retrieval import load_chunks
+from src.rag.loaders import load_text, supported_extensions
+from src.rag.retrieval import load_chunks
 
 
 # ---------------------------------------------------------------------------

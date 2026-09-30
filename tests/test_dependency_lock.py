@@ -1,0 +1,118 @@
+"""依赖锁定的一致性守护。
+
+为什么需要这个测试
+------------------
+`requirements.txt` 全用 `>=`（表达意图），`requirements.lock` 钉死版本（保证可复现）。
+两处名单一旦漂移，后果是**静默的**：新人加了个包、忘了重新生成 lock，
+构建依旧成功，只是那个包**没有受到版本约束** —— 直到某天上游发新版才炸。
+
+CI 的 `test` job 刻意不装 docling/transformers，所以这里校验的是
+**静态一致性**（声明与锁定对齐），不是"装没装得上"。后者由 Dockerfile 构建负责。
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+REQ = ROOT / "requirements.txt"
+LOCK = ROOT / "requirements.lock"
+
+
+def _norm(name: str) -> str:
+    """PyPI 包名归一化：Pdfminer.six / pdfminer-six / pdfminer.six 是同一个包。"""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _parse(path: Path) -> list[tuple[str, str]]:
+    out = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]+\])?\s*(.*)$", line)
+        if m:
+            out.append((m.group(1), (m.group(3) or "").strip()))
+    return out
+
+
+def _lock_pins() -> dict[str, str]:
+    pins = {}
+    for name, spec in _parse(LOCK):
+        if spec.startswith("=="):
+            pins[_norm(name)] = spec[2:]
+    return pins
+
+
+def test_lock_file_exists():
+    """缺了锁定清单，构建就回到"每次装什么都看运气"的状态。"""
+    assert LOCK.exists(), "缺少 requirements.lock；跑 `python scripts/lock_requirements.py --write` 生成"
+
+
+def test_every_declared_package_is_pinned():
+    """requirements.txt 里声明的每个包，lock 里都必须有精确版本。"""
+    pins = _lock_pins()
+    missing = [n for n, _ in _parse(REQ) if _norm(n) not in pins]
+    assert not missing, (
+        f"以下包在 requirements.txt 里声明了但未锁定版本：{missing}\n"
+        "跑 `python scripts/lock_requirements.py --write` 重新生成。"
+    )
+
+
+def test_no_orphans_in_lock():
+    """lock 里不该有 requirements.txt 已删除的包 —— 否则长期误导后来人。"""
+    declared = {_norm(n) for n, _ in _parse(REQ)}
+    orphan = [k for k in _lock_pins() if k not in declared]
+    assert not orphan, f"lock 里有 requirements.txt 已不声明的包：{orphan}"
+
+
+def test_lock_pins_are_exact_versions():
+    """锁定项必须是 `==x.y.z`，不能混入 `>=`（那等于没锁）。
+
+    这条防的是"把 lock 写成第二份 requirements.txt"这种退化。
+    """
+    bad = [(n, s) for n, s in _parse(LOCK) if not s.startswith("==")]
+    assert not bad, f"锁定清单里出现非精确版本约束：{bad}"
+
+
+def test_requirements_do_not_use_exact_pins():
+    """反向约束：requirements.txt 应保持范围约束。
+
+    如果两处都写 `==`，就会出现"改版本要改两个文件、漏改一处则静默不一致"。
+    职责分离是这套双层结构成立的前提。
+    """
+    pinned = [(n, s) for n, s in _parse(REQ) if s.startswith("==")]
+    assert not pinned, (
+        f"requirements.txt 里不该出现精确版本（那是 requirements.lock 的职责）：{pinned}"
+    )
+
+
+def test_dockerfile_uses_the_lock_file():
+    """Dockerfile 必须真的引用 lock —— 有文件但不用，等于没锁。"""
+    dockerfile = (ROOT / "deploy" / "app" / "Dockerfile").read_text(encoding="utf-8")
+    assert "-c requirements.lock" in dockerfile, (
+        "Dockerfile 未使用 requirements.lock，构建依然不可复现"
+    )
+    assert "COPY requirements.txt requirements.lock" in dockerfile, (
+        "Dockerfile 未把 lock 文件拷进构建上下文，`-c` 会找不到它"
+    )
+
+
+def test_ci_workflow_runs_the_lock_check():
+    """CI 里必须有这道门禁，否则漂移只能靠人自觉。"""
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "lock_requirements.py" in ci, "CI 未执行依赖锁定一致性检查"
+
+
+def test_checker_script_passes_on_current_tree():
+    """端到端：直接跑校验脚本，确认它在本仓库现状下是通过的。"""
+    r = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "lock_requirements.py")],
+        capture_output=True, text=True, cwd=str(ROOT),
+    )
+    assert r.returncode == 0, f"锁定校验未通过：\n{r.stdout}\n{r.stderr}"

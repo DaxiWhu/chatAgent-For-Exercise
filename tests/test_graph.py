@@ -88,3 +88,48 @@ def test_full_graph_retrieve_error_does_not_crash(mock_model):
     result = g.invoke({"messages": [AIMessage(content="随便问")]}, config=cfg)
     assert result["context"] == ""
     assert result["score"] == 90
+
+
+# ---------------------------------------------------------------------------
+# 语料可见性：空语料是**静默失败**，必须留下告警
+# ---------------------------------------------------------------------------
+def test_empty_corpus_is_warned(monkeypatch, caplog):
+    """语料为空必须告警。
+
+    这是本条目唯一能防住的一类故障：语料目录没挂进容器 / DOCS_DIR 指错 ⇒
+    `load_chunks` 对不存在的目录**返回 [] 而不抛异常** ⇒ 服务照常起、探针照常绿、
+    SSE 照常连，只是检索恒无结果、回答里没有任何引用。没有这条告警就只能靠
+    用户反馈"答得不对"才发现，排查时又会去怀疑模型而不是部署。
+    """
+    import logging as _logging
+
+    from src import graph as G
+
+    monkeypatch.setattr(G, "_CHUNKS", None)
+    monkeypatch.setattr(G, "load_chunks_cached", lambda d: [])
+
+    with caplog.at_level(_logging.WARNING):
+        assert G._load_chunks_once() == []
+
+    assert any("RAG 语料为空" in r.getMessage() for r in caplog.records), (
+        "空语料没有告警 —— 漏挂语料目录时会变成'检索恒无结果且无任何信号'"
+    )
+
+
+def test_nonempty_corpus_is_not_warned(monkeypatch, caplog):
+    """反向断言：语料正常时不得误报。
+
+    告警的价值取决于它是否稀缺 —— 一条经常误报的 warning 会被运维当噪音过滤掉，
+    于是真正出问题那次也一起被过滤。
+    """
+    import logging as _logging
+
+    from src import graph as G
+
+    monkeypatch.setattr(G, "_CHUNKS", None)
+    monkeypatch.setattr(G, "load_chunks_cached", lambda d: [{"text": "块"}])
+
+    with caplog.at_level(_logging.WARNING):
+        assert len(G._load_chunks_once()) == 1
+
+    assert not any("RAG 语料为空" in r.getMessage() for r in caplog.records)

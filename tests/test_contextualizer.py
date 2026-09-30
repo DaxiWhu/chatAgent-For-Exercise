@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from src import contextualizer as C
+from src.rag import contextualizer as C
 
 
 def _chunks(n=3, source="a.pdf"):
@@ -20,13 +20,13 @@ def enabled(monkeypatch, tmp_path):
     """打开开关并把缓存指到临时目录（避免污染仓库、也避免跨用例互相命中）。"""
     monkeypatch.setattr(C, "CTX_API_KEY", "sk-fake")
     monkeypatch.setattr(C, "CTX_CACHE_DIR", str(tmp_path / "ctx"))
-    import src.retrieval as R
+    import src.rag.retrieval as R
     monkeypatch.setattr(R, "CONTEXTUAL", True)
     return True
 
 
 def test_disabled_by_default(monkeypatch):
-    import src.retrieval as R
+    import src.rag.retrieval as R
     monkeypatch.setattr(R, "CONTEXTUAL", False)
     called = []
     stats = C.apply(_chunks(), call=lambda p: called.append(p) or "前缀")
@@ -34,7 +34,7 @@ def test_disabled_by_default(monkeypatch):
 
 
 def test_on_without_key_is_explicit(tmp_path, monkeypatch):
-    import src.retrieval as R
+    import src.rag.retrieval as R
     monkeypatch.setattr(R, "CONTEXTUAL", True)
     monkeypatch.setattr(C, "CTX_API_KEY", "")
     ok, why = C.enabled()
@@ -77,6 +77,29 @@ def test_cache_prevents_paying_twice(enabled):
     stats = C.apply(again, call=fake)
     assert len(calls) == 3, "相同内容不该再次调用模型"
     assert stats["cached"] == 3 and all(c["text"].startswith("前缀") for c in again)
+
+
+def test_cache_key_is_whitespace_insensitive(enabled):
+    """带首尾空白的块也必须命中缓存。
+
+    读侧取 text 时先 strip 再查缓存，写侧若传未 strip 的原文，同一块"写进去的键"与
+    "下次读取的键"就不同 —— 缓存静默永久失效（不报错、不告警，只是每次都重新付费）。
+    这个用例就是钉住那个不对称：写侧必须与读侧同口径。
+    """
+    calls = []
+    def fake(prompt):
+        calls.append(prompt)
+        return "前缀"
+
+    def padded(n=2):
+        return [{"source": "a.pdf", "section": "",
+                 "text": f"  第{i}块的内容" + "字" * 20 + "\n"} for i in range(n)]
+
+    C.apply(padded(), call=fake)
+    assert len(calls) == 2
+    stats = C.apply(padded(), call=fake)
+    assert len(calls) == 2, "带首尾空白的块不该重新调用模型"
+    assert stats["cached"] == 2
 
 
 def test_cache_key_includes_model(enabled, monkeypatch):
@@ -247,3 +270,43 @@ def test_rate_limit_stops_early_instead_of_burning_quota(enabled):
     assert stats["prefixed"] == 0
     assert stats["failed"] >= 1
     assert all("ctx_prefix" not in c for c in chunks)
+
+    # **必须断言调用次数**（2026-09-28 补）：只断言 prefixed/failed 的话，把
+    # `stop.set()` 删掉这条**依然通过**（20 个块全失败 ⇒ failed=20 >= 1），
+    # 是典型的假绿。这里钉住"第一次被限流后就再没发起过请求"。
+    assert len(calls) == 1, f"限流后仍发起了 {len(calls)} 次调用，止损没生效"
+
+
+def test_rate_limit_warning_names_the_source(enabled, caplog):
+    """限流告警必须点名来源文件，且同一文件只点名一次。
+
+    原实现只打"（%d 块未做）"，虽然 `_work` 一路在 `limited.append(source)`，
+    但那个列表全文件唯一的读法是 `if limited:` —— 内容没人用。后果是多文件灌库时
+    只看到一个总块数，查不出是哪份文档撞的配额。
+
+    为什么要加 barrier：真实场景里 4 个 worker 同时发出请求、会**同时**收到 429，
+    于是 4 个都 append 同一个文件名（这也是去重存在的理由）。如果让假实现立刻抛错，
+    worker1 会在 2/3/4 启动前就置位 stop，只剩 1 条 append，去重分支根本走不到
+    （实测确认过）。barrier 把 4 个 worker 卡到齐再一起失败，去重才真的被踩到；
+    wait 带 timeout 并在 BrokenBarrierError 时放行，避免线程数不足时把测试挂死。
+    """
+    import threading
+
+    barrier = threading.Barrier(4)
+
+    def limited(prompt):
+        try:
+            barrier.wait(timeout=5)
+        except threading.BrokenBarrierError:
+            pass
+        raise RuntimeError("Error code: 429 - rate limit for free users")
+
+    chunks = _chunks(8, source="限流样本.pdf")
+    with caplog.at_level("WARNING"):
+        C.apply(chunks, call=limited, workers=4)
+
+    # 逐块失败告警里也含文件名，所以只能从汇总告警那一条里数。
+    summary = [r.getMessage() for r in caplog.records if "被限流打断" in r.getMessage()]
+    assert len(summary) == 1, "汇总告警只该打一条"
+    assert "来源：限流样本.pdf" in summary[0]
+    assert summary[0].count("限流样本.pdf") == 1, "同一文件命中多个块也只能点名一次"
