@@ -14,12 +14,18 @@
   4. **SLO 文档与表达式脱节** —— `SLO.md` 写着 14.4 倍燃尽，表达式里却是别的数；
      或表达式里正则是 `le="1"` 而指标实际渲染 `le="1.0"`（全串匹配 ⇒ **永不触发**
      且没有任何报错）。这类错误没有任何运行时信号，只能靠断言钉住。
+  5. **接收人方向只查了一半** —— "路由指向不存在的接收人"和"接收人没有被任何路由
+     指向"是同一件事的两个方向：前者丢告警，后者是**死出口**（新增了接收人却忘了那条
+     路由，配置看起来"该有的都有"）。同理，分流其实有**两处**（Alertmanager 的 route
+     选 receiver、网关的 `ALERT_SINK_ROUTES` 选通道），网关对表里没有的 receiver 会
+     静默退回 `default` —— 只对了一处，就会得出"我已经分好了"的错误结论。
 
 这些都无法靠"人能记住"来防（改配置的人通常只关心自己那条规则），所以固化成断言。
 """
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import subprocess
 import textwrap
@@ -149,6 +155,26 @@ def test_default_route_receiver_exists(am_cfg):
     兜底一旦失效，"漏配某条子路由"的表现就是**安静地丢告警** —— 最难发现的一类。
     """
     assert am_cfg["route"]["receiver"] in _receiver_names(am_cfg)
+
+
+def test_every_declared_receiver_is_reachable(am_cfg):
+    """已声明的接收人必须至少被一条路由指向 —— 否则它的出口是死的。
+
+    这是"路由引用了不存在的接收人"（上面那条）的**镜像**，同样静默、方向相反：
+    有人新增了一个接收人、打算把某类告警引过去，却忘了（或写错了）那条路由。
+    接收人本身合法、Alertmanager 启动正常、配置看起来"该有的都有"，
+    而那个出口**永远收不到任何东西**。
+
+    只有把"声明的"与"被路由用到的"两个集合相减才看得出来 ——
+    靠人 review 时，多出来一个接收人不会显得可疑（它看起来正是"刚加好的"）。
+    """
+    declared = _receiver_names(am_cfg)
+    routed = {r["receiver"] for r in _walk_routes(am_cfg["route"])}
+    orphans = sorted(declared - routed)
+    assert not orphans, (
+        f"这些接收人已声明，但没有任何路由指向它们：{orphans}\n"
+        "它们的出口是死的（永远收不到告警），而配置看起来完全正常。"
+    )
 
 
 def test_all_categories_are_routed(alerts_cfg, am_cfg):
@@ -289,6 +315,63 @@ def test_receiver_url_suffix_matches_receiver_name(am_cfg):
                 f"receiver {r['name']!r} 的 URL 末段是 {suffix!r}，与 receiver 名不符；"
                 "网关会把它路由到错误的通道（或落进 default），且不报错。"
             )
+
+
+# ---------------------------------------------------------------------------
+# 两处分流的第二处：网关的 ALERT_SINK_ROUTES
+# ---------------------------------------------------------------------------
+SINK_PATH = MON / "alert_sink.py"
+ENV_EXAMPLE = ROOT / ".env.example"
+SINK_ROUTES_KEY = "ALERT_SINK_ROUTES"
+
+
+def _sink_routes() -> dict[str, str]:
+    """用网关**自己的** `parse_routes` 解析 `.env.example` 里的分流表。
+
+    刻意不在这里另写一份解析：两套解析迟早对不上，而"对不上"的表现恰好就是
+    这条守卫要防的静默误投。`.env.example` 是随仓库发布的契约值
+    （真实 `.env` 不入库，也不该被测试读 —— 那会让测试结果依赖本机环境）。
+
+    `deploy/` 不是包，所以按路径加载（与 `tests/test_alert_sink.py` 同一手法）。
+    """
+    spec = importlib.util.spec_from_file_location("alert_sink", SINK_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    m = re.search(rf"(?m)^{SINK_ROUTES_KEY}=(.*)$", text)
+    assert m, f".env.example 里没有 {SINK_ROUTES_KEY} —— 网关的分流表没有契约来源"
+    return mod.parse_routes(m.group(1).strip())
+
+
+def test_every_sink_receiver_has_an_explicit_channel_route(am_cfg):
+    """经网关投递的每个接收人，都必须在 `ALERT_SINK_ROUTES` 里**显式**给出通道。
+
+    分流有**两处**：Alertmanager 的 route（决定"找谁"）与网关的分流表
+    （决定"用哪个通道"）。只看前者会得出"我已经按类目分好了"的错误结论 ——
+    分流表若漏了某个 receiver，`channel_for()` 会退回 `default` 兜底**且不报错**，
+    于是"安全告警"安静地进了 oncall 群，而两份配置看起来都对。
+
+    反方向同样要查：分流表里的键必须都对应真实接收人。否则那是接收人改过名之后的
+    残留 —— 改名后的那个接收人现在会静默退回 `default`，同样没有任何报错。
+    """
+    routes = _sink_routes()
+    via_sink = {
+        r["name"]
+        for r in am_cfg["receivers"]
+        for c in (r.get("webhook_configs") or [])
+        if ALERT_SINK_HOST in c["url"]
+    }
+    missing = sorted(via_sink - set(routes))
+    assert not missing, (
+        f"这些接收人经 {ALERT_SINK_HOST} 投递，但 {SINK_ROUTES_KEY} 里没有它们：{missing}\n"
+        "网关会把它们**静默**退回 default 通道 —— 收到告警的人错了，且不会有任何报错。"
+    )
+    stale = sorted(set(routes) - _receiver_names(am_cfg))
+    assert not stale, (
+        f"{SINK_ROUTES_KEY} 里有不对应任何接收人的键：{stale}\n"
+        "多半是接收人改过名而分流表没跟着改 —— 那个接收人现在会静默退回 default。"
+    )
 
 
 # ---------------------------------------------------------------------------
