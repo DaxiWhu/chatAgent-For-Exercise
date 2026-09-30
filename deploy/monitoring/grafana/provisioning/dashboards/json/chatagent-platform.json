@@ -228,20 +228,35 @@
     {
       "id": 8,
       "type": "timeseries",
-      "title": "备份循环指标",
-      "description": "backup_backend_skipped=1 表示该后端没启用（此时「备份很旧」是正常的，不该报警）；配合 backup_last_success_timestamp_seconds 一起看才能区分「没启用」和「启用了但坏了」。",
+      "title": "备份与演练指标",
+      "description": "backup_backend_skipped=1 表示该后端没启用（此时「备份很旧」是正常的，不该报警）；配合 backup_last_success_timestamp_seconds 才能区分「没启用」与「启用了但坏了」。下半部分是**恢复演练**：备份存在 ≠ 能恢复，`backup_drill_last_success_timestamp_seconds` 才是「有人真的恢复过一次」的证据；`backup_drill_result=0` 表示上次演练没通过。⚠️ 「距上次尝试」与「距上次成功」要**并排看**：前者小、后者大 = 有人在跑但一直失败（去找 drill 的输出）；两个都是空 = 从来没人跑过。只看成功那一条时，这两种情况长得一模一样。",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
       "targets": [
         {
           "refId": "A",
           "expr": "time() - backup_last_success_timestamp_seconds",
-          "legendFormat": "{{target}} 距上次成功(s)"
+          "legendFormat": "{{target}} 距上次备份(s)"
         },
         {
           "refId": "B",
           "expr": "backup_backend_skipped",
           "legendFormat": "{{target}} skipped"
+        },
+        {
+          "refId": "C",
+          "expr": "time() - backup_drill_last_success_timestamp_seconds",
+          "legendFormat": "{{target}} 距上次成功演练(s)"
+        },
+        {
+          "refId": "D",
+          "expr": "backup_drill_result",
+          "legendFormat": "{{target}} 演练结果(1=通过)"
+        },
+        {
+          "refId": "E",
+          "expr": "time() - backup_drill_last_attempt_timestamp_seconds",
+          "legendFormat": "{{target}} 距上次演练尝试(s)"
         }
       ],
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },

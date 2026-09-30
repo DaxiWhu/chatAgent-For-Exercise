@@ -55,6 +55,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+# 让"直接跑脚本"（python scripts/qdrant_backup.py）也能 import 到项目模块
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scripts import drill_metrics  # noqa: E402
+
 DEFAULT_BACKUP_DIR = "backups/qdrant"
 RC_OK, RC_FAIL, RC_UNREACHABLE = 0, 1, 2
 
@@ -386,10 +390,14 @@ def main(argv=None) -> int:
 
     args = ap.parse_args(argv)
     try:
-        return args.func(args)
+        rc = args.func(args)
     except KeyboardInterrupt:
         print("\n中断", file=sys.stderr)
         return RC_FAIL
+    if args.cmd == "drill":
+        # 演练结果落 textfile 指标（见 scripts/drill_metrics.py 的说明）
+        drill_metrics.publish("qdrant", rc == RC_OK)
+    return rc
 
 
 if __name__ == "__main__":

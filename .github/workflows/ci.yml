@@ -152,6 +152,91 @@ jobs:
         run: pytest tests/ -q -p no:cacheprovider
 
   # ------------------------------------------------------------------
+  # 3.5) 恢复演练（每月一次）：证明"备份能被恢复"这条链没有腐烂
+  # ------------------------------------------------------------------
+  # 为什么必须有这个 job
+  # -------------------
+  # `scripts/pg_backup.py drill` 是唯一能证明"备份可用"的操作（备份 → 恢复到临时库
+  # → 逐表比对行数），但**此前没有任何东西在跑它**：RUNBOOK 写着"每季度做一次"，
+  # 而靠人记着的事一定会在最忙的那一季度被跳过。
+  #
+  # 生产上的演练要建临时库、要连真实数据，只能人工做（缺失由
+  # `BackupDrillMissing` / `BackupDrillOverdue` 两条告警来吵你）。这里补的是另一半：
+  # **脚本本身没坏**。恢复路径、临时库的建与删、行数比对 —— 这些一旦被改坏，
+  # 只有在真的需要恢复的那天才会暴露，而那时已经晚了。
+  #
+  # 用 service container 起**真 PG**：drill 的全部价值就在于"真的恢复一次"，
+  # 把数据库 mock 掉等于什么都没验证。
+  drill:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      pg:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: drill
+          POSTGRES_PASSWORD: drill
+          POSTGRES_DB: drilldb
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U drill"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: 装 PG 客户端与 psycopg
+        run: |
+          python -m pip install --upgrade pip
+          pip install "psycopg[binary]>=3.2" python-dotenv
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+
+      - name: 建表并插数据（drill 需要"有东西可比对"）
+        env:
+          PGPASSWORD: drill
+        run: |
+          set -eu
+          psql -h 127.0.0.1 -U drill -d drilldb -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE TABLE IF NOT EXISTS checkpoints (
+            id serial PRIMARY KEY,
+            payload text NOT NULL
+          );
+          INSERT INTO checkpoints (payload)
+          SELECT 'x' || g FROM generate_series(1, 200) AS g;
+          SQL
+          psql -h 127.0.0.1 -U drill -d drilldb -c '\dt'
+
+      # 真跑一遍「备份 → 恢复到临时库 → 逐表比对 → 清理」。脚本自己会在结尾删临时库。
+      # 给一个独立的 BACKUP_DIR，避免污染工作区。
+      - name: 恢复演练
+        env:
+          DB_URL: postgresql://drill:drill@127.0.0.1:5432/drilldb?sslmode=disable
+          BACKUP_DIR: /tmp/drill-backups
+        run: python scripts/pg_backup.py drill
+
+      # 演练"通过"还不够：结果必须**落在指标上**，否则生产上的
+      # BackupDrillMissing / BackupDrillOverdue 就是哑弹。
+      # 这里断言的是**线格式**（文件里真有那一行），而不是"函数被调用过"。
+      - name: 校验演练指标真的写出来了
+        run: |
+          set -eu
+          F=/tmp/drill-backups/drill-pg.prom
+          test -f "$F" || { echo "::error::没有生成 $F —— 演练指标没发布，那两条告警会是哑弹"; exit 1; }
+          cat "$F"
+          grep -q 'backup_drill_result{target="pg"} 1' "$F" \
+            || { echo "::error::backup_drill_result 不是 1"; exit 1; }
+          grep -q 'backup_drill_last_success_timestamp_seconds{target="pg"}' "$F" \
+            || { echo "::error::缺 backup_drill_last_success_timestamp_seconds"; exit 1; }
+
+  # ------------------------------------------------------------------
   # 4) 部署产物：镜像构建 → 冒烟启动 → 漏洞扫描
   # ------------------------------------------------------------------
   # 为什么必须有这个 job

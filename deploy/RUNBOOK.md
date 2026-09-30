@@ -424,6 +424,27 @@ python scripts/qdrant_backup.py drill   # 建快照 → 校验结构 → 打印�
 > （步骤由 `drill` 打印）。Qdrant 的数据可以从语料重建，但重建要花 embedding 钱
 > 与几小时，所以快照的定位是"降低 RTO"，不是"唯一真相来源"。
 
+**演练不再"靠人记着"**。每个 `drill` 结束都会把结果写进 `backups/drill-<target>.prom`
+（node-exporter 的 textfile 采集），于是有三条告警在盯这件事：
+
+| 告警 | 含义 | 响应 |
+|---|---|---|
+| `BackupDrillMissing` | **从来没成功演练过** —— 首次部署后它就会响，这是刻意的 | 跑一次 drill（见上） |
+| `BackupDrillOverdue` | 超过 100 天没成功演练过 | 排到本周 |
+| `BackupDrillFailed` | 上次演练**没通过** | **最急**：说明备份此刻很可能恢复不了 |
+
+面板 `chatAgent · 平台自身` 最下面一格就是"距上次成功演练多久"。
+
+> **为什么不做成定时自动演练**：`pg_backup.py` 要调 `pg_dump` / `pg_restore`，
+> 执行通道是「`docker exec` 进 PG 容器」或「宿主机 PATH 里有客户端」——
+> **容器里两条都不成立**（容器内没有 docker，app 镜像里也没有 PG 客户端）。
+> 做一个跑不通的定时容器，比让人手动跑一次更糟：它会给人"已经在自动演练了"的错觉。
+
+不可自动化的是"**你的真实数据**能不能恢复"；可自动化的那一半已经补上了：
+**CI 每月真跑一次 `drill`**（`.github/workflows/ci.yml` 的 `drill` job，用 service
+container 起真 PG，跑完整条备份→恢复→比对链）。它证明**脚本没坏** ——
+restore 路径、临时库的建与删、行数比对，这些一旦被改坏，只有在真需要恢复的那天才会暴露。
+
 **保留窗口是算出来的，不是猜的**：`BACKUP_INTERVAL_HOURS × BACKUP_KEEP` 才是
 可回溯天数。默认 `6h × 56 = 14 天`（pg）、`6h × 28 = 7 天`（qdrant）。
 **只改间隔不改份数**，窗口会静默缩短（这是最容易犯的一次错）。

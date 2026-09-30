@@ -495,3 +495,51 @@ groups:
           description: "当前最小可用比例 {{ $value | humanizePercentage }}。低于临界后 PG 会先变成只读、随后写失败，表现是**随机 500** 与检查点丢失，而原因看不出来。"
           runbook: "1) `df -h` 定位是哪个挂载点；2) 最常见的是容器日志（`docker system df -v` 看 LOGS 一列）—— 确认各服务的 `logging` 轮转生效；3) 其次是 `promdata`（Prometheus TSDB 保留期）与 `backups/`（`BACKUP_KEEP` 没生效）；4) 清理后**核对告警是否自动恢复**（`send_resolved`），并回头看这段时间是否有被掩盖的写入失败。"
 
+      - alert: BackupDrillMissing
+        # `drill`（备份 → 恢复到临时库 → 逐表比对）是**唯一能证明备份可用**的操作，
+        # 而它此前没有任何东西在跑：RUNBOOK 写着"每季度做一次"，靠人记着 = 一定会被跳过。
+        # 这条告警把"从没演练过"变成一件会响的事实 —— 所以**首次部署后它就会响**，
+        # 这是刻意的：你确实还没验证过备份能不能恢复。跑一次 drill 它就会静默。
+        #
+        # 为什么不做成"定时自动演练"：`pg_backup.py drill` 要调 pg_dump / pg_restore，
+        # 执行通道是「docker exec 进 PG 容器」或「宿主机 PATH 里的客户端」——
+        # **容器里两条都不成立**。做一个跑不通的定时容器，比让人跑一次更糟。
+        expr: absent(backup_drill_last_success_timestamp_seconds)
+        for: 1h
+        labels:
+          category: platform
+          severity: warning
+        annotations:
+          summary: "从未成功执行过一次恢复演练"
+          description: "Prometheus 里没有任何 `backup_drill_last_success_timestamp_seconds` 序列。**没被恢复过的备份不算备份** —— 备份文件可能在，但恢复链（pg_restore 权限、版本匹配、临时库创建）从未被验证过。"
+          runbook: "在仓库根执行 `python scripts/pg_backup.py drill`（备份→恢复到临时库→逐表比对→清理），再跑 `python scripts/qdrant_backup.py drill` 校验向量库快照。两者都会把结果写进 `backups/drill-*.prom`，本告警随之解除。"
+
+      - alert: BackupDrillOverdue
+        # 与 Missing 的分工：Missing 管"从来没有过"，这一条管"有过、但太旧"。
+        # 100 天 ≈ 一个季度再留余量；按 RUNBOOK 的季度要求，超过它说明至少漏了一整个季度。
+        #
+        # ⚠️ 不要写成 `for: 24h` 之类的长窗口：`for` 只影响"进入告警"的延迟，
+        #    它不会让"已经过期 100 天"这件事更可信。
+        expr: time() - backup_drill_last_success_timestamp_seconds > 100 * 86400
+        for: 1h
+        labels:
+          category: platform
+          severity: warning
+        annotations:
+          summary: "恢复演练已超过 100 天没有成功过（target={{ $labels.target }}）"
+          description: "上次成功演练距今 {{ $value | humanizeDuration }}。备份在持续产生，但**没有人验证过它还能被恢复**；而语料、PG 版本、权限都可能在这段时间里变了。"
+          runbook: "跑一次 `python scripts/pg_backup.py drill`。若它失败，先按失败原因修 —— 这是最有价值的信号：说明**你现在手上的备份可能真的恢复不了**。修好后重跑，确认 `backups/drill-pg.prom` 里的时间戳已更新。"
+
+      - alert: BackupDrillFailed
+        # 演练**跑了但没过**。这条比 Missing / Overdue 更急：它说明"备份此刻恢复不了"，
+        # 而且我们已经知道了 —— 此时什么都不做，等于明知故犯地继续裸奔。
+        expr: backup_drill_result == 0
+        for: 5m
+        labels:
+          category: platform
+          severity: warning
+        annotations:
+          summary: "上一次恢复演练**未通过**（target={{ $labels.target }}）"
+          description: "`backup_drill_result{target=...} == 0`：演练执行了但结果不通过（行数不一致、表缺失、快照结构损坏）。这意味着**当前的备份很可能恢复不出可用的库**。"
+          runbook: "1) 看演练输出里的 `✗` 标记，确定是哪些表缺失或行数不一致；2) 常见成因：备份时用了 `--schema-only`、目标库 PG 版本与源不一致、备份文件被截断（`verify` 能查出来）；3) 修好后重跑 drill，确认 `backup_drill_result` 变回 1。"
+

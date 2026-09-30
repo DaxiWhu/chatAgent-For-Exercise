@@ -89,6 +89,27 @@ def _external_metric_names() -> set[str]:
     return set(re.findall(r"\b([a-z][a-z0-9_]*)\b", text))
 
 
+# 脚本自产指标的声明形式：`M_SUCCESS = "backup_drill_last_success_timestamp_seconds"`
+_SCRIPT_METRIC_RE = re.compile(r'^\s*M_[A-Z0-9_]+\s*=\s*"([a-z][a-z0-9_]*)"', re.M)
+
+
+def _script_metric_names() -> set[str]:
+    """`scripts/` 里以**常量形式**声明的指标名。
+
+    备份/演练指标既不由 app 产生，也不写在 prometheus.yml / alerts.yml 里，
+    而是由 `scripts/drill_metrics.py` 发布 —— 它既不在 app/ 也不在 src/，
+    前两个来源都收不到它。
+
+    刻意只收 `M_XXX = "..."` 这个形式，而不是把 scripts 里所有小写标识符
+    一股脑倒进来：后者会把 `os`、`path`、`rc` 之类的局部名放进白名单，
+    于是面板里拼错的 `backup_drill_typo` 只要恰好是某个变量名就会被放行。
+    """
+    names: set[str] = set()
+    for py in (ROOT / "scripts").glob("*.py"):
+        names |= set(_SCRIPT_METRIC_RE.findall(py.read_text(encoding="utf-8")))
+    return names
+
+
 def _dashboards() -> list[dict]:
     out = []
     for path in sorted(DASH_JSON_DIR.glob("*.json")):
@@ -222,6 +243,7 @@ def test_panel_identifiers_are_all_known():
     allowed = (
         _app_metric_names()
         | _external_metric_names()
+        | _script_metric_names()
         | _PROMQL_KEYWORDS
         | _KNOWN_LABELS
     )

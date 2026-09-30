@@ -42,6 +42,11 @@ import shutil
 import subprocess
 import sys
 
+# 让 `python scripts/pg_backup.py` 这种"直接跑脚本"的方式也能 import 到项目模块
+# （直接跑时 sys.path[0] 是 scripts/ 而不是仓库根）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scripts import drill_metrics  # noqa: E402
+
 
 def _load_env():
     """让 .env 生效（可选依赖）。"""
@@ -379,7 +384,11 @@ def main(argv=None) -> int:
     if args.cmd == "restore":
         return 0 if do_restore(cfg, args.file, args.target_db, args.yes) == 0 else 1
     if args.cmd == "drill":
-        return 0 if do_drill(cfg) else 1
+        ok = do_drill(cfg)
+        # 演练结果落 textfile 指标：让"上次成功演练是什么时候"变成可观测的事实，
+        # 而不是某个人的记忆（见 scripts/drill_metrics.py 的说明）。
+        drill_metrics.publish("pg", ok)
+        return 0 if ok else 1
     p.print_help()
     return 1
 
