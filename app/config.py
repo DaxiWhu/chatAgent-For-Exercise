@@ -30,6 +30,7 @@ sse_starlette 的 `client_close_handler_callable` 回调，不再有轮询间隔
 
 import logging
 import os
+from pathlib import Path
 
 
 def _env_bool(name, default=False):
@@ -59,7 +60,30 @@ def _env_str(name, default=""):
 # --------------------------------------------------------------------------
 # 应用标识（灰度/版本）
 # --------------------------------------------------------------------------
-APP_VERSION = _env_str("APP_VERSION", "0.2.0")
+def _read_version() -> str:
+    """读应用版本号。**唯一真源是仓库根的 `VERSION` 文件。**
+
+    优先级：环境变量 `APP_VERSION`（容器 / CI 按发布标签注入）→ `VERSION` 文件。
+    两者都取不到时返回 `0.0.0+unknown` —— 刻意**不猜**一个版本号：`/health` 与
+    启动日志回显的版本一旦是编的，"线上跑的是哪一版"就会得出错误结论，
+    比明确说"不知道"更糟。
+
+    为什么不在本模块硬编码：版本号曾同时写在这里、`.env`、compose 的镜像 tag
+    三处，改一处漏两处时"服务自报的版本"与"镜像 tag"会不一致，且**没有任何信号**。
+    现在三处都收敛到 `VERSION`（守卫见 tests/test_version_source.py）。
+    """
+    v = _env_str("APP_VERSION", "")
+    if v:
+        return v
+    try:
+        return (Path(__file__).resolve().parents[1] / "VERSION").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        return "0.0.0+unknown"
+
+
+APP_VERSION = _read_version()
 # stable / canary：同名镜像的两个实例用它区分，/health 会回显，便于灰度期核对流量去向
 APP_RELEASE = _env_str("APP_RELEASE", "stable")
 

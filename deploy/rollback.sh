@@ -20,7 +20,7 @@
 #   deploy/rollback.sh
 #   deploy/rollback.sh --reason "5xx 从 0.1% 涨到 4%"
 #   deploy/rollback.sh --stop-canary          # 顺便停掉灰度实例（事后清理时用）
-#   deploy/rollback.sh --to chatagent:0.2.0   # 顺手把灰度实例也换回旧镜像
+#   deploy/rollback.sh --to chatagent:0.1.0   # 顺手把灰度实例也换回旧镜像
 #
 # 退出码
 #   0  回滚完成且验证通过
@@ -33,6 +33,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 COMPOSE=(docker compose --env-file .env -f deploy/app/docker-compose.yml)
+# 与 release.sh 同源：镜像 tag 的真源是仓库根 VERSION（compose 里是 `${APP_VERSION:-<版本>}`）
+APP_VERSION="${APP_VERSION:-$(cat VERSION 2>/dev/null || echo 0.0.0-unknown)}"
+export APP_VERSION
 ENTRY="${ROLLBACK_ENTRY:-http://127.0.0.1:8080}"
 REASON="（未填写原因）"
 STOP_CANARY=0

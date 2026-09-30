@@ -1,8 +1,26 @@
 # 自包含的应用栈 + 灰度（canary）编排
 #
 # 起停（在项目根目录执行）：
+#   export APP_VERSION=$(cat VERSION)     # ← 镜像 tag 的来源，见下面『版本号』一节
 #   docker compose --env-file .env -f deploy/app/docker-compose.yml up -d --build
 #   docker compose --env-file .env -f deploy/app/docker-compose.yml ps
+#
+# ---------------------------------------------------------------------------
+# 版本号：唯一真源是**仓库根的 `VERSION` 文件**
+# ---------------------------------------------------------------------------
+# 本文件里的镜像 tag 一律写成 `${APP_VERSION:-<版本>}`，其中的默认值与 `VERSION`
+# 文件的内容**必须相等** —— `tests/test_version_source.py` 会逐条断言，
+# 改一处漏一处就变红（这正是"三处各写各的、静默漂移"的解法）。
+#
+# 因此正确做法是**只改一处**，再让脚本同步：
+#   echo 0.3.0 > VERSION && python scripts/sync_version.py
+#
+# 想临时跑别的版本（如灰度回滚）时，用环境变量覆盖即可 —— 它优先级高于默认值，
+# `deploy/release.sh` / `rollback.sh` / `make` 都会自动注入：
+#   export APP_VERSION=$(cat VERSION)
+#
+# `app/config.py` 读的是**同一个** `VERSION` 文件（环境变量优先），所以
+# "镜像 tag"与"服务自报的版本"不会再各说各话。
 #
 # ---------------------------------------------------------------------------
 # ⚠️⚠️ `--env-file .env` 不是可选的美化，**少写它整套配置就不生效**
@@ -231,7 +249,7 @@ services:
     build:
       context: ../..                     # 上下文必须是仓库根
       dockerfile: deploy/app/Dockerfile
-    image: chatagent:0.2.0
+    image: chatagent:${APP_VERSION:-0.2.0}
     restart: unless-stopped
     logging: *default-logging
     networks: [edge,data,monitor]
@@ -318,7 +336,7 @@ services:
     # 默认值与 `app-stable` 一致，所以"什么都没配"时行为与以前完全相同。
     # 传完整引用（含仓库前缀）便于灰度用 CI 推到 GHCR 的镜像：
     #     deploy/release.sh ghcr.io/<org>/chatagent:<sha>
-    image: ${CANARY_IMAGE:-chatagent:0.2.0}
+    image: ${CANARY_IMAGE:-chatagent:${APP_VERSION:-0.2.0}}
     restart: unless-stopped
     logging: *default-logging
     networks: [edge,data,monitor]
@@ -379,7 +397,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/monitoring/Dockerfile.alert-sink
-    image: chatagent-alert-sink:0.2.0
+    image: chatagent-alert-sink:${APP_VERSION:-0.2.0}
     restart: unless-stopped
     logging: *default-logging
     networks: [monitor]
@@ -816,11 +834,12 @@ services:
   # 为什么每天只跑一次且放在凌晨：清理是后台动作，`BATCH=500` 分批删除；
   # 与备份错开可以避免在备份窗口里抢锁。
   #
-  # ⚠️ 它复用 app 镜像（`chatagent:0.2.0`）—— 脚本里有 `os.chdir(ROOT)` 与
+  # ⚠️ 它复用 app 镜像（与 `app-stable` 同一个 tag，由 `APP_VERSION` 插值决定）
+  #    —— 脚本里有 `os.chdir(ROOT)` 与
   #    `from app import config`，所以**必须**在镜像里那个 `/app` 结构下运行。
   #    若你还没构建过 app 镜像，先 `docker compose ... up -d --build app-stable`。
   retention-sweep:
-    image: chatagent:0.2.0
+    image: chatagent:${APP_VERSION:-0.2.0}
     restart: unless-stopped
     logging: *default-logging
     networks: [data]

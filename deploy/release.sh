@@ -45,6 +45,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 COMPOSE=(docker compose --env-file .env -f deploy/app/docker-compose.yml)
+# 镜像 tag 的唯一真源是仓库根的 VERSION 文件（compose 里写的是 `${APP_VERSION:-<版本>}`）。
+# 这里显式注入，好处是"脚本起的容器 tag"与"服务 /health 自报的版本"必然同源；
+# 也可以用 `APP_VERSION=0.3.0 deploy/release.sh ...` 临时覆盖。
+APP_VERSION="${APP_VERSION:-$(cat VERSION 2>/dev/null || echo 0.0.0-unknown)}"
+export APP_VERSION
 PROM_URL="${PROMETHEUS_URL:-http://127.0.0.1:9090}"
 STAGES="1,10,50,100"
 OBSERVE=300
