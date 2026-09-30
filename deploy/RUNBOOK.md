@@ -197,6 +197,36 @@ curl -s 'localhost:9090/api/v1/query?query=rate(llm_tokens_total[5m])' | python 
 - **换过向量库的版本要额外注意**：Qdrant 的 `QDRANT_ON_DISK=1` 会显著增加检索延迟，
   它是有意的空间换时间，但会体现在这里。
 
+#### `ConcurrencyShedding`（warning，5m）/ `ConcurrencySaturated`（warning，10m）
+两条是**容量**信号，不是"挂了"：进程活着、依赖健康、5xx 也不一定高，
+只是单实例的**在途并发**被占满了（`MAX_CONCURRENT_REQUESTS`）。后者是前者的
+提前量 —— 还没开始拒人，但余量已不足。
+
+```bash
+# 1) 饱和率与拒绝速率（面板 `chatAgent · 服务总览` 最下面两块同源）
+curl -s 'localhost:9090/api/v1/query?query=100*http_concurrency_in_flight/clamp_min(http_concurrency_limit,1)' | python -m json.tool
+curl -s 'localhost:9090/api/v1/query?query=rate(http_requests_rejected_total{reason="concurrency"}[5m])' | python -m json.tool
+# 2) 是不是被刷？看"拒绝"有没有特定的来源集中
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 app-stable | grep 并发已达上限
+```
+
+处置顺序（**先分清是"被刷"还是"真增长"**）：
+
+1. **被刷**（同 IP / 同 Key 的请求速率异常，或大量 SSE 长连接开而不关）
+   ⇒ 临时收紧 `RATE_LIMIT_*`；已确认是攻击时**不要急着调大上限** ——
+   那只会把上游一起拖垮（背压的意义就是在这里把损失限制在自己这一层）。
+2. **真增长** ⇒ 加副本（首选，见 `CAPACITY.md`），或调大 `MAX_CONCURRENT_REQUESTS`，
+   **前提是先确认内存与上游配额扛得住**。
+3. 加了上限却仍不生效 ⇒ 检查是否**多 worker**：该值是**单进程**上限，
+   实例实际上限 = worker 数 × 该值（启动日志的 `limits.max_concurrent_requests` 可核对）。
+
+> ⚠️ 上限为 0（默认）时 `http_concurrency_in_flight` / `http_concurrency_limit`
+> 这两个指标**根本不存在**，两条规则都**不会触发** —— 面板上显示 0 是"没有闸门"
+> 而不是"很空闲"。要区分只能看启动日志里回显的 `max_concurrent_requests`。
+> ⚠️ `/health/*` 与 `/metrics` 刻意豁免本闸门：它们被拒会让编排重启实例、
+> 让 Prometheus 在最该看数据的时候没有数据。
+
+
 #### `StreamErrorsHigh`（critical，5m）
 SSE 流中途抛异常。典型成因：检查点后端故障、模型超时、配额被拒。
 

@@ -50,7 +50,7 @@ _PROMQL_KEYWORDS = {
 # Prometheus 注入 / 约定标签，以及本项目自己用的标签名
 _KNOWN_LABELS = {
     "job", "instance", "le", "status", "path", "method", "kind", "scope",
-    "phase", "target", "fstype", "mountpoint",
+    "phase", "target", "fstype", "mountpoint", "reason",
 }
 
 _IDENT_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b")

@@ -60,7 +60,8 @@ from src.prompts import PROMPT_VERSION
 
 from . import config, health, metrics, middleware, tracing
 from .idempotency import NEW as IDEM_NEW, build_idempotency_store
-from .middleware import BodySizeLimitMiddleware, RequestContextMiddleware
+from .middleware import (BodySizeLimitMiddleware, ConcurrencyLimitMiddleware,
+                         RequestContextMiddleware)
 from .quota import RequestBudget, build_quota_manager, estimate_tokens
 from .ratelimit import build_rate_limiter
 from .review_queue import build_review_queue
@@ -203,25 +204,33 @@ app = FastAPI(
     **_docs_kwargs(config.ENABLE_DOCS),
 )
 
-# 中间件嵌套顺序（外层 → 内层）：ServerError > CORS > RequestContext > BodySizeLimit > 路由
+# 中间件嵌套顺序（外层 → 内层）：
+#   ServerError > CORS > RequestContext > ConcurrencyLimit > BodySizeLimit > 路由
 #
 # ⚠️ `add_middleware` 是 `insert(0, ...)` —— **后添加的在更外层**，与"读代码时
-# 从上往下"的直觉相反。所以下面的调用顺序是 BodySizeLimit → RequestContext → CORS，
-# 才能得到上面那个嵌套（实测打印过 middleware_stack 确认，不要凭直觉调换）。
+# 从上往下"的直觉相反。所以下面的调用顺序是 BodySizeLimit → ConcurrencyLimit →
+# RequestContext → CORS，才能得到上面那个嵌套（实测打印过 middleware_stack 确认，
+# 不要凭直觉调换）。
 #
 # 为什么 BodySizeLimit 必须在 RequestContext **之内**：
 #   它发出的 413 需要经过 RequestContext 的 send 包装，才会带上 X-Request-ID 并计进
 #   `http_requests_total{status=413}`。反了的话，"被拒的大包"在指标里完全看不见 ——
 #   而这恰是容量问题的第一信号。（这不是推测：第一版就是反的，测试直接抓到 413
 #   没有 X-Request-ID。）
+# 为什么 ConcurrencyLimit 也在 RequestContext **之内**、BodySizeLimit **之外**：
+#   ① 在内层就没法带上 request_id、不进 `http_requests_total` —— 同 413 的理由；
+#   ② 在外层则**先拒后读**：过载时连请求体都不用读，省下的是最紧的资源。
+#      反过来的话，一个正在发大包的客户端会先把内存吃掉，然后才被并发闸门挡住。
 # 为什么 CORS 在最外：
-#   让所有响应（含 413、500、限流 429）都带跨域头。CORS 要是在内层，浏览器对
+#   让所有响应（含 413、503、500、限流 429）都带跨域头。CORS 要是在内层，浏览器对
 #   413 只会报"缺少 CORS 头"，前端永远看不到真正的原因。
 #
 # allow_credentials 恒为 False：鉴权走 X-API-Key 请求头而不是 Cookie，
 # 因此不需要凭据模式，也就避免了"`*` + credentials"这个浏览器非法组合。
 app.add_middleware(BodySizeLimitMiddleware, max_bytes=config.MAX_REQUEST_BYTES,
                    enabled=True)
+app.add_middleware(ConcurrencyLimitMiddleware,
+                   limit=config.MAX_CONCURRENT_REQUESTS, enabled=True)
 app.add_middleware(RequestContextMiddleware, enabled=config.METRICS_ENABLED)
 app.add_middleware(CORSMiddleware,
                    allow_origins=config.CORS_ALLOW_ORIGINS,

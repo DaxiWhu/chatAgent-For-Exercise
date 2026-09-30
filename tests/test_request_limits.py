@@ -221,12 +221,17 @@ def test_413_carries_cors_header():
 
 
 def test_middleware_nesting_order_is_pinned():
-    """把嵌套顺序钉住：CORS 最外、BodySizeLimit 在 RequestContext **之内**。
+    """把嵌套顺序钉住：CORS 最外、BodySizeLimit 在 RequestContext **之内**，
+    并发闸门夹在两者之间。
 
     为什么值得为"顺序"单独写一条测试（而不是靠注释）：
     `add_middleware` 是 `insert(0, ...)`（后加的在外层），与读代码的直觉相反。
     第一版就写反了 —— 功能全对、测试全绿，只有一个后果：413 不带 request_id、
     不进指标、浏览器看不到跨域头。这类"顺序反了"没有任何报错，只能靠断言拦。
+
+    并发闸门的位置也有实质后果：它必须在 RequestContext **之内**（否则 503 不带
+    request_id、不进 `http_requests_total`），且在 BodySizeLimit **之外**
+    （过载时先拒后读，连请求体都不读 —— 那是过载时最紧的资源）。
     """
     node = M.app.middleware_stack or M.app.build_middleware_stack()
     names = []
@@ -234,6 +239,7 @@ def test_middleware_nesting_order_is_pinned():
         names.append(type(node).__name__)
         node = getattr(node, "app", None)
     assert names.index("CORSMiddleware") < names.index("RequestContextMiddleware") \
+        < names.index("ConcurrencyLimitMiddleware") \
         < names.index("BodySizeLimitMiddleware"), names
 
 

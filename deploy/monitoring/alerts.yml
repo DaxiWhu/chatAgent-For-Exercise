@@ -73,6 +73,34 @@ groups:
           description: "当前 P95 = {{ $value }}s。注意 SSE 长连接会天然拉高尾部延迟，请结合 llm_tokens_per_request 判断是不是生成变慢了。"
           runbook: "若同时 llm_tokens_per_request 上升 ⇒ 模型产出变长/变慢；若只有延迟高 ⇒ 查数据库与检索（rerank 熔断是否打开）。"
 
+      - alert: ConcurrencyShedding
+        # 背压真的在拒人时的信号。`reason` 标签把"并发满"与将来可能新增的
+        # 其它拒绝原因分开 —— 混在一起会让"该加副本"和"该改配额"分不清。
+        expr: rate(http_requests_rejected_total{reason="concurrency"}[5m]) > 0.1
+        for: 5m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "实例并发已满，正在拒绝新请求（{{ $value | humanize }} req/s）"
+          description: "在途请求长期贴着 MAX_CONCURRENT_REQUESTS 上限，新请求收到 503 + Retry-After。这不是'挂了'（进程、依赖都正常），是**容量不够**。"
+          runbook: "1) 看面板『chatAgent · 服务总览』的『并发饱和率』，接近 100% 即确认；2) 先判断是不是被刷（同 IP/同 Key 的请求速率、是否大量长连接不关）——是则临时收紧限流；3) 否则按 CAPACITY.md 加副本，或调大 MAX_CONCURRENT_REQUESTS（**先确认内存与上游配额扛得住**）；4) 已确认是攻击时不要急着调大上限，那只会把上游一起拖垮。"
+
+      - alert: ConcurrencySaturated
+        # 比上面那条**早一步**：还没开始拒人，但余量已经耗尽。
+        # 有它才能在"用户开始收到 503"之前动手。
+        expr: |
+          http_concurrency_in_flight
+          / clamp_min(http_concurrency_limit, 1) > 0.8
+        for: 10m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "并发用量长期高于上限的 80%"
+          description: "在途 {{ $value | humanizePercentage }} 于 MaxConcurrency 上限，余量已不足。上限未配置时本指标不存在，这条规则不会触发（那是刻意的：没有闸门就没有饱和可言）。"
+          runbook: "同 ConcurrencyShedding，但现在是『还有时间从容处理』的窗口：先看是常态增长还是突发，再决定加副本（推荐）还是调上限。"
+
       - alert: StreamErrorsHigh
         expr: rate(chat_stream_errors_total[5m]) > 0.2
         for: 5m

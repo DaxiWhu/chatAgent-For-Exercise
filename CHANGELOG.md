@@ -11,6 +11,22 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **知识库级联删除**（`src/rag/kb_inventory.py` + `scripts/kb_prune.py`）。
+  灌库是幂等的，但此前**没有反向路径**：源文件删了或改了之后那批块会永久驻留，
+  表现为"答案里有已下线内容"与"声明已删除却仍可被搜出来"。现在每个块带上
+  `source_path` 与 `content_hash`（**都不参与 `chunk_id`**），由 `tasks kb-prune`
+  比对语料目录清理两类孤儿（`missing` 默认清、`stale` 需显式开启）。
+  ⚠️ 语料目录扫不到任何文件时**拒绝执行**（退出码 2）—— 那几乎总是"语料没挂进
+  容器"，照常比对会清空全库。
+- **并发闸门**（`middleware.ConcurrencyLimitMiddleware` + `MAX_CONCURRENT_REQUESTS`）。
+  `RATE_LIMIT_*` 限的是每分钟新请求数，管不住**并发驻留**：一个客户端按限流上限
+  开若干 SSE 连接并保持不关就能把单实例占满，而所有既有指标都正常。
+  超限返回 `503 + Retry-After`；`/health/*` 与 `/metrics` 豁免（被拒会让编排重启
+  实例、让 Prometheus 在最该看数据时没有数据）；饱和率与拒绝速率进面板，
+  配 `ConcurrencySaturated` / `ConcurrencyShedding` 两条告警。
+
 ## [0.2.0] - 2026-09-30
 
 从 notebook 原型到可上线服务的一次性收敛。0.2.0 之前的形态没有版本化记录。
