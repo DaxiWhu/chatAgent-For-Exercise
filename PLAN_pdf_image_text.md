@@ -33,7 +33,7 @@ KnowledgeChunk（知识检索单元）    ← 本项目需要的结构
 | **阅读顺序重建** | 双栏、复杂排版按正确顺序输出（`body` 树的子项顺序即阅读顺序）——**这是 pdfminer 做不到的** |
 | **表格结构** | `TableItem.data.grid`：N×M 单元格数组，**含行列跨度（row/col span）与表头标记** |
 | **公式** | 行内与独立公式**自动转 LaTeX** |
-| **图片** | `PictureItem`：图片数据 + **caption** + **内容分类标注**（如 `predicted_class: "line_chart"`） |
+| **图片** | `PictureItem`：图片数据 + **caption** + **内容分类标注**（取值如 `line_chart`；实际字段路径是 `meta.classification.predictions[].class_name`，另兼容写入 `annotations[].predicted_classes[].class_name`） |
 | **溯源** | 每个元素带 `page_no` + `bbox`（l/t/r/b）+ `charspan` |
 | **正文 / 修饰分离** | `body` vs `furniture`——**页眉、页脚、页码自动归入 furniture**，不用自己判"是不是装饰" |
 | **结构感知切分** | `HybridChunker`：切块附带 `meta.headings`（章节路径）与 `meta.doc_items`（回溯引用） |
@@ -112,7 +112,10 @@ RecursiveCharacterTextSplitter(
 
 ## 4 图片"有无价值"的判定（基于 Docling 输出，规则极简）
 
-**有了 Docling 的 `picture.label` + `annotations.predicted_class` + `captions` + `furniture` 分离，"是否有意义"不再需要 7 个自研信号**，规则可以压缩成：
+**有了 Docling 的 `picture.label` + 图片分类（`meta.classification.predictions[].class_name`，兼容 `annotations[].predicted_classes[].class_name`）+ `captions` + `furniture` 分离，"是否有意义"不再需要 7 个自研信号**，规则可以压缩成：
+
+> ⚠️ 早期方案里把分类字段写成 `annotations.predicted_class`，是**错的**（复数才是真实字段名）。
+> 实测该读法恒返回空串，会让所有分类静默失效。详见 `PLAN_doc_parsing_v3.md` §G2。
 
 | 判据（按顺序） | 结论 |
 |---|---|

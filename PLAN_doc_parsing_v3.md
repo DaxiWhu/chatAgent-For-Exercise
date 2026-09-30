@@ -53,11 +53,13 @@
 **要点**：**分流在解析层，收敛在产物层**。无论上游用 Docling / MinerU / TextIn，出口必须是同一个 `KnowledgeChunk` 结构——这是 `docling_loader.py` 作为唯一耦合点的意义。
 
 > **落地现状（批次 1–8 + 各格式结构化，均已完成）**：①②③④ 全部实现 ——
-> `.docx` 走 A+C 双路线；`.pdf` 走 Docling（按文字层厚度决定 OCR，不可用自动降级 pdfminer）；
-> 扫描件走 Docling + RapidOCR（中文参数显式配置，实测清晰扫描件能重建表格，**故暂不引入 MinerU**）；
+> `.docx` 走 A+C 双路线；`.pdf` 走 Docling（**按页**判文字层决定 OCR，不可用自动降级 pdfminer）；
+> 扫描页走 Docling + RapidOCR（中文参数显式配置，实测清晰扫描件能重建表格，**故暂不引入 MinerU**）；
+> 混合文档（电子页 + 扫描页混排）整份开 OCR、给图规则逐页生效（2026-09-25，见 `PDF_PIPELINE_DETAIL.md` §1.2）；
 > 其余格式走 `load_blocks` 结构化解析（见 §2B），与 docx/pdf 收敛到同一套产物。
-> 仍**未**实现的三条：模糊件转 TextIn（未接，属计划内"条件触发"）、
-> 旧二进制 `.doc/.xls/.ppt`（要装 LibreOffice）、页面渲染截图（`generate_page_images` 未开）。
+> 仍**未**实现的两条：模糊件转 TextIn（未接，属计划内"条件触发"）、
+> 旧二进制 `.doc/.xls/.ppt`（要装 LibreOffice）。
+> 页面渲染截图已实现（`generate_page_images` + `_attach_cite_images`，默认开启）。
 
 ---
 
@@ -162,7 +164,7 @@ OLE 对象同理：拿到嵌入的 `.xlsx` 原件后，直接用 `openpyxl` 或 
 | `do_cell_matching` | `True` | `True` | 单元格与文本对齐，影响 `export_to_dataframe()` 的准确度 |
 | `do_formula_enrichment` | **`False`** | 按需 | 转 LaTeX。**每页跑公式模型，显著变慢**。只在确实有数学内容时开 |
 | `do_code_enrichment` | `False` | 按需 | 代码块专用 OCR |
-| `do_picture_classification` | **`False`** | **`True`** | 产出 `predicted_class`（`line_chart` / `bar_chart` / `picture` …）——**我们的图片价值判定直接依赖它** |
+| `do_picture_classification` | **`False`** | **`True`** | 产出图片分类（真实字段是 `meta.classification.predictions[].class_name`，另有 `annotations[].predicted_classes[].class_name` 兼容写入）——**我们的图片价值判定直接依赖它** |
 | `do_picture_description` | **`False`** | 见 §6 | Docling **内置** VLM 描述能力，可配 `PictureDescriptionVlmOptions(repo_id=...)`。默认模型很小（SmolVLM-256M 级），中文/复杂图表能力有限 |
 | `generate_picture_images` | **`False`** | **`True`** | 不显式打开就**导不出裁剪图**。这是"图片导出成文件"的开关 |
 | `generate_page_images` | **`False`** | 按需 | 整页位图。**内存开销大**（每页一张图），只在需要"附页面截图"时开 |
@@ -241,7 +243,7 @@ vlm_input = {
         "preceding_text": "<图前最近一段文本，截尾 200 字>",
         "following_text": "<图后最近一段文本，截首 200 字>",
         "caption": "<Docling 抽到的图注，若有>",
-        "predicted_class": "line_chart",                    # Docling 图片分类
+        "predicted_class": "line_chart",                    # Docling 图片分类，取自 meta.classification.predictions[].class_name
     },
 }
 ```
@@ -275,6 +277,12 @@ vlm_input = {
 - **不一致时以确定性来源为准** —— 这也是 §2.3 优先取 XML 的原因。
 
 ### 6.4 什么图才值得送 VLM（沿用 v2 §4，规则极简）
+
+> 下表里的 `predicted_class` 指**图片分类的取值**，实际字段路径见 §G2
+> （`meta.classification.predictions[].class_name`）。另注意实现时的方向调整：
+> 本项目对**命中数据图表类**的图反而**不送** VLM（`needs_vlm=False`），
+> 因为 docx 原生图表能从 chart XML 逐值读出、比看图猜可靠；
+> 只有拿不到确定性数据源的位图才送。详见 §G2 与 `_CHART_CLASSES` 的注释。
 
 | 判据（按序） | 结论 |
 |---|---|
@@ -430,6 +438,7 @@ v2 §6 的结构继续有效，v3 增加 4 个字段以承载本次扩展：
   "chunk_id":       "sha1(source + page + kind + bbox)",
   "source":         "report.docx",
   "page":           7,
+  "pages":          [7, 8],                ← v3.1：完整跨越页码（`page` 只是它的首元素）
   "kind":           "text | table | chart | diagram | formula | unprocessable",
   "section_path":   "第三章 > 出口情况",
   "bbox":           [l, t, r, b],
@@ -457,6 +466,14 @@ v2 §6 的结构继续有效，v3 增加 4 个字段以承载本次扩展：
 - `origin`：告诉下游这个 chunk 是"直读结构化所得"还是"渲染后识别所得"。**同一份文档里两者精度不同**，排查坏 chunk 时这是第一手线索；
 - `parent_id`：为 §8 的父子块预留，现在留空不影响上线；
 - `unprocessable_reason`：显式失败状态。
+
+**v3.1 追加 `pages`（完整跨越页码，升序去重）**：
+
+`page` 只是起始页 —— 给人看的代表值。一个块**可以跨多页**（正文块、整文档兜底块尤其如此），
+真实范围只有 `pages` 说得清。丢了它的后果很具体：引用里写"第 7 页"而内容延续到第 8 页，
+去核对的人在那一页只看得到一半，且不知道还有后半段。
+
+**它刻意不进 `chunk_id` 的 anchor** —— 进了会改掉全部既有 id，触发全库重建 + 引用失效。
 
 ---
 
@@ -705,7 +722,7 @@ python scripts/fetch_docling_models.py models/docling
 
 ### F. ⚠️ 切块器会静默丢内容（实测缺陷，已修）
 
-**现象**：扫描件 OCR 成功后，`parse_document` 仍返回 `unprocessable`，理由是"疑似扫描件且未启用 OCR"——但 OCR 明明是开着的、日志里三个 onnx 权重都加载了。
+**现象**：扫描件 OCR 成功后，`parse_pdf` 仍返回 `unprocessable`，理由是"疑似扫描件且未启用 OCR"——但 OCR 明明是开着的、日志里三个 onnx 权重都加载了。
 
 **逐步定位**（`scripts/check_ocr.py` + 一次性诊断脚本）：
 
@@ -713,7 +730,7 @@ python scripts/fetch_docling_models.py models/docling
 |---|---|---|
 | docling 转换 | `status=success`，`len(doc.texts)=1`，文本 = `'Hello Docling World Invoice Number 2024'` | OCR 完全正常 |
 | HybridChunker | `raw chunks = 0`，**且不抛异常** | 内容在这一层被丢掉 |
-| parse_document | 拿到空 chunks → 判 unprocessable | 已有内容被替换成 `[未能解析]` |
+| parse_pdf | 拿到空 chunks → 判 unprocessable | 已有内容被替换成 `[未能解析]` |
 
 **根因**：HybridChunker 对"通篇只有标题、没有正文 item"的文档返回 **0 块**（标题负责开章节，章节里没有 body 就不产出任何块）。OCR 把整页文字识别成 `section_header` 时正好命中。而我们拿到 0 块后据此判定"解析不出内容"，把已经抽到的文字丢了——**静默数据丢失**，且报错原因把排查方向带偏到"OCR 没开"。
 
@@ -726,24 +743,44 @@ python scripts/fetch_docling_models.py models/docling
 | 3 | 按 item 逐条（`knowledge_chunk.from_docling_items`） | 粒度最好，跳过标题 |
 | 4 | 整文档 Markdown 单块（`from_docling_markdown`） | **保证不变式：文档有内容 → 一定有块** |
 
-配套把 `parse_document` 的判定拆开：只有文档**真的**没抽出东西（`texts/tables/pictures` 全空）才判 `unprocessable`；"抽到内容却切不出块"单独报，reason 明确写成实现问题，不再误报成扫描件。
+配套把 `parse_pdf` 的判定拆开：只有文档**真的**没抽出东西（`texts/tables/pictures` 全空）才判 `unprocessable`；"抽到内容却切不出块"单独报，reason 明确写成实现问题，不再误报成扫描件。
 
 **顺带的两个实测坑**：
 
 1. **docling 的 item 上没有 `export_to_text`**。只有 `export_to_doctags` / `export_to_document_tokens`（混着坐标的结构标记流，不能当正文）。正文在各 item 的 `.text` 上，表格/图片才走 `export_to_markdown`。
 2. **`OcrMode` 默认不是全页 OCR**。`OcrMode.DEFAULT` 实为 `PDF_AWARE_LAYOUT_REGIONS`：先取版面检测的簇，再剔除已被 PDF 文字覆盖的。本次实测三种模式（DEFAULT / FULL_PAGE / LAYOUT_REGIONS）在本样本上都能捞回文字，故暂不改默认；但**版面模型漏检的扫描件需要 `mode=OcrMode.FULL_PAGE`**，这是后续遇到真实坏件时的第一个旋钮。
 
-### G. ⚠️ `chunk.meta.doc_items` 装的是「引用」而非元素（影响批次 3/4，已修）
+### G. ⚠️ `chunk.meta.doc_items` 可能是「引用」而非元素（影响批次 3/4，已修）
+
+> **2026-09-23 实测补正**：本节原写"装的是引用"，不完整——**两种形态并存**，
+> 取决于该块有没有超 token 预算（详见下方"根因"）。结论不变：必须按引用处理。
 
 **现象**：`kc.table_md` 一直是空串，`linearize_table()`（本项目"表格数值可被自然语言问句命中"的核心设计）**从未真正执行过**；图片分类恒为空、全部落到"diagram + 需 VLM"。
 
-**根因**：`HybridChunker` 产出的 `chunk.meta.doc_items` 里，元素是 `DocItem` **轻量引用**——只有 `self_ref`（如 `#/tables/0`）、`label`、`prov`，**没有 `.text`、没有 `export_to_markdown`、没有 `annotations`**。而引用上恰好还有个 `prov`，所以"有坐标"这条线索看起来正常，掩盖了其余能力全在走回退分支。
+**根因**：`HybridChunker._split_using_plain_text` 里两条路径给 `doc_items` 装了不同的东西：
+
+| 情形 | 代码路径 | `doc_items` 形态 |
+|---|---|---|
+| 未超预算（`RAG_DOC_CHUNK_TOKENS` 默认 512，**多数块**） | `DocChunk(**doc_chunk.export_json_dict())` | 退化成 `DocItem` **基类**（引用） |
+| 超预算被 token 切分 | `DocChunk(text=s, meta=doc_chunk.meta)` | 保留完整**实体** |
+
+根因是 `DocMeta.doc_items` 的类型注解写的是**基类** `list[DocItem]`，而
+`export_json_dict()` 用 `model_dump(mode="json")` 按注解序列化，只输出
+`self_ref / label / prov / parent / children / content_layer` ——
+子类字段（`TextItem.text`、`TableItem.data`、`PictureItem.annotations`）**全被丢弃**。
+所以"轻量引用"不是 docling 刻意设计的结构，而是"基类注解 + JSON 往返"的副作用。
+
+实测（docling 2.129）：2 行小表 + 2000 token 预算 → `{'DocItem': 2}`；
+40 行大表 + 60 token 预算 → `{'DocItem': 1, 'TableItem': 40}`。
+**默认 512 token 下多数块走往返路径，按引用处理是常态而非例外。**
+
+而引用上恰好还有个 `prov`，所以"有坐标"这条线索看起来正常，掩盖了其余能力全在走回退分支。
 
 | 我们依赖的能力 | 只拿引用时 | 后果 |
 |---|---|---|
 | `item.export_to_markdown(doc)` | `AttributeError` → 被 `try/except` 吞掉 | `table_md` 空，`linearize_table` 拿到空串 |
 | `item.text` | 不存在（`None`） | 混排块的正文丢失 |
-| `item.annotations`（图片分类） | 不存在 | 图片分类永远失效，VLM 预算被浪费 |
+| `item.annotations` / `item.meta.classification`（图片分类） | 都不存在 | 图片分类永远失效，VLM 预算被浪费 |
 
 **为什么一直没暴露**：docling 自己的 `chunk.text` 会把表格序列化成 `East, Revenue = 1200. West, Revenue = 980` 这种准自然语言，检索效果"看着还行"，于是"内容不为空"掩盖了整条链路在走回退分支。
 
@@ -755,7 +792,55 @@ resolved = _resolve(items, doc)   # 按 self_ref 换回完整元素，换不到�
 pages, boxes = _collect_prov(items + resolved)   # 两边都收，避免丢位置
 ```
 
-**教训（可复用到任何"框架对象字段"的假设上）**：拿到第三方的结构化对象时，先 `print(type(obj), obj.model_dump() if hasattr(...) else dir(obj))` 看清它到底是什么，再写消费代码。本项目为此踩了两次坑：`WordFormatOption`（猜 API 名字）与本次（猜字段存在）。
+### G2. ⚠️ 图片分类：读取字段名错 + 映射表类别名过期（2026-09-23 修复）
+
+`_resolve_items` 修好之后，图片分类**仍然读不到** —— 还有两处独立的断点叠在上面。
+这类缺陷的共同特征是：**开关是好的、代码在跑、就是不报错**。
+
+**断点 1：`_predicted_class()` 读了一个不存在的字段名。**
+
+docling 往**两个容器**写分类（`document_picture_classifier.py`，`_keep_deprecated_annotations` 默认 `True`）：
+
+| 路径 | 容器 | 元素 | 取分类名的字段 |
+|---|---|---|---|
+| 新（主） | `item.meta.classification` | `PictureClassificationMetaField` | `.predictions[].class_name` |
+| 旧（兼容） | `item.annotations` | `PictureClassificationData` | `.predicted_classes[].class_name` |
+
+原实现读的是 `ann.predicted_class`（**单数**）—— 两个类上都没有这个字段。实测：
+
+```
+ann 有 .predicted_class  ？ False      ← 原实现读的就是这个
+ann 有 .predicted_classes ？ True
+旧读法结果: ''                          ← 恒为空串
+新读法结果: 'bar_chart'
+```
+
+**断点 2：`_CHART_CLASSES` 的键名与 docling 实际加载的模型对不上。**
+
+docling 2.129 默认用 `docling-project/DocumentFigureClassifier-v2.5`（**26 类**），
+而原表 14 个键里**只有 6 个能命中**：
+
+| 原表里的键 | v2.5 实际情况 |
+|---|---|
+| `line_chart` `bar_chart` `pie_chart` `flow_chart` `box_plot` `geographical_map` | 命中 |
+| `scatter_chart` | 真实类名是 **`scatter_plot`** |
+| `stacked_bar_chart` `heatmap` `histogram` `schematic_diagram` `boxplot` `dot_plot` `area_chart` | **v2.5 里没有这些类** |
+
+原表应是照更早的模型写的。已收敛为五个：`bar_chart / line_chart / pie_chart /
+scatter_plot / box_plot` —— **刻意不收录** `flow_chart`、`geographical_map`、
+`topographical_map`、`engineering_drawing` 等"看着像图表但没有确定性数据源"的类别：
+它们在 pdf/docx 里通常是嵌入位图（没有 chart XML 可读），判 `needs_vlm=False`
+会让图里信息**永久丢失**；落到默认分支走 VLM，只是多花一次调用。
+
+**修复后的行为**（`tests/test_knowledge_chunk.py` 已锁）：两条路径各有独立用例；
+`flow_chart` 断言必须 `(diagram, True)`；并新增一条断言"映射表的键必须全部存在于
+v2.5 的 26 类里"，把"键名要对得上模型"变成可执行约束。
+
+**教训**：`do_picture_classification=True` 只能保证**写入**，不保证**读得到**。
+读第三方产出的字段前，必须打印真实对象确认字段名（`print(ann.model_dump())`
+或 `dir(ann)`）；映射表这类"把外部枚举翻译成内部枚举"的表，必须附上它的来源模型版本与类别清单。
+
+**通用教训（可复用到任何"框架对象字段"的假设上）**：拿到第三方的结构化对象时，先 `print(type(obj), obj.model_dump() if hasattr(...) else dir(obj))` 看清它到底是什么，再写消费代码。本项目为此踩了三次坑：`WordFormatOption`（猜 API 名字）、`doc_items`（猜字段存在）、图片分类（**假对象按错误字段名写，把 bug 一起测绿了**——假对象必须照真实结构写，否则测试只验证"我以为的字段名"）。
 
 ### H. docx 双路线实测（批次 5，已落地）
 
@@ -775,6 +860,7 @@ pages, boxes = _collect_prov(items + resolved)   # 两边都收，避免丢位�
 1. **Docling 把整篇正文和图表塞进同一个块，然后按"含图片"判成 diagram** → `retrieval_text` 只剩一句"图表"，**整篇正文失去检索入口**（正文只在 `content` 里，而检索层只认 `text`）。
    修法：混排块按内容降级——有正文就保留正文进 `retrieval_text`，同时清掉 `needs_vlm`（图片已由 C 路线索引，块里也没有图像字节）。
    顺带修好同类缺陷：`_kind_for_items` 原来"含表格就只输出表格、含图片就只输出一句图表"，同样会把同块正文挤出检索文本。
+   （注：该函数已于 2026-09-24 随分块器合流**删除** —— 含结构元素的块现在按元素逐个成块、正文自有其块，不再需要"多选一"判据；详见 `PLAN_unify_chunk_scope.md` §8。）
 2. **OLE 对象的 VML 预览位图会重复入库**。Word 插入 OLE 时同时写 `<v:imagedata>`（预览位图，常为 EMF）与 `<o:OLEObject>`（原件），**在同一个段落里**。
    修法：`docx_media._mark_ole_previews()` 在"引用形式是 VML `imagedata`"且"同段落 OLE 的内层正文确实解析出来了"两个条件同时成立时才标记去重；原件没解出来时保留预览（那份图可能是唯一的视觉线索）。
 3. **`[Content_Types].xml` 里缺主文档 `Override`** 时 python-docx 会直接判 `Input document is not valid`，Docling docx 后端同样拒收。手拼夹具必须带这条，否则测的是夹具不是解析器。

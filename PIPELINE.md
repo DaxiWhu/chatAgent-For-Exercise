@@ -11,25 +11,25 @@
 ```
 文件
  │
- ├─ ① 分流（按容器格式）───────────────────────────── src/loaders.py · src/retrieval.py
+ ├─ ① 分流（按容器格式）───────────────────────────── src/rag/loaders.py · src/rag/retrieval.py
  │    .pdf / .docx → Docling 双后端        csv/tsv/xlsx/pptx/json/jsonl/html/md/txt → load_blocks()
  │    图片 → 有图无文的块 → VLM/OCR        .doc/.xls/.ppt → 不支持（需 LibreOffice）
  │
- ├─ ② 解析（每格式的确定性抽取）────────────────────── src/docling_loader.py · src/docx_media.py · src/loaders.py
+ ├─ ② 解析（每格式的确定性抽取）────────────────────── src/rag/docling_loader.py · src/rag/docx_media.py · src/rag/loaders.py
  │    PDF：版面/表格/OCR/公式 + 图片裁剪 + 原页位图
  │    Word：Docling 正文（A）+ 解 zip 取图片/OLE/图表 XML（C）
  │    其它：各自的结构（表头/工作表/幻灯片/记录/标题/代码块）
  │
- ├─ ③ 统一产物 KnowledgeChunk（26 字段，双轨：content 保真 / retrieval_text 面向检索）── src/knowledge_chunk.py
+ ├─ ③ 统一产物 KnowledgeChunk（26 字段，双轨：content 保真 / retrieval_text 面向检索）── src/rag/knowledge_chunk.py
  │
- ├─ ④ 切分 ──────────────────────────────────────── src/retrieval.py
+ ├─ ④ 切分 ──────────────────────────────────────── src/rag/retrieval.py
  │    docling 侧：HybridChunker + 四级兜底阶梯（保证"有内容 → 一定有块"）
  │    其它格式：结构块 + 超大块二次切分（section/page 跟着走）
  │    再叠加：父窗（small-to-big）
  │
- ├─ ⑤ 切分 → 向量化之间的处理（9 步，见 §5）────────── src/chunk_writer.py · src/contextualizer.py
+ ├─ ⑤ 切分 → 向量化之间的处理（9 步，见 §5）────────── src/rag/chunk_writer.py · src/rag/contextualizer.py
  │
- ├─ ⑥ 向量化与索引 ──────────────────────────────── src/retrieval.py
+ ├─ ⑥ 向量化与索引 ──────────────────────────────── src/rag/retrieval.py
  │    TfidfRetriever（字符 n-gram）| EmbeddingRetriever（bge-m3）| HybridRetriever（RRF 融合）
  │
  └─ ⑦ 检索 → 生成 → 引用（含原页返图）────────────── src/graph.py · app/main.py

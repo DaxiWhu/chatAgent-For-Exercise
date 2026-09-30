@@ -376,7 +376,7 @@
 | **L2** | 表格结构化 | ✅ TableFormer **ACCURATE** + 行列文字化（`Region=East；Revenue=1200`） |
 | **L2** | 图像 caption | ✅ **确定性优先**：docx 图表读 chart XML、图片读作者替代文字、OLE 解内层原件；只有都拿不到才送 VLM |
 | **L2** | 片段补上下文 | ✅ 标题路径 + 父窗（small-to-big，默认开）+ 可选上下文前缀（Contextual Retrieval） |
-| **L3** | 多格式装载 | ✅ `src/loaders.py`（27 个扩展名）升级为**结构化块**：csv/xlsx/pptx/json/html/md 各自带上 section/page/kind/表格列名（详见 `PLAN_doc_parsing_v3.md` §2B）；图片文件接入为"有图无文"的块 |
+| **L3** | 多格式装载 | ✅ `src/rag/loaders.py`（27 个扩展名）升级为**结构化块**：csv/xlsx/pptx/json/html/md 各自带上 section/page/kind/表格列名（详见 `PLAN_doc_parsing_v3.md` §2B）；图片文件接入为"有图无文"的块 |
 | **L3** | 离线灌库 | ❌ 无（`scripts/build_index.py` 未实现） |
 | **L3** | 持久化 | ❌ **零**（每次启动全量重算） |
 | **L3** | 增量更新 | ❌ 无 |

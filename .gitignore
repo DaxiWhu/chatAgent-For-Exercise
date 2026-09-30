@@ -57,6 +57,12 @@ langgraph_checkpoints*
 !.env.example
 *.key
 *.pem
+
+# 部署证书目录（私钥/全链证书都绝不进仓库）
+deploy/app/certs/
+
+# 数据库备份产物（体积大且含业务数据）
+backups/
 secrets.json
 
 # ---- Logs ----
@@ -91,6 +97,17 @@ data/.media/
 # 都是"按内容哈希命名"的调用结果：丢了只是重新花钱调一次，不该入库。
 data/.vlm_cache/
 data/.ctx_cache/
+
+# ---- 文档解析结果缓存（P1-7 引入）----
+# 与上面三类同性质：按内容哈希命名、丢了重新解析一次即可。
+# ⚠️ 但它的键里含**文档正文的哈希、且文件内含解析出的文本** ——
+# 入库等于把语料内容复制一份进仓库（体积 + 内容泄露两重问题）。
+data/.parse_cache/
+
+# ---- 本地调试探针的临时产物 ----
+# 里面的 pt_* / pytest_tmp 等目录是 pytest tmp_path 的落地结果，
+# 每次跑测试都会重新生成；probe_*.py 是排障用的临时脚本。
+tmp_probe/
 
 # ---- WorkBuddy project data (do not delete, but usually not committed) ----
 .workbuddy/
