@@ -58,7 +58,7 @@ def _code_keys() -> set[str]:
     `RERANK_API_BASE`、`DOCLING_*` 全被误判成"不存在的键"）。
 
     覆盖来源：
-      - `app/config.py`：统一入口，用 `_env_str/bool/int("KEY")` 读；
+      - `app/config.py`：统一入口，用 `_env_str/bool/int/float("KEY")` 读；
       - `app/serve.py`：**例外**，argparse 直接读 `APP_WORKERS` /
         `WEB_CONCURRENCY` / `GRACEFUL_SHUTDOWN_TIMEOUT`（有意绕过 config）；
       - `src/rag/*.py`：检索链路模块在导入期 `os.getenv(...)` 读一批
@@ -74,7 +74,7 @@ def _code_keys() -> set[str]:
     targets += sorted((ROOT / "scripts").glob("*.py"))
 
     pat = re.compile(
-        r'_env_(?:str|bool|int)\(\s*"([A-Za-z0-9_]+)"'
+        r'_env_(?:str|bool|int|float)\(\s*"([A-Za-z0-9_]+)"'
         r'|os\.(?:getenv|environ\.get)\(\s*"([A-Za-z0-9_]+)"'
         r'|os\.environ\[\s*"([A-Za-z0-9_]+)"\s*\]'
     )
@@ -114,6 +114,13 @@ def _known_keys() -> set[str]:
         # 所以手工补进白名单 —— 这不是"放宽"，只是补上静态分析的能力边界。
         "APP_WORKERS",
         "WEB_CONCURRENCY",
+        # `PROMPT_VERSION` **不是环境变量**，而是 `src/prompts.py` 里的模块常量
+        # （所以既不在 `.env.example`、也不被 `_code_keys()` 的 os.getenv 正则抓到）。
+        # 但运维文档提到它是**有意义的**：模型开始编造引用编号时，第一件要确认的事
+        # 就是"最近有没有人 bump 过它"（见 RUNBOOK `CitationUnsupportedFrequent`）。
+        # 这里补白名单而不是把文档里的反引号去掉 —— 去掉只是让守卫闭嘴，
+        # 而它本来就该被当成一个"真实存在的、会影响线上行为的标识符"。
+        "PROMPT_VERSION",
     }
     return _env_example_keys() | _code_keys() | _compose_keys() | extra
 

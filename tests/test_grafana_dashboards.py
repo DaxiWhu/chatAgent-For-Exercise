@@ -62,6 +62,7 @@ _HIST_SUFFIXES = ("_bucket", "_sum", "_count")
 _APP_PREFIXES = (
     "http_", "llm_", "chat_stream_", "client_", "review_", "quota_",
     "rag_", "rate_limited", "request_", "session_", "tenant_", "shared_backend_",
+    "citation_",
 )
 
 

@@ -162,6 +162,24 @@ groups:
           description: "启动自检发现库里既有向量是用**另一个** embedding 模型（模型名或维度不同）灌的，而当前 `EMBEDDING_MODEL` 指向新模型。旧向量与新查询不在同一个向量空间 ⇒ 检索命中明显变差、答案开始答非所问，但吞吐与错误率一切正常。`/health/ready` 的 vector_store 明细里有库里的与当前的模型名、维度。"
           runbook: "1) 看启动日志里 `索引身份自检：status=mismatch` 那一行，它分别打印**库里的**与**当前的**模型名与维度；2) 若确实换过模型：把 `QDRANT_COLLECTION` / `PGVECTOR_TABLE` 改成一个新名字后重新灌库（旧集合/表**先保留**，以便比对与回滚），灌完确认 `rag_index_identity_ok` 变回 1；3) 若是误报（只是模型名写法变了，如大小写/前缀）：把库里 `embedding_fingerprint` 那条记录改成当前指纹即可。⚠️ **不要**为了让告警消失而直接删掉那条记录 —— 那等于把这项检查永久关掉。"
 
+      - alert: CitationUnsupportedFrequent
+        # 答案里出现了**不存在的引用编号**（例如标了 `[7]` 而本轮只用 7 条命中的前 3 条）
+        # —— 这是可以用代码证明的"编造引用"，而不是主观判断。
+        #
+        # ⚠️ 当前 `answer_prompt` **没有要求**模型标编号 ⇒ 多数部署下这条**不会响**。
+        #    这是刻意的：它守的是"模型开始自发标编号，并且标错"（换模型/改提示词之后
+        #    很常见），以及将来提示词演进出强制引用之后的常态监控。
+        #    一条"偶尔才响、一响就是真的"的告警，比一条常年噪音的告警有用得多。
+        expr: increase(citation_check_unsupported_total[1h]) > 5
+        for: 10m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "1 小时内出现 {{ $value }} 次编造引用"
+          description: "`citation_check_unsupported_total` 在涨：模型在答案里标了**本轮检索命中里不存在**的引用编号。用户会照着这个编号去核对出处，而它指向的东西不存在 —— 比「没有引用」更糟，因为它让人以为有据可查。响应里的 `citation_check` 事件带 `refs` 与 `missing`，可直接定位是哪几个编号。"
+          runbook: "1) 从日志搜 `引用校验未通过`，看 `refs` 是哪几个编号、本轮命中了几条；2) 常见成因是**换了模型或改了提示词**后模型开始自己编号 —— 先确认 `PROMPT_VERSION` 与 `EMBEDDING_MODEL` 是否有人动过；3) 若已配 `RAG_CITATION_CHECK_ACTION=block`，这类回答的引用会被吞掉（答案照常返回），核对「消失的引用」是否都是这一类；4) 若模型只是编号习惯不同（比如把整段引用写成 `[资料1]`），那不是本告警的范畴 —— 本告警只认数字编号。"
+
       - alert: IndexIdentityNeverReported
         # "没检出问题"与"根本没检查"必须能区分开 —— 这是本项目反复踩的一类假绿。
         # 用持久化向量后端（pg / qdrant）时，启动自检**必然**会写下这个指标；

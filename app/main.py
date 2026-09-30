@@ -675,6 +675,8 @@ def _session_view(state, thread_id: str) -> dict:
         "feedback": values.get("feedback") or "",
         "draft": values.get("output") or "",
         "citations": values.get("citations") or [],
+        # 引用校验结论（`citations` 非空 ≠ 有依据，两者必须分开报）
+        "citation_check": values.get("citation_check") or {},
         "messages": _serialize_messages(values.get("messages")),
         "pending_review": review,
     }
@@ -817,6 +819,47 @@ def _sse_json(event: str, payload) -> dict:
     payload: 任意可 JSON 序列化的对象。
     """
     return {"event": event, "data": json.dumps(payload, ensure_ascii=False)}
+
+
+# ---------------------------------------------------------------------------
+# 引用校验的交付策略（见 src/rag/citation_check.py）
+# ---------------------------------------------------------------------------
+# 现状：`citations` 非空只说明"这一轮检索命中了东西"，**推不出**"答案用了它"、
+# 更推不出"答案有依据"。而模型完全可以在命中 3 条之后写出一段与三条都不沾边的
+# 话，还带着 3 条引用 —— 前端如实展示，看起来就像"有出处"。
+_CITATION_CHECK_FIELDS = (
+    "status", "ok", "detail", "citations", "refs", "missing",
+    "best_overlap", "best_overlap_n", "warnings",
+)
+
+
+def _public_citation_check(check: dict) -> dict:
+    """把校验结论收敛成**可以下发给客户端**的字段（不下发内部统计字段）。"""
+    return {k: check.get(k) for k in _CITATION_CHECK_FIELDS}
+
+
+def _citation_blocked() -> bool:
+    """当前是否处于"拦截不可信引用"的策略（且开关是开的）。"""
+    return (config.CITATION_CHECK
+            and (config.CITATION_CHECK_ACTION or "").strip().lower() == "block")
+
+
+def _should_withhold_citations(check: dict) -> bool:
+    """是否**不下发**引用。
+
+    抽成纯函数是为了可测：这一条决定"用户还能不能看到引用"，而它的失效方式
+    恰恰是最安静的那种 —— 拦错了（把正常引用吞掉）不会报错，只会让引用区空着，
+    看起来和"这一轮没检索到东西"一模一样。
+
+    两道闸门**缺一不可**：
+      1. `block_worthy` —— 只有确凿错误（答案引用了不存在的编号）才算。
+         重叠率低只是**可疑**：模型改写幅度大一点就会低，拿它吞掉用户的引用，
+         误伤成本远大于收益；
+      2. 策略真的配成了 `block` —— 默认 `warn`，行为与改造前**完全一致**。
+    """
+    if not check or not check.get("block_worthy"):
+        return False
+    return _citation_blocked()
 
 
 def _client_error(exc: BaseException) -> str:
@@ -1123,8 +1166,25 @@ async def _stream_graph(incoming, config, req_kind: str, tenant: str = "",
         values = state_snap.values
 
         cites = values.get("citations") or []
-        if cites:
+        check = values.get("citation_check") or {}
+        blocked = False
+        if check:
+            # status 是**有限取值**（ok/weak/degraded/unsupported/no_citations/no_answer），
+            # 适合做标签；绝不要把 detail 或引用来源放进标签（高基数）。
+            metrics.inc("citation_check_total",
+                        status=str(check.get("status") or "unknown"))
+            if check.get("block_worthy"):
+                metrics.inc("citation_check_unsupported_total")
+            blocked = _should_withhold_citations(check)
+        if cites and not blocked:
             yield _sse_json("citations", cites)
+        elif blocked:
+            logging.warning("引用校验未通过（%s），按策略 block：不下发引用",
+                            check.get("detail"))
+        if check:
+            # 校验结论**总要下发**（含 block 的那次）：客户端需要知道
+            # "这段回答的引用为什么不见了"，否则"没有引用"与"引用被拦了"分不开。
+            yield _sse_json("citation_check", _public_citation_check(check))
 
         if state_snap.next and "human_review" in state_snap.next:
             item = {

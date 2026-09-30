@@ -306,6 +306,34 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml logs app-stable 
 4. 确认 `RAG_VECTOR_STORE` 不是 `memory` —— 内存后端天然没有索引身份，
    "没有这个指标"是**预期**；生产不该用内存后端。
 
+#### `CitationUnsupportedFrequent`（warning，10m）
+
+**答案里出现了本轮检索命中里不存在的引用编号** —— 例如本轮只命中 3 条，答案却标了
+`[7]`。这是**可以用代码证明的编造引用**，不是主观判断：用户会照着这个编号去核对出处，
+而它指向的东西不存在。它比"没有引用"更糟，因为**它让人以为有据可查**。
+
+```bash
+# 定位是哪几个编号：从响应 / 日志里找 citation_check
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs app-stable \
+  | grep '引用校验未通过'
+# 指标按状态拆分，先看是哪一类在涨
+curl -s localhost:8000/metrics | grep '^citation_check'
+```
+
+1. 看日志里 `refs` 是哪几个编号、`citation_check` 事件里 `citations` 有几条。
+   越界的那些就是编造出来的。
+2. **常见成因是换了模型或改了提示词**后模型开始自己编号 —— 先确认 `PROMPT_VERSION`
+   与 `EMBEDDING_MODEL` 最近有没有人动过（`git log` + 启动日志回显）。
+3. ⚠️ **别急着把 `RAG_CITATION_CHECK` 关掉**。这条告警响本身就是有价值的信号；
+   关掉它只是让"编造引用"重新变得不可见。若已配 `RAG_CITATION_CHECK_ACTION=block`，
+   这类回答的引用会被吞掉（**答案照常返回**）—— 核对"消失的引用"是否都是这一类。
+4. **模型只是编号习惯不同**（比如把整段引用写成 `[资料1]`）**不属于本告警** ——
+   本告警只认数字编号（`[n]` / `【n】` / `［n］`，**刻意不认 `(n)`**：正文里
+   "第(3)条"太常见，认了就是稳定误报，而稳定误报的判据最后一定会被人关掉）。
+5. `status=weak` / `degraded` **不会**触发本告警（前者是"改写幅度大"的启发式、
+   后者是"源文件被删"的数据状态，都不该拿拦用户答案）—— 它们只进
+   `citation_check_total{status=...}`，用于巡检而非告警。
+
 ### 3.2 SLO 与错误预算（category: slo）
 
 先读 `deploy/monitoring/SLO.md` 的处置表，这里只给补充：

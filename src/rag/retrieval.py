@@ -1601,6 +1601,10 @@ def build_citations(hits, snippet_chars=None) -> list:
         cite = {
             "n": i,
             "source": chunk.get("source", ""),
+            # 相对语料根目录的 POSIX 路径（本次改造前灌的老数据没有这个字段）。
+            # **必须带出去**：只给 basename 时，同名不同目录的文件无法唯一定位，
+            # "这条引用指向的源文件还在不在"就判不了（见 citation_check.missing_sources）。
+            "source_path": chunk.get("source_path", ""),
             "score": round(float(score), 4),
             "chunk_id": chunk.get("chunk_id", ""),
             "kind": chunk.get("kind", ""),

@@ -24,7 +24,7 @@ from .rag.retrieval import (
     load_chunks, build_retriever, build_citations, context_block, resolve_tenant,
 )
 from .rag.parse_cache import load_chunks_cached
-from .rag import guard
+from .rag import citation_check, guard
 from . import prompts
 
 # ----------------------------------------------------------------------------
@@ -82,6 +82,9 @@ class OverAllState(MessagesState):
     output: str = ""
     context: str = ""          # RAG 检索到的参考资料（送模型的文本）
     citations: list = []       # 引用的结构化来源信息（给用户回溯核对用）
+    # 引用校验结论（见 src/rag/citation_check.py）：citations 非空只说明"检索命中了
+    # 东西"，推不出"答案用了它"。"引用带了"与"有依据"必须分开报。
+    citation_check: dict = {}
     is_need_evaluate: bool = False
     score: int = 0
     feedback: str = ""
@@ -273,6 +276,30 @@ def retrieve(state: OverAllState, config: RunnableConfig | None = None) -> OverA
         return {"context": "", "citations": []}
 
 
+def _check_citations(state: OverAllState, draft) -> dict:
+    """对刚产出的草稿做引用校验（**只算，不拦**），返回结论 dict。
+
+    为什么在 generate 里而不是单独开一个节点：langgraph 的图与边是编译期固定的，
+    加节点要动图；而校验需要的两样东西（新草稿 + 本轮 citations）在这一步刚好都齐，
+    且**每轮都会跑到** —— 首轮与每次修订后的新版本都要判，漏一轮就等于漏掉那个版本。
+
+    为什么不在图里"拦"：图内部改写文案会让"模型实际产出了什么"变得不可复现，
+    而排查答案质量时第一件要看到的就是模型原文。拦截放在接口层
+    （`app/main.py`，只对 `block_worthy` 的确凿错误生效）。
+
+    任何异常都降级为 `{}`：**观测失败不能影响作答**（与项目其它降级口径一致）。
+    """
+    try:
+        return citation_check.verify(
+            draft if isinstance(draft, str) else "",
+            state.get("citations") or [],
+            docs_dir=DOCS_DIR,
+        )
+    except Exception as e:  # noqa: BLE001
+        logging.warning("引用校验失败（不影响作答）：%s", e)
+        return {}
+
+
 def generate(state: OverAllState) -> OverAllState:
     """生成节点：首轮带 RAG 上下文作答，后续轮按评审/人工意见修订。
 
@@ -301,6 +328,7 @@ def generate(state: OverAllState) -> OverAllState:
             "messages": res,
             "iteration": iteration + 1,
             "output": res.content,
+            "citation_check": _check_citations(state, res.content),
         }
     src = state.get("feedback_source", "ai")
     src_cn = "评审模型" if src == "ai" else "人工审核"
@@ -311,6 +339,8 @@ def generate(state: OverAllState) -> OverAllState:
         "messages": [instruction, res],  # 反馈指令 + 新草稿 一并追加进历史
         "iteration": iteration + 1,
         "output": res.content,
+        # 修订轮同样要判：新草稿可能引入了原文里没有的说法
+        "citation_check": _check_citations(state, res.content),
     }
 
 

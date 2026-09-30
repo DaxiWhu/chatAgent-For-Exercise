@@ -51,6 +51,14 @@ def _env_int(name, default):
         return default
 
 
+def _env_float(name, default):
+    """读浮点环境变量，非法值退回默认（同 `_env_int`：一个手滑的 .env 不该让服务起不来）。"""
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _env_str(name, default=""):
     """读字符串环境变量并 strip（.env 里常见的尾随空格是事故源）。"""
     v = os.getenv(name)
@@ -380,6 +388,20 @@ GUARD_ENABLED = _env_bool("RAG_GUARD", True)
 GUARD_ACTION = _env_str("RAG_GUARD_ACTION", "warn").lower()
 
 # --------------------------------------------------------------------------
+# 引用校验（答案的引用是否可追溯 / 有依据）
+# --------------------------------------------------------------------------
+# 能力开关默认开（开着但判据不足时只标注，不改变交付内容）；判定默认只告警 ——
+# 判据里含启发式成分（答案与引用的文本重叠率），默认就 block 会把正常的改写
+# 当成"没依据"拦下来，而那种误伤比不拦更糟。
+CITATION_CHECK = _env_bool("RAG_CITATION_CHECK", True)
+# warn（记日志 + 指标 + 明细随响应带出去）| block（**只对确凿错误生效**：
+# 答案引用了不存在的编号 —— 那是可以用代码证明的编造，而重叠率低只是可疑）
+CITATION_CHECK_ACTION = _env_str("RAG_CITATION_CHECK_ACTION", "warn").lower()
+# 答案与引用文本的最低 n-gram 重叠率。**定得很低**：模型本来就会总结与改写，
+# 这一层要抓的是"整段凭空生成"，不是"改写幅度大"。
+CITATION_MIN_OVERLAP = _env_float("RAG_CITATION_MIN_OVERLAP", 0.05)
+
+# --------------------------------------------------------------------------
 # 解析结果落盘缓存（P1-7）
 # --------------------------------------------------------------------------
 PARSE_CACHE_ENABLED = _env_bool("RAG_PARSE_CACHE", True)
@@ -484,6 +506,10 @@ def as_dict(runtime=None):
             "default": DEFAULT_TENANT or None,
         },
         "guard": {"enabled": GUARD_ENABLED, "action": GUARD_ACTION},
+        # 回显出来才回答得了"线上到底有没有在校验引用、低重叠会不会被拦"
+        "citation_check": {"enabled": CITATION_CHECK,
+                           "action": CITATION_CHECK_ACTION,
+                           "min_overlap": CITATION_MIN_OVERLAP},
         "parse_cache": PARSE_CACHE_ENABLED,
         "circuit": {"enabled": CIRCUIT_ENABLED,
                     "fail_threshold": CIRCUIT_FAIL_THRESHOLD,

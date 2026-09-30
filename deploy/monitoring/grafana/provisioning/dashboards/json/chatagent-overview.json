@@ -545,6 +545,50 @@
         "graphMode": "none",
         "textMode": "auto"
       }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "引用校验状态分布",
+      "description": "每轮回答的引用校验结论（`citation_check_total` 按 status 拆分）。`ok` / `no_citations` 是常态；`unsupported`（模型标了**本轮命中里不存在**的编号）是唯一会触发告警的一类，对应 CitationUnsupportedFrequent。`weak`（与引用文本重叠偏低）与 `degraded`（被引用的源文件已不在语料目录）**不会**告警 —— 前者是启发式、后者该由 kb-prune 清孤儿，都不该拿来拦用户答案，放这里只为巡检。⚠️ 面板**没有数据**只说明最近没有请求，不等于「引用都对」。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 18,
+        "x": 6,
+        "y": 28
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (status) (rate(citation_check_total[5m]))",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     }
   ]
 }
