@@ -159,7 +159,8 @@ python scripts/snapshot_openapi.py --write    # 确认变更后重新生成
 
 - 对外路由清单（新增/删除端点必须有人显式确认）；
 - 旧路径 `/chat`、`/review` 必须带 `deprecated` 标记（否则客户端收不到迁移信号）；
-- 需要鉴权的路由必须声明 `X-API-Key` / `X-Tenant-Id` 头；
+- 需要鉴权的路由必须声明 `Authorization` / `X-Tenant-Id` 两个头，且**不得**声明
+  `X-API-Key`（共享密钥已删除，留着会让接入方以为它还是凭证）；
 - 模型里不得出现 `maxLength` 这类"从配置冻进来的"约束（字段闸门在**调用时**读
   config，冻进模型会让限制值变成对外契约的一部分且无法被测试改）。
 
@@ -259,24 +260,171 @@ SSE 一断（弱网、切后台、代理超时），客户端手里往往只剩"
 客户端"提前关掉"时**不会**下发 `http.disconnect`，这条路永远走不到。
 端到端覆盖在 `tests/test_disconnect.py`（自己构造 ASGI `receive` 通道投递断连）。
 
-### 鉴权与租户（三档，按配置自动选择）
+### 鉴权与身份（人对服务 / 机器对服务）
 
-请求头：`X-API-Key` 带密钥，`X-Tenant-Id`（可选）声明租户。
+**只有一种身份来源：本服务签发的会话令牌。** 人类用户与服务账号都走同一条路 ——
+账号密码经 `POST /v1/auth/login` 换 `Bearer` 令牌，用户身份与租户身份都在令牌载荷里：
+`sub`（用户名）、`tenant`（租户名）、`roles`。服务账号与人类用户共用 `users` 表
+（命名习惯加 `svc-` 前缀），这样脚本身份可归因（留痕里有 `user`）、可单独撤权、
+租户来自令牌载荷而**不可自报**。
 
-| 配置 | 身份模式 | 租户怎么定 | 适用 |
-|------|----------|-----------|------|
-| `TENANT_KEYS=acme:k1,globex:k2` | `tenant-key` | 由 Key **反查**，请求头只用于核对（不一致 **403**） | 生产多租户（推荐） |
-| 只配 `SERVE_API_KEY` | `global-key` | 仍由请求头**自报** ⇒ 启动时告警 | 单租户 / 兼容 |
-| 都不配 | `anonymous` | 请求头或 `RAG_TENANT` | 仅本地开发 |
+⚠️ **2026-10-05：共享密钥 `SERVE_API_KEY`（`X-API-Key`）、"匿名放行"开关
+（`REQUIRE_AUTH`），以及外部身份源（OIDC / JWKS）都已随代码路径一起删除。**
+不是"废弃、留空即可"，而是**环境里存在它们（留空也算）会让服务拒绝启动**
+（守卫 `app/main.py::_assert_no_legacy_auth_knobs`，OIDC 那一族按 `AUTH_OIDC_`
+**前缀**匹配）。删而不是留空的理由见 `deploy/SECRETS.md` §4.2：共享密钥那三条缺陷
+（分不出身份 / 撤不掉 / 租户只能自报）都是**结构性**的，只要留着一行配置，就总会有
+人为了省事去配它；OIDC 则是**从未启用过**的第二条身份入口。
 
-> **为什么多租户必须用 `TENANT_KEYS`**：只有"一个全局 Key + 请求头"时，租户是客户端
-> **自报**的 —— 任何持 Key 者改个 header 就是"另一个租户"：日配额重新计算、
-> 审核队列归属失真、配合可猜的 `thread_id` 还能串读别人的会话。
-> 配了 `TENANT_KEYS` 后租户由 Key 反查得出，请求头只能"确认"不能"声明"。
-> 会话归属由 `app/sessions.py` 登记属主（仅多租户模式启用）。
+```
+Authorization: Bearer <jwt>   ──► 用户主体(sub) + 租户 + 角色 + 会话，可撤销、可审计
+                                （人类与服务账号**都走这条**，也是**唯一**一条）
+（不带凭证）                   ──► 401（没有任何"匿名放行"或"凭共享密钥放行"的兜底）
+```
 
-`APP_ENV=production` 会推导出两个收紧默认：`REQUIRE_AUTH=1`（**未配任何密钥就拒绝启动**）、
-`ENABLE_DOCS=0`（`/docs` `/redoc` `/openapi.json` 全 404）。
+身份只有一种：`Authorization: Bearer`（本服务签发的会话令牌），租户一律取**载荷里的
+`tenant`**，没有租户就是空串。⚠️ 代码里**没有** `via` 这类"认证方式"标记：它的取值
+曾经是 session / oidc / 共享密钥 / 匿名，如今只剩一种存在可能 —— 恒为定值的字段会被
+误读成"还有别的认证方式"，所以随 OIDC 一起删掉了（见 `CHANGELOG.md` 的移除条目）。
+
+`X-Tenant-Id` **只是"确认"**：带上它时与令牌里的租户不符即 403；不带也照常工作。
+**它永远不是租户来源** —— 租户只能来自已验签的载荷。会话归属由 `app/sessions.py` 登记属主。
+
+⚠️ **无租户 ≠ 能看全库。** 口径 2026-10-05 反转：无租户只能读到**公共租户**
+（`RAG_TENANT`，本项目用 `public`）的文档；**没配公共租户则什么都检索不到**
+（检索层落到 `NO_TENANT_SENTINEL` 哨兵值）。旧口径（空串 = 不加过滤 = 能召回
+全部租户的文档）恰好相反，直接后果是"自助注册的账号能读全库"，作为生产默认站不住。
+
+> **为什么共享密钥必须删掉而不是留着**：它的租户由**请求头自报且被采信** ——
+> 任何持证者改个 header 就是"另一个租户"：日配额重新计算、审核队列归属失真、
+> 配合可猜的 `thread_id` 还能串读别人的会话。用户鉴权把租户放进**已验签的 JWT**，
+> 客户端只能"带着"、不能"声明"。
+
+⚠️ **生产环境必须启用用户鉴权**：`APP_ENV=production` 且没有 `AUTH_SESSION_SECRET`
+与可登录的账号时，服务**拒绝启动**。⚠️ **没有任何环境变量能关掉这条检查** ——
+曾经能"绕过鉴权要求"的两个变量（`SERVE_API_KEY` / `REQUIRE_AUTH`）都已经不在代码里了。
+
+`APP_ENV=production` 推导出的收紧默认是 `ENABLE_DOCS=0`（`/docs` `/redoc`
+`/openapi.json` 全 404）。⚠️ 鉴权要求**不由它推导**：无论什么环境，"没有凭证 ⇒ 401"
+都是结构性的。
+
+### 用户鉴权（账号与会话）
+
+只有 JWT 一种口径。**管理接口与审稿接口都只认 JWT**，而且现在**所有接口都是这样** ——
+历史上审稿接口对"非 JWT 身份"有一处刻意豁免（为了让持共享密钥的旧调用方不被 403），
+那条路径删除后豁免也随之消失。
+
+| 场景 | 配置 | 效果 |
+|------|------|------|
+| 标准自部署 | `AUTH_SESSION_SECRET`（首启用 `AUTH_USERS` 种子建出第一个管理员） | 本服务账号表（PBKDF2，零额外依赖）+ 可撤销、可清场的会话 |
+
+**多设备**：同一用户可以在多台设备同时登录，每一台是一个独立会话。
+`POST /v1/auth/logout` 只登出当前那一台；加 `?all=true` 清空该用户**全部**设备
+（作用域只到当前凭证里的 user，不是"任意踢人"接口）。
+
+认证端点：`POST /v1/auth/login`（账号密码换会话令牌）、
+`POST /v1/auth/refresh`、`POST /v1/auth/logout`、`GET /v1/auth/me`。
+login / refresh **不走** `_preflight`（此时还没有会话，否则死锁），只过限流。
+
+> **为什么必须引入服务端状态**
+> 因为**撤销**。无状态 JWT 在任何地方都有效，服务端**无法单方面作废**它 —— 用户点了
+> 登出、密码泄漏、员工离职，服务端都没有手段让已签发的 token 立刻失效。所以拆职责：
+> **本服务既回答"你是谁"，也回答"你现在还能不能用"**。后者落在一张**会话白名单**上，
+> 每个会话一个键 `auth:sess:{user}:{sid}`：登录新增一个键、登出删掉自己的那个键、
+> 校验时判断"这个 sid 还在不在"。
+> 为什么是白名单而不是"已作废 jti"的黑名单：黑名单要保存所有历史 token 直到它们过期，
+> 是**无界增长**的；白名单只存当前有效的会话，条数 = 用户数 × 在线设备数，且有 TTL 回收。
+> 两条配套约束：① 白名单键的 TTL 取 `max(access, refresh)`；② 刷新**必须沿用同一个 sid**
+> —— 每次刷新都新建会话的话，条数就变成"刷新次数"而不是"登录次数"，又变成无界增长。
+
+⚠️ **多 worker / 多容器部署必须配 `REDIS_URL`**。会话校验是**无条件**查存储的 ——
+副本 A 签发的会话在副本 B 查不到，用户会按请求落在哪个副本**随机收到 401**
+（表现为"刚登录成功、隔几次请求又要重登"）。检查启动日志里的
+`auth.user_auth.session_backend` 应显示 `redis`；否则启动期会点名告警。
+
+**本地用户表的哈希怎么来**（不要手写）：
+
+```bash
+python -m scripts.hash_password -u alice -t acme -r reviewer,admin   # 输出可直接粘贴的条目
+python -m scripts.hash_password --check alice                        # 排障：拿当前配置验一次密码
+```
+
+⚠️ **`.env` 里 `AUTH_USERS` 的值必须加单引号**：PBKDF2 串含 `$`，而 compose 对**未加引号**的
+值会做变量插值，`$<hex>` 段被当成变量名替换成**空串** ⇒ 哈希报废 ⇒
+「密码明明是对的却登不进去」，且全程没有报错。脚本输出的就是带引号的成品，照抄即可。
+反过来说：**本地直跑能登进去，不代表容器里能登进去**（python-dotenv 只插值 `${VAR}`，
+不受影响）—— 加单引号两边都对，没有理由不加。
+
+用户鉴权相关变量：
+
+| 变量 | 必填 | 说明 |
+|------|------|------|
+| `AUTH_USERS` | 首启种子 | `user:hash:tenant[:role\|role][,...]`。**只在账号表为空时用来建出第一个管理员**（解鸡生蛋），之后不再被读 —— 用户的增删改查走 `app/accounts.py` 与下面的管理接口。⚠️ 值要加**单引号**（见上文） |
+| `AUTH_ADMIN_ROLES` | 否 | 允许管理用户与租户的角色，默认 `admin`。⚠️ **fail-closed**：留空就等于**没人能管**（管理接口一律 403）。✅ 2026-10-05 起 `AUTH_REVIEWER_ROLES` 也统一为 fail-closed（默认 `reviewer`），两者不再刻意相反 —— 要放开必须**显式写空** |
+| `AUTH_ALLOW_SELF_REGISTER` | 否 | 是否开放 `POST /v1/auth/register`，默认 `false`（**关闭**）。开启后任何人都能建出**无租户**账号 |
+| `AUTH_SESSION_SECRET` | 建议必填 | 会话签名密钥，`openssl rand -hex 32`。**不配 ⇒ 无法签发/续期本服务会话 ⇒ 登出/撤销能力整体不可用** |
+| `AUTH_ACCESS_TTL` / `AUTH_REFRESH_TTL` | 否 | 秒，默认 `900` / `604800`。会话键的 TTL 取两者**最大值**（只取 access TTL 会让"闲一会儿回来要重新登录"） |
+| `REDIS_URL` | 多副本必填 | 会话白名单的存放位置。**不配 = 落在进程内存**：单进程可正常工作，但一旦多 worker / 多容器，副本 A 签发的会话在副本 B 查不到 ⇒ **随机 401**。启动自检会点名（见下） |
+| ~~`AUTH_SINGLE_SESSION`~~ | — | **已于 2026-10-01 移除**：现在**允许同一用户在多台设备同时登录**。登出只影响发起请求的那一台，`POST /v1/auth/logout?all=true` 可清场。`.env` 里若残留该变量会被**静默忽略** |
+| `AUTH_REVIEWER_ROLES` | 否 | 允许审稿的角色，默认 `reviewer`（⚠️ **2026-10-05 改**：此前默认空 = 不限制）。**不配 = 只有带 `reviewer` 角色的人能审**；要"不做角色校验"必须**显式写空** `AUTH_REVIEWER_ROLES=`。**只对 JWT 生效**：共享密钥路径没有角色概念，该豁免随 `SERVE_API_KEY` 一起退役 |
+
+> ~~JWKS / OIDC 相关的变量已随外部身份源一起删除~~（2026-10-05）。
+> 它们历史上解决的是"JWKS 拉不到就拒绝（fail-closed）、算法白名单在取公钥之前校验、
+> kid 未命中先刷缓存"这几件事 —— 属于已删除功能的设计说明，保留在
+> `deploy/SECRETS.md` 与 `CHANGELOG.md` 里备查。
+
+### 账号体系（用户 / 租户 / 加入申请）
+
+用户与租户存在库里（`app/accounts.py`；有 `DB_URL` 走 PG、否则退回内存 —— 内存会让
+"在 A 副本建的用户，B 副本说密码错"，启动自检会点名）。关系是**多对一**：`users.tenant`
+是单列，**一个用户只能属于一个租户**，无租户即空串。
+
+**谁管谁**：管理员角色（`AUTH_ADMIN_ROLES`）能对用户与租户做增删改查；普通用户只能改
+自己的密码、递交加入申请。管理接口**只认 JWT**（`_assert_admin_role` 对没有角色的
+身份一律 403；没有凭证连门都进不来，401）。
+
+| 端点 | 谁 | 作用 |
+|------|----|------|
+| `POST /v1/auth/register` | 任何人（需开关） | 自助注册，建出**无租户**账号 |
+| `POST /v1/auth/password` | 本人 | 改自己的密码（改完该用户所有会话失效） |
+| `POST /v1/join-requests` | 本人 | 递交"加入某租户"的申请 |
+| `GET /v1/join-requests/me` | 本人 | 查自己的申请状态 |
+| `POST` / `GET /v1/admin/tenants` | 管理员 | 建 / 列租户 |
+| `GET` / `PATCH` / `DELETE /v1/admin/tenants/{name}` | 管理员 | 查 / 改名 / 删租户 |
+| `POST` / `GET /v1/admin/users` | 管理员 | 建 / 列用户 |
+| `GET` / `PATCH` / `DELETE /v1/admin/users/{username}` | 管理员 | 查 / 改 / 删用户 |
+| `GET /v1/admin/join-requests` | 管理员 | 列待审申请 |
+| `POST /v1/admin/join-requests/{req_id}` | 管理员 | 批准 / 驳回申请 |
+
+**申请-审批两段式**：注册出来的账号租户为空。要加入某个租户，本人递申请、管理员批。
+防并发重复审批靠"部分唯一索引（只对 `pending` 唯一）+ 带 `status='pending'` 条件的 CAS 更新"，
+两个管理员同时点批准只会有一个成功。
+
+⚠️ **审批前的空档期他能读全库** —— 这正是上面"空串 = 不加过滤"的直接后果，是 2026-10-04
+明确接受的口径。要收紧就给无租户用户一个具名隔离桶（把 `RAG_TENANT` 设成具体值）。
+
+⚠️ **权限变更即刻生效**：租户 / 角色 / 状态 / 密码任一变更都执行 `logout_all` ——
+因为 JWT 里的租户与角色是**签发时的快照**，不重新登录不会变。`POST /v1/auth/refresh`
+会从账号表**重读** `tenant` / `roles`（不沿用 refresh token 里的旧快照），并检查账号仍是
+`active`，所以"停用某账号"能立刻挡住它的续期。
+
+**唯一例外是"批准加入租户"：它不断会话，改为给客户端一个可判定的重登信号。**
+
+| 从哪看 | 字段 | 含义 |
+|---|---|---|
+| `GET /v1/auth/me` | `relogin_required` / `relogin_reason` | 令牌载荷里的租户或角色与账号表当前值不一致 |
+| `GET /v1/join-requests/me` | `requires_relogin`（逐条）+ 同样的两个整体字段 | 该申请已批准、而令牌里还是旧租户 |
+
+**客户端必须据此提示用户重新登录。** 不实现的话，用户的症状是"申请明明通过了却搜不到
+东西" —— 而按当前口径无租户恰好能搜全库，他自己很难想明白。`examples/http_client.py`
+的 `whoami` 子命令演示了这一步。判定对**所有**身份都生效 —— 现在只剩本服务签发的
+会话令牌一种凭证，不再有"改了本地账号表却对它无效"的那类令牌。
+
+**密码策略**：新设的密码有长度**下限**，默认 8（`MIN_PASSWORD_CHARS`）。8 是行业基本线 ——
+NIST SP 800-63B 对"仅凭密码"的认证要求至少 8 位，OWASP 也以 8 位为起点（推荐 12）。
+可以调高，**不允许调低**。下限只约束**新设**的密码：登录与被验的旧密码不受它约束，
+否则早期设的短密码会被反锁在门外。上限 512（`MAX_PASSWORD_CHARS`）防的是另一件事
+（PBKDF2 对超长输入的白开销）。
 
 ## 状态机
 
@@ -313,10 +461,9 @@ human_review → END（accept）| generate（revise，带人工意见重写）
 
 | 变量 | 必填 | 说明 |
 |------|------|------|
-| `APP_ENV` | 否 | `development`（默认）/ `production`。生产会推导出 `REQUIRE_AUTH=1`、`ENABLE_DOCS=0` |
-| `REQUIRE_AUTH` | 否 | 默认跟随 `APP_ENV`。开启时**未配任何密钥就拒绝启动**（拦"裸奔上线"） |
-| `SERVE_API_KEY` | 否 | 单一全局 Key，非空则开启鉴权。⚠️ **留空 = 接口完全裸奔** |
-| `TENANT_KEYS` | 否 | `租户:密钥[,...]`。把租户**绑定到 Key**（生产多租户必配，见上文） |
+| `APP_ENV` | 否 | `development`（默认）/ `production`。生产会推导出 `ENABLE_DOCS=0`；且生产**未配用户鉴权时拒绝启动**（拦"裸奔上线"）。⚠️ 鉴权要求**不由它推导**：任何环境下"没有凭证 ⇒ 401"都成立 |
+| ~~`REQUIRE_AUTH`~~ | — | **已于 2026-10-05 删除**。它存在的唯一意义是"关掉鉴权要求"，而匿名兜底已经删除 ⇒ 鉴权要求是结构性的。**环境里存在它会让服务拒绝启动** |
+| ~~`SERVE_API_KEY`~~ | — | **已于 2026-10-05 删除**（连带 `X-API-Key` 请求头参数）。⚠️ 不带身份（留痕里 `user` 恒为空）、租户由脚本自报且被采信、永不过期、换值必须重启 ⇒ **分不出谁、撤不掉、能自报租户**，所以是删代码而不是留空。**环境里存在它（留空也算）会让服务拒绝启动**；脚本与 CI 改走「账号密码 → `POST /v1/auth/login` → Bearer」 |
 | `ENABLE_DOCS` | 否 | 默认开发开、生产关。关时 `/docs` `/redoc` `/openapi.json` 全部 404 |
 | `CORS_ALLOW_ORIGINS` | 否 | 逗号分隔白名单，默认 `*`（`allow_credentials` 恒 false，不涉及 Cookie） |
 | `TRUST_PROXY_HEADERS` | 否 | 默认 `0`。反代后设 `1` 才按 `X-Forwarded-For` 第一段计限流；**直连时设 1 可被伪造绕过限流** |
@@ -329,7 +476,8 @@ human_review → END（accept）| generate（revise，带人工意见重写）
 | `RATE_LIMIT_ENABLED` / `RATE_LIMIT_BY_SESSION` | 否 | 两个限流维度各自的开关，默认都开 |
 | `RATE_LIMIT_PER_MINUTE` / `RATE_LIMIT_SESSION_PER_MINUTE` | 否 | 按 IP、按会话的每分钟上限，默认 `120` |
 | `LLM_MAX_TOKENS_PER_REQUEST` | 否 | 单请求 token 预算，超限**停止继续生成**（已产出的照常返回）。`0`=不限 |
-| `USER_DAILY_TOKEN_QUOTA` | 否 | 每租户每日 token 上限，超了先拦 429。`0`=不限 |
+| `USER_DAILY_TOKEN_QUOTA` | 否 | **每租户**每日 token 上限，超了拦 429。`0`=不限。⚠️ 名字里的 `USER_` 是历史包袱，它管的是整个租户 |
+| `DAILY_TOKEN_QUOTA_PER_USER` | 否 | **每人**每日 token 上限，超了拦 429。`0`=不限。与上一项**同时生效、两级都要过**（更紧的那一级说了算）。⚠️ 只配上一项时额度是整个租户共用一份：一个人刷满，同租户其余人当天全部 429（启动日志会点这一条） |
 | `REQUEST_TIMEOUT_SECONDS` | 否 | **请求级总时限**（秒），超时下发 `timeout` 事件后收流（已产出的照常返回）。`0`=不限。⚠️ LLM client 的 `timeout` 只管单次调用，多轮 self-review 的总时长靠它兜底 |
 | `RAG_GUARD` / `RAG_GUARD_ACTION` | 否 | 提示词注入防护，`warn`（默认）/ `strip` / `block` |
 | `RAG_PARSE_CACHE` | 否 | 文档级解析结果落盘缓存，默认 `1`（语料没变就跳过重新解析，docling/OCR 是分钟级） |
@@ -358,7 +506,7 @@ human_review → END（accept）| generate（revise，带人工意见重写）
 | `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` | 否 | 块大小（默认 300 字符）与重叠（默认 50） |
 | `RAG_HYBRID_POOL` | 否 | hybrid 每一路各取多少条候选送入融合，默认 10 |
 | `RERANK_MODEL` | 否 | 填了就在 hybrid 上挂一层精排（失败自动回退到融合顺序）；留空则关闭 |
-| `RAG_TENANT` | 否 | 兜底租户，**仅在单租户模式生效**。多租户请用 `TENANT_KEYS`，别靠它 |
+| `RAG_TENANT` | **建议填** | **公共租户**：没有租户的身份能读到的**唯一**分区（同时是灌库时的默认租户）。⚠️ **留空 = 什么都检索不到**（落到 `NO_TENANT_SENTINEL`）—— 2026-10-05 前留空的含义恰好相反（"不加过滤 ⇒ 能看全部租户"），生产上应给一个具名值（如 `public`）。多租户隔离靠 **JWT 载荷里的 `tenant`**，不靠它 |
 
 > `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` 没填满时，`RAG_EMBEDDING=semantic|hybrid` 会**自动回退 TF-IDF**
 > 并打一条 WARNING，服务不会因配置缺失而崩。
@@ -371,15 +519,19 @@ human_review → END（accept）| generate（revise，带人工意见重写）
 ### 1) 生产必填
 
 ```bash
-APP_ENV=production                     # 推导出 REQUIRE_AUTH=1 + 关闭 API 文档
-TENANT_KEYS=acme:<key>,globex:<key>    # 多租户：租户**绑定到 Key**（单租户可改用 SERVE_API_KEY）
+APP_ENV=production                     # 关闭 API 文档；生产未配用户鉴权会拒绝启动
+AUTH_SESSION_SECRET=...                # 用户鉴权：本服务会话签名（openssl rand -hex 32）
+RAG_TENANT=public                      # 公共租户（无租户身份能读到的唯一分区；留空=搜不到）
+AUTH_ADMIN_ROLES=admin                 # 谁能管用户与租户（默认就是 admin）
 DB_URL=postgresql://user:pwd@host:5432/db
 AGNES_API_KEY=...                      # LLM（生成）
 EMBEDDING_API_BASE/KEY/MODEL=...       # 检索 embedding，与 LLM 分开配
 ```
 
-`APP_ENV=production` 且**没有任何 Key** 时服务会**拒绝启动**（刻意的：宁可起不来，
-也不要以无鉴权状态接管线上流量）。
+`APP_ENV=production` 且**没有启用用户鉴权**（`AUTH_SESSION_SECRET` 为空、`AUTH_USERS`
+也没种子）时服务会**拒绝启动**；环境里残留 `SERVE_API_KEY` 或 `REQUIRE_AUTH` 的键
+（留空也算）同样拒绝启动（刻意的：宁可起不来，也不要以无鉴权状态接管线上流量，
+或者让某扇已拆掉的门看起来还在）。
 
 **怎么确认"我配的开关真的生效了"**（配置错配最典型的表现是静默不生效）：
 
@@ -467,28 +619,107 @@ python -m scripts.load_test --endpoint chat --yes-spend --disconnect-after 3   #
 路由与接收人在同目录 `alertmanager.yml`，SLO 的**定义**（SLI 口径、目标、燃尽率表、
 复核节奏）在 `SLO.md` —— 文档与表达式由测试逐行对齐，改一处会立刻测红。
 
-## 检索质量评测
+## 质量评测（三层）
+
+「准不准」在这套系统里有三个**互不替代**的层次：前两层停在模型之前，
+第三层才评模型产出的答案本身。少任何一层，都会有一类问题看不见：
+
+| 层 | 回答的问题 | 脚本 | 主要指标 |
+|----|-----------|------|---------|
+| **检索召回** | 找对文档了吗 | `scripts/eval_retrieval.py` | Top1 / Top3 / MRR / **Recall@k / nDCG@k / Prec@k** |
+| **材料充足** | 喂给模型的材料够不够 | `scripts/eval_answer.py` | 来源覆盖 / 关键点覆盖 / 引用可回溯 |
+| **生成忠实** | **模型产出的答案**准不准 | `scripts/eval_generation.py` | 答案可信率 / **标识符幻觉率** / 拒答正确率 |
+
+一次跑完三层，汇总成一页并与上次对比：
 
 ```bash
-python -m scripts.eval_retrieval              # 完整对比（每个组合会逐条发请求，较慢）
-python -m scripts.eval_quick                  # 快速版：批量算查询向量，秒级返回
-python -m scripts.eval_retrieval --show-miss  # 打印未命中明细，便于定位问题
+python scripts/tasks.py eval           # 或 make eval：三层门禁 + scorecard
+python scripts/eval_scorecard.py --baseline scripts/scorecard.json   # 与上次对比，标出退化
 ```
 
-评测集在 `scripts/eval_set.json`，把 `documents` 换成你自己的语料、`queries` 换成你真会问的问题即可。
+### 口径必须钉死——否则同一份代码给出两套结论
+
+`src/rag/retrieval.py` 在**导入期**就 `load_dotenv(dotenv_path=仓库根/.env)`，把
+`RAG_EMBEDDING` / `RAG_RERANK` 读成**模块常量**。于是同一个评测脚本：
+
+| 跑在哪 | 实际后端 | 材料层「来源覆盖」 |
+|--------|---------|------------------|
+| 开发机（`.env` 配了 `EMBEDDING_API_KEY`） | hybrid（**真的调外部 embedding API**） | 0.841 → **门禁红** |
+| CI / 全量回归（清空密钥） | bm25 | 0.955 → 门禁绿 |
+
+**两边都不报错**，而阈值只按 bm25 校准过 —— 看日志的人无从判断该信哪个，
+甚至看不出"这是口径问题"。
+
+所以三层评测一律经 `scripts/eval_backend.local_eval()` 把口径**钉成 bm25**，
+并且**连同 rerank 一起钉**：`build_retriever` 里 rerank 的判据是
+`RERANK_ENABLED and rerank_configured()`，**与后端无关** ⇒ bm25 也会被它改写排序，
+只钉后端等于留了一条看不见的旁路。
+
+守这条规则的是 `tests/test_eval_backend.py`：它断言的是**调用 `build_retriever` 那一刻
+模块常量的实际取值**，而不是"源码里有没有那句话"（后者改坏了也不会红）。
+
+> ⚠️ 门禁只保证「**在这一个口径下**没有退化」。生产若跑 hybrid，数字是另一套（见下表），
+> 门禁**不覆盖**它 —— 要评估 hybrid 请直接看 `eval_retrieval.py` 打出的逐后端对比表。
+
+### 检索召回——为什么既有 Top1 又有 Recall@k
+
+Top1/Top3/MRR 回答「**对不对**」（第一条准不准），集合指标回答「**找全了吗**」。
+一条查询期望多个来源时，Top1 只说得出"第一条对了"，说不出"另外两条找回来没有"。
+
+实测（28 条中文查询，`scripts/eval_set.json`）：
+
+| 后端 | Top1 | Top3 | MRR | Recall@k | nDCG@k | Prec@k |
+|------|------|------|-----|----------|--------|--------|
+| **bm25**（评测口径） | 61% | 75% | 0.673 | 75% | 0.837 | **49%** |
+| hybrid（生产可选后端） | 54% | 68% | 0.601 | 66% | 0.607 | 33% |
+
+最后一列最值得注意：Top3 看着有 75%，但 **Top-3 里一半是无关文档**。
+只报 Top3 会让人以为检索质量不错，而 Prec@k 把这个假象戳破了。
+
+第二行是**实测出来的真实差距**，也说明为什么门禁必须钉口径：hybrid 在这份语料上
+每一项都低于 bm25。要比较后端请用 `scripts/eval_retrieval.py`（它逐后端跑成一张表），
+**别把探索数字和门禁数字混成一个**。
+
+评测集在 `scripts/eval_set.json`，把 `documents` 换成自己的语料、`queries` 换成真会问的问题即可。
 **务必保留 `type` 字段**：`literal`（照抄原文词）与 `paraphrase`（换种说法）必须分开统计——
 混在一起会得出「关键词就够用」的错误结论。
 
-实测参考（28 条中文查询 / 6 篇共 17 个片段，bge-m3）：
+### 生成忠实——不调 LLM 怎么量「答案准不准」
 
-| 后端 | 整体 Top1 | 照抄 Top1 | 改写 Top1 |
-|------|-----------|-----------|-----------|
-| tfidf | **75%** | **100%** | 42% |
-| hybrid + 前缀 | 61% | 75% | 42% |
-| semantic + 前缀 | 39% | 50% | 25% |
+判据全在 `src/rag/answer_quality.py`，**纯标准库、不调任何模型**：
 
-结论：**小语料、查询多照抄原文词时关键词最强**；把切分从「递归 500」改成「结构感知 300」后，
-tfidf 照抄 Top1 由 88% → 100%。语义检索的价值要在文档变长、说法差异大时才体现出来。
+| 指标 | 含义 | 能否硬判 |
+|------|------|---------|
+| `identifier_hallucination_rate` | 答案里出现、但资料里**没有**的标识符（配置项 / 接口路径 / 反引号内容） | ✅ 唯一能判失败的 |
+| `grounded_ratio` | 答案有多少内容能在资料里找到出处 | 仅趋势 |
+| `refused` | 资料里没有答案时，是否如实拒答 | ✅ 负样本上硬判 |
+| `ok` | 综合结论（`True` / `False` / **`None`**） | — |
+
+**为什么数字只记不判**：「15 分钟」与资料里的「900 秒」是同一件事，字符串却对不上。
+把数字做成失败判据，指标第一天就会变成误报机器，然后被人关掉——那时连标识符
+那一半也一起没了。所以只让**标识符**（只可能对或错的东西）参与硬判。
+
+**为什么不用 LLM-as-judge**：忠实度评测（RAGAS 那类）要一次答案配一次 judge 调用，
+有噪声、要密钥、不可复现。当 CI 门禁会引入**随机红**，而随机红的下场一定是被关掉。
+真要看模型质量用 `--live`（本地手动跑、数字留档），它不进 CI：
+
+```bash
+python scripts/eval_generation.py              # 离线：对人工参考答案跑指标（CI 用，零密钥）
+python scripts/eval_generation.py --live       # 现场调模型，量真实答案（需 AGNES_API_KEY）
+python scripts/eval_generation.py --show-miss  # 看是哪条判据没过
+```
+
+评测集 `scripts/generation_set.json` 分两类用例，**缺一不可**：
+`answerable: true` 的带人工 `reference_answer`（验证"忠实答案不会被误报成幻觉"），
+`answerable: false` 是**负样本**（资料里确实没有，验证"该拒答时会不会编"）。
+全正样本 ⇒ 测不出编造；全负样本 ⇒ 测不出误报。
+
+实测基线（data/kb 6 篇，11 条用例 = 8 正 + 3 负）：
+答案可信率 **1.000** / 标识符幻觉率 **0.000**（17 个标识符）/ 拒答正确率 **1.000** / 平均可回溯性 **0.592**。
+
+> ⚠️ 三层各用各的语料，**不是同一个分母**：检索层用 `eval_set.json` 内嵌的通用语料
+> （考检索算法本身），后两层用 `data/`（考随仓库分发的知识库）。并排读时别混。
+
 
 ## 说明
 
@@ -514,7 +745,7 @@ tfidf 照抄 Top1 由 88% → 100%。语义检索的价值要在文档变长、�
 | job | 触发 | 守住什么 |
 |-----|------|---------|
 | `test` | 每次 push / PR | 全量**离线**用例（刻意不装 docling/transformers）+ 依赖锁定静态一致性 |
-| `eval-gate` | 每次 push / PR | 检索基线（tfidf Top1 ≥ 0.55）—— 改 prompt / 换模型 / 调切分后召回率不许悄悄掉 |
+| `eval-gate` | 每次 push / PR | **三层质量门禁**：检索基线（bm25 Top1 ≥ 0.55）→ 材料覆盖（引用与关键点）→ **生成侧编造与拒答** |
 | `full-deps` | 每日定时 / 手动 | 装齐 docling/transformers 跑全量：**补上 `test` 刻意跳过的那批解析用例**（否则"本地绿 ≠ CI 绿"） |
 | `image` | 每次 push / PR | **部署产物**：镜像能构建 → 容器能起来并通过 `/health/live` → 漏洞扫描无 HIGH/CRITICAL |
 
