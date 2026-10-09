@@ -30,6 +30,7 @@ DDL 的单一出处
     rag_chunks      → PgVectorStore.ensure_schema
     review_queue    → ReviewQueue.ensure_schema
     session_owners  → SessionRegistry.ensure_schema
+    tenants / users / tenant_join_requests → AccountStore.ensure_schema
 
 否则同一张表会有两份定义，迟早漂移。
 
@@ -48,7 +49,7 @@ import sys
 from dataclasses import dataclass
 
 #: 当前代码期望的结构版本（新增迁移时同步 +1）
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 8
 
 #: 迁移元表。**这份 DDL 必须内联**：它是"记录其他迁移的工具"，不能被别的迁移依赖。
 _MIGRATIONS_TABLE = (
@@ -145,12 +146,113 @@ def _m5_session_owners_activity(dsn, ctx):
     SessionRegistry(dsn=dsn, enabled=True).ensure_schema()
 
 
+def _m6_session_owners_user(dsn, ctx):
+    """会话归属表的**用户维度**列（把同租户内的隔离下沉到人）。
+
+    DDL 出处仍是 `SessionRegistry._ensure_schema`（负责
+    `ADD COLUMN IF NOT EXISTS owner_user text NOT NULL DEFAULT ''`）。
+
+    为什么单独占一个版本号：与 m4/m5 同理 —— v5 在老部署里已记录为"已应用"，
+    `apply_pending` 按版本号跳过它。只改 `_ensure_schema` 而不加版本号，
+    老库既不会通过 `--apply` 补列，`--status` 也报不出来（预检显示"可以部署"）。
+
+    这一列缺失的后果是**隔离静默失效**：代码会按 `owner_user` 过滤，而列不存在
+    时查询直接抛错 → 上层 catch 后**放行**（归属校验是旁路保护，刻意不阻断服务）
+    ⇒ 表现为"同租户内任何人都能读到别人的会话"，而日志里只有一行 warning。
+    列存在但值为空串时，语义退化为"属于该租户的机器调用方"，与升级前一致，
+    不会误伤存量数据。
+    """
+    from .sessions import SessionRegistry
+
+    SessionRegistry(dsn=dsn, enabled=True).ensure_schema()
+
+
+def agent_session_ddl(dsn: str) -> list[str]:
+    """生成"跨轮对话历史表"的建表语句（**纯函数**，不连库；供迁移与守卫测试共用）。
+
+    为什么要拆出来：`_m7` 里剩下的部分需要真连一次 PG，而 CI 里没有 PG —— 拆开后
+    "**我们到底会执行哪几条 SQL**"就能在离线环境里被断言（见
+    `tests/test_agent_history_budget.py`）。不拆的话这段逻辑只能靠"上了生产才知道"。
+    """
+    from agents.extensions.memory import SQLAlchemySession
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.schema import CreateIndex, CreateTable
+
+    from src.agents.session import to_async_dsn
+
+    # 只借它把 Table 定义交出来。`create_async_engine` 是**懒连接** —— 不会碰数据库。
+    probe = SQLAlchemySession(
+        "__migration__", engine=create_async_engine(to_async_dsn(dsn))
+    )
+    dialect = postgresql.dialect()
+    statements: list[str] = []
+    # 顺序不能换：`agent_messages` 有指向 `agent_sessions` 的外键。
+    for table in (probe._sessions, probe._messages):
+        statements.append(
+            str(CreateTable(table, if_not_exists=True).compile(dialect=dialect))
+        )
+        for index in sorted(table.indexes, key=lambda i: i.name or ""):
+            statements.append(
+                str(CreateIndex(index, if_not_exists=True).compile(dialect=dialect))
+            )
+    return statements
+
+
+def _m7_agent_session_tables(dsn, ctx):
+    """跨轮对话历史的两张表：`agent_sessions` / `agent_messages`（2026-10-03）。
+
+    为什么 DDL **不是**"委托给某个模块的 `ensure_schema`"（本文件的一贯做法）：
+    这两张表**不归本仓库任何模块所有** —— 它们是官方 `openai-agents` 的
+    `SQLAlchemySession` 直接读写的数据表，所以没有一个"表的主人"可以委托。
+
+    为什么也**不手抄一份 DDL**：手抄的那份在 SDK 升版时会**静默漂移**，而漂的后果
+    是运行期才炸（列名对不上 → 每次取历史都失败 → `session_for` 降级 ⇒ 每轮没有历史，
+    而服务照常跑、指标全绿）。所以这里让 **SDK 自己把 Table 定义交出来**
+    （见 `agent_session_ddl`），本函数只负责执行。
+
+    ⚠️ 它用到了 SDK 的两个私有属性（`_sessions` / `_messages`）。这是刻意的取舍：
+    依赖私有属性会随 SDK 升版断掉，但那**是迁移/启动期炸**（看得见、能修），
+    比运行期静默降级好。守卫见 `tests/test_agent_history_budget.py`。
+
+    幂等：`CREATE TABLE / CREATE INDEX ... IF NOT EXISTS`。
+    """
+    import psycopg
+
+    statements = agent_session_ddl(dsn)
+    with psycopg.connect(dsn, connect_timeout=10, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            for statement in statements:
+                cur.execute(statement)
+
+
+def _m8_account_tables(dsn, ctx):
+    """账号体系的三张表：`tenants` / `users` / `tenant_join_requests`（2026-10-04）。
+
+    DDL 出处：`AccountStore.schema_statements`（本文件不重写 DDL，与 m1~m6 同口径）。
+
+    为什么单独占一个版本号：与 m4~m6 同理 —— 老库的 `schema_migrations` 里没有
+    这条记录，`--apply` 才会执行它。只改代码不加版本号的话，`--status` 会报
+    "无待应用迁移、可以部署"，于是新表在老库上**永远不会被建出来**，直到某个
+    管理接口第一次被调用才炸 —— 而那时报的是 SQL 错误，离"忘了跑迁移"很远。
+
+    为什么不像 m1~m6 那样挂在别的模块上：这三张表**只归本仓库所有**（不像
+    `agent_sessions` 属于 SDK），所以委托给它们的"主人" `AccountStore` 是正解。
+    """
+    from .accounts import AccountStore
+
+    AccountStore(dsn=dsn).ensure_schema()
+
+
 MIGRATIONS: tuple = (
     Migration(1, "rag_chunks 向量表", _m1_rag_chunks),
     Migration(2, "review_queue 审核队列表", _m2_review_queue),
     Migration(3, "session_owners 会话归属表", _m3_session_owners),
     Migration(4, "review_queue 审计列（操作者/时间/决定备注）", _m4_review_queue_audit),
     Migration(5, "session_owners 最后活动时间列", _m5_session_owners_activity),
+    Migration(6, "session_owners 用户维度列（同租户内隔离到人）", _m6_session_owners_user),
+    Migration(7, "agent_sessions / agent_messages 跨轮对话历史表", _m7_agent_session_tables),
+    Migration(8, "tenants / users / tenant_join_requests 账号体系表", _m8_account_tables),
 )
 
 
@@ -239,7 +341,8 @@ def status(dsn, table="rag_chunks", dim=None) -> dict:
                 "`CREATE EXTENSION vector`（需超级用户权限）"
             )
 
-        for t in (table, "review_queue", "session_owners"):
+        for t in (table, "review_queue", "session_owners",
+                  "tenants", "users", "tenant_join_requests"):
             out["tables"][t] = _table_rows(conn, t)
 
         actual = embedding_dim(conn, table)

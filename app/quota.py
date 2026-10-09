@@ -1,4 +1,4 @@
-"""用量配额：单请求 token 预算 + 用户（租户）日配额。
+"""用量配额：单请求 token 预算 + 日额度（**两级**）。
 
 为什么要有这一层
 --------------
@@ -8,8 +8,34 @@ self-review 迭代，可以在一次请求里把当日 LLM 额度打掉一大半
 
 1. **单请求预算**（`LLM_MAX_TOKENS_PER_REQUEST`）：流式回答过程中累计 token，
    超了就**停止继续生成**（已产出的部分照常返回）。防"一次请求失控"。
-2. **用户日配额**（`USER_DAILY_TOKEN_QUOTA`）：按租户累计当日用量，请求进来先查，
-   超了直接 429。防"一个用户/租户把全站额度吃光"。
+2. **日额度**（两级，见下）：请求进来先查，超了直接 429。防"把全站额度吃光"。
+
+日额度为什么是两级（2026-10-06 起）
+----------------------------------
+只有一级（按租户）时，"吃光额度"这件事有两条没人拦得住的路：
+
+  · **同租户内互抢**：额度是整个租户共用一份，一个人先刷满，同租户其余人当天
+    全部 429 —— 而他们什么都没做错。
+  · **无租户账号共用一个桶**：账号的租户可以是空串（"还没有租户"是合法状态，
+    见 `config.DEFAULT_TENANT`），于是所有无租户账号落进同一个
+    `quota::<日期>` 桶，彼此互抢。
+
+所以改成两级，**两级都要过，任一越界即拒**：
+
+  · `USER_DAILY_TOKEN_QUOTA`（租户级）= 天花板，防"一个租户把全站额度吃光"；
+  · `DAILY_TOKEN_QUOTA_PER_USER`（每人级）= 防"一个人吃掉同租户的份额"。
+
+有效的每人额度是 `min(每人级, 租户级)` —— 两级都要过，更紧的那一级说了算。
+两级都是 `0 = 不限`（默认），所以这一层开着也不会改变既有行为。
+⚠️ 只配租户级不配每人级时，"同租户互抢"仍然存在，启动日志会点这一条。
+
+桶键的口径（改它之前先想清楚）
+----------------------------
+  · 租户级：`quota:{tenant}:{today}` —— **刻意与历史完全一致**。改前缀会让升级
+    当天已累计的用量归零（额度被静默放宽）；滚动发布期间新旧副本各用一套键，
+    用量还会各算一份。
+  · 每人级：`quota@user:{user}:{today}` —— 第 6 个字符与前缀不同，所以它**不可能**
+    与任何租户桶撞键（租户名里禁止出现 `:`，见 `accounts._FORBIDDEN_IN_NAME`）。
 
 计数口径
 -------
@@ -19,7 +45,7 @@ self-review 迭代，可以在一次请求里把当日 LLM 额度打掉一大半
 
 存储
 ----
-- 日配额：内存 dict（`{tenant: {date: tokens}}`）；配了 REDIS_URL 则用
+- 日额度：内存 dict（`{桶键: (日期, tokens)}`）；配了 REDIS_URL 则用
   `INCRBY` + 到当天结束过期，多实例共享。
 - 单请求预算：天然是请求内的，无需外部存储。
 
@@ -81,11 +107,14 @@ class QuotaStatus:
     """配额检查结果。
 
     allowed: 是否允许本次请求。
-    used: 今日已用 token（**不含本次预占**）。
-    limit: 日配额上限（0 = 不限）。
+    used: 今日已用 token（**不含本次预占**）—— 拒绝时是**触发拒绝的那一级**的已用量
+        （两级都看时，用租户级那一层会答非所问：额度是被每人级拦下的）。
+    limit: 触发判定那一级的上限（0 = 不限）。
     reset_after: 距离配额重置（次日零点）还有多少秒。
     tenant: 租户标识。
     reserved: 本次请求已经**预占**的 token 数（`claim` 成功时 >0，供结算用）。
+    subject: 本次请求的**主体**（用户名）；每人级的桶键用它，空串表示没传。
+    scope: 触发拒绝的是哪一级 —— "tenant" / "subject"；放行时为空串。
     """
 
     allowed: bool
@@ -94,22 +123,53 @@ class QuotaStatus:
     reset_after: int
     tenant: str = ""
     reserved: int = 0
+    subject: str = ""
+    scope: str = ""
+
+
+def _today() -> str:
+    """今天的日期串（本地时区），作为日额度的天然分桶键。"""
+    return datetime.date.today().isoformat()
+
+
+def _tenant_bucket(tenant: str, today: str) -> str:
+    """租户级桶键。**格式刻意与历史一致** —— 改它等于把升级当天已累计的用量清零。
+
+    空租户名是合法输入（"还没有租户"），此时键是 `quota::<日期>`。
+    """
+    return f"quota:{tenant}:{today}"
+
+
+def _subject_bucket(subject: str, today: str) -> str:
+    """每人级桶键。前缀里的 `@` 是**防撞键**用的：
+
+    租户名禁止出现 `:`（`accounts._FORBIDDEN_IN_NAME`），但允许 `@`。所以只要
+    "第 6 个字符"与租户键不同，`quota@user:...` 就不可能被任何租户键命中 ——
+    否则一个恰好叫 `@user:x` 的租户就能与某个用户的桶互相污染（表现为某人莫名
+    被限，且查配置一切正常）。
+    """
+    return f"quota@user:{subject}:{today}"
 
 
 class _MemoryStore:
-    """进程内日用量：{tenant: (date, tokens)}。"""
+    """进程内日用量：`{桶键: (日期, 计数)}`。
+
+    ⚠️ 键是**已经带日期的桶键**（如 `quota:acme:2026-10-06`）。值里那个日期仍
+    留着：结算的退还有可能落到"新的一天"的键上（预占在昨天、结算在今晨），
+    靠它把跨天的残留读成 0。
+    """
 
     def __init__(self):
         self._data: dict[str, tuple[str, int]] = {}
         self._lock = threading.Lock()
 
-    def get(self, tenant: str, today: str) -> int:
+    def get(self, bucket: str, today: str) -> int:
         """读今日已用量；跨天自动归零。"""
         with self._lock:
-            d, v = self._data.get(tenant, (today, 0))
+            d, v = self._data.get(bucket, (today, 0))
             return v if d == today else 0
 
-    def add(self, tenant: str, today: str, n: int) -> int:
+    def add(self, bucket: str, today: str, n: int) -> int:
         """累加今日用量并返回新值。
 
         `n` 允许为负（结算时要把多预占的部分退回来）。结果**下限截到 0**：
@@ -117,10 +177,11 @@ class _MemoryStore:
         用量会变成负数 —— 表现成"跨天时白送一段额度"。
         """
         with self._lock:
-            d, v = self._data.get(tenant, (today, 0))
+            d, v = self._data.get(bucket, (today, 0))
             v = max(0, (v if d == today else 0) + int(n))
-            self._data[tenant] = (today, v)
+            self._data[bucket] = (today, v)
             return v
+
 
 
 class _RedisStore:
@@ -135,11 +196,7 @@ class _RedisStore:
         # 表现成"配额配了 Redis 却完全不算数"。提前到构造期，由上层记 ERROR 并回退。
         self._r.ping()
 
-    @staticmethod
-    def _key(tenant: str, today: str) -> str:
-        return f"quota:{tenant}:{today}"
-
-    def get(self, tenant: str, today: str) -> int:
+    def get(self, bucket: str, today: str) -> int:
         """读今日已用量（键不存在返回 0）。
 
         redis-py 默认 `decode_responses=False`，拿到的是 bytes；
@@ -148,10 +205,10 @@ class _RedisStore:
         **下限截到 0**：结算的退还有可能落到"新的一天"的键上（预占在昨天、结算
         在今晨），不截断的话今天的用量会是负数 = 白送一段额度。
         """
-        v = self._r.get(self._key(tenant, today))
+        v = self._r.get(bucket)
         return max(0, int(v or 0))
 
-    def add(self, tenant: str, today: str, n: int) -> int:
+    def add(self, bucket: str, today: str, n: int) -> int:
         """累加并保证键在当天末过期。
 
         `n` 允许为负：结算时把多预占的部分退回（`settle` 的说明）。返回值同样
@@ -163,17 +220,12 @@ class _RedisStore:
         **配额永远攒不满，静默失效**。这里用 `max(60, ...)` 再兜一层，
         保证任何情况下键至少活 60 秒。
         """
-        key = self._key(tenant, today)
+        key = bucket
         ttl = max(60, _end_of_day_epoch() - int(time.time()))
         with self._r.pipeline() as pipe:
             pipe.incrby(key, int(n))
             pipe.expire(key, ttl)
             return max(0, int(pipe.execute()[0]))
-
-
-def _today() -> str:
-    """今天的日期串（本地时区），作为日配额的天然分桶键。"""
-    return datetime.date.today().isoformat()
 
 
 def _end_of_day_epoch() -> int:
@@ -186,17 +238,30 @@ def _end_of_day_epoch() -> int:
 
 
 class QuotaManager:
-    """配额管理器：`check()` 判额度、`add()` 记用量。"""
+    """配额管理器：`claim()` 预占并判定、`settle()` 结算、`check()` 只读查。
 
-    def __init__(self, daily_limit=0, request_limit=0, enabled=True, redis_url=""):
+    日额度分**两级**（租户级 / 每人级），两级都要过。哪一级开了额度
+    （limit > 0）就参与判定与记账，两级都配 0 时这一层完全不介入。
+    """
+
+    def __init__(self, daily_limit=0, request_limit=0, enabled=True, redis_url="",
+                 per_user_limit=0):
         """构造。
 
-        daily_limit: 每租户每日 token 上限，0 = 不限。
+        daily_limit: **租户级**每日 token 上限（`USER_DAILY_TOKEN_QUOTA`），0 = 不限。
         request_limit: 单请求 token 上限，0 = 不限（由调用方流式累计后判定）。
-        enabled: False 时 check 恒放行、add 不计数。
+        enabled: False 时这一层完全不介入。
         redis_url: 非空则用 Redis 共享日用量，失败回退内存。
+        per_user_limit: **每人级**每日 token 上限（`DAILY_TOKEN_QUOTA_PER_USER`），0 = 不限。
+
+        ⚠️ 前四个参数的名字与**顺序**都不能动：测试、脚本、`identity` 里大量用
+        `QuotaManager(daily_limit=..., request_limit=...)` 构造（关键字与位置两种都有）。
+        新增的每人级额度只能**追加在末尾** —— 第一版把它插在 `request_limit` 前面，
+        位置调用一律静默错位（`request_limit` 被当成 `per_user_limit`），
+        表现成 20+ 个用例变红，而报错信息完全指不到这里。
         """
         self.daily_limit = max(0, int(daily_limit))
+        self.per_user_limit = max(0, int(per_user_limit))
         self.request_limit = max(0, int(request_limit))
         self.enabled = bool(enabled)
         # `_local` 是**兜底表**（与主后端是两个独立实例，语义见 _hit/_fallback 的说明）
@@ -218,15 +283,37 @@ class QuotaManager:
                     "REDIS_URL 已配置但连接不可用 ⇒ 共享日配额**未生效**，当前用进程内计数："
                     "多副本下每个副本各有一份额度。请检查 REDIS_URL 与网络。原因：%s", e)
 
-        # 预占制下的一个致命错配：单请求上限 ≥ 日配额时，**每一次**请求的预占都装不进
-        # 日额度 ⇒ 全部请求被判超额、服务整体 429。这种"配置写错 = 全站不可用"必须
-        # 在启动日志里点名，否则排查方向会跑到鉴权/网络上去。
-        if self.daily_limit > 0 and self.request_limit >= self.daily_limit:
+        self._warn_about_limit_mismatch()
+
+    def _warn_about_limit_mismatch(self):
+        """启动期点出两种"配了但对不上"的额度组合 —— 两者都是**静默**故障。
+
+        ⚠️ 某级额度 ≤ 单请求上限 ⇒ **全站 429**：预占（`reservation()` 取单请求
+        上限）连自己那一关都过不去，**每一次**请求都被判超额。配置看起来完全正常，
+        排查方向会跑到鉴权/网络上去。
+
+        ⚠️ 只配了租户级（**默认就会命中**，因为每人级默认 0）⇒ **同租户内的人互相
+        抢额度**：一个人刷满后同租户其余人当天全部 429；无租户的账号（租户为空串）
+        还会共用一个桶。症状要等到某天有人刷满、同一批人集体 429 才出现，而那时
+        没人会想到"额度是按租户分的桶"。
+        """
+        for scope, limit, knob in (
+            ("租户级", self.daily_limit, "USER_DAILY_TOKEN_QUOTA"),
+            ("每人级", self.per_user_limit, "DAILY_TOKEN_QUOTA_PER_USER"),
+        ):
+            if limit > 0 and self.request_limit >= limit:
+                logging.warning(
+                    "单请求上限(%d) 不小于日配额（%s=%d，%s）：任何请求的预占都无法被"
+                    "容纳，**所有请求都会被判 429**。请把 LLM_MAX_TOKENS_PER_REQUEST "
+                    "调到远小于该额度（经验值是 1/20 上下）。",
+                    self.request_limit, knob, limit, scope)
+
+        if self.daily_limit > 0 and self.per_user_limit == 0:
             logging.warning(
-                "单请求上限(%d) 不小于日配额(%d)：任何请求的预占都无法被容纳，"
-                "所有请求都会被判 429。请把 LLM_MAX_TOKENS_PER_REQUEST 调到远小于 "
-                "USER_DAILY_TOKEN_QUOTA（经验值是 1/20 上下）。",
-                self.request_limit, self.daily_limit)
+                "只配了租户级日额度(%d)、未配每人级 ⇒ **同一个租户里的人会互相抢额度**："
+                "一个人先刷满，同租户其余人当天全部 429。无租户的账号（租户为空串）"
+                "更是共用一个桶，彼此互抢。配 %s 可消除（每人每天多少 token）。",
+                self.daily_limit, "DAILY_TOKEN_QUOTA_PER_USER")
 
     def _fallback(self, exc: Exception, action: str):
         """共享后端出错时切到进程内计数，并把这件事变得可见。
@@ -254,22 +341,52 @@ class QuotaManager:
         """
         return self.request_limit if self.request_limit > 0 else 1
 
-    def _bump(self, tenant: str, n: int) -> int:
-        """加/减一次用量；主后端失败时退到进程内计数并留痕。
+    def levels(self, tenant: str, subject: str, today: str) -> list:
+        """本次请求要判定的层级：`[(scope, 桶键, 上限), ...]`，只含**开了额度**的层。
 
+        scope 是 "tenant" / "subject"，用于日志与 429 文案定位是哪一级拦下的。
+        空 subject 不跳过每人级 —— 它会落到 `quota@user::<日期>` 这个**共享桶**上。
+        宁可"身份缺失的人也仍然被限、且与同样缺身份的人共享一份"，也不要
+        "身份缺失就没人管"（fail-closed）。
+        """
+        out = []
+        if self.daily_limit > 0:
+            out.append(("tenant", _tenant_bucket(tenant, today), self.daily_limit))
+        if self.per_user_limit > 0:
+            out.append(("subject", _subject_bucket(subject, today), self.per_user_limit))
+        return out
+
+    def _bump(self, bucket: str, n: int) -> int:
+        """给某个桶加/减一次用量；主后端失败时退到进程内计数并留痕。
+
+        bucket: 已经拼好的桶键（见 `levels`）。
         n: 正数累加、负数退回。兜底也失败时会把异常抛给调用方，
             由调用方决定是"放行"还是"放弃结算"。
         """
         try:
-            return self.store.add(tenant, _today(), n)
+            return self.store.add(bucket, _today(), n)
         except Exception as e:  # noqa: BLE001
             self._fallback(e, "累加" if n >= 0 else "退回")
-            return self._local.add(tenant, _today(), n)
+            return self._local.add(bucket, _today(), n)
 
-    def claim(self, tenant: str = "") -> QuotaStatus:
+    def _release(self, taken: list, reserved: int) -> None:
+        """把已经预占的桶逐个退回。
+
+        taken: `[(桶键, 上限, scope, 预占后的计数), ...]`（`claim` 攒下来的）。
+        退回失败只记日志不抛：那会让额度偏紧（安全方向），而这里已经在失败路径上，
+        再抛一个异常出去只会把"额度不够"变成 500。
+        """
+        for bucket, _limit, _scope, _after in taken:
+            try:
+                self._bump(bucket, -reserved)
+            except Exception:  # noqa: BLE001
+                logging.error("配额预占退回失败（额度会偏紧，需人工核对）：bucket=%s", bucket)
+
+    def claim(self, tenant: str = "", subject: str = "") -> QuotaStatus:
         """**原子地**"预占额度 + 判定"。取代"先 check、请求结束再 add"的两步写法。
 
-        tenant: 租户标识（空串视为一个匿名租户）。
+        tenant: 租户标识（空串合法 = "这个人还没有租户"）。
+        subject: 主体（用户名），每人级的桶键用它。空串会落到一个共享桶（见 `levels`）。
 
         为什么必须合成一步（这一步就是原来的 TOCTOU）
         --------------------------------------------
@@ -282,6 +399,10 @@ class QuotaManager:
         **一次原子加**进去，再看是否越界；越界就把它退回来（被拒的请求不该消耗
         额度）。这样"判定"与"记账"是同一次原子操作，不存在中间窗口。
 
+        两级时逐级预占，**任一级越界就把已经占上都退回**（否则被拒的请求会永久
+        吃掉一级的额度，且没有任何症状）。两级之间**不是**一个原子操作（那样要
+        上 Lua），但方向仍然是安全的：并发下最坏是"偶发多拒一次"。
+
         返回的 `used` 是**不含本次预占**的已用量，便于日志与 429 文案对齐直觉；
         `reserved` 字段给出预占量，请求结束时交给 `settle` 换成实际值。
 
@@ -290,77 +411,124 @@ class QuotaManager:
         而不是"偶发多放一次" —— 计费闸门宁可偏严。
         """
         reset = max(1, _end_of_day_epoch() - int(time.time()))
-        if not self.enabled or self.daily_limit <= 0:
-            return QuotaStatus(True, 0, self.daily_limit, reset, tenant)
+        empty = QuotaStatus(True, 0, 0, reset, tenant, 0, subject=subject)
+        if not self.enabled:
+            return empty
+
+        today = _today()
+        levels = self.levels(tenant, subject, today)
+        if not levels:
+            return empty
 
         reserve = self.reservation()
+        taken = []          # 已经预占成功的 (桶键, 上限, scope, 预占后的计数)
+        for scope, bucket, limit in levels:
+            try:
+                after = self._bump(bucket, reserve)
+            except Exception:  # noqa: BLE001  兜底也失败才真正放行（计费故障不该打死服务）
+                self._release(taken, reserve)
+                return empty
+            taken.append((bucket, limit, scope, after))
+            if after > limit:
+                self._release(taken, reserve)
+                return QuotaStatus(False, max(0, after - reserve), limit, reset,
+                                   tenant, 0, subject=subject, scope=scope)
+
+        # 放行时报告**最紧的那一级**的用量：只报租户级会误导 —— 两级都看的时候，
+        # "还剩多少额度"是由离上限更近的那一级决定的（通常是每人级）。
+        # 用已经握在手里的 `after` 算，不额外读一次存储。
+        scope, limit, after = min(
+            ((s, lim, a) for _b, lim, s, a in taken),
+            key=lambda row: (row[1] - row[2]) / max(1, row[1]))
+        return QuotaStatus(True, max(0, after - reserve), limit, reset, tenant, reserve,
+                           subject=subject, scope=scope)
+
+    def _read(self, bucket: str) -> int:
+        """读一个桶的当前计数；主后端失败退到进程内计数。读失败返回 0。"""
         try:
-            after = self._bump(tenant, reserve)
-        except Exception:  # noqa: BLE001  兜底也失败才真正放行（计费故障不该打死服务）
-            return QuotaStatus(True, 0, self.daily_limit, reset, tenant)
+            return self.store.get(bucket, _today())
+        except Exception as e:  # noqa: BLE001
+            self._fallback(e, "读取")
+            try:
+                return self._local.get(bucket, _today())
+            except Exception:  # noqa: BLE001
+                return 0
 
-        used = max(0, after - reserve)
-        if after <= self.daily_limit:
-            return QuotaStatus(True, used, self.daily_limit, reset, tenant, reserve)
-
-        try:
-            self._bump(tenant, -reserve)
-        except Exception:  # noqa: BLE001  退回失败只会让额度偏紧，不阻塞请求
-            logging.error("配额预占退回失败（额度会偏紧，需人工核对）：tenant=%s", tenant)
-        return QuotaStatus(False, used, self.daily_limit, reset, tenant, 0)
-
-    def settle(self, tenant: str, reserved: int, actual: int) -> int:
+    def settle(self, tenant: str, reserved: int, actual: int, subject: str = "") -> int:
         """请求结束时把"预占"换成"实际消耗"，返回调整后的今日用量。
 
         tenant: 租户标识。
         reserved: `claim` 返回的 `reserved`（没走预占则传 0）。
         actual: 本次实际消耗的 token。
+        subject: 与 `claim` 同一次请求传的同一个主体（缺了会算到错误的桶上）。
 
         ⚠️ 差额多为**负数**（模型提前结束、断连中止都会让实际小于预占），所以这条路
         必须允许减计数：不允许的话预占永远不退，额度被逐次吃掉 —— 表现成"配额比
         实际消耗快得多地用尽"，而且没有任何报错，只能靠对账发现。
+
+        ⚠️ 结算的层级 = **当前配置下开了额度的层级**，与 `claim` 时天然一致
+        （进程内配置不会变）。所以这里不需要把"claim 时占了哪几级"记进返回值 ——
+        少一个可以传错的状态。
         """
         delta = int(actual) - int(reserved)
-        if delta == 0:
+        if not self.enabled or delta == 0:
             return 0
-        return self.add(tenant, delta)
+        today = _today()
+        last = 0
+        for _scope, bucket, _limit in self.levels(tenant, subject, today):
+            try:
+                last = self._bump(bucket, delta)
+            except Exception:  # noqa: BLE001  兜底也失败才放弃记账
+                last = 0
+        return last
 
-    def check(self, tenant: str = "") -> QuotaStatus:
-        """查该租户今日额度是否还够（只读，不做预占）。
+    def check(self, tenant: str = "", subject: str = "") -> QuotaStatus:
+        """查今日额度是否还够（只读，不做预占）。
 
-        tenant: 租户标识（空串视为一个匿名租户）。
+        tenant: 租户标识（空串合法 = "这个人还没有租户"）。
+        subject: 主体（用户名）；不传则每人级按共享桶判（见 `levels`）。
 
-        日配额为 0（不限）或功能关闭时恒放行。存储异常时退到进程内计数；
+        两级额度都为 0（不限）或功能关闭时恒放行。存储异常时退到进程内计数；
         进程内计数也异常才真正放行（计费类故障不该把服务直接打死）。
 
         ⚠️ 只读端点用它可以，**要开始一次生成必须用 `claim`** —— 拿 check 的结果
         去决定"能不能开工"，等于把 TOCTOU 又请回来。
         """
-        used, reset = 0, max(1, _end_of_day_epoch() - int(time.time()))
-        if not self.enabled or self.daily_limit <= 0:
-            return QuotaStatus(True, used, self.daily_limit, reset, tenant)
-        try:
-            used = self.store.get(tenant, _today())
-        except Exception as e:  # noqa: BLE001
-            self._fallback(e, "读取")
-            try:
-                used = self._local.get(tenant, _today())
-            except Exception:  # noqa: BLE001
-                return QuotaStatus(True, used, self.daily_limit, reset, tenant)
-        return QuotaStatus(used < self.daily_limit, used, self.daily_limit, reset, tenant)
+        reset = max(1, _end_of_day_epoch() - int(time.time()))
+        if not self.enabled:
+            return QuotaStatus(True, 0, 0, reset, tenant, 0, subject=subject)
+        levels = self.levels(tenant, subject, _today())
+        if not levels:
+            return QuotaStatus(True, 0, 0, reset, tenant, 0, subject=subject)
 
-    def add(self, tenant: str, tokens: int) -> int:
-        """把一次消耗计入该租户今日用量，返回累计值。
+        rows = [(scope, limit, self._read(bucket)) for scope, bucket, limit in levels]
+        scope, limit, used = min(rows, key=lambda r: (r[1] - r[2]) / max(1, r[1]))
+        return QuotaStatus(used < limit, used, limit, reset, tenant, 0,
+                           subject=subject, scope=scope if used >= limit else "")
+
+    def add(self, tenant: str, tokens: int, subject: str = "") -> int:
+        """把一次消耗计入今日用量，返回累计值。
 
         tenant: 租户标识。
         tokens: 增量；>0 累加、<0 退回（`settle` 用）、==0 直接返回当前值。
+        subject: 主体（用户名）；留空则不额外计入每人级。
+
+        ⚠️ 正常路径请用 `settle`（它同时处理两级）。这个方法保留给"没有预占、
+        只有一次实际消耗"的场景（测试、脚本回填）。
         """
         if not self.enabled or int(tokens) == 0:
             return 0
-        try:
-            return self._bump(tenant, int(tokens))
-        except Exception:  # noqa: BLE001  兜底也失败才放弃记账
+        today = _today()
+        buckets = [bucket for _scope, bucket, _limit in self.levels(tenant, subject, today)]
+        if not buckets:
             return 0
+        last = 0
+        for bucket in buckets:
+            try:
+                last = self._bump(bucket, int(tokens))
+            except Exception:  # noqa: BLE001  兜底也失败才放弃记账
+                last = 0
+        return last
 
 
 class RequestBudget:
@@ -396,6 +564,7 @@ def build_quota_manager() -> QuotaManager:
 
     return QuotaManager(
         daily_limit=config.USER_DAILY_TOKEN_QUOTA,
+        per_user_limit=config.DAILY_TOKEN_QUOTA_PER_USER,
         request_limit=config.LLM_MAX_TOKENS_PER_REQUEST,
         enabled=config.QUOTA_ENABLED,
         redis_url=config.REDIS_URL,

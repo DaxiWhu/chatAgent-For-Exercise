@@ -30,6 +30,15 @@ import app.main as M  # noqa: E402
 from app import metrics  # noqa: E402
 from app.quota import QuotaManager  # noqa: E402
 from app.ratelimit import RateLimiter  # noqa: E402
+from tests.auth_util import auth_headers  # noqa: E402
+
+#: 本文件手工构造 ASGI 请求，所以要自己带上凭证。
+#:
+#: 为什么必须有它：2026-10-05 起服务只剩 JWT 一条鉴权路径，**没有凭证的请求一律 401**
+#: （此前能跑通是因为还有匿名档）。用真签的 token 而不是 monkeypatch 鉴权层，
+#: 是为了让这些用例仍跑在**真实**的鉴权上下文里 —— 断连止损是横切行为，若鉴权层被
+#: 换掉，"401 短路"与"断连处理"谁先发生就测不出来了。
+_AUTH_HEADER = auth_headers()["Authorization"]
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +122,7 @@ def _scope(path, body: bytes, method="POST") -> dict:
             (b"host", b"testserver"),
             (b"content-type", b"application/json"),
             (b"content-length", str(len(body)).encode()),
+            (b"authorization", _AUTH_HEADER.encode()),
         ],
         "server": ("testserver", 80),
         "client": ("127.0.0.1", 45678),
@@ -142,17 +152,24 @@ async def _drive(app, scope, receive, *, after_tokens=None, timeout=10) -> bytes
 
     try:
         await asyncio.wait_for(task, timeout)
-    except asyncio.TimeoutError:  # pragma: no cover - 只在回归时命中
+    except TimeoutError:  # pragma: no cover - 只在回归时命中
         task.cancel()
-        raise AssertionError("断连后应用未结束（连接很可能被挂死）")
+        raise AssertionError("断连后应用未结束（连接很可能被挂死）") from None
     return b"".join(sent)
 
 
 @pytest.fixture
 def offline(monkeypatch):
     """把横切组件换成"绝不拦路"的实例，让用例只考察断连这一件事。"""
-    monkeypatch.setattr(M.config, "TENANT_KEYS", {})
-    monkeypatch.setattr(M, "SERVE_API_KEY", "")
+    # 这个 fixture 此前还关掉过两个横切开关，现在都随着鉴权收口一起没有了：
+    #   · `M.config.TENANT_KEYS = {}`（"租户 ↔ API Key"对照表，2026-10-04 删）；
+    #   · `M.SERVE_API_KEY = ""`（共享密钥通行证，2026-10-05 删）。
+    # 它们的存在意义是"让请求不必出示 X-API-Key"，而**现在所有请求都必须出示
+    # JWT** —— 这个 fixture 只管断连，所以它不再需要动鉴权：本文件的用例都直接
+    # 调图/端点内部，不经过 `_authenticate`。
+    # 剩下两件事才是真正的"绝不拦路"：
+    #   - 限流/配额放到不可能触发的量级；
+    #   - 指标清零，免得上一轮用例的计数混进来。
     monkeypatch.setattr(M, "_LIMITER", RateLimiter(per_minute=10 ** 6))
     monkeypatch.setattr(M, "_QUOTA", QuotaManager(daily_limit=0, request_limit=0))
     metrics.reset()

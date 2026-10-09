@@ -1,6 +1,25 @@
 {
   "components": {
     "schemas": {
+      "ChangePasswordReq": {
+        "description": "改自己的密码（需要给出当前密码）。\n\n为什么要验旧密码：不验的话，一个被借走的**已登录设备**可以静默改密码并锁死\n原主人 —— 而\"改密码\"正是原主人用来踢掉入侵者的手段。要求旧密码让这条攻击\n至少需要片刻的已知凭据。",
+        "properties": {
+          "new_password": {
+            "title": "New Password",
+            "type": "string"
+          },
+          "old_password": {
+            "title": "Old Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "old_password",
+          "new_password"
+        ],
+        "title": "ChangePasswordReq",
+        "type": "object"
+      },
       "ChatReq": {
         "properties": {
           "message": {
@@ -30,6 +49,94 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "JoinReqReq": {
+        "description": "提交\"加入某个租户\"的申请。",
+        "properties": {
+          "note": {
+            "default": "",
+            "title": "Note",
+            "type": "string"
+          },
+          "tenant": {
+            "title": "Tenant",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant"
+        ],
+        "title": "JoinReqReq",
+        "type": "object"
+      },
+      "JoinResolveReq": {
+        "description": "审批一条加入申请。\n\napprove=true 时**顺带把申请人的租户改成申请的那个** —— 两件事必须同批完成，\n否则会出现\"申请批了、人还在无租户状态\"，而无租户正好是\"能看全部内容\"的那一档\n（见 AccountStore.resolve_join_request）。",
+        "properties": {
+          "approve": {
+            "title": "Approve",
+            "type": "boolean"
+          },
+          "note": {
+            "default": "",
+            "title": "Note",
+            "type": "string"
+          }
+        },
+        "required": [
+          "approve"
+        ],
+        "title": "JoinResolveReq",
+        "type": "object"
+      },
+      "LoginReq": {
+        "description": "登录请求体：本地用户名密码。\n\n⚠️ `password` 是唯一一个会出现在**请求体**里的敏感字段。它不进任何日志：\n本模块对请求体的记录一律取字段白名单，而登录失败日志只记 `code`。",
+        "properties": {
+          "password": {
+            "default": "",
+            "title": "Password",
+            "type": "string"
+          },
+          "username": {
+            "default": "",
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "title": "LoginReq",
+        "type": "object"
+      },
+      "RefreshReq": {
+        "description": "刷新会话请求体。",
+        "properties": {
+          "refresh_token": {
+            "title": "Refresh Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "refresh_token"
+        ],
+        "title": "RefreshReq",
+        "type": "object"
+      },
+      "RegisterReq": {
+        "description": "自助注册请求体。\n\n⚠️ 注册出来的账号**没有租户**（租户字段为空串）。按本项目当前口径，空租户在\n检索层等于\"不加过滤\" ⇒ **注册完即可搜到全部租户的文档**。这是刻意的\n（用户 2026-10-04 拍板）。也正因如此，这个端点默认**关闭**\n（需要 `AUTH_ALLOW_SELF_REGISTER=true` 才开放）。\n\n想加入租户要走 `POST /v1/join-requests` 提交申请，由管理员审批。",
+        "properties": {
+          "password": {
+            "title": "Password",
+            "type": "string"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "RegisterReq",
         "type": "object"
       },
       "ResumeReq": {
@@ -67,6 +174,121 @@
           "action"
         ],
         "title": "ReviewReq",
+        "type": "object"
+      },
+      "TenantRenameReq": {
+        "description": "租户改名。挂靠用户的租户字段会被**同批改写**（见 AccountStore.rename_tenant）。",
+        "properties": {
+          "new_name": {
+            "title": "New Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "new_name"
+        ],
+        "title": "TenantRenameReq",
+        "type": "object"
+      },
+      "TenantReq": {
+        "description": "新建租户。`name` 就是租户的唯一标识（没有额外的 id 层）。",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "note": {
+            "default": "",
+            "title": "Note",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "TenantReq",
+        "type": "object"
+      },
+      "UserPatchReq": {
+        "description": "管理员修改用户。**只改显式提供的字段**（缺省 = 不动）。\n\n⚠️ `tenant` 的类型是 `str | None`，默认 `None` 表示\"不动\"，而 `\"\"` 表示\n\"把他移出租户\"。这两个必须区分：类型写成 `str = \"\"` 的话，\"移出租户\"这个动作\n会被静默实现成\"什么都没发生\"。",
+        "properties": {
+          "password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Password"
+          },
+          "roles": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Roles"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "tenant": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tenant"
+          }
+        },
+        "title": "UserPatchReq",
+        "type": "object"
+      },
+      "UserReq": {
+        "description": "管理员创建用户。\n\ntenant 允许留空 = 创建一个\"还没有租户\"的用户（他会落到与自助注册相同的状态）。\nroles 是纯字符串列表 —— 代码里**不存在**合法角色清单，真正说了算的是配置里的\n`AUTH_REVIEWER_ROLES` / `AUTH_ADMIN_ROLES`：没被列进去的角色只是装饰品。",
+        "properties": {
+          "password": {
+            "title": "Password",
+            "type": "string"
+          },
+          "roles": {
+            "default": [],
+            "items": {},
+            "title": "Roles",
+            "type": "array"
+          },
+          "tenant": {
+            "default": "",
+            "title": "Tenant",
+            "type": "string"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "UserReq",
         "type": "object"
       },
       "ValidationError": {
@@ -125,21 +347,31 @@
         "parameters": [
           {
             "in": "header",
-            "name": "x-api-key",
-            "required": false,
-            "schema": {
-              "default": "",
-              "title": "X-Api-Key",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
             "name": "x-tenant-id",
             "required": false,
             "schema": {
               "default": "",
               "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Idempotency-Key",
               "type": "string"
             }
           }
@@ -255,21 +487,31 @@
         "parameters": [
           {
             "in": "header",
-            "name": "x-api-key",
-            "required": false,
-            "schema": {
-              "default": "",
-              "title": "X-Api-Key",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
             "name": "x-tenant-id",
             "required": false,
             "schema": {
               "default": "",
               "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Idempotency-Key",
               "type": "string"
             }
           }
@@ -307,18 +549,18 @@
         "summary": "Review Legacy"
       }
     },
-    "/v1/chat": {
-      "post": {
-        "description": "POST /v1/chat：启动一轮 SSE 流式对话。\n\nreq: 请求体 ChatReq —— thread_id 串起多轮与后续人工审核，message 是用户输入。\nx_api_key: 请求头 X-API-Key。配了 TENANT_KEYS 时由它**反查租户**；否则校验 SERVE_API_KEY。\nx_tenant_id: 请求头 X-Tenant-Id，多租户模式下**仅用于核对**（与 Key 不符返回 403）。\n\n内部把 message 包成 HumanMessage 作为图输入；若图停在 human_review，\n流里会下发 need_review 事件（草稿 + 评分 + 意见），由前端调 /review 续跑。\n请求处理前会过\"限流 → 配额 → 会话归属\"三道闸门。",
-        "operationId": "chat_v1_v1_chat_post",
+    "/v1/admin/join-requests": {
+      "get": {
+        "description": "GET /v1/admin/join-requests：列出加入申请（`?status=pending` 只看待审）。\n\n默认**全部**而不是只列待审：审批之后还能回看\"谁批的、什么时候批的\"，\n是这套流程存在的意义之一。",
+        "operationId": "admin_join_list_v1_v1_admin_join_requests_get",
         "parameters": [
           {
-            "in": "header",
-            "name": "x-api-key",
+            "in": "query",
+            "name": "status",
             "required": false,
             "schema": {
               "default": "",
-              "title": "X-Api-Key",
+              "title": "Status",
               "type": "string"
             }
           },
@@ -329,6 +571,1067 @@
             "schema": {
               "default": "",
               "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Join List V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/admin/join-requests/{req_id}": {
+      "post": {
+        "description": "POST /v1/admin/join-requests/{id}：批准或驳回一条申请。\n\n批准时**顺带把申请人加入该租户** —— 两件事必须同批完成。只批准不改租户的话，\n申请人会一直停在\"无租户\"状态，而无租户按当前口径能搜到全部内容：审批动作\n看起来成功了，实际什么也没改变。\n\n已处理过的申请不能重复处理（409）—— 否则\"先驳回、再批准\"能绕过审批记录。",
+        "operationId": "admin_join_resolve_v1_v1_admin_join_requests__req_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "req_id",
+            "required": true,
+            "schema": {
+              "title": "Req Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JoinResolveReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Join Resolve V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/admin/tenants": {
+      "get": {
+        "description": "GET /v1/admin/tenants：列出全部租户，带各自的用户数。\n\n带 `user_count` 是有用的：删租户前先看这里就知道会不会踩到\"还有人在里面\"\n（`DELETE` 默认会因此拒绝）。",
+        "operationId": "admin_tenant_list_v1_v1_admin_tenants_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Tenant List V1",
+        "tags": [
+          "v1"
+        ]
+      },
+      "post": {
+        "description": "POST /v1/admin/tenants：新建租户（需要管理员角色）。\n\n租户在本项目里**就是一个名字**：它会进 JWT 载荷、进向量库的过滤字段、\n进审计日志。没有独立的数字 id —— 多一层映射不带来任何好处，只多一处要同步。",
+        "operationId": "admin_tenant_create_v1_v1_admin_tenants_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Tenant Create V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/admin/tenants/{name}": {
+      "delete": {
+        "description": "DELETE /v1/admin/tenants/{name}：删除租户。\n\n⚠️ 默认**拒绝**删除还有用户挂靠的租户（返回 409 并列出那些人）。必须显式加\n`?force=true` 才会连带把他们移出租户。这不是过度谨慎 —— 按当前口径，\n\"移出租户\"等于\"变成能搜到全部内容\"，所以这一步必须是**看得见的**勾选，\n而不是一个顺带发生的副作用。",
+        "operationId": "admin_tenant_delete_v1_v1_admin_tenants__name__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Force",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Tenant Delete V1",
+        "tags": [
+          "v1"
+        ]
+      },
+      "get": {
+        "description": "GET /v1/admin/tenants/{name}：租户详情（不存在返回 404）。",
+        "operationId": "admin_tenant_get_v1_v1_admin_tenants__name__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Tenant Get V1",
+        "tags": [
+          "v1"
+        ]
+      },
+      "patch": {
+        "description": "PATCH /v1/admin/tenants/{name}：租户改名。\n\n⚠️ 改名会**同批改写挂靠用户的租户字段**（以及历史申请记录里的租户名）。\n只改租户表的话，那些人会指向一个不存在的租户 —— 而那个状态不报错，\n只表现为\"他们突然搜不到东西了\"。",
+        "operationId": "admin_tenant_rename_v1_v1_admin_tenants__name__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantRenameReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Tenant Rename V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/admin/users": {
+      "get": {
+        "description": "GET /v1/admin/users：列出用户；`?tenant=` 只列该租户的。\n\n⚠️ `tenant=` 传空串与不传是**两个意思**（\"只看无租户的人\" vs \"看全部\"），\n所以这里区分得很清楚：不传 = 全部；传了（哪怕空串）= 精确匹配。",
+        "operationId": "admin_user_list_v1_v1_admin_users_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Tenant",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin User List V1",
+        "tags": [
+          "v1"
+        ]
+      },
+      "post": {
+        "description": "POST /v1/admin/users：管理员创建用户。\n\n`tenant` 可以留空（创建一个还没有租户的用户）。填了的话**不校验租户是否存在**\n是有意的吗 —— 不，这里会校验：一个不存在的租户名会让这个人落到一个没有数据、\n也没人能管的桶里，而那种状态从响应上看和成功一模一样。",
+        "operationId": "admin_user_create_v1_v1_admin_users_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin User Create V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/admin/users/{username}": {
+      "delete": {
+        "description": "DELETE /v1/admin/users/{username}：删除用户，并清掉他的全部会话。\n\n⚠️ **不能删自己**：把自己删掉之后，如果系统里没有别的管理员，就再也没人能\n管理账号了（只能改配置重启——而那需要能登进服务器的人）。\n\n⚠️ **也不能删掉最后一个管理员**（接口层那条只拦得住\"删自己\"，拦不住\n\"管理员 A 删管理员 B\"以及两个管理员**并发**互删）：由存储层在同一个事务里\n带锁判定，见 `AccountStore._guard_last_admin`。\n\n删除会**同批清掉他的会话**。只删用户行的话，他手上那个未过期的 access token\n仍然带着有效的签名与 jti —— 而会话白名单里那条记录还在，于是它继续可用\n直到自然过期。这类\"删了用户却还能用\"的窗口不报错、不告警，只能靠这里封住。",
+        "operationId": "admin_user_delete_v1_v1_admin_users__username__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "username",
+            "required": true,
+            "schema": {
+              "title": "Username",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin User Delete V1",
+        "tags": [
+          "v1"
+        ]
+      },
+      "get": {
+        "description": "GET /v1/admin/users/{username}：用户详情（不含口令哈希）。",
+        "operationId": "admin_user_get_v1_v1_admin_users__username__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "username",
+            "required": true,
+            "schema": {
+              "title": "Username",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin User Get V1",
+        "tags": [
+          "v1"
+        ]
+      },
+      "patch": {
+        "description": "PATCH /v1/admin/users/{username}：改用户（改密码 / 换租户 / 改角色 / 停用）。\n\n⚠️ 三件事必须知道：\n\n  1. **租户变更会立刻断掉他现有的会话**。JWT 里的租户与角色是**签发时的快照**，\n     不清理会话的话，管理员把某人移出租户之后，他手上的令牌仍然是旧租户 ——\n     最长能再撑一个 access token 的生命周期（默认 15 分钟）。所以这里对\n     \"租户 / 角色 / 状态 / 密码\"任一变更都执行一次**登出全部设备**，\n     让新权限在下一个请求就生效。代价是他需要重新登录。\n  2. **`tenant` 传空串 = 移出租户**（不是\"不改\"）。缺省（不传这个字段）= 不改。\n  3. **两条\"自伤\"护栏**：不能把自己**停用**，也不能**摘掉自己的管理员角色**\n     （自降权）。两者都会当场把自己锁在管理接口外面，而恢复只能靠另一个管理员\n     —— 系统里可能只有一个。自降权尤其隐蔽：请求本身会**成功**，直到下一次调用\n     管理接口才 403，那时的第一反应会是\"令牌坏了 / 角色配置丢了\"，而不是\n     \"昨天自己改过角色\"。\n  4. **不能移除最后一个管理员**（降权 / 停用 / 删除都算，含\"两个管理员互相\n     降权\"这种并发情形）：由存储层在同一个事务里带锁判定，见\n     `AccountStore._guard_last_admin`。接口层的护栏只拦得住\"改自己\"，\n     拦不住这一步 —— 两层都需要。",
+        "operationId": "admin_user_patch_v1_v1_admin_users__username__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "username",
+            "required": true,
+            "schema": {
+              "title": "Username",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserPatchReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin User Patch V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/auth/login": {
+      "post": {
+        "description": "POST /v1/auth/login：用账号密码换发**本服务会话 token**。\n\n登出/撤销能力来自本服务的**会话白名单**（见 `app/auth.py` 文件头）：\n每个 sid 各占一个键，登出删掉自己那把即可，该用户其它设备不受影响。\n\n返回 access_token（短期，放 `Authorization: Bearer`）与 refresh_token\n（长期、**单次使用**、每次刷新轮换）。",
+        "operationId": "auth_login_v1_v1_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Auth Login V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/auth/logout": {
+      "post": {
+        "description": "POST /v1/auth/logout：登出**当前这台设备**；`?all=true` 登出该用户全部设备。\n\n默认只移除当前这一个会话，**不影响该用户在其他设备上的登录** —— 允许多设备\n并存之后，\"登出\"的语义就应该是\"登出这一台\"，而不是\"把该用户所有端都踢掉\"。\n\n`?all=true` 是**清场**手段（改密码后、凭证泄漏、员工离职）：把该用户的所有会话\n从白名单移除。⚠️ 作用域严格取自**已验签凭证里的 user**，不接受任何指定用户名的\n参数 —— 否则它就成了一个人人可用的\"任意踢人\"接口。\n\n⚠️ 能进到这里的身份**必然是**一个服务端会话：`_authenticate` 只认本服务签发的\n令牌，而验签要求载荷带 `jti`（缺了就是 401）。此前那条\"外部 IdP token 直连 ⇒\n无会话可撤、请到 IdP 撤销\"的分支，随外部身份源的删除一并消失 —— 现在不存在\n\"没有会话记录却仍算已认证\"的身份。",
+        "operationId": "auth_logout_v1_v1_auth_logout_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "all",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "All",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Auth Logout V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/auth/me": {
+      "get": {
+        "description": "GET /v1/auth/me：回显当前身份（客户端据此判断\"我是谁、能不能审稿\"）。\n\n纯读、无副作用。**刻意不返回任何 token** —— 它只是一个身份探针。\n\n⚠️ 2026-10-05 删掉了 `session_bound` 字段（破坏性契约变更）。它原本表示\"这次身份\n是否挂着一条服务端会话记录\"，但验签要求载荷带 `jti`（缺了就是 401）⇒ 能到达这里的\n身份**必然**挂着一个会话，该字段恒为 `true`。恒为定值的字段没有信息量，反而会让\n客户端与后来读代码的人以为\"还存在没有会话的已认证身份\" —— 那是外部身份源直连才有的\n形态，已随 OIDC 整体删除。\n\n`relogin_required` / `relogin_reason` 是给**客户端弹提示**用的：令牌里的租户与角色\n是签发时的快照，管理员改了它们（或批准了入租申请）之后、旧令牌仍在手里生效。\n为真的含义是\"服务端的权限已经不是你这张令牌里的了，重新登录才会拿到新的\"。\n判定口径与它为什么只认本服务会话，见 `_relogin_reason`。",
+        "operationId": "auth_me_v1_v1_auth_me_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Auth Me V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/auth/password": {
+      "post": {
+        "description": "POST /v1/auth/password：改**自己**的密码（需要验证当前密码）。\n\n为什么要验旧密码：不验的话，一台被借走的**已登录设备**就能静默改掉密码、\n把原主人锁在门外 —— 而\"改密码\"恰恰是原主人用来赶走入侵者的手段。\n\n改完**清掉该用户的全部会话**（含发起这次请求的这一台）：改密码的典型动机就是\n\"怀疑密码泄漏\"，此时把旧会话留着等于什么都没做。代价是客户端需要重新登录，\n这是刻意的。\n\n管理员重置**别人**的密码走 `PATCH /v1/admin/users/{username}`。",
+        "operationId": "auth_change_password_v1_v1_auth_password_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePasswordReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Auth Change Password V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/auth/refresh": {
+      "post": {
+        "description": "POST /v1/auth/refresh：用 refresh token 换新的会话三元组（**轮换**）。\n\n旧 refresh token 在被用掉的瞬间失效（单次使用）。这是\"被截获的 refresh\ntoken 不能长期复用\"的**全部**保证：攻击者用它一次之后，真正的用户下次刷新\n就会失败从而暴露异常，而不是双方都能无限期静默续期。\n\n刷新**沿用同一个会话**（不新建 sid）：会话已被撤销时这里抛 `session_revoked`\n—— 被登出的会话不能靠 refresh 续命，否则\"登出\"就只剩个形式。",
+        "operationId": "auth_refresh_v1_v1_auth_refresh_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Auth Refresh V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/auth/register": {
+      "post": {
+        "description": "POST /v1/auth/register：自助注册一个账号（**默认关闭**）。\n\n注册出来的账号**没有租户**。按本项目当前口径，无租户的账号在检索层不加过滤\n⇒ **注册完即可搜到全部租户的文档**。这是刻意拍板的行为（见配置文件里\nDEFAULT_TENANT 的说明），所以这个端点默认是关的：要开放必须显式配置\n`AUTH_ALLOW_SELF_REGISTER=true` —— 让这个决定看得见，而不是默认打开。\n\n⚠️ 注册**不返回令牌**：新账号要自己去 `/v1/auth/login` 换。这样注册接口就\n不需要签发能力，也少掉\"刷注册接口囤积有效会话\"这条路径。\n\n想加入某个租户，注册后走 `POST /v1/join-requests`。",
+        "operationId": "auth_register_v1_v1_auth_register_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Auth Register V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/chat": {
+      "post": {
+        "description": "POST /v1/chat：启动一轮 SSE 流式对话。\n\nreq: 请求体 ChatReq —— thread_id 串起多轮与后续人工审核，message 是用户输入。\nauthorization: 请求头 Authorization: Bearer <JWT>（**必带**）。身份与租户都来自\n    令牌载荷：用户/租户/角色是签发时的**快照**。租户为空串表示\"这个账号还没有\n    租户\"，此时检索层只给看**公共租户**的内容（不再\"不加过滤\"）。\n    令牌获取：`POST /v1/auth/login`。\nx_tenant_id: 请求头 X-Tenant-Id。**不是租户来源**，只做一致性核对 ——\n    与令牌里的租户不符会被 403。不带它也能正常调用。\nidempotency_key: 可选的 `Idempotency-Key`。带上它，客户端超时重试就不会\n    重跑一整轮（规范见 `deploy/IDEMPOTENCY.md`）。\n\n内部把 message 包成 HumanMessage 作为图输入；若图停在 human_review，\n流里会下发 need_review 事件（草稿 + 评分 + 意见），由前端调 /review 续跑。\n请求处理前会过\"限流 → 配额 → 会话归属\"三道闸门。\n\n幂等闸门排在**所有业务 4xx 之后、配额之前**（理由见 `_IdemGate` 的说明）。",
+        "operationId": "chat_v1_v1_chat_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Idempotency-Key",
               "type": "string"
             }
           }
@@ -371,19 +1674,9 @@
     },
     "/v1/chat/resume": {
       "post": {
-        "description": "POST /v1/chat/resume：续跑一条**中途断掉**的会话（SSE，事件与 /v1/chat 相同）。\n\nreq: 请求体 ResumeReq，只有 thread_id —— 要跑的内容早就在检查点里了。\nx_api_key / x_tenant_id: 同 /v1/chat。\n\n语义（实测确认，不是推测）：检查点停在**当前未完成的那个节点之前**，\n所以续跑是**重新执行该节点**，而不是\"接上上次的半个 token\"。\n对客户端而言是\"从头把这次回答重新流一遍\"，拿到的是完整、自洽的正文。\n对账时注意：这会**再花一次**该节点的 token（但省掉了前面已完成的检索与迭代）。\n\n三种状态各自该走哪条路：\n    next 含 human_review  → 409，提示调 POST /v1/review（需要人的决定，不是续跑）；\n    next 空               → 409，本轮已收尾，没有可续的内容；\n    其余（next 非空）      → 200 + SSE，用 `astream(None, ...)` 从检查点继续。\n\n⚠️ 为什么不做成\"自动判断后用一条接口搞定一切\"：把\"要人的决定\"和\"机器能自己跑完\"\n混在一个接口里，客户端就无法区分\"我需要弹审核界面\"和\"我可以直接继续\" ——\n而这正是 human-in-the-loop 里唯一必须由人做的分支。宁可让客户端多判断一次。",
+        "description": "POST /v1/chat/resume：续跑一条**中途断掉**的会话（SSE，事件与 /v1/chat 相同）。\n\nreq: 请求体 ResumeReq，只有 thread_id —— 要跑的内容早就在检查点里了。\nx_tenant_id: 同 /v1/chat。\nidempotency_key: 同 /v1/chat（续跑同样是一次真实生成，重试代价一样大）。\n\n语义（实测确认，不是推测）：检查点停在**当前未完成的那个节点之前**，\n所以续跑是**重新执行该节点**，而不是\"接上上次的半个 token\"。\n对客户端而言是\"从头把这次回答重新流一遍\"，拿到的是完整、自洽的正文。\n对账时注意：这会**再花一次**该节点的 token（但省掉了前面已完成的检索与迭代）。\n\n三种状态各自该走哪条路：\n    next 含 human_review  → 409，提示调 POST /v1/review（需要人的决定，不是续跑）；\n    next 空               → 409，本轮已收尾，没有可续的内容；\n    其余（next 非空）      → 200 + SSE，用 `astream(None, ...)` 从检查点继续。\n\n⚠️ 为什么不做成\"自动判断后用一条接口搞定一切\"：把\"要人的决定\"和\"机器能自己跑完\"\n混在一个接口里，客户端就无法区分\"我需要弹审核界面\"和\"我可以直接继续\" ——\n而这正是 human-in-the-loop 里唯一必须由人做的分支。宁可让客户端多判断一次。",
         "operationId": "chat_resume_v1_v1_chat_resume_post",
         "parameters": [
-          {
-            "in": "header",
-            "name": "x-api-key",
-            "required": false,
-            "schema": {
-              "default": "",
-              "title": "X-Api-Key",
-              "type": "string"
-            }
-          },
           {
             "in": "header",
             "name": "x-tenant-id",
@@ -391,6 +1684,26 @@
             "schema": {
               "default": "",
               "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Idempotency-Key",
               "type": "string"
             }
           }
@@ -431,21 +1744,11 @@
         ]
       }
     },
-    "/v1/review": {
+    "/v1/join-requests": {
       "post": {
-        "description": "POST /v1/review：人工审核 resume，续跑被 interrupt 挂起的图。\n\nreq: 请求体 ReviewReq。thread_id 用于定位会话；action 只允许 accept / revise；\n    feedback 在 revise 时必填（accept 时可留空）。\nx_api_key / x_tenant_id: 同 /v1/chat。\n\n三道前置校验，任一条不过都不进入图：\n  - action 非 accept/revise → 400；\n  - revise 但 feedback 全空白 → 400；\n  - 该 thread 当前并不停在 human_review（如已完成、或从未触发）→ 409。\n通过后把队列里的记录标记为已处理（accepted / revised）。",
-        "operationId": "review_v1_v1_review_post",
+        "description": "POST /v1/join-requests：申请加入某个租户（由管理员审批）。\n\n⚠️ 申请期间申请人**仍然处于\"无租户\"状态**，而按当前口径无租户能搜到全部内容\n—— 也就是说\"提交申请\"只是走流程，在获批之前就已经读得到所有租户的文档。\n这是 2026-10-04 拍板口径的直接后果（判据在 `_retrieval_tenant`），\n不是本接口的缺陷。想收口的话有两条路：给 `RAG_TENANT` 配一个具体值\n（无租户从此是一个具名隔离桶），或改检索层对空租户的语义。\n\n一人只能属于一个租户：已经在某个租户里的人**不能**再申请加入别的\n（换租户要走管理员），否则\"一人一租户\"这条约束就名存实亡。",
+        "operationId": "join_request_create_v1_v1_join_requests_post",
         "parameters": [
-          {
-            "in": "header",
-            "name": "x-api-key",
-            "required": false,
-            "schema": {
-              "default": "",
-              "title": "X-Api-Key",
-              "type": "string"
-            }
-          },
           {
             "in": "header",
             "name": "x-tenant-id",
@@ -453,6 +1756,140 @@
             "schema": {
               "default": "",
               "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JoinReqReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Join Request Create V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/join-requests/me": {
+      "get": {
+        "description": "GET /v1/join-requests/me：查看**自己**提交过的申请及其状态。\n\n刻意不给\"按用户名查\"的参数 —— 那会变成一个\"任何人都能看别人申请记录\"的接口。\n\n`requires_relogin`（逐条）与 `relogin_required`（整体）是给客户端弹提示用的：\n审批通过**只改账号表、不断会话**（用户口径 2026-10-04），所以申请人手上那张令牌\n里还是旧租户（通常为空 = 能读全库）。客户端看到这个标记就可以提示\n\"你已加入 X 租户，重新登录后生效\"，而不必等用户自己发现搜不到东西。",
+        "operationId": "join_request_mine_v1_v1_join_requests_me_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Join Request Mine V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/review": {
+      "post": {
+        "description": "POST /v1/review：人工审核 resume，续跑被 interrupt 挂起的图。\n\nreq: 请求体 ReviewReq。thread_id 用于定位会话；action 只允许 accept / revise；\n    feedback 在 revise 时必填（accept 时可留空）。\nx_tenant_id: 同 /v1/chat。\nidempotency_key: 同 /v1/chat。它同时挡住了\"审核 POST 被重试\"这类事故。\n\n三道前置校验，任一条不过都不进入图：\n  - action 非 accept/revise → 400；\n  - revise 但 feedback 全空白 → 400；\n  - 该 thread 当前并不停在 human_review（如已完成、或从未触发）→ 409。\n通过后把队列里的记录标记为已处理（accepted / revised）。\n\n⚠️ 幂等闸门必须排在 `_REVIEW_QUEUE.resolve` **之前**：那条 resolve 是\n**写操作**（出队 + 留痕\"谁批的\"）。若一条重试先改了状态、再被幂等判成\n重复，队列里就会留下\"某人已批\"的审计记录，而这次审批根本没执行。",
+        "operationId": "review_v1_v1_review_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Idempotency-Key",
               "type": "string"
             }
           }
@@ -495,7 +1932,7 @@
     },
     "/v1/reviews": {
       "get": {
-        "description": "GET /v1/reviews：列出待人工审核的会话（默认 50 条，按时间倒序）。\n\n给\"审核工作台\"用：没有它，待审内容只存在于 checkpoint 里，无人知晓。",
+        "description": "GET /v1/reviews：列出待人工审核的会话（默认 50 条，按时间倒序）。\n\n给\"审核工作台\"用：没有它，待审内容只存在于 checkpoint 里，无人知晓。\n\n⚠️ 2026-10-05 修了两处（此前是个可被低权限账号利用的跨租户泄露口）：\n1. **补了资源级授权**。此前只做 `_authenticate`，不查角色 —— 任何登录账号\n   都能读到同租户里别人的待审草稿与评审意见；而写侧的 `/v1/review` 一直是\n   查角色的。读写两侧的授权强度不一致，等于把\"能看\"当成了\"能审\"的弱化版。\n2. **租户口径**。此前把原始 `ident.tenant` 交给队列，而队列对**空串**的语义\n   曾是\"不过滤\" ⇒ 任何一个还没有租户的账号（`UserReq.tenant` 默认就是空串，\n   是正常运营中必然存在的状态）会拿到**全部租户**的待审草稿。\n   现在空串只表示\"空租户那一份队列\"，不再等于\"不加过滤\"（见\n   `ReviewQueue.pending`）。这里仍然传**原始租户**而不是 `_retrieval_tenant`：\n   \"这个人有没有租户\"是需要如实记录的事实，与\"给他看什么内容\"是两件事，\n   这一点在 `_retrieval_tenant` 的 docstring 里已经写明，本次不改那条边界。",
         "operationId": "list_reviews_v1_reviews_get",
         "parameters": [
           {
@@ -510,21 +1947,21 @@
           },
           {
             "in": "header",
-            "name": "x-api-key",
-            "required": false,
-            "schema": {
-              "default": "",
-              "title": "X-Api-Key",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
             "name": "x-tenant-id",
             "required": false,
             "schema": {
               "default": "",
               "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
               "type": "string"
             }
           }
@@ -557,7 +1994,7 @@
     },
     "/v1/sessions/{thread_id}": {
       "delete": {
-        "description": "DELETE /v1/sessions/{thread_id}：**履行删除请求**（合规要求，此前无处可做）。\n\n删三类数据，缺一类都算不上\"删干净\"：\n\n  1. **检查点** —— 完整对话历史、所有中间草稿、评分与引用。数据主体；\n  2. **审核队列记录** —— 待审/已审的草稿正文与审核意见。它独立存表，\n     只删检查点会留下一份\"幽灵草稿\"；\n  3. **归属登记行** —— 不删会让同一个 thread_id 永久挂在旧租户名下：\n     归属表只增不减，且该 id 之后谁也再用不了（新租户来会被判 403）。\n\n为什么必须做归属校验（而不是\"有合法 Key 就能删\"）\n----------------------------------------------\n`thread_id` 是**客户端提供的**。只要能猜到别人的 id 就能删掉那条会话 ——\n这比\"读\"严重一个量级：读是泄露，删是**不可逆的破坏**。所以这里复用\n`_assert_session_readable` 的 fail-closed 语义：多租户下归属不符 403、\n查不到属主 404（两种情况分开，是因为处置方式不同：前者是攻击信号，\n后者是\"id 不存在\"）。\n\n为什么单租户下删不存在的会话也返回成功\n------------------------------------\n返回 404 会把端点变成\"这个 thread_id 存在吗\"的探针。删除本身是幂等的，\n`deleted` 明细已经如实告诉调用方每一项到底删掉没有。\n\n为什么不做成\"软删除\"\n------------------\n软删除（打标记）保住的是\"万一删错了还能恢复\"，但对合规诉求毫无帮助 ——\n数据仍在库里。真要可恢复应该靠备份，而不是让线上库长期留着已承诺删除的内容。",
+        "description": "DELETE /v1/sessions/{thread_id}：**履行删除请求**（合规要求，此前无处可做）。\n\n删四类数据，缺一类都算不上\"删干净\"：\n\n  1. **检查点** —— 完整对话历史、所有中间草稿、评分与引用。数据主体；\n  2. **agent 侧跨轮历史** —— ``agent_sessions`` / ``agent_messages`` 两张表，\n     存的是\"下一轮的模型会读到的对话\"（官方 Session 后端）。⚠️ 它与检查点是\n     **两份独立的数据**：只删 1 会留下一整段用户消息与助手产出，而接口却告诉\n     调用方\"已删除\"；\n  3. **审核队列记录** —— 待审/已审的草稿正文与审核意见。它独立存表，\n     只删检查点会留下一份\"幽灵草稿\"；\n  4. **归属登记行** —— 不删会让同一个 thread_id 永久挂在旧租户名下：\n     归属表只增不减，且该 id 之后谁也再用不了（新租户来会被判 403）。\n\n为什么必须做归属校验（而不是\"有合法 Key 就能删\"）\n----------------------------------------------\n`thread_id` 是**客户端提供的**。只要能猜到别人的 id 就能删掉那条会话 ——\n这比\"读\"严重一个量级：读是泄露，删是**不可逆的破坏**。所以这里复用\n`_assert_session_readable` 的 fail-closed 语义：多租户下归属不符 403、\n查不到属主 404（两种情况分开，是因为处置方式不同：前者是攻击信号，\n后者是\"id 不存在\"）。\n\n为什么单租户下删不存在的会话也返回成功\n------------------------------------\n返回 404 会把端点变成\"这个 thread_id 存在吗\"的探针。删除本身是幂等的，\n`deleted` 明细已经如实告诉调用方每一项到底删掉没有。\n\n为什么不做成\"软删除\"\n------------------\n软删除（打标记）保住的是\"万一删错了还能恢复\"，但对合规诉求毫无帮助 ——\n数据仍在库里。真要可恢复应该靠备份，而不是让线上库长期留着已承诺删除的内容。",
         "operationId": "session_delete_v1_v1_sessions__thread_id__delete",
         "parameters": [
           {
@@ -571,21 +2008,21 @@
           },
           {
             "in": "header",
-            "name": "x-api-key",
-            "required": false,
-            "schema": {
-              "default": "",
-              "title": "X-Api-Key",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
             "name": "x-tenant-id",
             "required": false,
             "schema": {
               "default": "",
               "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
               "type": "string"
             }
           }
@@ -616,7 +2053,7 @@
         ]
       },
       "get": {
-        "description": "GET /v1/sessions/{thread_id}：取会话的**持久化状态快照**（断点续传的基础）。\n\nthread_id: 会话 id（路径参数）。\nx_api_key / x_tenant_id: 同 /v1/chat。\n\n返回（全部字段都是 JSON 原生类型）：\n    status            unknown | awaiting_review | incomplete | completed\n    resumable         true 时请调 POST /v1/chat/resume 续跑\n    draft             最新草稿全文（断流后\"已经生成到哪了\"就是它）\n    messages          完整对话历史，[{role, content}]，role ∈ user/assistant/system/tool\n    citations         上一轮的引用（来源/页码/节选，供回溯核对）\n    score / feedback  评审分数与意见\n    pending_review    待人工审核时的 {draft, score, feedback, error}，否则 null\n\n为什么是 GET + 纯读：客户端重连后第一件事就是\"我刚才进行到哪了\"，\n这个动作必须幂等、无副作用，才能安全重试。",
+        "description": "GET /v1/sessions/{thread_id}：取会话的**持久化状态快照**（断点续传的基础）。\n\nthread_id: 会话 id（路径参数）。\nx_tenant_id: 同 /v1/chat。\n\n返回（全部字段都是 JSON 原生类型）：\n    status            unknown | awaiting_review | incomplete | completed\n    resumable         true 时请调 POST /v1/chat/resume 续跑\n    draft             最新草稿全文（断流后\"已经生成到哪了\"就是它）\n    messages          完整对话历史，[{role, content}]，role ∈ user/assistant/system/tool\n    citations         上一轮的引用（来源/页码/节选，供回溯核对）\n    score / feedback  评审分数与意见\n    pending_review    待人工审核时的 {draft, score, feedback, error}，否则 null\n\n为什么是 GET + 纯读：客户端重连后第一件事就是\"我刚才进行到哪了\"，\n这个动作必须幂等、无副作用，才能安全重试。",
         "operationId": "session_state_v1_v1_sessions__thread_id__get",
         "parameters": [
           {
@@ -630,21 +2067,21 @@
           },
           {
             "in": "header",
-            "name": "x-api-key",
-            "required": false,
-            "schema": {
-              "default": "",
-              "title": "X-Api-Key",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
             "name": "x-tenant-id",
             "required": false,
             "schema": {
               "default": "",
               "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
               "type": "string"
             }
           }

@@ -23,10 +23,13 @@ def test_readiness_ok_when_all_checks_pass(monkeypatch):
     monkeypatch.setattr(config, "API_KEY", "sk-test")
     monkeypatch.setattr(health, "_check_db", lambda: (True, "stub"))
     monkeypatch.setattr(health, "_check_vector_store", lambda: (True, "stub"))
+    monkeypatch.setattr(health, "_check_pg_pool", lambda: (True, "未建立"))
 
     ok, body = health.readiness()
     assert ok and body["status"] == "ok"
-    assert set(body["checks"]) == {"llm", "db", "vector_store", "checkpointer"}
+    # `pg_pool` 是**可见性**项而非健康判据（占用高只代表在排队），但它必须在明细里 —— 
+    # 少了它，连接池打满的唯一症状是"延迟上升、没有任何错误"，排障会一路往模型上找。
+    assert set(body["checks"]) == {"llm", "db", "vector_store", "checkpointer", "pg_pool"}
     assert all(v["ok"] for v in body["checks"].values())
 
 
@@ -77,8 +80,9 @@ def test_checkpointer_check_flags_memory_saver(monkeypatch):
     这是"以为接了 PG、其实静默降级，重启后会话全丢且日志查不到"的唯一防线。
     判定仍是 ok=True（降级≠不可用，不该被摘流量），但 detail 必须点名。
     """
-    import app.main as M
     from langgraph.checkpoint.memory import InMemorySaver
+
+    import app.main as M
 
     monkeypatch.setattr(config, "DB_URL", "postgresql://x")
     monkeypatch.setattr(M, "graph", _FakeGraph(InMemorySaver()))

@@ -49,7 +49,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -62,6 +62,23 @@ from app import config  # noqa: E402
 # langgraph 的 pg saver 建的三张表。表名是**内部常量白名单**（不是外部输入），
 # 因此下面的 f-string 拼表名是安全的；但仍然只从这份白名单里取值。
 CHECKPOINT_TABLES = ("checkpoints", "checkpoint_blobs", "checkpoint_writes")
+
+# ⚠️ `agent_sessions` / `agent_messages` **刻意不在清理名单里**（2026-10-03 产品口径拍板：
+# 对话历史**永久保留**）。这不是遗漏，加进来之前请先读 `src/agents/session.py` 的
+# 「历史的寿命」一节与 `PRODUCTION_CONFIG.md` 的 `RETENTION_DAYS` 条目。
+#
+# 三条理由，缺一条都不足以支撑这个决定：
+#   1. 用户隔多久回来都应该还能接上上一轮 —— 这是产品承诺，不是技术默认值；
+#   2. 这两张表与检查点的**生命周期本来就不同**：检查点是"跑到一半的中间态"，
+#      丢了只影响续跑；历史是**用户可见的对话内容**，丢了就是数据丢失、不可恢复；
+#   3. 故意留出不对称：即便有人显式 `--days N` 启用清理（本意是清中间态、省空间），
+#      也不该顺带删掉用户的对话记录。真要做到"某一轮对话整段消失"，正确入口是
+#      `DELETE /v1/sessions/{id}`（它四类一起删、且是用户主动发起）。
+#
+# ⇒ 若将来因合规要求必须让历史也过期，那是一次**产品口径变更**：要同时改这里、
+#   `session.py` 的 docstring、`PRODUCTION_CONFIG.md`、`CHANGELOG.md`，并重新评估
+#   `DELETE /v1/sessions/{id}` 的语义（用户主动删除是否仍要保留历史？）。
+AGENT_HISTORY_TABLES = ("agent_sessions", "agent_messages")
 
 #: 单批删除的 thread_id 个数。一次删几十万行会长时间持锁、把库拖慢，
 #: 而清理是后台动作 —— 宁可多跑几批。
@@ -93,12 +110,31 @@ def _has_column(cur, table, column) -> bool:
     return cur.fetchone() is not None
 
 
+def agent_history_rows(cur) -> dict:
+    """报告 agent 对话历史当前的**行数**（用于把"永久保留"这个口径显式播报出来）。
+
+    刻意只统计、不删除（理由见 `AGENT_HISTORY_TABLES` 上方的注释）。
+
+    为什么非要播报：这个脚本的输出是运维判断"清理有没有按预期工作"的依据。
+    如果它对 agent 两表**只字不提**，读的人会合理地认为"这两张表被清理过了"，
+    于是下次容量告警时往错的方向查（以为历史不会再涨）。让它在每一轮都说一遍
+    "这两张表不受影响、原因是产品口径"，比写进文档更难被忽略。
+    """
+    tables = _existing_tables(cur, AGENT_HISTORY_TABLES) & set(AGENT_HISTORY_TABLES)
+    out = {}
+    for t in sorted(tables):
+        cur.execute(f"SELECT count(*) FROM {t}")  # noqa: S608  表名来自内部白名单
+        out[t] = int(cur.fetchone()[0])
+    return out
+
+
 def plan(cur, cutoff) -> dict:
     """算出"打算删什么"（dry-run 用）。"""
     report = {
         "cutoff": cutoff.isoformat(),
         "threads": 0,          # 超期会话条数（= 待删的归属登记行数）
         "review_queue": 0,
+        "agent_history": agent_history_rows(cur),   # 只统计，永不删
         "warnings": [],
     }
 
@@ -163,6 +199,14 @@ def sweep(cur, cutoff) -> dict:
     return result
 
 
+def _agent_history_line(hist: dict) -> str:
+    """把"agent 历史不清理"这件事渲染成一行给人看的输出（见 `agent_history_rows`）。"""
+    if not hist:
+        return "  agent 对话历史  未启用（这两张表不存在）"
+    detail = "、".join(f"{t} {n} 行" for t, n in hist.items())
+    return f"  agent 对话历史 {detail} —— 不清理（产品口径：永久保留）"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -187,7 +231,7 @@ def main():
               file=sys.stderr)
         return 2
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff = datetime.now(UTC) - timedelta(days=days)
 
     try:
         with _connect(dsn) as conn:
@@ -203,6 +247,7 @@ def main():
                               "（含其检查点与归属登记行）")
                         print(f"  审核队列记录   {preview['review_queue']}")
                         print("（检查点按超期会话清单删除，行数需实际执行才能确定）")
+                        print(_agent_history_line(preview["agent_history"]))
                         for w in preview["warnings"]:
                             print(f"  ⚠️ {w}", file=sys.stderr)
                         print("\n加 --apply 执行删除。")
@@ -220,6 +265,7 @@ def main():
                         print(f"    {t}: {n}")
                     print(f"  审核队列记录   {done['review_queue']}")
                     print(f"  归属登记行     {done['session_owners']}")
+                    print(_agent_history_line(preview["agent_history"]))
                 return 0
     except Exception as e:  # noqa: BLE001
         print(f"清理失败：{type(e).__name__}: {e}", file=sys.stderr)

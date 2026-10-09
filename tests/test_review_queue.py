@@ -41,6 +41,29 @@ def test_pending_filters_by_tenant():
     assert [i["thread_id"] for i in q.pending(tenant="a")] == ["t1"]
 
 
+def test_pending_empty_tenant_filters_instead_of_returning_everything():
+    """空串 = **空租户那一份队列**，不是"不加过滤"。
+
+    此前判据是 `if tenant:`，于是空串落进 else 分支 ⇒ 不加租户条件 ⇒ 返回全部。
+    这个等价关系没有任何症状：调用方看着"我明明传了 tenant"，实际拿到的是全量。
+    `GET /v1/reviews` 正好踩中 —— 它传的是身份原始租户，而"还没有租户"
+    （`tenant=""`）是正常运营中必然存在的状态，于是那个账号列出了全租户草稿。
+
+    "不过滤"现在必须**显式传 `None`**：两种意图在调用点一眼可辨，
+    而且不传参数的默认行为只该被运维脚本用（生产端点必须传身份自己的租户）。
+    """
+    q = _q()
+    q.add("t-empty", tenant="")
+    q.add("t-acme", tenant="acme")
+
+    assert [i["thread_id"] for i in q.pending(tenant="")] == ["t-empty"], (
+        "空串又把别的租户带出来了 —— 这正是那个跨租户泄露口"
+    )
+    # 显式 None 才是全量（运维视角），且不能因为上面那条把全量能力也弄丢
+    assert len(q.pending()) == 2
+    assert len(q.pending(tenant=None)) == 2
+
+
 def test_disabled_queue_is_noop():
     q = _q(enabled=False)
     assert q.add("t1") is False
@@ -109,20 +132,19 @@ def test_notify_failure_is_swallowed(monkeypatch):
 # 少了操作者，复盘只能看到"这条被 accept 了"：无法判断是正常放行、越权还是误点。
 # ---------------------------------------------------------------------------
 def test_resolve_records_actor_via_note_and_time():
-    """解决一条记录时，操作者 / 认证方式 / 决定备注 / 处理时刻**都要落下来**。
+    """解决一条记录时，操作者 / 决定备注 / 处理时刻**都要落下来**。
 
     删掉 `resolve` 里任何一个审计字段的写入，本用例立刻变红。
     """
     q = _q()
     q.add("t1", draft="草稿", score=20, tenant="acme")
 
-    assert q.resolve("t1", "revised", actor="acme", via="tenant-key",
-                     note="补上引用来源") is True
+    assert q.resolve("t1", "revised", actor="acme", note="补上引用来源") is True
 
     rec = q.record("t1")
     assert rec["status"] == "revised"
     assert rec["resolved_by"] == "acme"
-    assert rec["resolved_via"] == "tenant-key"
+    assert rec["resolved_via"] == "session"
     assert rec["resolution_note"] == "补上引用来源"
     assert rec["resolved_at"], "没记处理时刻 —— updated_at 会被 add 刷新，替代不了它"
     # 出队语义不变：处理完就不再出现在待审列表里
@@ -144,7 +166,7 @@ def test_record_shape_is_identical_before_and_after_resolve():
     assert rec["resolved_by"] == "" and rec["resolved_at"] is None
 
     # 待审列表里的条目形状也一致（列表页要能直接显示"谁处理的"）
-    assert set(("resolved_by", "resolved_at")) <= set(q.pending()[0])
+    assert {"resolved_by", "resolved_at"} <= set(q.pending()[0])
 
 
 def test_record_is_none_for_unknown_thread():
@@ -177,11 +199,11 @@ def test_audit_log_names_the_actor_but_not_the_content(caplog):
     q.add("t1")
     secret = "把第三段里的客户手机号删掉"
     with caplog.at_level(logging.INFO):
-        q.resolve("t1", "revised", actor="acme", via="tenant-key", note=secret)
+        q.resolve("t1", "revised", actor="acme", note=secret)
 
     line = "\n".join(r.getMessage() for r in caplog.records)
     assert "t1" in line and "revised" in line
-    assert "acme" in line and "tenant-key" in line, f"日志里没有操作者：{line!r}"
+    assert "acme" in line, f"日志里没有操作者：{line!r}"
     assert f"note_chars={len(secret)}" in line, f"日志里没有反馈长度：{line!r}"
     assert secret not in line, "反馈正文被写进日志（会被转发到第三方日志系统）"
 

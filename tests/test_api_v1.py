@@ -15,8 +15,9 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import app.main as M  # noqa: E402
 from app.ratelimit import RateLimiter  # noqa: E402
+from tests.auth_util import TEST_USER, auth_headers  # noqa: E402
 
-client = TestClient(M.app)
+client = TestClient(M.app, headers=auth_headers())
 
 
 # ---------------- 版本化路由 ----------------
@@ -71,17 +72,33 @@ def test_metrics_endpoint_returns_prometheus_text():
 
 
 # ---------------- 鉴权 ----------------
-def test_missing_api_key_rejected_when_configured(monkeypatch):
-    monkeypatch.setattr(M, "SERVE_API_KEY", "sekret")
-    r = client.post("/v1/review", json={"thread_id": "t", "action": "accept"})
+def test_unauthenticated_request_is_rejected():
+    """不带凭证的业务请求必须 401。
+
+    ⚠️ 这里刻意**新建**一个不带默认头的客户端：模块级 `client` 带着测试身份
+    （见 tests/auth_util.py），拿它测不出"裸请求会被拒"。
+    """
+    bare = TestClient(M.app)
+    r = bare.post("/v1/review", json={"thread_id": "t", "action": "accept"})
     assert r.status_code == 401
 
 
-def test_correct_api_key_passes_auth(monkeypatch):
-    monkeypatch.setattr(M, "SERVE_API_KEY", "sekret")
-    r = client.post("/v1/review", json={"thread_id": "t", "action": "accept"},
-                    headers={"X-API-Key": "sekret"})
-    assert r.status_code != 401          # 409（不在审核态）说明已过鉴权
+def test_shared_api_key_header_is_not_accepted_anymore():
+    """`X-API-Key` 这条路径已整体删除 —— 带着它也一样 401。
+
+    这条守卫的意义：删掉共享密钥档之后，"客户端还在发这个头"是一个**必须**
+    表现为失败的状态。若哪天有人把它加回来（哪怕只是"兼容一下"），本条会红。
+    """
+    bare = TestClient(M.app)
+    r = bare.post("/v1/review", json={"thread_id": "t", "action": "accept"},
+                  headers={"X-API-Key": "sekret"})
+    assert r.status_code == 401
+
+
+def test_bearer_token_passes_auth():
+    """带上真签的令牌即可通过鉴权：409（不在审核态）说明已经进到业务逻辑。"""
+    r = client.post("/v1/review", json={"thread_id": "t", "action": "accept"})
+    assert r.status_code != 401
 
 
 # ---------------- 限流 ----------------
@@ -179,7 +196,7 @@ def test_review_action_records_who_did_it(monkeypatch):
     """端到端：`/v1/review` 必须把**操作者与认证方式**写进队列记录。
 
     只断言"状态变成 accepted"是不够的 —— 那是改造前就有的行为。这条用例要钉的是
-    `_REVIEW_QUEUE.resolve(... actor=..., via=...)` 这串关键字参数真的从端点传下去了
+    `_REVIEW_QUEUE.resolve(... actor=..., note=...)` 这串关键字参数真的从端点传下去了
     （漏传时 `resolve` 照样成功返回 True，队列照样出队，只有审计字段是空的）。
     """
     from types import SimpleNamespace
@@ -214,8 +231,6 @@ def test_review_action_records_who_did_it(monkeypatch):
     monkeypatch.setattr(M, "_REVIEW_QUEUE", q)
     monkeypatch.setattr(M, "graph", _FakeGraph())
     monkeypatch.setattr(M, "_LIMITER", RateLimiter(per_minute=1000))
-    monkeypatch.setattr(M.config, "DEFAULT_TENANT", "acme")
-    monkeypatch.setattr(M, "SERVE_API_KEY", "")
 
     r = client.post("/v1/review", json={"thread_id": "audit-1", "action": "revise",
                                         "feedback": "请补上来源"})
@@ -223,17 +238,34 @@ def test_review_action_records_who_did_it(monkeypatch):
 
     rec = q.record("audit-1")
     assert rec["status"] == "revised"
-    assert rec["resolved_by"] == "acme", "审核动作没记操作者"
-    assert rec["resolved_via"] == "anonymous", "审核动作没记认证方式"
+    # 操作者记的是**用户名**（不是租户）：共享密钥档删除后不可能再有"没有用户概念"
+    # 的身份，于是"是谁批的"永远答得出来。
+    assert rec["resolved_by"] == TEST_USER, "审核动作没记操作者"
+    # ⚠️ 这一列现在是**固定值**（只剩会话令牌一种凭证），断言保留是为了钉住"写库没被
+    # 顺手删掉" —— 它仍是"这条记录出自哪个认证体系"的历史留痕列。
+    assert rec["resolved_via"] == "session", "留痕列没写"
     assert rec["resolution_note"] == "请补上来源", "人工反馈没落进审计记录"
     assert rec["resolved_at"], "审核动作没记处理时刻"
 
 
 # ---------------- 租户 ----------------
-def test_tenant_header_overrides_default(monkeypatch):
-    monkeypatch.setattr(M.config, "DEFAULT_TENANT", "fallback")
-    assert M._tenant_of("acme") == "acme"
-    assert M._tenant_of("") == "fallback"
+def test_retrieval_tenant_prefers_own_then_public(monkeypatch):
+    """有租户用自己的；没租户落到**公共租户**（而不是"不加过滤"）。"""
+    monkeypatch.setattr(M.config, "DEFAULT_TENANT", "public")
+    assert M._retrieval_tenant(M.Identity(tenant="acme")) == "acme"
+    assert M._retrieval_tenant(M.Identity(tenant="")) == "public"
+
+
+def test_retrieval_tenant_is_fail_closed_without_public_tenant(monkeypatch):
+    """公共租户没配 ⇒ 无租户的账号**什么都查不到**，绝不能退化成空串。
+
+    空串在检索层的语义是"不加过滤"（能召回全部租户的内容），所以这里必须是一个
+    **不可能与真实租户相等**的哨兵值。把返回值改回 `""` 时本条变红。
+    """
+    monkeypatch.setattr(M.config, "DEFAULT_TENANT", "")
+    got = M._retrieval_tenant(M.Identity(tenant=""))
+    assert got == M.config.NO_TENANT_SENTINEL
+    assert got != "", "空串 = 不加过滤 ⇒ 无租户账号能看到所有租户的文档"
 
 
 # ---------------- 审核队列端点 ----------------
@@ -247,6 +279,59 @@ def test_list_reviews_returns_pending(monkeypatch):
     body = client.get("/v1/reviews").json()
     assert body["count"] == 1
     assert body["items"][0]["thread_id"] == "pending-1"
+
+
+# ---------------- thread_id 非空 ----------------
+@pytest.mark.parametrize("bad", ["", "   ", "\t\n"])
+def test_thread_id_must_not_be_blank(bad):
+    """空 / 纯空白的 `thread_id` 必须在入口被拒（422）。
+
+    检查点按 thread_id 落库、会话归属表也按它登记。空 id 让所有客户端**共用
+    同一个空 key 的会话空间** —— 互相能读到对方的上下文；而归属校验对空 id
+    是"直接短路放行"，所以这条隔离在最该生效的时候恰好不起作用。
+
+    这是"**合法输入导致隔离失效**"：此前它只判长度上限，空串是合法值，
+    于是没有任何一处会报错。三个空白变体都要覆盖 —— 只测 `""` 的话，
+    一个"只判 `if not v` 但不去空白"的实现照样能过。
+    """
+    r = client.post("/v1/chat", json={"thread_id": bad, "message": "hi"})
+    assert r.status_code == 422, f"thread_id={bad!r} 竟然被接受：{r.status_code}"
+    assert "thread_id" in r.text
+
+
+# ---------------- 未处理异常 ----------------
+def test_unhandled_exception_returns_500_with_request_id():
+    """未处理异常必须回**脱敏 500 且带 `X-Request-ID`**。
+
+    此前全仓没有任何异常处理器，500 由最外层的 `ServerErrorMiddleware` 生成 ——
+    它走的是最初的 `send`，不经过写 rid 的那层中间件。于是 401/403/409/429 都带
+    rid，**唯独最需要 rid 的 500 不带**：用户报"500 了"，响应头和响应体里都没有
+    任何可检索的标识，运维无从定位。
+
+    ⚠️ 断言落在**响应头**上：只断言"body 里有 rid"是不够的 —— body 里的 rid 是
+    `_client_error` 拼进去的，与"响应头可检索"是两件事，而网关与日志系统按的是头。
+    """
+    class _Boom:
+        def pending(self, **_kw):
+            raise RuntimeError("连不上 db.internal:5432（/srv/secret/path）")
+
+    original = M._REVIEW_QUEUE
+    M._REVIEW_QUEUE = _Boom()
+    try:
+        c = TestClient(M.app, headers=auth_headers(), raise_server_exceptions=False)
+        r = c.get("/v1/reviews")
+    finally:
+        M._REVIEW_QUEUE = original
+
+    assert r.status_code == 500
+    assert r.headers.get("x-request-id"), (
+        "500 没有 X-Request-ID —— 这条响应头是运维按 rid 定位的唯一入口"
+    )
+    if M.config.IS_PRODUCTION:
+        assert "db.internal" not in r.text and "secret" not in r.text, (
+            f"生产环境的 500 把内部细节回给客户端了：{r.text}"
+        )
+        assert "request_id=" in r.text, "生产文案必须带上 rid 供用户报障"
 
 
 # ---------------- SSE 事件：预算事件与既有事件并存 ----------------
@@ -415,6 +500,7 @@ def test_budget_exceeded_payload_is_json_on_the_wire(monkeypatch):
     （端点不读它，读的是配额的 request_limit）。
     """
     import json
+
     from app.quota import QuotaManager
 
     class _FakeGraph:

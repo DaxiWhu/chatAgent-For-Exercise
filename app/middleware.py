@@ -155,6 +155,21 @@ class RequestContextMiddleware:
                 headers[b"x-request-id"].decode("latin-1", "ignore").strip())
         rid = incoming_rid or uuid.uuid4().hex[:16]
         token = set_request_id(rid)
+        # ⚠️ 同时写进 `scope`，因为**外层的代码读不到上面那个 contextvar**
+        # ------------------------------------------------------------------
+        # `scope` 是同一个 dict 对象、自上而下传引用，所以内层改它对**外层**可见。
+        # contextvar 不行：用户中间件是跑在 AnyIO task group 里的，那一层会**复制**
+        # 一份 context（FastAPI 自己的注释就写了 "those create a new contextvars
+        # context copy by using a new AnyIO task group"）⇒ 在这里 `set` 的值，
+        # 到比本中间件更外层的代码里读出来还是空。
+        #
+        # 谁需要它：`@app.exception_handler(Exception)`。实测（fastapi 0.135.1 的
+        # `build_middleware_stack`）注册给 `Exception` 的处理器会被交给
+        # **`ServerErrorMiddleware`**（最外层），而不是 `ExceptionMiddleware`
+        # （用户中间件之内）—— 所以它既读不到这里的 contextvar，产出的响应也不会
+        # 再穿过下面的 `send_wrapper`。不写这一行，结果就是 401/403/429 都带
+        # X-Request-ID，**唯独 500 不带**（而 500 恰恰最需要它）。
+        scope.setdefault("state", {})["request_id"] = rid
         started = time.perf_counter()
         # 在途计数**不受 enabled 影响**：即使指标关闭，优雅关闭也需要知道
         # "现在还有几个请求在跑"。它只是一次加/减，成本可忽略。
@@ -404,7 +419,7 @@ class ConcurrencyLimitMiddleware:
 
         global _CONCURRENT
         with _CONCURRENT_LOCK:
-            if _CONCURRENT >= self.limit:
+            if self.limit <= _CONCURRENT:
                 admitted, current = False, _CONCURRENT
             else:
                 _CONCURRENT += 1

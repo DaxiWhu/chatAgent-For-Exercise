@@ -27,8 +27,7 @@ import json
 import pytest
 
 from app import metrics
-from app.middleware import (ConcurrencyLimitMiddleware, RequestContextMiddleware,
-                            concurrent_count)
+from app.middleware import ConcurrencyLimitMiddleware, RequestContextMiddleware, concurrent_count
 
 # ---------------------------------------------------------------------------
 # 测试脚手架：一个可以"挂住"的假内层应用

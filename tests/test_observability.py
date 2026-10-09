@@ -10,8 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app import metrics
-from app.logging_setup import (JsonFormatter, TextFormatter, get_request_id,
-                               reset_request_id, set_request_id)
+from app.logging_setup import JsonFormatter, TextFormatter, get_request_id, reset_request_id, set_request_id
 from app.middleware import RequestContextMiddleware
 
 
@@ -57,6 +56,112 @@ def test_request_id_defaults_to_empty_outside_request():
 
 
 # ---------------- 指标 ----------------
+def _prometheus_text_violations(text: str) -> list[str]:
+    """按 **Prometheus 服务端（Go `expfmt`）** 的规则检查文本格式，返回违规清单。
+
+    ⚠️ 为什么不能拿 `prometheus_client` 的解析器当判据：它是**宽松**实现 ——
+    对"同一个指标名出现多行 `# TYPE`"不报错，只静默保留第一条。2026-10-06 实测：
+    同一段含 3 行重复 TYPE 的文本，Go 报
+    `second TYPE line for metric name "x", or TYPE reported after samples` 并中止解析，
+    而 `prometheus_client.parser.text_string_to_metric_families()` **解析成功**。
+    用它做断言 = 这条真实缺陷永远显示为绿。
+    """
+    import re as _re
+
+    declared: dict[str, str] = {}       # 指标名 -> 已声明的类型
+    seen_samples: set[str] = set()
+    problems: list[str] = []
+
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("# TYPE "):
+            name = line.split()[2]
+            if name in declared:
+                problems.append(f"第 {n} 行：{name} 出现第二行 # TYPE")
+            elif name in seen_samples:
+                problems.append(f"第 {n} 行：{name} 的 # TYPE 出现在样本之后")
+            declared[name] = line.split()[3]
+            continue
+        if line.startswith("#"):
+            continue
+        m = _re.match(r"([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{|[ \t]|$)", line)
+        assert m, f"第 {n} 行不是合法的样本行：{line}"
+        # 直方图的样本名带 `_bucket`/`_sum`/`_count` 后缀，归并回它所属的 family
+        family = _re.sub(r"_(bucket|sum|count)$", "", m.group(1))
+        seen_samples.add(family)
+        if family not in declared:
+            declared[family] = "untyped"
+    return problems
+
+
+def test_render_emits_one_type_line_per_metric_name():
+    """每个指标名**恰好一行** `# TYPE` —— 否则整个 /metrics 是非法文本。
+
+    2026-10-06 回归钉子。旧实现按"每个 (指标名, 标签组合)"打一行 TYPE，
+    于是 `http_requests_total` 有几个标签组合就有几行 TYPE。Prometheus 服务端
+    遇到第二行会报 `second TYPE line for metric name ...` 并**立即中止解析**、
+    整批样本丢弃（target 变 `up == 0`）。
+    危害量级不是"少一个指标"，而是全部指标 / SLO / 燃尽率 / 告警规则依赖的数据
+    根本不存在 —— 而单测若用宽松解析器会误判为正常。
+    """
+    metrics.reset()
+    for status in ("200", "404", "429", "500"):
+        metrics.inc("http_requests_total", method="GET", path="/v1/chat", status=status)
+    metrics.set_gauge("review_pending", 3)
+    metrics.set_gauge("review_pending", 5, tenant="acme")
+    metrics.observe("rag_seconds", 0.1, stage="retrieve")
+    metrics.observe("rag_seconds", 0.2, stage="rerank")
+
+    text = metrics.render()
+    for name in ("http_requests_total", "review_pending", "rag_seconds"):
+        assert text.count(f"# TYPE {name} ") == 1, f"{name} 的 TYPE 行不唯一：\n{text}"
+    assert _prometheus_text_violations(text) == []
+
+
+def test_render_puts_every_type_line_before_its_samples():
+    """`# TYPE` 必须排在该指标名的**所有样本之前**（规范原文要求）。
+
+    与上一条是两件事：TYPE 唯一但仍排在样本之后，Go 同样报
+    "TYPE reported after samples"。旧实现在第 2 个标签组合处就会踩到这条。
+    """
+    metrics.reset()
+    metrics.inc("a_total", x="1")
+    metrics.inc("a_total", x="2")
+    metrics.set_gauge("b_gauge", 1)
+    metrics.observe("c_seconds", 0.1, k="v")
+
+    text = metrics.render()
+    assert _prometheus_text_violations(text) == []
+
+    lines = text.splitlines()
+    type_at = next(i for i, ln in enumerate(lines) if ln.startswith("# TYPE a_total "))
+    first_sample = next(i for i, ln in enumerate(lines) if ln.startswith("a_total{"))
+    assert type_at < first_sample, "TYPE 落在了样本之后"
+
+    # 直方图同理：`c_seconds` 的 TYPE 必须在 `c_seconds_bucket` 之前
+    h_type = next(i for i, ln in enumerate(lines) if ln.startswith("# TYPE c_seconds "))
+    h_sample = next(i for i, ln in enumerate(lines) if ln.startswith("c_seconds_bucket"))
+    assert h_type < h_sample
+
+
+def test_misdeclared_metric_name_does_not_break_the_whole_exposition():
+    """同一个名字既是 counter 又是 gauge（编程错误）时，宁可跳过它也不能输出两行 TYPE。
+
+    取舍：这个撞名是**代码 bug**，但它的代价不该由整个 /metrics 承担 ——
+    让一次撞名把全部监控打瞎，比少一个指标严重得多。所以 render() 记 ERROR
+    并保留先注册的类型。这条钉住的就是"错误被降级为局部"。
+    """
+    metrics.reset()
+    metrics.inc("dup_total")
+    metrics.set_gauge("dup_total", 1)
+
+    text = metrics.render()
+    assert text.count("# TYPE dup_total ") == 1, text
+    assert _prometheus_text_violations(text) == []
+
+
 def test_counter_and_histogram_render_prometheus_text():
     metrics.reset()
     metrics.inc("demo_total", 2, a="1")
@@ -220,3 +325,34 @@ def test_middleware_records_metrics_and_error_counter():
     text = metrics.render()
     assert 'http_requests_total{method="GET",path="/ping",status="200"}' in text
     assert 'http_errors_total{path="/boom"}' in text
+
+
+# ---------------------------------------------------------------------------
+# trace 元数据与 request_id 对齐（2026-10-04 补）
+# ---------------------------------------------------------------------------
+def test_run_config_carries_the_request_id_for_trace_lookup():
+    """trace 元数据里必须带上 `request_id`。
+
+    它是用户唯一报得出来的标识（日志里的 rid 与它是同一个值），而在此之前
+    它反查不到任何一条 trace ⇒ "用户说这次答得不对"只能按时间点大海捞针。
+    """
+    from app import tracing
+
+    token = set_request_id("rid-abc123")
+    try:
+        cfg = tracing.build_run_config({}, thread_id="t1", tenant="acme")
+    finally:
+        reset_request_id(token)
+    assert cfg["metadata"]["request_id"] == "rid-abc123"
+
+
+def test_run_config_omits_request_id_outside_a_request():
+    """不在请求上下文里（脚本、定时任务）不写这个键。
+
+    写个空串进去会让面板里多出一列全是空值的维度 —— 与"有值才写"的既有口径不一致
+    （`build_run_config` 对其它元数据也是这么处理的）。
+    """
+    from app import tracing
+
+    cfg = tracing.build_run_config({}, thread_id="t1", tenant="acme")
+    assert "request_id" not in cfg["metadata"]

@@ -18,8 +18,9 @@
 import logging
 import time
 
-from . import config
 from src import prompts
+
+from . import config
 
 
 def liveness() -> dict:
@@ -101,8 +102,8 @@ def _check_vector_store() -> tuple[bool, str]:
     不是这个实例的问题 —— 摘流量、重启都解决不了它，只会额外制造一次停机。
     但它必须**可见**（这就是回显的目的），否则这条链路等于没有告警。
     """
-    from src.rag import vector_store as vs
     from src.rag import retrieval as R
+    from src.rag import vector_store as vs
 
     ident = _index_identity_note()
     backend = (R.VECTOR_STORE or "memory").strip().lower()
@@ -129,7 +130,7 @@ def _check_checkpointer() -> tuple[bool, str]:
     返回恒为 (True, 明细)；明细里点名具体类型与是否需要关注。
     """
     try:
-        import app.main as M          # 延迟导入：避免与 main→health 形成循环导入
+        import app.main as M  # 延迟导入：避免与 main→health 形成循环导入
         cp = getattr(M.graph, "checkpointer", None)
     except Exception as e:  # noqa: BLE001
         return True, f"未知（读取失败：{type(e).__name__}）"
@@ -140,6 +141,35 @@ def _check_checkpointer() -> tuple[bool, str]:
         note = "（内存，重启丢状态！）" if config.DB_URL else "（未配 DB_URL，属预期）"
         return True, f"{name}{note}"
     return True, f"{name}（已持久化）"
+
+
+def _check_pg_pool() -> tuple[bool, str]:
+    """回显同步 PG 连接池的占用情况（**只读进程内计数，零 IO**）。
+
+    为什么必须可见：连接池打满的表现是"延迟上升、吞吐不再增长"，**没有任何错误**。
+    没有这一项，排障时会一路往模型、向量库上找，而真正的原因是本进程自己的 8 条
+    连接全被占用、后续请求在排队。
+
+    为什么**不判失败**：池是"配了 DB_URL 才建"的，没建只是"尚未用到"；
+    而占用高（available=0 且有 waiting）说明在**排队**而不是故障 —— 摘掉流量
+    只会让剩下的副本排得更久。所以它是可见性，不是健康判据。
+    """
+    from . import pg
+
+    try:
+        st = pg.stats()
+    except Exception as e:  # noqa: BLE001  （探针不该因它失败）
+        return True, f"未知（读取失败：{type(e).__name__}）"
+    if not st:
+        return True, ("未建立（尚未用到 PG）" if config.DB_URL
+                      else "未配置 DB_URL（跳过）")
+    parts = []
+    for dsn, v in st.items():
+        line = f"{dsn}: available={v.get('available')}/{v.get('size')}"
+        if v.get("waiting"):
+            line += f"，waiting={v['waiting']}（连接池已打满，请求在排队）"
+        parts.append(line)
+    return True, "；".join(parts)
 
 
 def readiness() -> tuple[bool, dict]:
@@ -156,6 +186,7 @@ def readiness() -> tuple[bool, dict]:
         ("db", _check_db),
         ("vector_store", _check_vector_store),
         ("checkpointer", _check_checkpointer),
+        ("pg_pool", _check_pg_pool),
     ):
         ok, detail, ms = _timed(fn)
         checks[name] = {"ok": ok, "detail": detail, "ms": ms}

@@ -50,6 +50,13 @@ N 次 —— **任意 60 秒滑窗内最多 2N 次**。这不是"理论上的边
 回退后 `RateLimiter.backend_name` 会如实变成 "memory"，由启动日志回显出来可核对。
 
 运行期后端异常时**退到进程内计数**（而不是放行），见 `_hit` 的说明。
+
+共享出口（代理 / NAT）与"配错 TRUST_PROXY_HEADERS"
+----------------------------------------------
+按 IP 限流的前提是"一个 IP 背后是一个人"。这个前提在两种常见形态下不成立，而
+两者的**症状完全一样**（一个桶被很多人用、一个人刷满则其他人全部 429），所以要靠
+"同一个 IP 桶背后出现了几个不同主体"来发现它，再按情况给不同语气的告警与处置。
+细节见 `RateLimiter` 的类文档；真正的修复入口是 `TRUST_PROXY_HEADERS`。
 """
 
 import logging
@@ -221,10 +228,46 @@ class _RedisBackend:
 
 
 class RateLimiter:
-    """双维度限流器：`check(ip, session)` 返回最严格的判定结果。"""
+    """限流器：IP / 会话双维度判定 + **共享出口检测**（2026-10-06 补）。
+
+    检测要解决的问题
+    ---------------
+    按 IP 限流有个前提：**一个 IP 背后是一个人**。这个前提在两种常见部署下不成立：
+
+      · 应用在反向代理后面、但 `TRUST_PROXY_HEADERS=0`（配错）⇒ 每个请求的 IP 都是
+        那台代理 ⇒ **全站共用同一个桶**，一个人刷满 120/分钟就能让所有人登不进来；
+      · 反代后面还有 NAT / 网关 / 公司出口（配对了也会这样）⇒ 一个 IP 背后是一群人。
+
+    两种情况的共同特征是**同一个 IP 桶背后出现了很多个不同主体**。据此判定"这是一个
+    共享出口"，然后做两件事：
+
+      1. **让它可见**：记 ERROR（`TRUST_PROXY_HEADERS=0` 时 —— 有一个明确的修复动作）
+         或 WARNING（已信任转发头时 —— 这是 NAT，修不了配置，只能提额度或按主体分桶），
+         并计数 `ratelimit_shared_egress_total`。这是**唯一**能在流量进来之后发现
+         "配置配错了"的手段：配错的表现只是"额度算错了"，不报错也不崩。
+      2. **退化成按主体分桶**：见 `_ip_key`。让一个人占不满别人的额度。
+
+    ⚠️ 为什么"按主体分桶"只对**已验证**的主体生效
+    -------------------------------------------
+    主体若是客户端自报的（登录接口里的用户名、或者任何请求头），那分桶就等于把
+    限流键交给了攻击者：每换一个自报名字就换一个桶，额度可以无限刷。所以只有
+    **已验签身份**（JWT 里的用户名）才参与。登录这类"还没有身份"的端点保持共享桶，
+    由 nginx 那一道按真实 IP 的硬帽子兜底（见 `deploy/app/nginx.conf` 的 auth zone）。
+
+    ⚠️ 已知代价：拿到 N 个账号的人在这台机器上确实能拿到 N 份额度 —— 但那与
+    "N 个账号本来就是 N 个人"无法区分，且会话维度与日额度仍然各自生效。
+    """
+
+    #: 一个 IP 桶背后出现过多少个不同主体，就判定它是**共享出口**（代理 / NAT / 网关）
+    SHARED_EGRESS_SUBJECTS = 4
+    #: 跟踪表的桶数上限 —— 检测器**不能**变成"高基数 IP"的内存放大面
+    #: （与 `_MemoryBackend` 只存两个整数是同一个顾虑：可被攻击者撑大的结构就是 DoS 面）
+    TRACKED_MAX = 1024
+    #: 单个桶最多记多少个主体（够了就不再往上加，"一个 IP 上万个账号"也撑不爆）
+    SUBJECTS_MAX = 16
 
     def __init__(self, per_minute=120, session_per_minute=None, enabled=True,
-                 redis_url="", by_session=True):
+                 redis_url="", by_session=True, proxy_headers_trusted=False):
         """构造限流器。
 
         per_minute: 每个 (IP, 路由) 每分钟上限。
@@ -232,11 +275,18 @@ class RateLimiter:
         enabled: False 时 check 恒放行（开关关掉）。
         redis_url: 非空则尝试 Redis 后端，失败回退内存。
         by_session: 是否启用会话维度。
+        proxy_headers_trusted: 是否已信任转发头（就是 `TRUST_PROXY_HEADERS`）。
+            **只用于决定共享出口告警的语气**（ERROR / WARNING），不参与限流判定 ——
+            判定只有一个来源，见 `app/main.py::_client_ip`。
         """
         self.per_minute = max(1, int(per_minute))
         self.session_per_minute = max(1, int(session_per_minute or per_minute))
         self.enabled = bool(enabled)
         self.by_session = bool(by_session)
+        self.proxy_headers_trusted = bool(proxy_headers_trusted)
+        # 共享出口跟踪表：`(ip, 路由) -> {"subjects": set, "shared": bool}`
+        # 有界（`TRACKED_MAX`）+ 每桶主体有上限（`SUBJECTS_MAX`），见类的说明。
+        self._tracked: dict[tuple, dict] = {}
         # `_local` 是**兜底表**：后端（可能是 Redis）出错时改用它计数。
         # 它与主后端必须是**两个独立实例** —— 共用同一个 _MemoryBackend 时，
         # "回退"其实还是在读主后端的状态，语义就不成立了。
@@ -259,12 +309,86 @@ class RateLimiter:
                     "REDIS_URL 已配置但连接不可用 ⇒ 共享计数**未生效**，当前用进程内计数："
                     "多副本下实际额度 = 配置值 × 副本数。请检查 REDIS_URL 与网络。原因：%s", e)
 
-    def check(self, ip: str = "", session: str = "", route: str = "") -> RateLimitResult:
+    def _note_subject(self, ip: str, route: str, subject: str) -> bool:
+        """记下"这个 IP 桶背后又出现了一个新主体"，返回该桶是否已判定为共享出口。
+
+        subject 为空（还没登录、或调用方没传）时不参与判定 —— 否则一个匿名请求
+        就等于"一个主体"，检测立刻全是误报。
+        """
+        if not subject:
+            return False
+        key = (ip, route)
+        entry = self._tracked.get(key)
+        if entry is None:
+            if len(self._tracked) >= self.TRACKED_MAX:
+                # FIFO 淘汰最老的一条（dict 保持插入序）。为什么不是"清空"：
+                # 清空会让跟踪表永远凑不满，检测在这台机器上再也触发不了。
+                self._tracked.pop(next(iter(self._tracked)), None)
+            entry = {"subjects": set(), "shared": False}
+            self._tracked[key] = entry
+        subjects = entry["subjects"]
+        if len(subjects) < self.SUBJECTS_MAX:
+            subjects.add(subject)
+        if not entry["shared"] and len(subjects) >= self.SHARED_EGRESS_SUBJECTS:
+            entry["shared"] = True          # 先置位再报，保证每个桶只报一次
+            self._report_shared_egress(ip, route, len(subjects))
+        return entry["shared"]
+
+    def _report_shared_egress(self, ip: str, route: str, fanout: int) -> None:
+        """把"这个 IP 其实是共享出口"报出来。
+
+        为什么两种语气（ERROR / WARNING）要分开
+        -----------------------------------
+        `TRUST_PROXY_HEADERS=0` 时这是**配置错了**：真实客户端地址就在转发头里，
+        只要打开那个开关就能修好，而且不修的话按 IP 的限流（连同登录接口的防爆破
+        闸门）全都算在一个桶上。给 ERROR，并直接写出修复动作。
+        已信任转发头时这是 **NAT/网关**：同一出口下确实有很多人，改配置也没用，
+        能做的是提额度或依赖"按主体分桶"这条降级路径。给 WARNING，不要制造噪音。
+        """
+        metrics.inc("ratelimit_shared_egress_total", scope="ip",
+                    trusted="yes" if self.proxy_headers_trusted else "no")
+        if self.proxy_headers_trusted:
+            logging.warning(
+                "限流 IP 维度检测到**共享出口**：ip=%s route=%s 背后已有 %d 个不同主体"
+                "（NAT / 网关 / 公司出口）。这些人的额度是**共用一份**的；已验证身份"
+                "的请求已改按主体分桶，匿名请求（如登录）仍共用。必要时提高 "
+                "RATE_LIMIT_PER_MINUTE 或按出口数量评估。",
+                ip, route, fanout)
+        else:
+            logging.error(
+                "限流 IP 维度检测到**共享出口**：ip=%s route=%s 背后已有 %d 个不同主体。"
+                "这通常意味着**应用在反向代理后面，但 TRUST_PROXY_HEADERS 没打开** ⇒ "
+                "所有请求被算成同一个 IP，全站共用一份额度（一个人刷满其他人全部 429，"
+                "登录接口同样在内）。请确认部署形态：反代后面设 TRUST_PROXY_HEADERS=1，"
+                "直连则查为什么会有多个不同主体出现在同一个对端地址上。",
+                ip, route, fanout)
+
+    @staticmethod
+    def _ip_key(ip: str, route: str, subject: str, subject_verified: bool,
+                shared: bool) -> str:
+        """IP 维度的桶键。
+
+        shared（该 IP 已判定为共享出口）+ 主体**已验签** ⇒ 改按主体分桶。
+        两个条件缺一不可：只满足 shared 就把键交给自报主体 = 换个名字换一个桶；
+        只满足 verified 而不看 shared，等于废掉 IP 维度（NAT 场景本可以共用一份）。
+        """
+        if shared and subject and subject_verified:
+            return f"ip:{ip}:{subject}:{route or '-'}"
+        return f"ip:{ip}:{route or '-'}"
+
+    def check(self, ip: str = "", session: str = "", route: str = "",
+              subject: str = "", subject_verified: bool = False) -> RateLimitResult:
         """判定是否放行。
 
         ip: 客户端 IP（可能为空）。
         session: 会话 id（thread_id，可能为空）。
-        route: 路由模板，用于把 IP 维度的计数按端点拆开（避免 /chat 与 /review 互相挤占）。
+        route: **路由模板**（如 `/v1/sessions/{thread_id}`），用于把 IP 维度的计数按
+            端点拆开（避免 /chat 与 /review 互相挤占）。必须用模板而不是原始路径：
+            后者会让每个 thread_id 各占一个桶，既让额度随"客户端能造出多少个 id"
+            放大，也让共享出口跟踪表被撑大。
+        subject: 请求主体（用户名）。空 = 还没身份（如登录接口）。
+        subject_verified: 这个 subject 是否来自**已验签的身份**。只有 True 才允许
+            参与"共享出口时改按主体分桶"，理由见类文档。
 
         返回 RateLimitResult。两个维度都查，任一超限即拒绝；返回的是"更严格"的那个。
         两个维度共用同一个 `now` —— 各算各的时钟会出现"IP 维度按旧窗口、会话维度按
@@ -277,7 +401,8 @@ class RateLimiter:
         results = []
 
         if ip:
-            key = f"ip:{ip}:{route or '-'}"
+            shared = self._note_subject(ip, route, subject)
+            key = self._ip_key(ip, route, subject, subject_verified, shared)
             used, reset = self._hit(key, self.per_minute, now)
             results.append(RateLimitResult(used <= self.per_minute, self.per_minute,
                                            max(0, self.per_minute - used), reset, "ip"))
@@ -334,4 +459,5 @@ def build_rate_limiter() -> RateLimiter:
         enabled=config.RATE_LIMIT_ENABLED,
         redis_url=config.REDIS_URL,
         by_session=config.RATE_LIMIT_BY_SESSION,
+        proxy_headers_trusted=config.TRUST_PROXY_HEADERS,
     )

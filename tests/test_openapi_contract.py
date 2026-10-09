@@ -28,7 +28,12 @@ import json
 import pytest
 
 from scripts.snapshot_openapi import (
-    SNAPSHOT, describe_change, dumps, load_schema, normalize, routes_of,
+    SNAPSHOT,
+    describe_change,
+    dumps,
+    load_schema,
+    normalize,
+    routes_of,
     unified_diff,
 )
 
@@ -43,6 +48,34 @@ EXPECTED_ROUTES = {
     # 当初漏了同步这份手写清单 —— 于是快照与代码都被 --write 抹平了，只有这里红着。
     "DELETE /v1/sessions/{thread_id}",
     "POST /v1/chat/resume",
+    # 用户鉴权（第二档，2026-10-01）。
+    # ⚠️ login / refresh 是**未认证可达**的（见 _UNAUTHENTICATED_ROUTES）：
+    #    "要求先登录才能登录"是个死循环，客户端永远拿不到第一份凭证。
+    "POST /v1/auth/login",
+    "POST /v1/auth/refresh",
+    "POST /v1/auth/logout",
+    "GET /v1/auth/me",
+    # 账号体系（2026-10-04）：自助注册 + 改自己的密码 + 加入租户的申请-审批。
+    # ⚠️ register 也是**未认证可达**的（同 login 的鸡生蛋问题）：它就是"第一份
+    #    凭证"的来源之一。默认关闭，要开须显式配 AUTH_ALLOW_SELF_REGISTER=true。
+    "POST /v1/auth/register",
+    "POST /v1/auth/password",
+    "POST /v1/join-requests",
+    "GET /v1/join-requests/me",
+    # 账号体系：管理员面（用户与租户的增删改查 + 审批）。
+    # 这些**不豁免**非 JWT 身份 —— 管理是"发权限"，归因不到人的主体不能做。
+    "POST /v1/admin/tenants",
+    "GET /v1/admin/tenants",
+    "GET /v1/admin/tenants/{name}",
+    "PATCH /v1/admin/tenants/{name}",
+    "DELETE /v1/admin/tenants/{name}",
+    "POST /v1/admin/users",
+    "GET /v1/admin/users",
+    "GET /v1/admin/users/{username}",
+    "PATCH /v1/admin/users/{username}",
+    "DELETE /v1/admin/users/{username}",
+    "GET /v1/admin/join-requests",
+    "POST /v1/admin/join-requests/{req_id}",
     # 旧路径：保留兼容，但已标记 deprecated（见下面的用例）
     "POST /chat",
     "POST /review",
@@ -55,6 +88,21 @@ EXPECTED_ROUTES = {
 
 #: 需要鉴权头的路由前缀。
 _AUTHED_PREFIXES = ("/v1/", "/chat", "/review")
+
+#: 例外：**必须**在未认证状态下可达的端点。
+#: 登录/刷新若要求先出示凭证，就是一个鸡生蛋的死循环 —— 客户端永远拿不到
+#: 第一份凭证。它们的防滥用手段是**限流**（登录端点单独过 `_rate_limit`），
+#: 不是鉴权。把这条显式写出来，是为了让"新增一个免鉴权端点"变成一次
+#: 需要人确认的动作，而不是顺手漏掉头声明就静默通过。
+#:
+#: 自助注册同理：它就是"第一份凭证"的来源之一，要求先登录才能注册等于把
+#: 自助注册这个功能本身取消掉。它默认**关闭**（AUTH_ALLOW_SELF_REGISTER），
+#: 打开后靠限流防刷 —— 这条豁免不是"顺手漏掉头声明"换来的，是刻意的。
+_UNAUTHENTICATED_ROUTES = frozenset({
+    "POST /v1/auth/login",
+    "POST /v1/auth/refresh",
+    "POST /v1/auth/register",
+})
 
 
 @pytest.fixture(scope="module")
@@ -143,10 +191,14 @@ def test_legacy_routes_are_marked_deprecated(snapshot):
 
 
 def test_v1_and_legacy_routes_accept_the_auth_headers(snapshot):
-    """需要鉴权的路由必须在 OpenAPI 里声明 `X-API-Key` / `X-Tenant-Id`。
+    """需要鉴权的路由必须在 OpenAPI 里声明 `Authorization` / `X-Tenant-Id`。
 
-    鉴权是自定义头（不是 Bearer），调用方只能从 OpenAPI 得知它的存在与名字。
-    漏声明的后果是接入方按文档写完必然 401，然后来问"为什么"。
+    调用方只能从 OpenAPI 得知这两个头的存在与名字，漏声明的后果是"按文档写完
+    必然 401，然后来问为什么"。
+
+    ⚠️ 2026-10-05：`X-API-Key`（共享密钥）**已从契约里删除**，这条随之改成
+    从**反面**钉住它不在了 —— 一个"照着旧文档带 X-API-Key"的接入方必须立刻
+    401，而不是拿到某种半开的状态。少一个人误以为那条路还通，就少一次排障。
     """
     for path, item in snapshot["paths"].items():
         if not path.startswith(_AUTHED_PREFIXES):
@@ -154,12 +206,21 @@ def test_v1_and_legacy_routes_accept_the_auth_headers(snapshot):
         for method, op in item.items():
             if method not in ("get", "post", "put", "patch", "delete"):
                 continue
+            if f"{method.upper()} {path}" in _UNAUTHENTICATED_ROUTES:
+                continue
             names = {p["name"] for p in (op.get("parameters") or [])}
-            assert "x-api-key" in names, (
-                f"{method.upper()} {path} 没有声明 X-API-Key 头"
+            # `Authorization: Bearer` 是**唯一**的凭证入口。
+            assert "authorization" in names, (
+                f"{method.upper()} {path} 没有声明 Authorization 头"
             )
+            # `X-Tenant-Id` 只是"确认"（与令牌里的租户不符即 403），不是租户来源；
+            # 它可选但必须声明，否则调用方不知道可以用它做一致性核对。
             assert "x-tenant-id" in names, (
                 f"{method.upper()} {path} 没有声明 X-Tenant-Id 头"
+            )
+            assert "x-api-key" not in names, (
+                f"{method.upper()} {path} 又声明了 X-API-Key —— 共享密钥路径已删除，"
+                "留着这个头会让接入方以为它还是凭证"
             )
 
 

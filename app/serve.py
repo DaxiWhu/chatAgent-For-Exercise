@@ -52,7 +52,7 @@ def loop_factory(use_subprocess: bool = False):
     if sys.platform == "win32":
         return asyncio.SelectorEventLoop()
     try:
-        import uvloop                       # 可选依赖；Linux/macOS 上更快
+        import uvloop  # 可选依赖；Linux/macOS 上更快
         return uvloop.new_event_loop()
     except Exception:                       # noqa: BLE001
         return asyncio.SelectorEventLoop()

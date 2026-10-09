@@ -22,10 +22,14 @@ import pytest
 redis = pytest.importorskip("redis", reason="需要 redis 客户端")
 fakeredis = pytest.importorskip("fakeredis", reason="用内存假 Redis 覆盖该代码路径")
 
-from app import metrics, ratelimit, quota  # noqa: E402
-from app import config                      # noqa: E402
-from app.quota import QuotaManager          # noqa: E402
-from app.ratelimit import RateLimiter       # noqa: E402
+from app import (  # noqa: E402
+    config,  # noqa: E402
+    metrics,
+    quota,
+    ratelimit,
+)
+from app.quota import QuotaManager  # noqa: E402
+from app.ratelimit import RateLimiter  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

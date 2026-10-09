@@ -18,12 +18,20 @@ contextvars 是 asyncio 原生的：每个请求任务有独立的副本，天�
 - json（默认，生产）：一行一个 JSON 对象，字段固定 ts/level/logger/msg[/request_id]，
   异常额外带 exc；日志系统（ELK/Loki）能直接按字段检索与聚合。
 - text：`asctime LEVEL logger [rid] msg`，本地开发看着顺眼。
+
+凭据脱敏
+--------
+本模块还负责**把所有日志记录里的凭据抹掉**（`redact()` / `install_redaction()`），
+由 `setup_logging()` 自动装上。原因与做法见下面的长注释 —— 一句话：
+DSN 里的口令会随 psycopg 异常被 `logging.error("...%s", e)` 带进日志，
+而调用点逐个覆盖不可能不漏。**脱敏是兜底网，不是"可以随便记"的许可证。**
 """
 
 import contextvars
 import json
 import logging
 import os
+import re
 import sys
 import time
 
@@ -37,6 +45,128 @@ _STD_ATTRS = {
     "relativeCreated", "thread", "threadName", "processName", "process", "taskName",
     "message",
 }
+
+
+# ---------------------------------------------------------------------------
+# 凭据脱敏（兜底网）
+# ---------------------------------------------------------------------------
+# 为什么要在**日志层**做，而不是在各调用点做
+# -----------------------------------------
+# 调用点脱敏是"记得就做、忘了就漏"，而本项目里存在一处**必然**泄漏的路径：
+#
+#     DSN 里带口令（`postgresql://user:pass@host/db`），而 psycopg / psycopg_pool
+#     的异常文本会把它带上；这些异常被 `logging.error("...：%s", e)` 记下来，
+#     口令就进了日志。
+#
+# 异常是透传的，"谁在哪一层记下来"事先不知道；第三方库（uvicorn/httpx/openai）
+# 自己打的日志更管不到。所以做法是**换掉日志记录工厂**
+# （`logging.setLogRecordFactory`）—— 那是唯一一个"所有记录都必然经过"的点。
+#
+# ⚠️ 为什么不给 handler 加 Filter：Logger 层级上的 filter 对"从子 logger 冒泡上来"
+#    的记录**不生效**（`Logger.callHandlers` 只调 handler 自己的 filter），
+#    而 uvicorn / psycopg / openai 各有一套 logger 与 handler，逐个挂必漏。
+#
+# ⚠️ 它**不**能替代"根本不要记录敏感值"：脱敏是兜底网，不是许可证。
+#
+# 每条模式都写成"锚点明确、量词有界"，因为脱敏跑在**每条日志**上。
+_REDACT_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # 带凭据的连接串。只脱口令那一节，保留 scheme/user/host ——
+    # 排障时要能认出"是哪个库连不上"。
+    # ⚠️ user 段写成 `*` 而不是 `+`：Redis 的常见写法是 `redis://:pass@host`
+    # （用户名留空），要求至少一个字符就会**整条漏掉**。
+    (re.compile(r"(?i)\b(postgres(?:ql)?|redis|rediss|amqp|amqps|mongodb(?:\+srv)?)"
+                r"://([^:@/\s]*):([^@/\s]+)@"),
+     r"\1://\2:***@"),
+    # `Authorization: Bearer <token>`（JWT 是长串 base64url，含 `.` 分隔）
+    (re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9\-._~+/=]{8,}"),
+     r"\1 ***"),
+    # `key=value` 形态的凭据。key 必须是明确的凭据名，避免误伤普通业务字段
+    # （比如日志里的 `secret_count=3` 这种）。
+    (re.compile(r"(?i)\b(access[_-]?token|refresh[_-]?token|api[_-]?key|apikey"
+                r"|auth[_-]?token|password|passwd|client[_-]?secret|secret)"
+                r"(\"?\s*[=:]\s*\"?)([^\s\"',;&]{4,})"),
+     r"\1\2***"),
+    # OpenAI 风格密钥。⚠️ 长度下限 16：短值（测试里的 `sk-test`）不该被抹掉，
+    # 否则守卫测试与排障都会被无谓地打断。
+    (re.compile(r"\bsk-[A-Za-z0-9]{16,}\b"),
+     "sk-***"),
+    # 私钥块：只要出现头，就别再往外写内容。
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]{0,4096}?"
+                r"-----END [A-Z ]*PRIVATE KEY-----"),
+     "-----BEGIN PRIVATE KEY-----***-----END PRIVATE KEY-----"),
+]
+
+_FORMATTER = logging.Formatter()
+_REDACTION_INSTALLED = False
+
+
+def redact(text: str) -> str:
+    """把文本里已知形态的凭据替换成 `***`。
+
+    纯函数、幂等（`postgresql://u:***@h` 再脱敏一次不变）—— 这样"工厂已脱敏过、
+    格式器又脱敏一次"不会互相打架。
+
+    text: 任意待输出文本。
+    """
+    if not text:
+        return text
+    out = text
+    for pattern, repl in _REDACT_PATTERNS:
+        out = pattern.sub(repl, out)
+    return out
+
+
+def _wrap_record(record: logging.LogRecord) -> None:
+    """把单条记录上**所有会被输出的文本**都换成脱敏版本。
+
+    覆盖四类出口：`getMessage()`（msg + args）、`extra=` 带的字符串字段、
+    异常堆栈（`exc_text`）、`stack_info`。少任何一类都是一个"看起来已脱敏"的假象。
+    """
+    original_get_message = record.getMessage
+
+    def _redacted_message() -> str:
+        return redact(original_get_message())
+
+    record.getMessage = _redacted_message        # type: ignore[method-assign]
+
+    # extra= 传进来的自定义字段：JsonFormatter 会把它们原样拼进 JSON，
+    # 所以 `extra={"authorization": "Bearer ..."}` 若不处理就直接落盘了。
+    for key, value in list(record.__dict__.items()):
+        if key in _STD_ATTRS or key.startswith("_"):
+            continue
+        if isinstance(value, str):
+            record.__dict__[key] = redact(value)
+
+    if record.exc_info:
+        try:
+            record.exc_text = redact(_FORMATTER.formatException(record.exc_info))
+        except Exception:                        # noqa: BLE001  脱敏失败不该影响日志
+            pass
+
+    if record.stack_info:
+        record.stack_info = redact(record.stack_info)
+
+
+def install_redaction() -> None:
+    """装上凭据脱敏（幂等）。由 `setup_logging()` 调用，不必单独调。"""
+    global _REDACTION_INSTALLED
+    if _REDACTION_INSTALLED:
+        return
+    _REDACTION_INSTALLED = True
+    base_factory = logging.getLogRecordFactory()
+
+    def factory(*args, **kwargs):
+        record = base_factory(*args, **kwargs)
+        _wrap_record(record)
+        return record
+
+    logging.setLogRecordFactory(factory)
+
+
+def redaction_installed() -> bool:
+    """本进程是否已装上脱敏（供守卫测试断言"启动路径真的装了它"）。"""
+    return _REDACTION_INSTALLED
+
 
 
 def set_request_id(rid: str) -> contextvars.Token:
@@ -78,7 +208,10 @@ class JsonFormatter(logging.Formatter):
                   + f".{int(record.msecs):03d}",
             "level": record.levelname,
             "logger": record.name,
-            "msg": record.getMessage(),
+            # 显式再脱敏一次：`install_redaction()` 已经在记录工厂里脱过，
+            # 但那张网是"进程级"的 —— 单独 import 本模块构造格式器（如测试）时
+            # 它可能没装。宁愿多跑一次（幂等、微秒级）也不要留一个假象。
+            "msg": redact(record.getMessage()),
         }
         rid = get_request_id()
         if rid:
@@ -88,12 +221,23 @@ class JsonFormatter(logging.Formatter):
             if k not in _STD_ATTRS and k not in payload and not k.startswith("_"):
                 try:
                     json.dumps(v)          # 只收可序列化的值，避免 json.dumps 整行失败
-                    payload[k] = v
+                    payload[k] = redact(v) if isinstance(v, str) else v
                 except (TypeError, ValueError):
-                    payload[k] = str(v)
+                    payload[k] = redact(str(v))
         if record.exc_info:
-            payload["exc"] = self.formatException(record.exc_info)
+            payload["exc"] = _exception_text(record, self)
         return json.dumps(payload, ensure_ascii=False)
+
+
+def _exception_text(record: logging.LogRecord, formatter: logging.Formatter) -> str:
+    """取异常文本并脱敏。
+
+    优先用记录上已有那份（`_wrap_record` 预格式化并脱敏过的），避免重复格式化；
+    没有就现场格式化再脱敏。
+    """
+    if record.exc_text:
+        return record.exc_text
+    return redact(formatter.formatException(record.exc_info))
 
 
 class TextFormatter(logging.Formatter):
@@ -105,9 +249,9 @@ class TextFormatter(logging.Formatter):
         head = f"{self.formatTime(record, '%H:%M:%S')} {record.levelname:<5} {record.name}"
         if rid:
             head += f" [{rid}]"
-        line = f"{head} {record.getMessage()}"
+        line = f"{head} {redact(record.getMessage())}"
         if record.exc_info:
-            line += "\n" + self.formatException(record.exc_info)
+            line += "\n" + _exception_text(record, self)
         return line
 
 
@@ -131,6 +275,11 @@ def setup_logging(level=None, fmt=None):
     """
     lvl = (level or os.getenv("LOG_LEVEL", "INFO")).upper()
     formatter = build_formatter(fmt or os.getenv("LOG_FORMAT", "json"))
+
+    # 脱敏与格式设置绑在一起：**只要配了日志，就一定有脱敏**。
+    # 单独放一个"记得调用"的启动步骤，迟早会漏 —— 而漏掉的后果是口令进日志，
+    # 且没有任何症状。
+    install_redaction()
 
     root = logging.getLogger()
     if not root.handlers:

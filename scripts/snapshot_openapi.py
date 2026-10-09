@@ -147,7 +147,13 @@ def main(argv=None) -> int:
     if args.write:
         SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
         old = SNAPSHOT.read_text(encoding="utf-8") if SNAPSHOT.exists() else ""
-        SNAPSHOT.write_text(text, encoding="utf-8")
+        # ⚠️ `newline="\n"`：Windows 上 `Path.write_text` 的默认行为是把 `\n`
+        # 改写成 `\r\n`，于是"在 Windows 上 --write 一次"就会把整份快照的**每一行**
+        # 都标成改动（内容其实没变），git diff 里看不出真正变了什么 —— 而这正是
+        # 快照门禁最怕的事：一次"顺手 --write"把真变更淹在换行噪声里。
+        # 与 `scripts/pg_table_stats.py` 同一口径（那里有 `test_write_uses_lf_even_on_windows`）。
+        with open(SNAPSHOT, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
         if not args.quiet:
             print(f"已写入 {rel}")
             if old and old != text:

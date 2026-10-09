@@ -22,14 +22,15 @@ os.environ["DB_URL"] = ""
 
 pytest.importorskip("fastapi.testclient", reason="TestClient 需要 httpx")
 
-from fastapi.testclient import TestClient      # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
 
-import app.main as M                            # noqa: E402
-from app import metrics                         # noqa: E402
+import app.main as M  # noqa: E402
+from app import metrics  # noqa: E402
 from app.middleware import BodySizeLimitMiddleware  # noqa: E402
-from app.ratelimit import RateLimiter           # noqa: E402
+from app.ratelimit import RateLimiter  # noqa: E402
+from tests.auth_util import auth_headers  # noqa: E402
 
-client = TestClient(M.app)
+client = TestClient(M.app, headers=auth_headers())
 MAX = M.config.MAX_REQUEST_BYTES
 
 

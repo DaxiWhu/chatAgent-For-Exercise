@@ -19,6 +19,7 @@ import logging
 import os
 
 from . import config
+from .logging_setup import get_request_id
 
 
 def init_tracing() -> str:
@@ -98,8 +99,9 @@ def build_run_config(base_config: dict, thread_id: str = "", tenant: str = "",
 
     返回**新的** dict（不就地改入参），带上：
       - callbacks：Langfuse handler（无则省略该键）；
-      - metadata：app_version / release / thread_id / tenant —— 线上复盘时
-        "这条 trace 属于哪个版本、哪个租户"是最先要看的两个维度；
+      - metadata：app_version / release / thread_id / tenant / request_id —— 线上复盘时
+        "这条 trace 属于哪个版本、哪个租户"是最先要看的两个维度，而 `request_id` 是
+        **用户唯一报得出来的那个标识**（它与日志里的 rid 是同一个值，两边能对上）；
       - configurable.rag_tenant：检索隔离用（仅当显式传入时）。
     """
     cfg = dict(base_config or {})
@@ -111,6 +113,11 @@ def build_run_config(base_config: dict, thread_id: str = "", tenant: str = "",
         "release": config.APP_RELEASE,
         "thread_id": thread_id,
         "tenant": tenant,
+        # ⚠️ `request_id` 由 middleware 写进 contextvar，这里读的是**当前请求**的值
+        # （不在请求上下文里时是空串，下面的过滤会把它整个丢掉 —— 不留空键）。
+        # 为什么必须有它：`X-Request-ID` 是**用户唯一能报出来的**标识（日志里也是它），
+        # 而在此之前它反查不到任何一条 trace ⇒ "用户说这次答得不对"就只能靠时间点大海捞针。
+        "request_id": get_request_id(),
     }
     cfg["metadata"] = {**(cfg.get("metadata") or {}), **{k: v for k, v in meta.items() if v}}
     if rag_tenant is not None:

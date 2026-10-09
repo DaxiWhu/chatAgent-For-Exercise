@@ -19,8 +19,9 @@ pytest.importorskip("fastapi.testclient", reason="TestClient 需要 httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
+from tests.auth_util import auth_headers  # noqa: E402
 
-client = TestClient(app)
+client = TestClient(app, headers=auth_headers())
 
 
 def test_health_ok():

@@ -27,6 +27,7 @@
 """
 
 import bisect
+import logging
 import threading
 import time
 from collections import defaultdict
@@ -199,11 +200,56 @@ def _fmt_labels(labels):
     return "{" + inner + "}"
 
 
+def _histogram_lines(name, labels, cum, total_sum, total_count):
+    """一个直方图的 `_bucket` / `_sum` / `_count` 三件套（`le` 递增，末桶 `+Inf`）。
+
+    `_bucket` 是**累积**的（le = 小于等于）：0.3 秒同时落进 le=0.5 及之后每一格。
+    `strict=False` 是**显式**的：cum 是直方图累计值，长度本就比边界多一（末桶是 +Inf），
+    这里刻意丢掉尾巴。B905 的价值就在于逼出这个判断，而不是消掉一条告警。
+    """
+    out = []
+    for b, cnt in zip(_BUCKETS, cum, strict=False):
+        lab = dict(labels)
+        lab["le"] = b
+        out.append(f"{name}_bucket{_fmt_labels(tuple(sorted(lab.items())))} {cnt}")
+    lab = dict(labels)
+    lab["le"] = "+Inf"
+    out.append(f"{name}_bucket{_fmt_labels(tuple(sorted(lab.items())))} {cum[-1]}")
+    out.append(f"{name}_sum{_fmt_labels(labels)} {total_sum}")
+    out.append(f"{name}_count{_fmt_labels(labels)} {total_count}")
+    return out
+
+
 def render():
     """输出 Prometheus 文本格式（text/plain; version=0.0.4）。
 
     计数器输出 `# TYPE x counter` + 样本行；直方图输出 `_bucket/_sum/_count` 三件套。
     末尾附带 `process_uptime_seconds`，便于看实例存活时长。
+
+    ⚠️ **TYPE 行必须按"指标名"去重，且排在该名字的所有样本之前**
+    ----------------------------------------------------------
+    这是 Prometheus 文本格式的硬规定（官方 exposition_formats 文档原文：
+    "Only one `TYPE` line may exist for a given metric name"，且
+    "The `TYPE` line ... must appear before the first sample is reported"）。
+
+    2026-10-06 修掉了一个**让整套监控全盲**的实现错误：原先的循环写成
+    "每个 (指标名, 标签组合) 打一行 TYPE"，于是只要某个指标有 ≥2 个标签组合
+    （`http_requests_total{method,path,status}` 在生产必然如此），输出里就会出现
+    重复的 TYPE 行，且第 2 行起**落在样本之后**。Prometheus 的 Go 解析器
+    （`expfmt/text_parse.go` 的 `readingType`）对此直接报：
+
+        text format parsing error in line N: second TYPE line for metric name "x",
+        or TYPE reported after samples
+
+    并且**立即中止解析**、整批样本丢弃 ⇒ target 变成 `up == 0`。
+    危害量级不是"少一个指标"，而是 **34 个指标 + SLO + 燃尽率 + 全部告警规则
+    所依赖的数据根本不存在** —— 而本地/测试用 Python 的 `prometheus_client`
+    解析器验证时会**误判为正常**（它比 Go 实现宽容），所以这个缺陷在
+    单测里是隐形的。守卫见 `tests/test_observability.py`。
+
+    另一个被顺带堵住的口子：同一个指标名**跨类型**（既是 counter 又是 gauge）
+    同样会输出两行 TYPE。这类撞名属于编程错误，这里记 ERROR 并保留先注册的
+    类型，而不是让整个 /metrics 变成非法文本。
     """
     lines = []
     with _LOCK:
@@ -213,28 +259,30 @@ def render():
                       for k, h in _HISTOGRAMS.items()}
         gauges = dict(_GAUGES)
 
-    for (name, labels), val in sorted(counters.items()):
-        lines.append(f"# TYPE {name} counter")
-        lines.append(f"{name}{_fmt_labels(labels)} {val}")
-        lines.append("")
+    # name -> 该名字下的全部 (labels, payload)；kinds 记录它已声明的类型
+    families: dict[str, list] = {}
+    kinds: dict[str, str] = {}
+    for kind, table in (("counter", counters), ("gauge", gauges),
+                        ("histogram", histograms)):
+        for (name, labels), payload in table.items():
+            declared = kinds.setdefault(name, kind)
+            if declared != kind:
+                logging.error(
+                    "指标名跨类型重复：%s 已声明为 %s，又被当作 %s 写入 —— "
+                    "该指标名会被跳过（同名多个 TYPE 行会让整个 /metrics 变非法）",
+                    name, declared, kind)
+                continue
+            families.setdefault(name, []).append((labels, payload))
 
-    for (name, labels), val in sorted(gauges.items()):
-        lines.append(f"# TYPE {name} gauge")
-        lines.append(f"{name}{_fmt_labels(labels)} {val}")
-        lines.append("")
-
-    for (name, labels), (cum, total_sum, total_count) in sorted(histograms.items()):
-        lines.append(f"# TYPE {name} histogram")
-        # `_bucket` 是**累积**的（le = 小于等于）：0.3 秒同时落进 le=0.5 及之后每一格
-        for b, cnt in zip(_BUCKETS, cum):
-            lab = dict(labels)
-            lab["le"] = b
-            lines.append(f"{name}_bucket{_fmt_labels(tuple(sorted(lab.items())))} {cnt}")
-        lab = dict(labels)
-        lab["le"] = "+Inf"
-        lines.append(f"{name}_bucket{_fmt_labels(tuple(sorted(lab.items())))} {cum[-1]}")
-        lines.append(f"{name}_sum{_fmt_labels(labels)} {total_sum}")
-        lines.append(f"{name}_count{_fmt_labels(labels)} {total_count}")
+    for name in sorted(families):
+        kind = kinds[name]
+        lines.append(f"# TYPE {name} {kind}")
+        # 组内按标签元组排序：输出顺序可复现，便于 diff 与断言
+        for labels, payload in sorted(families[name], key=lambda row: row[0]):
+            if kind == "histogram":
+                lines.extend(_histogram_lines(name, labels, *payload))
+            else:
+                lines.append(f"{name}{_fmt_labels(labels)} {payload}")
         lines.append("")
 
     lines.append("# TYPE process_uptime_seconds gauge")

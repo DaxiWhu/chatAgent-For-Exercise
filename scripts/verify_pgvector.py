@@ -38,21 +38,21 @@ def db_report(dsn, table):
     try:
         with psycopg.connect(dsn, connect_timeout=5) as conn:
             cur = conn.cursor()
-            cur.execute("select count(*) from %s" % table)
-            print("[库统计] %s 行数 = %d" % (table, cur.fetchone()[0]))
+            cur.execute(f"select count(*) from {table}")
+            print(f"[库统计] {table} 行数 = {cur.fetchone()[0]}")
             cur.execute("select extversion from pg_extension where extname='vector'")
             row = cur.fetchone()
             print("[库统计] vector 扩展版本 =", row[0] if row else "未安装 !!")
             cur.execute(
-                "select source, count(*), vector_dims(embedding) from %s "
-                "group by source, vector_dims(embedding) order by source" % table
+                f"select source, count(*), vector_dims(embedding) from {table} "
+                "group by source, vector_dims(embedding) order by source"
             )
             for src, cnt, dim in cur.fetchall():
-                print("           %-24s %3d 块  维度=%d" % (src, cnt, dim))
+                print(f"           {src:<24} {cnt:>3d} 块  维度={dim}")
             cur.execute("select indexname from pg_indexes where tablename=%s", (table,))
             print("[库统计] 索引 =", [r[0] for r in cur.fetchall()])
     except Exception as e:  # noqa: BLE001
-        print("[库统计] 失败：%s: %s" % (type(e).__name__, e))
+        print(f"[库统计] 失败：{type(e).__name__}: {e}")
 
 
 def main():
@@ -67,21 +67,21 @@ def main():
 
     t0 = time.time()
     retriever = R.build_retriever(chunks)
-    print("检索器 = %s（构建耗时 %.1fs）" % (type(retriever).__name__, time.time() - t0))
+    print(f"检索器 = {type(retriever).__name__}（构建耗时 {time.time() - t0:.1f}s）")
 
     if R.DB_URL:
         db_report(R.DB_URL, R.PGVECTOR_TABLE)
 
     hits = retriever.search("梧州六堡茶有什么特点", 3)
-    print("检索命中 %d 条" % len(hits))
+    print(f"检索命中 {len(hits)} 条")
     for i, item in enumerate(hits):
         if isinstance(item, tuple):
             item = item[0]
         if isinstance(item, dict):
             text = (item.get("text") or "").replace("\n", " ")[:46]
-            print("  [%d] %s | %s" % (i, item.get("source"), text))
+            print(f"  [{i}] {item.get('source')} | {text}")
         else:
-            print("  [%d] %r" % (i, item))
+            print(f"  [{i}] {item!r}")
 
 
 if __name__ == "__main__":
