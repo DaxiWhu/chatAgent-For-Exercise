@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from types import SimpleNamespace
 
@@ -54,6 +55,8 @@ _KNOBS = (
     "AGENT_REFLECT_AFTER_HOPS",
     "AGENT_REFLECT_ON_REPEAT",
     "AGENT_REFLECT_MAX_LEVEL1",
+    "AGENT_REFLECT_MAX_LEVEL2",
+    "AGENT_REFLECT_MAX_FIRES",
     "AGENT_REFLECT_TIMEOUT",
     "AGENT_REFLECT_WAIT_SECONDS",
     "AGENT_HISTORY_TOKEN_LIMIT",
@@ -334,19 +337,25 @@ def test_nothing_fires_when_the_guard_is_off(monkeypatch):
     assert ctx.reflection.tasks == set()
 
 
-def test_no_more_fires_than_the_injection_cap(monkeypatch, sink):
-    """发起次数不超过注入上限 —— 多发的结论没有位置可去（每次注入都会清空队列）。
+def test_no_more_fires_than_the_fire_cap(monkeypatch, sink):
+    """发起次数不超过**发起上限**（``AGENT_REFLECT_MAX_FIRES``）。
 
-    ⚠️ 这条同时钉住"发起"这件事**不会**因为反复调用 ``maybe_reflect`` 而失控：
+    ⚠️ 第 4 步之前这条断言的是"不超过**注入**上限"—— 那时两者是同一个数。第 4 步把发起
+    上限拆出来之后，用注入上限去卡发起次数会让第 2 级**永远轮不到**（它的触发线是
+    "第 1 级上限 + 1"，本来就发生在注入额度用光之后），所以这里改成钉住发起上限本身生效。
+
+    ⚠️ 它同时钉住"发起"这件事**不会**因为反复调用 ``maybe_reflect`` 而失控：
     钩子每次工具结束都会调它一次，一个 12 轮的运行会调十几次。
+    ⚠️ 这里**故意**让发起上限(1) ≠ 注入上限(2)：两个数相等时，"用了错的哪一个"是测不出来的。
     """
-    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=1, AGENT_REFLECT_MAX_LEVEL1=2)
+    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=1, AGENT_REFLECT_MAX_FIRES=1)
     ctx = TaskContext()
     for i in range(1, 6):
         _do(ctx, "kb_search", json.dumps({"q": i}), i)
         _fire(ctx)
 
-    assert sum(ctx.reflection.fired.values()) == 2, ctx.reflection.fired
+    assert sum(ctx.reflection.fired.values()) == 1, ctx.reflection.fired
+    assert R.max_level1() == 2, "另一个数保持默认，否则这条测不出「用错了哪一个」"
 
 
 def test_in_flight_tasks_are_held_and_released(monkeypatch):
@@ -746,3 +755,397 @@ def test_an_end_to_end_run_does_not_blow_up_when_the_gate_fires(tmp_path, monkey
     assert out.answer == "答复。"
     assert out.exit_reason != "error"
     assert ctx.reflection.fired == {"tools": 1}, "闸门没被触发（这条用例就白跑了）"
+
+
+# --------------------------------------------------------------------------- #
+# 八、第 2 级：退回（撤回那一步）
+# --------------------------------------------------------------------------- #
+def _loop(problem: str = "loop", step: int = 1):
+    """让假旁路模型稳定报"同一类问题、同一步"。"""
+    return lambda evidence: {"problem": problem, "summary": "在打转", "step": step}
+
+
+def _tool_items(call_id: str, tool: str = "kb_search", output: str = "结果") -> list[dict]:
+    """一对"工具调用 + 结果"条目 —— 形状取自实测（见 probe_input_call_id.py）。"""
+    return [
+        {"id": call_id, "type": "function_call", "call_id": call_id,
+         "name": tool, "arguments": "{}"},
+        {"type": "function_call_output", "call_id": call_id, "output": output},
+    ]
+
+
+def test_fire_cap_defaults_leave_room_for_level_two():
+    """★★ 默认的**发起**上限必须装得下两级额度，否则第 2 级永远轮不到。
+
+    第 2 级的触发线是"第 1 级上限 + 1"—— 它**本来就发生在第 1 级额度用光之后**。
+    所以发起上限必须 ≥ 第 1 级上限 + 第 2 级上限（默认 2 + 1 = 3）。
+    ⚠️ 这个组合配错**不报错、不影响交付**：反思照常触发、提醒照常注入、指标照常在涨，
+    只有"退回"从不发生 —— 而"退回很少见"与"退回不可能发生"在看板上长得一模一样。
+    """
+    assert R._max_fires() >= R.max_level1() + R.max_level2()
+
+
+def test_a_too_small_fire_cap_warns_once(monkeypatch, caplog):
+    """发起上限装不下两级额度 ⇒ 打一条 warning，**而且只打一次**。
+
+    ⚠️ "只一次"是硬要求：本函数在**每次工具结束**都会被调到，一个 12 轮的运行会调十几次，
+    每次都打等于把日志变成噪声（同 history_budget 那条"打一次就够"的做法）。
+    """
+    _enable(monkeypatch, AGENT_REFLECT_MAX_FIRES=1)
+    caplog.set_level(logging.WARNING)
+
+    R._warn_once_if_the_cap_is_too_small()
+    R._warn_once_if_the_cap_is_too_small()
+    R._warn_once_if_the_cap_is_too_small()
+
+    hits = [r for r in caplog.records if "第 2 级" in r.getMessage()]
+    assert len(hits) == 1, f"配置自检打了 {len(hits)} 次"
+
+
+def test_default_fire_cap_says_nothing(caplog):
+    """默认配置下**不该**打这条 warning（否则守卫会教人无视它）。"""
+    caplog.set_level(logging.WARNING)
+
+    R._warn_once_if_the_cap_is_too_small()
+
+    assert not [r for r in caplog.records if "第 2 级" in r.getMessage()]
+
+
+def test_revertable_tools_are_read_only():
+    """★ 可撤回 = **只读**的动作；落盘类一个都不能进白名单。
+
+    撤回的语义是"让模型重做那一步"，而**已落盘的副作用拿不回来**（文件还在）——
+    撤一个落盘动作 = 得到两份产物。⚠️ 用白名单而不是黑名单：黑名单下"新加一个工具"
+    默认是**能**被撤回的，而"它有没有副作用"只有当它真被撤回一次、留下两份文件时才暴露。
+    """
+    revertable = R.revertable_tools()
+
+    assert revertable == {"kb_search", "research", "review_draft"}
+    for tool in ("save_text_asset", "generate_image", "build_slide_deck", "make_illustration"):
+        assert tool not in revertable, f"{tool} 有副作用，不能被撤回"
+
+
+def test_revert_decision_requires_a_whitelisted_tool():
+    """``_revert_decision`` 的四条分支：正常 / 还没到线 / 额度用完 / 白名单外。
+
+    ⚠️ 顺序是有意的：**先判升级线**。反过来的话，第 1、2 次反思（还没到升级的时候）
+    也会被计进 ``capped`` / ``side_effect``，那个指标立刻变成噪声。
+    """
+    due = {"loop": 3}
+
+    ok, why = R._revert_decision(
+        R.ReflectionState(kinds=dict(due)),
+        R.ReflectiveFinding(problem="loop", step=1, tool="kb_search"),
+    )
+    assert (ok, why) == (True, "")
+
+    ok, why = R._revert_decision(
+        R.ReflectionState(kinds={"loop": 1}),
+        R.ReflectiveFinding(problem="loop", step=1, tool="kb_search"),
+    )
+    assert (ok, why) == (False, ""), "还没到升级线时不该计任何「异常原因」"
+
+    ok, why = R._revert_decision(
+        R.ReflectionState(kinds=dict(due), reverted=1),
+        R.ReflectiveFinding(problem="loop", step=1, tool="kb_search"),
+    )
+    assert (ok, why) == (False, "capped")
+
+    ok, why = R._revert_decision(
+        R.ReflectionState(kinds=dict(due)),
+        R.ReflectiveFinding(problem="loop", step=1, tool="save_text_asset"),
+    )
+    assert (ok, why) == (False, "side_effect")
+
+    ok, why = R._revert_decision(
+        R.ReflectionState(kinds=dict(due)),
+        R.ReflectiveFinding(problem="loop", step=1, tool=""),
+    )
+    assert (ok, why) == (False, "side_effect"), "认不出工具名时必须 fail-safe（不可撤回）"
+
+
+def test_attach_step_ignores_a_step_the_model_made_up():
+    """★ "第几步"一律从**步骤清单**落定，不信模型报的编号与 ``call_id``。
+
+    撤回要按 ``call_id`` 定位，而模型完全可能报一个不存在（或指到别的动作上）的编号。
+    拿模型编的编号去定位，等于**把撤回交给模型决定** —— 而它撤掉的会是哪一条完全不可控。
+    """
+    ctx = TaskContext()
+    _do(ctx, "kb_search", '{"q": 1}', 1)
+
+    lying = R.ReflectiveFinding(problem="loop", step=99, call_id="c1", tool="kb_search")
+    R._attach_step(ctx, lying)
+    assert (lying.step, lying.call_id, lying.tool) == (0, "", ""), (
+        "越界步号必须退化成「不指代」，不能当成第 1 步去撤"
+    )
+
+    truth = R.ReflectiveFinding(problem="loop", step=1, call_id="骗人的")
+    R._attach_step(ctx, truth)
+    assert (truth.step, truth.call_id, truth.tool) == (1, "c1", "kb_search")
+
+
+def test_attach_step_tolerates_a_missing_or_absent_step():
+    """``step`` 缺失 / 非正数 / 上下文里没有步骤 ⇒ 一律归 0，不抛异常。"""
+    ctx = TaskContext()
+    finding = R.ReflectiveFinding(problem="loop")
+    R._attach_step(ctx, finding)
+
+    assert (finding.step, finding.call_id, finding.tool) == (0, "", "")
+
+
+def test_the_third_same_problem_reverts(monkeypatch):
+    """★★ 同类问题出现到**第 3 次**才退回（用户 2026-10-09 拍板）。
+
+    前两次只是提醒（"先提醒 N 次、还不行才撤"），第 3 次才动上下文。
+    """
+    monkeypatch.setattr(R, "_reflect_sync", _loop())
+    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=1)
+    ctx = TaskContext()
+    for i in range(1, 4):
+        _do(ctx, "kb_search", json.dumps({"q": "same"}), i)
+        _fire(ctx)
+
+    assert ctx.reflection.kinds == {"loop": 3}
+    assert [f.level for f in ctx.reflection.pending] == [1, 1, 2]
+    assert ctx.reflection.reverted == 1
+    last = ctx.reflection.pending[-1]
+    assert (last.call_id, last.tool) == ("c1", "kb_search"), (
+        "撤回的定位没落到步骤清单上（`call_id` 必须来自步骤记录，不是模型报的）"
+    )
+
+
+def test_two_same_problems_stay_at_level_one(monkeypatch):
+    """第 2 次同类问题**还不到**升级线 ⇒ 两级都仍是"注入提醒"。"""
+    monkeypatch.setattr(R, "_reflect_sync", _loop())
+    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=1)
+    ctx = TaskContext()
+    for i in range(1, 3):
+        _do(ctx, "kb_search", json.dumps({"q": "same"}), i)
+        _fire(ctx)
+
+    assert [f.level for f in ctx.reflection.pending] == [1, 1]
+    assert ctx.reflection.reverted == 0
+
+
+def test_the_revert_line_follows_the_level_one_cap(monkeypatch):
+    """★ 触发线 = **第 1 级上限 + 1**（把第 1 级额度配小 ⇒ 第 2 次同类问题就退回）。
+
+    这条钉住"两个数是推导关系"而不是各配各的：把触发线写成写死的常量时它会红。
+    """
+    monkeypatch.setattr(R, "_reflect_sync", _loop())
+    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=1,
+            AGENT_REFLECT_MAX_LEVEL1=1, AGENT_REFLECT_MAX_FIRES=2)
+    ctx = TaskContext()
+    for i in range(1, 3):
+        _do(ctx, "kb_search", json.dumps({"q": "same"}), i)
+        _fire(ctx)
+
+    assert [f.level for f in ctx.reflection.pending] == [1, 2]
+
+
+def test_only_the_same_kind_of_problem_counts_towards_the_line(monkeypatch):
+    """判"没纠正"的判据是**问题类型相同**，不是"又出问题了"。
+
+    两次 ``loop`` 夹一次 ``stuck`` ⇒ ``loop`` 只累计到 2 ⇒ 不到升级线。
+    ⚠️ 反过来（数"任意问题"的总数）会把"先打转、后卡住"这种**换了种毛病**的情况判成
+    "没纠正"，于是升级到一个和当前问题无关的处置上。
+    """
+    scripted = iter([_loop("loop"), _loop("stuck"), _loop("loop")])
+    monkeypatch.setattr(R, "_reflect_sync", lambda evidence: next(scripted)(evidence))
+    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=1)
+    ctx = TaskContext()
+    for i in range(1, 4):
+        _do(ctx, "kb_search", json.dumps({"q": "same"}), i)
+        _fire(ctx)
+
+    assert ctx.reflection.kinds == {"loop": 2, "stuck": 1}
+    assert ctx.reflection.reverted == 0
+
+
+def test_reverting_something_with_side_effects_is_skipped_and_counted(monkeypatch, sink):
+    """★ 落盘类动作**不撤**，但"本来该撤却没撤"必须**计数**。
+
+    不计数的话"退回从没发生过"只能靠人盯着看 —— 而它跟"一直没出问题"长得一模一样。
+    """
+    monkeypatch.setattr(R, "_reflect_sync", _loop())
+    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=1)
+    ctx = TaskContext()
+    for i in range(1, 4):
+        _do(ctx, "save_text_asset", json.dumps({"name": f"n{i}"}), i)
+        _fire(ctx)
+
+    assert ctx.reflection.reverted == 0
+    assert [f.level for f in ctx.reflection.pending] == [1, 1, 1]
+    assert [e[3] for e in sink.counters("agent_recovery_skipped_total")] == [
+        {"reason": "side_effect"}
+    ], "只有第 3 次（真到升级线那一次）该计 —— 前两次属正常"
+
+
+def test_reverting_when_the_budget_is_gone_is_counted(monkeypatch, sink):
+    """``AGENT_REFLECT_MAX_LEVEL2=0`` ⇒ 只提醒、绝不撤；到线的那些计入 ``capped``。"""
+    monkeypatch.setattr(R, "_reflect_sync", _loop())
+    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=1, AGENT_REFLECT_MAX_LEVEL2=0)
+    ctx = TaskContext()
+    for i in range(1, 4):
+        _do(ctx, "kb_search", json.dumps({"q": "same"}), i)
+        _fire(ctx)
+
+    assert ctx.reflection.reverted == 0
+    assert [e[3] for e in sink.counters("agent_recovery_skipped_total")] == [
+        {"reason": "capped"}
+    ]
+
+
+def test_the_revert_note_tells_the_model_the_step_was_removed():
+    """★★ 撤回说明必须写明"那一步已经被撤掉了"。
+
+    不写的后果是最坏的一种组合：模型看不到那一步，却收到一段"你在第 N 步打转"的提醒 ——
+    它要么当成幻觉忽略，要么**再把那个动作做一遍**，而"再做一遍"正是退回要阻止的事。
+    ⚠️ "不是用户的新要求"这句同样必须留：撤回说明看着比提醒更像一条指令。
+    """
+    note = R.ReflectiveFinding(
+        problem="loop", summary="在打转", step=3, tool="kb_search", advice="换关键词"
+    ).as_revert_note()
+
+    assert "已把第 3 步" in note and "kb_search" in note
+    assert "撤掉" in note
+    assert "不是" in note and "重新开始" in note
+    assert "换关键词" in note
+
+
+def test_revert_removes_the_step_and_everything_after_it():
+    """★ 撤回 = **从那一步删到末尾**（让模型回到那一步之前重新决定）。
+
+    只删那一条、把之后的东西留着的话，模型看到的是"我做了 Y，但我没做过它依赖的 X" ——
+    一段没有来由的历史。
+    """
+    ctx = TaskContext()
+    ctx.reflection.pending.append(
+        R.ReflectiveFinding(problem="loop", summary="在打转", step=1,
+                            call_id="c1", tool="kb_search", level=2)
+    )
+    md = _inputs({"role": "user", "content": "问"}, *_tool_items("c1"), *_tool_items("c2"))
+
+    out = asyncio.run(R.inject_reflections(md, context=ctx))
+
+    assert len(out.input) == 2, f"撤回后应只剩「用户消息 + 撤回说明」，实际 {out.input}"
+    assert out.input[0] == {"role": "user", "content": "问"}
+    assert out.input[-1]["role"] == "system"
+    assert "已把第 1 步" in out.input[-1]["content"]
+    assert ctx.reflection.revoked == {"c1", "c2"}, "被撤掉的那一段的 call_id 没记下来"
+    assert ctx.reflection.injected == 0, "第 2 级不该占用第 1 级的注入额度"
+
+
+def test_revert_is_persistent_across_later_model_calls():
+    """★★★ 撤回必须**持久** —— 之后每一次模型调用都不再看到那一段。
+
+    这是第 2 级最容易写成"看起来生效"的地方：注入口的改写是**本次调用专用**的
+    （官方 ``maybe_filter_model_input`` 只覆盖这一次），运行状态里的条目下一轮又被拼回输入
+    （``run_internal/run_loop.py``：``run_state._generated_items = ...``）。
+    ⇒ 只删一次的表现是"下一轮那条动作又回来了"，而模型会以为自己没做过、很可能再调一次。
+    """
+    ctx = TaskContext()
+    ctx.reflection.pending.append(
+        R.ReflectiveFinding(problem="loop", summary="在打转", step=1,
+                            call_id="c1", tool="kb_search", level=2)
+    )
+    md = _inputs({"role": "user", "content": "问"}, *_tool_items("c1"), *_tool_items("c2"))
+    asyncio.run(R.inject_reflections(md, context=ctx))
+    assert ctx.reflection.pending == []          # 这一轮已经处理过了
+
+    # 下一轮：官方又会把（它自己那份）条目原样送进来 —— 必须靠 revoked 滤掉
+    again = _inputs({"role": "user", "content": "问"}, *_tool_items("c1"), *_tool_items("c2"))
+    out = asyncio.run(R.inject_reflections(again, context=ctx))
+
+    assert [i.get("content") for i in out.input] == ["问"], (
+        f"被撤回的条目又回到了模型眼前：{out.input}"
+    )
+
+
+def test_revoked_items_never_reach_the_model_in_a_real_run(tmp_path):
+    """★★ 同一条不变量，走**真实运行**再验一遍：被撤回的那一步到不了模型面前。
+
+    上面那条测的是"注入口做了什么"，这条测的是"模型**看到**了什么" —— 中间还隔着
+    ``runner.model_input_filter`` 与 SDK 自己的一层处理（它会对过滤器返回的条目做
+    ``deduplicate_input_items_preferring_latest``）。只测前者是不够的。
+    """
+    ctx = make_ctx(tmp_path)
+    ctx.reflection.revoked.add("c1")
+    model = ScriptedModel([
+        call("save_text_asset", {"name": "n", "content": "c"}, "c1"),
+        decide("答复。"),
+    ])
+
+    asyncio.run(_run_frontline("写一段文字", ctx=ctx, model=model))
+
+    assert ctx.reflection.injected == 0          # 没有待注入结论 ⇒ 只是"滤掉"
+    seen = _flatten(model.calls[1].input)
+    assert "c1" not in seen, "被撤回的那一步仍然到了模型面前"
+    assert "写一段文字" in seen
+
+
+def test_unlocatable_step_falls_back_to_a_note_and_is_counted(monkeypatch, sink):
+    """★ 那一步已经不在输入里（被裁剪 / 压缩吃掉）⇒ **当次不退回**，降级成提醒并计数。
+
+    方案 §8 的风险清单第 6 条就是这条：压缩会把老历史换成摘要，而退回要删的是**具体条目**。
+    选择"降级 + 计数"而不是"直接放弃"：能力退化本身必须是看得见的 —— 否则
+    "退回老是不生效"与"一直没出问题"在看板上一模一样。
+    """
+    ctx = TaskContext()
+    ctx.reflection.pending.append(
+        R.ReflectiveFinding(problem="loop", summary="在打转", step=7,
+                            call_id="早被裁掉了", tool="kb_search", level=2)
+    )
+    md = _inputs({"role": "user", "content": "问"})
+
+    out = asyncio.run(R.inject_reflections(md, context=ctx))
+
+    assert out.input[0]["content"] == "问"
+    assert out.input[-1]["role"] == "system"
+    assert "在打转" in out.input[-1]["content"], "降级后应给出一条提醒"
+    assert "已把第 7 步" not in out.input[-1]["content"], "没撤成却告诉模型撤了"
+    assert ctx.reflection.revoked == set()
+    assert ctx.reflection.injected == 1
+    assert [e[3] for e in sink.counters("agent_recovery_skipped_total")] == [
+        {"reason": "not_found"}
+    ]
+
+
+def test_unlocatable_step_with_no_budget_left_changes_nothing(sink):
+    """定位不到、而且第 1 级额度也用光了 ⇒ **原样返回**（连拷贝都不做）。"""
+    ctx = TaskContext()
+    ctx.reflection.injected = R.max_level1()      # 额度已用光
+    ctx.reflection.pending.append(
+        R.ReflectiveFinding(problem="loop", summary="在打转", step=7,
+                            call_id="早被裁掉了", tool="kb_search", level=2)
+    )
+    md = _inputs({"role": "user", "content": "问"})
+
+    out = asyncio.run(R.inject_reflections(md, context=ctx))
+
+    assert out is md, "什么都没做却重建了输入"
+    assert [e[3] for e in sink.counters("agent_recovery_skipped_total")] == [
+        {"reason": "not_found"}
+    ]
+
+
+def test_level_two_ignores_the_injection_budget():
+    """★★ 第 2 级**不受**注入上限约束 —— 它本来就发生在注入额度用光之后。
+
+    拿注入上限去卡撤回，退回就永远不会发生（而触发线正是"第 1 级上限 + 1"）。
+    这条同时说明两级的"上限"是各自独立的两个数。
+    """
+    ctx = TaskContext()
+    ctx.reflection.injected = R.max_level1()          # 额度已经用光
+    ctx.reflection.pending.append(
+        R.ReflectiveFinding(problem="loop", summary="在打转", step=1,
+                            call_id="c1", tool="kb_search", level=2)
+    )
+    md = _inputs({"role": "user", "content": "问"}, *_tool_items("c1"))
+
+    out = asyncio.run(R.inject_reflections(md, context=ctx))
+
+    assert ctx.reflection.revoked == {"c1"}
+    assert out.input[0] == {"role": "user", "content": "问"}
+    assert len(out.input) == 2
+    assert ctx.reflection.injected == R.max_level1(), "第 2 级不该动第 1 级的计数"
