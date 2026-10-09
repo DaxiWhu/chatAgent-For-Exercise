@@ -27,6 +27,10 @@ hooks（SDK 源码里 ``as_tool`` 有独立的 ``hooks=`` 形参，默认 None�
 ``on_tool_end`` 拿到的已经是那句话（实测：失败路径照样触发这个钩子）⇒ 从钩子侧
 分不出"真的成功了"与"收到一句错误文本"。所以成败由**工具自己的错误处理函数**
 先定格，见 ``steps.tool_error_handler``。
+
+另外，``on_tool_end`` 还是**反思闸门的判决口**：每次动作定格后判一次"够了没有"
+（见 ``reflection.maybe_reflect``）。闸门数的几个量全是"定格"的产物，所以判点必须
+落在定格**之后** —— 早一步会让重复数系统性偏小，而"指标偏小"没有任何东西会报错。
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ from typing import Any
 
 from agents import RunHooks
 
+from . import reflection
 from .context import AgentStats, TaskContext
 from .steps import StepLog, calls_from_response, steps_enabled
 
@@ -125,10 +130,17 @@ class AgentRunHooks(RunHooks[TaskContext]):
         触发这个钩子（实现在 SDK 的 ``run_internal/tool_execution.py``）。所以
         成败**不在这里判**：失败由工具自己的错误处理函数先定格（见
         ``steps.tool_error_handler``），这里只做收尾；对已定格的条目不会重复播报。
+
+        收尾之后另做一件事：**判一次反思闸门**（见 ``reflection.maybe_reflect``）。
+        位置选在这里是因为闸门数的几个量（工具总数、重复次数）都是"定格"的产物 ——
+        早一步判会读到还没定格的清单，重复数会系统性偏小。
         """
         log = steps_of(context)
         if log is not None:
             log.finish(getattr(tool, "name", "") or "", result)
+        inner = getattr(context, "context", None)
+        if isinstance(inner, TaskContext):
+            reflection.maybe_reflect(inner)
 
 
 AGENT_HOOKS = AgentRunHooks()

@@ -1121,27 +1121,61 @@ def test_session_failure_degrades_without_losing_the_revise_context(tmp_path, mo
     assert _saw(sent, "开头太慢")
 
 
-def test_run_config_trims_by_tokens_and_omits_reasoning_ids():
-    """两个开关必须挂在**运行配置**上，且必须成对。
+def test_run_config_trims_by_tokens_and_omits_reasoning_ids(monkeypatch):
+    """三个开关必须挂在**运行配置**上，且必须成对。
 
     * ``call_model_input_filter`` —— 官方按 token 裁输入的口子（2026-10-03 起取代了
       ``session_settings.limit`` 那个**条数**旋钮，实现见 ``src/agents/history_budget.py``）。
+      2026-10-09 起它挂的是**装配后的两步**（``runner.py::model_input_filter`` =
+      裁剪 → 注入反思提醒）：注入点只有这一个，所以**两次都得在这个口子上接**。
     * ``reasoning_item_id_policy="omit"`` —— 历史里可能带着服务端分配的 ``rs_...``
       编号，**回灌会 404**（官方 ``prepare_input_with_session`` 的注释）。
 
     分开断言是刻意的：这两个开关的失效方式不同（一个让输入超窗、一个让多轮**报错**），
     合成一条断言会在只坏了一个的时候给出误导性的失败信息。
+
+    ⚠️ 所以这里不只断言"挂的是哪个函数"，还要**实跑一次**证明裁剪那道口子仍在链上：
+    两条链的失效方式完全一样（输入超窗），而"换个过滤器顺手把裁剪丢了"是一条
+    **不会报错**的改动 —— 只在上下文慢慢变长之后表现为"偶发 400 / 变贵"。
     """
-    from src.agents.history_budget import trim_model_input
-    from src.agents.runner import build_run_config
+    from agents.run_config import CallModelData, ModelInputData
+
+    from src.agents.runner import build_run_config, model_input_filter
 
     cfg = build_run_config(None)
-    assert cfg.call_model_input_filter is trim_model_input
+    assert cfg.call_model_input_filter is model_input_filter, (
+        "输入过滤器必须是**装配后的两步**。直接挂 `trim_model_input` 会让反思提醒"
+        "永远进不去（唯一的注入口就是它）；只挂注入则会让输入超窗。"
+    )
     assert cfg.reasoning_item_id_policy == "omit"
     assert cfg.session_settings is None, (
         "条数与 token 是**互不知道对方**的两套判据：两处都设上限时，条数那份会**先**把"
         "历史切掉，token 那层就永远看不到真实总量（于是要么裁不到位、要么白裁）。"
         "这里必须保持官方默认 None = 全取历史，只留 token 一个口径。"
+    )
+
+    # 预算压到 1 ⇒ 裁剪口子必然动手（最后一条无条件保留，前面的当超预算老历史丢掉）。
+    # ⚠️ 入参必须是官方说的 `CallModelData`：形状不对时裁剪那条链会**按原样放行**
+    # （`_trim_sync` 的第一条分支），于是"没裁"这件事在这里看起来跟"不用裁"一模一样。
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "1")
+    data = CallModelData(
+        model_data=ModelInputData(
+            input=[
+                {"role": "user", "content": "很早以前那句。" * 50},
+                {"role": "user", "content": "最近那句。"},
+            ],
+            instructions="",
+        ),
+        agent=None,
+        context=None,
+    )
+    out = asyncio.run(cfg.call_model_input_filter(data))
+
+    assert isinstance(out, ModelInputData), (
+        "官方这个口子是 `CallModelData` 进、`ModelInputData` 出（不是进什么出什么）"
+    )
+    assert [i["content"] for i in out.input] == ["最近那句。"], (
+        "装配后的过滤器没有再裁剪 —— 裁剪那道口子被换掉了（输入会超窗，且不报错）"
     )
 
 

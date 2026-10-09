@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .reflection import ReflectionState
 from .steps import StepLog
 
 __all__ = ["AgentStats", "CARRY_ACROSS_NODES", "TaskContext", "RUN_LOCAL", "stats_from_dict"]
@@ -233,6 +234,14 @@ class TaskContext:
     ⚠️ 与 ``stats`` 一样**不进 LangGraph state**（不是可序列化类型），且
     **不跨 agent 节点** —— 一次请求里每个 agent 节点各建一份 ``TaskContext``。
     理由与边界见 ``steps`` 模块的 docstring。
+    """
+
+    reflection: ReflectionState = field(default_factory=ReflectionState)
+    """反思闸门的运行内状态（待注入的结论、已触发 / 已注入几次、在飞任务的强引用）。
+
+    ⚠️ 与 ``stats`` / ``steps`` 同一条：**不进 LangGraph state、不跨 agent 节点**。
+    结论只注入**本节点**后续的模型调用 —— 理由见 ``reflection`` 模块 docstring 的
+    边界 1（第四步的"退回某一步"也只能在本节点内做，两者边界一致最不容易出错）。
     """
 
     def record(self, kind: str, value: Any) -> None:

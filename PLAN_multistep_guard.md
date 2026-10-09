@@ -1,6 +1,8 @@
 # 方案：多步任务的检测 / 处理 / 兜底（2026-10-09）
 
-> 状态：**设计已定，未动手**。落地前请核对 §7 的两处"必须先验证"。
+> 状态：**第 1~3 步已落地**（2026-10-09：步骤记录 / 重复计数 / 反思闸门），
+> 第 4~7 步待做（三级升级 · 兜底出口 · 结构化摘要 · 指标告警收口）。
+> 落地前请核对 §7 的两处"必须先验证"（第 4 步的输入侧 `call_id` **仍未验证**）。
 > 命名沿用项目惯例：新能力默认**可关**，关掉时行为与今天逐字节一致。
 
 ## 0. 要解决什么
@@ -170,6 +172,53 @@
 在那个位置**看不到**。阈值定得早时绝大多数情况等 0 秒，真正会等到的只有收官那一次。
 ⚠️ 这条要写进配置注释，否则运维会以为它是"只在最后等"。
 
+**✅ 已落地（2026-10-09，第三步）**
+
+落点：`src/agents/reflection.py`（`maybe_reflect` / `_run` / `inject_reflections` /
+`evidence_of` / `ReflectiveFinding` / `counts_of` / `_due`）、
+`hooks.py::on_tool_end` 末尾接一次判定（它是"判决口"）、
+`context.TaskContext.reflection`、`runner.py::build_run_config` 的
+`call_model_input_filter` 由"一处"变"两步"（`trim_model_input` → `inject_reflections`）。
+
+方案没写到、落地时必须自己定的三处（已拍板）：
+
+| 没写到的点 | 定下来的口径 | 为什么 |
+|---|---|---|
+| 阈值过了之后**多久再看一眼** | 阈值整数倍（8 ⇒ 第 8、16、24 次） | "每次都触发" ⇒ 长任务里反思比主线还贵；"只触发一次" ⇒ 第四步判不出"同类问题又出现了" |
+| **重量级**具体指哪些 | 叫专家（三个 `as_tool`）+ 落盘产出（`save_text_asset` / `generate_image`）；`kb_search` / `review_draft` 不算 | 检索本来就该多查几轮；评审是只读流程步骤，"产出→评审→改"本来要调几次 |
+| 决策 6 的"等"**等到什么程度** | 每次模型调用前最多 2 秒（`AGENT_REFLECT_WAIT_SECONDS`），0 = 不等 | 位置决定了它只能这么实现（见上一段）；没赶上的计 `agent_reflection_late_total` |
+
+⚠️ **两条容易写成"看起来能跑"的地方**（各有一条专属守卫）：
+
+1. **注入排在裁剪之前**：症状是"提醒过、模型没照做"，而日志与指标里一切正常
+   （提醒确实生成了、也确实进了输入，只是下一轮被当成老历史裁掉了）。
+   用 `AGENT_HISTORY_TOKEN_LIMIT=1` 把顺序差异逼成**行为差异**：
+   顺序反了 ⇒ 裁剪把提醒当成"最后一条无条件保留"，**用户那句被挤掉**。
+2. **在飞任务没有强引用**：`asyncio.create_task` 的返回值不持有就会被 GC 掉，
+   任务可能停在半个动作上（与 `app/main.py::_spawn_history_compaction` 同源）；
+   而同一份集合还是 `_wait_for_pending` 的"该等谁"名单 ⇒ 少了它两件事一起坏。
+
+守卫：`tests/test_agent_reflection.py`（44 条）；变异验证 **18 组全部按预测抓到**
+（阈值改成每次都发起 / 优先级反序 / 证据不筛选 / 证据无上限 / JSON 严格解析 /
+未知取值当问题 / 解析失败当问题 / 注入排在裁剪前 / 注入不清队列 / 不持有任务引用 /
+`hops` 从步骤清单取 / 重量级名单混进检索 / 总开关默认开 / 用 `>` 代替 `>=` /
+提醒插在最前 / `instructions` 不原样传回 / 等待无上限 / **装配处摘掉裁剪**）。
+
+⚠️ **守卫缺口是从变异验证里长出来的，不是想出来的**：
+
+* **证据不筛选**（把 `flagged` 恒为真）与**装配处摘掉裁剪**（`trim_model_input` 从链上
+  摘掉、只留注入）两种改法，在补守卫之前**一条测试都不会红** —— 原来的用例只断言
+  "该在的在"，没断言"不该在的不在"，而"不裁了"与"不用裁"在用例里长得一模一样；
+* **发起后不持有任务引用**同样全绿通过（只影响 GC 与"该等谁"，没有任何断言盯着它）。
+* ⇒ 三条各补一条守卫：`test_evidence_leaves_out_ordinary_steps`、
+  `test_in_flight_tasks_are_held_and_released`，以及把
+  `tests/test_agents_pipeline.py::test_run_config_trims_by_tokens_and_omits_reasoning_ids`
+  从"断言挂的是哪个函数"扩成**实跑一次证明裁剪仍在链上**。
+* ⚠️ 另一处教训（M18 第一版）：变异要**只改想验的那一处**。第一版写成
+  `return await reflection.inject_reflections(data, ...)`，把 `CallModelData` 原样返回 ⇒
+  整组 pipeline 用例（32 条）一起红，但红的原因是"形状写错了"、**把想验的那条不变量
+  盖住了**。改成只替换"裁剪那一次调用"后才是一次干净的验证。
+
 ### 3.5 三级升级
 
 **第 1 级 · 注入反馈，继续跑。**
@@ -229,14 +278,14 @@
 | `agent_tool_result_total` | counter | `tool` / `status` | **工具正确率**（缺口一）✅ 第一步已落地 |
 | `agent_tool_duration_seconds` | histogram | `tool` | 哪个工具慢 ✅ 第一步已落地 |
 | `agent_action_repeats_total` | counter | `tool` | 打转的直接信号 ✅ 第二步已落地 |
-| `agent_reflections_total` | counter | `trigger` / `verdict` | `trigger` ∈ tools/heavy/hops/repeat；`verdict` ∈ ok/problem |
-| `agent_reflection_duration_seconds` | histogram | | 反思自己多慢 |
-| `agent_reflection_timeout_total` | counter | | 反思没跑完 |
-| `agent_reflection_late_total` | counter | | 结论没赶上（白跑） |
+| `agent_reflections_total` | counter | `trigger` / `verdict` | `trigger` ∈ tools/heavy/hops/repeat；`verdict` ∈ ok/problem ✅ 第三步已落地（调用**失败**时记在 `trigger="error"` 上，与"反思跑完了但结论是 ok"区分开） |
+| `agent_reflection_duration_seconds` | histogram | | 反思自己多慢 ✅ 第三步已落地 |
+| `agent_reflection_timeout_total` | counter | | 反思没跑完 ✅ 第三步已落地（超时单独计数：它指向**配置**，与"网关抖动"处置不同） |
+| `agent_reflection_late_total` | counter | | 结论没赶上（白跑）✅ 第三步已落地（它在涨 ⇒ `AGENT_REFLECT_TIMEOUT` 或阈值配得不合适） |
 | `agent_recovery_level_total` | counter | `level` | 1 / 2 / 3 各发生几次 |
 | `agent_task_outcome_total` | counter | `outcome` | **任务完成率**（缺口二）：delivered / partial / manual / failed |
 
-⚠️ **前三个已落地，但只看板不告警**：告警（`AgentToolFailureRateHigh` /
+⚠️ **前三个 + 第三步那四个已落地，但只看板不告警**：告警（`AgentToolFailureRateHigh` /
 `AgentLoopDetected` / `AgentRecoveryLevel3Frequent`）排在 §7 第 7 步，与其余指标、
 配置、文档一起收口 —— 在那之前它们只是"有数据、没人盯"。
 
@@ -276,6 +325,16 @@
 数字用 `src/envutil.py` 的 `env_int/env_float`（带上下界夹取）。
 `.env.example` 与 `PRODUCTION_CONFIG.md` 同步。
 
+✅ **已落地**：`AGENT_TOOL_STEPS`（第 1~2 步）+ `AGENT_MULTISTEP_GUARD` /
+`AGENT_REFLECT_AFTER_TOOLS` / `AGENT_REFLECT_AFTER_HEAVY` / `AGENT_REFLECT_AFTER_HOPS` /
+`AGENT_REFLECT_ON_REPEAT` / `AGENT_REFLECT_MAX_LEVEL1` / `AGENT_REFLECT_TIMEOUT` /
+`AGENT_REFLECT_WAIT_SECONDS`（第 3 步，共 8 个键已进 `.env.example` 与运维文档）。
+⏳ 未落地：`AGENT_REFLECT_MAX_LEVEL2`（第 4 步）—— 在代码真的读它之前**不要**先写进
+`.env.example` / 运维文档。⚠️ 这种"写了不生效"的配置**没有任何守卫会拦**：
+`test_doc_drift.py` 只查反方向（文档提到的键必须真实存在），而一旦它进了
+`.env.example` 就成了"真实存在"的键 ⇒ 守卫反而放行。照它配完的人只会得到
+"改了没反应、也不报错"。
+
 ## 7. 落地顺序
 
 1. **步骤记录 + 成败分辨**（§3.1 / §3.2）—— ✅ **已完成**（2026-10-09）。
@@ -301,6 +360,14 @@
    下一步（反思闸门）直接读 `max_repeat` 与 `repeat_counts()` 判"该不该介入"。
 3. **反思闸门**（§3.4）—— 触发、异步、结构化输出、注入。
    先只做"注入"，不做退回。
+   ✅ **已完成**（2026-10-09）。落点：新建 `src/agents/reflection.py`、
+   `context.TaskContext.reflection`、`hooks.py::on_tool_end` 接判决、
+   `runner.py` 新增 `model_input_filter`（裁剪 → 注入**两步**）。
+   `.env.example` 与 `PRODUCTION_CONFIG.md` 已同步 8 个键。
+   守卫：`tests/test_agent_reflection.py`（44 条）；变异验证 **18 组全部按预测抓到**
+   （明细与三组"变异验证才发现"的守卫缺口见 §3.4 末）。
+   ⚠️ 这一步**刻意不碰**第 2 级退回：它的前提（`call_id` 在**输入侧**是否还在）
+   仍未验证，见 §8 第 1 条 —— 动手前必须先补。
 4. **三级升级**（§3.5）—— 第 2 级退回需要 `call_id` 定位，见下一条。
 5. **兜底出口**（§3.6）—— 接现有审核通道。
 6. **结构化摘要**（§4）—— 与压缩合并。

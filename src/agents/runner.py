@@ -88,7 +88,7 @@ from agents import (
 
 from .. import observability
 from ..envutil import env_int
-from . import runtime
+from . import reflection, runtime
 from .context import TaskContext
 from .frontline import frontline_agent
 from .guards import (
@@ -108,6 +108,7 @@ __all__ = [
     "MAX_TURNS",
     "TaskOutcome",
     "build_run_config",
+    "model_input_filter",
     "run_agent",
 ]
 
@@ -203,6 +204,26 @@ def _guardrail_name(exc: BaseException) -> str | None:
     return getter() if callable(getter) else getattr(guardrail, "name", None)
 
 
+async def model_input_filter(data: Any) -> Any:
+    """``RunConfig.call_model_input_filter`` 的**装配处**：裁剪之后再注入反思提醒。
+
+    三步各有归属，这里只负责顺序：
+
+    ① ``history_budget.trim_model_input`` —— 窗口压缩 + 按 token 硬截断；
+    ② ``reflection.inject_reflections`` —— 追加一条 system 消息（反思闸门的结论）。
+
+    ⚠️ **顺序不能反**：注入排在裁剪**之后**，塞进去的提醒才不会在下一次模型调用时
+    被当成"超预算的老历史"裁掉。反过来的症状是"提醒过、但模型没按提醒做"，而日志与
+    指标里完全看不出来（提醒确实生成了、也确实进了输入，只是在下一轮被丢了）。
+    ⚠️ 注入**不占**预算：它排在预算判定之后，所以输入可能比 ``AGENT_HISTORY_TOKEN_LIMIT``
+    略高一点 —— 那是有意的，一条几十字的提醒远小于"提醒没生效"的代价。
+    """
+    trimmed = await trim_model_input(data)
+    return await reflection.inject_reflections(
+        trimmed, context=getattr(data, "context", None)
+    )
+
+
 def build_run_config(model: Any | None = None) -> RunConfig:
     """一处装配、全链路生效。
 
@@ -224,9 +245,12 @@ def build_run_config(model: Any | None = None) -> RunConfig:
 
     跨轮历史那个开关也在这里挂（与 ``session_for`` 里的后端选择配套）：
 
-    * ``call_model_input_filter``：**按 token 裁"送进模型的那一份"**（2026-10-03 起）。
-      官方 docstring 写明这个口子的用途就是 "to stay within a token limit"，实现见
-      ``src/agents/history_budget.py``（预算 ``AGENT_HISTORY_TOKEN_LIMIT``，默认 10 万）。
+    * ``call_model_input_filter``：**模型输入的最后一道加工**，现在是两步
+      （装配见 ``model_input_filter``）：
+      ① **按 token 裁"送进模型的那一份"**（2026-10-03 起）—— 官方 docstring 写明
+      这个口子的用途就是 "to stay within a token limit"，实现见
+      ``src/agents/history_budget.py``（预算 ``AGENT_HISTORY_TOKEN_LIMIT``，默认 10 万）；
+      ② **注入反思提醒**（2026-10-09 起）—— 见 ``reflection.py``，排在裁剪**之后**。
       ⚠️ 它**只动送进模型的那一份，库里一行都不删** —— 裁掉的内容只是不再进模型，
       存储那份仍然完整（所以"历史还在不在"与"模型看得见多少"是两个问题）。
       ⚠️ 它跑在 ``Runner.run`` **内部、每次模型调用之前**，所以形状写错的表现是
@@ -243,7 +267,7 @@ def build_run_config(model: Any | None = None) -> RunConfig:
         model=model,
         workflow_name="chatagent_sub_agents",
         output_guardrails=[citation_traceability_guardrail, length_guardrail],
-        call_model_input_filter=trim_model_input,
+        call_model_input_filter=model_input_filter,
         reasoning_item_id_policy="omit",
         # 默认会把对话内容带上追踪。本服务的内容是用户数据，
         # 与 main.py 里"日志不落原文"的口径一致：关掉。
