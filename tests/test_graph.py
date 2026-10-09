@@ -1,11 +1,24 @@
-"""整图集成测试：覆盖 RAG 注入、人工审核回路、直接结束、节点降级不崩。"""
+"""整图集成测试：覆盖 RAG 注入、人工审核回路、直接结束、节点降级不崩。
+
+本文件的用例统一走**异步 API**（`ainvoke` / `asyncio.run`），这是**省事**的选择而非
+硬性要求：agent 链路拆成 `frontline` / `literary` 两个节点后，这两个节点都是
+`async def`，异步入口两条分支都能跑，同步入口只在 `route=rag` 分支上可行。
+
+⚠️ 口径在 2026-10-02 **反转**过，别照旧笔记理解：此前 `graph.dispatch` 是 `async def`
+（要 `await` 一次内容分诊），因此"整个图只能用异步 API"；现在入口只做可用性探测、
+**不含 await**，改成了同步函数。详见 `tests/test_agents_route.py` 的文件头。
+
+测试环境未装配 agent 运行时（`runtime.is_ready()` 为 False），所以 `dispatch` 走的是
+`runtime_not_ready` 降级分支，**不会真的发模型请求**，断言口径与改造前一致。
+"""
+import asyncio
 from unittest.mock import MagicMock
 
 from langchain_core.messages import AIMessage
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 
-from src.graph import build_graph, ReviewResult
+from src.graph import ReviewResult, build_graph
 
 
 def _make_model(score=50, side_effect=None):
@@ -31,16 +44,45 @@ class _BoomRetriever:
         raise RuntimeError("index broken")
 
 
+def test_dispatch_is_a_pure_sync_probe():
+    """★ 入口节点必须是**同步**的 —— 语义在这一轮发生了反转。
+
+    改造前：`dispatch` 要 `await` 一次内容分诊（"这次要一份作品、还是一段说明"），
+    所以**必须**是 `async def`；当时的守卫写的是"改回 `def` 会静默失效"。
+
+    改造后：入口只回答"agent 链路现在能不能用"，**一次模型调用都不花**
+    （`tests/test_agents_route.py::test_dispatch_sends_every_request_to_the_agent_link`
+    用一个空脚本证明这一点：偷偷调模型就会因脚本用尽而失败），因此**必须**是 `def`。
+
+    于是这条守卫现在防的是**反向**回归：谁把入口改回 `async def`，几乎一定意味着
+    "内容分诊"又被塞了回来 —— 而那是被明确否掉的形态（官方
+    `examples/customer_service` 的入口 agent 自己就是分诊者，代码里不存在第二层内容判定）。
+
+    ⚠️ 不要再断言"整图只能走异步 API"：入口变同步后，`route=rag` 分支整条已经能同步
+    跑通（实测通过），那种断言会把**正常状态**判红。
+    """
+    import inspect
+
+    from src import graph as G
+
+    assert not inspect.iscoroutinefunction(G.dispatch), (
+        "graph.dispatch 又变成 async 了 —— 入口是不是被重新塞进了「内容分诊」那次模型调用？"
+        "所有请求都必须直接进 agent 链路，由前台自己决定叫哪个帮手。"
+    )
+
+
 def test_full_graph_reaches_human_then_accept(graph):
     """mock model 返回 score=50 → 进 human_review → interrupt → resume accept → END。"""
     cfg = {"configurable": {"thread_id": "t_human"}}
     try:
-        graph.invoke({"messages": [AIMessage(content="写一段文案")]}, config=cfg)
+        asyncio.run(
+            graph.ainvoke({"messages": [AIMessage(content="写一段文案")]}, config=cfg)
+        )
     except GraphInterrupt:
         pass  # 进入 human_review 后暂停，符合预期
 
-    result = graph.invoke(
-        Command(resume={"action": "accept", "feedback": None}), config=cfg
+    result = asyncio.run(
+        graph.ainvoke(Command(resume={"action": "accept", "feedback": None}), config=cfg)
     )
     assert result["human_action"] == "accept"
 
@@ -50,7 +92,7 @@ def test_full_graph_high_score_ends(mock_model, fake_retriever):
     m = _make_model(score=90)
     g = build_graph(model=m, retriever=fake_retriever)
     cfg = {"configurable": {"thread_id": "t_high"}}
-    result = g.invoke({"messages": [AIMessage(content="写文章")]}, config=cfg)
+    result = asyncio.run(g.ainvoke({"messages": [AIMessage(content="写文章")]}, config=cfg))
     assert result["score"] == 90
 
 
@@ -59,7 +101,7 @@ def test_full_graph_degrade_no_crash(mock_model, fake_retriever):
     m = _make_model(side_effect=Exception("boom"))
     g = build_graph(model=m, retriever=fake_retriever)
     cfg = {"configurable": {"thread_id": "t_degrade"}}
-    result = g.invoke({"messages": [AIMessage(content="写文章")]}, config=cfg)
+    result = asyncio.run(g.ainvoke({"messages": [AIMessage(content="写文章")]}, config=cfg))
     assert result["force_exit"] is True
     assert result["output"] == "服务出现问题请稍后重试"
 
@@ -68,7 +110,9 @@ def test_full_graph_retrieve_writes_context(mock_model):
     """retrieve 命中时，参考资料应写进 state["context"]。"""
     g = build_graph(model=_make_model(score=90), retriever=_HitRetriever())
     cfg = {"configurable": {"thread_id": "t_ctx"}}
-    result = g.invoke({"messages": [AIMessage(content="梧州有什么特产")]}, config=cfg)
+    result = asyncio.run(
+        g.ainvoke({"messages": [AIMessage(content="梧州有什么特产")]}, config=cfg)
+    )
     assert "六堡茶" in result["context"]
 
 
@@ -76,7 +120,7 @@ def test_full_graph_no_docs_gives_empty_context(mock_model, fake_retriever):
     """知识库未配置 / 无召回 → context 为空，主流程照常走完。"""
     g = build_graph(model=_make_model(score=90), retriever=fake_retriever)
     cfg = {"configurable": {"thread_id": "t_nodoc"}}
-    result = g.invoke({"messages": [AIMessage(content="随便问")]}, config=cfg)
+    result = asyncio.run(g.ainvoke({"messages": [AIMessage(content="随便问")]}, config=cfg))
     assert result["context"] == ""
     assert result["score"] == 90
 
@@ -85,7 +129,7 @@ def test_full_graph_retrieve_error_does_not_crash(mock_model):
     """检索器抛异常 → 图仍应完整跑完（降级为空上下文）。"""
     g = build_graph(model=_make_model(score=90), retriever=_BoomRetriever())
     cfg = {"configurable": {"thread_id": "t_boom"}}
-    result = g.invoke({"messages": [AIMessage(content="随便问")]}, config=cfg)
+    result = asyncio.run(g.ainvoke({"messages": [AIMessage(content="随便问")]}, config=cfg))
     assert result["context"] == ""
     assert result["score"] == 90
 

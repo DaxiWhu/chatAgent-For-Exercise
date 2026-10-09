@@ -1,15 +1,17 @@
 """节点与路由单元测试：不依赖真实 LLM / 数据库 / 语料。"""
+from unittest.mock import MagicMock
+
+from langchain_core.messages import AIMessage
+
 import src.graph as g
 from src.graph import (
-    route_review,
+    ReviewResult,
     after_human,
     evaluate,
     generate,
     retrieve,
-    ReviewResult,
+    route_review,
 )
-from unittest.mock import MagicMock
-from langchain_core.messages import AIMessage
 
 
 def make_state(**kw):

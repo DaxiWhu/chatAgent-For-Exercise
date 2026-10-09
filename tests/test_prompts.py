@@ -208,8 +208,10 @@ def test_prompt_version_reaches_the_response_header(monkeypatch):
     monkeypatch.setattr(M, "_QUOTA", QuotaManager(daily_limit=10 ** 6, request_limit=500))
     monkeypatch.setattr(M, "graph", _FakeGraph())
 
-    r = TestClient(M.app).post("/v1/chat",
-                               json={"thread_id": "pv-1", "message": "hi"})
+    from tests.auth_util import auth_headers
+
+    r = TestClient(M.app, headers=auth_headers()).post(
+        "/v1/chat", json={"thread_id": "pv-1", "message": "hi"})
     assert r.status_code == 200
     assert r.headers.get("x-prompt-version") == prompts.PROMPT_VERSION, (
         "响应头 X-Prompt-Version 缺失或与常量不一致 —— "
