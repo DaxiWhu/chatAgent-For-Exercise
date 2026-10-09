@@ -589,6 +589,560 @@
           "sort": "desc"
         }
       }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "agent 路由与移交",
+      "description": "请求走的是 agent 链路还是问答兜底（`agent_route_total` 按 route）、跨节点转交的次数（`agent_handoff_total` 按 src/dst。⚠️ 拆分后只有 **前台 → 文学** 这一种组合，且是**请求口径** —— 它答的是「多少请求被交给了专家」，不是运行数）、以及**想走却走不了**的次数（`agent_unavailable_total` 按 reason）。⚠️ `agent_*` 序列**不存在**只说明最近没有 agent 流量，不等于链路正常；`reason=module_unavailable`（没装 openai-agents）或 `runtime_not_ready`（没配模型）在涨才是故障 —— 此时请求静默退回问答链路，零报错、探针全绿、答得「像那么回事」。对应告警 AgentLinkDegraded。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (route) (rate(agent_route_total[5m]))",
+          "legendFormat": "路由 {{route}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (src, dst) (rate(agent_handoff_total[30m]))",
+          "legendFormat": "移交 {{src}} → {{dst}}"
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (reason) (rate(agent_unavailable_total[5m]))",
+          "legendFormat": "降级 {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "agent 运行结果与评审结论",
+      "description": "每次 **agent 运行**的收尾方式（`agent_runs_total` 按 exit_reason：passed / unreviewed / review_failed / transfer / input_guardrail / output_guardrail / max_turns / error）与评审判定分布（`agent_review_outcome_total` 按 score）。⚠️ 链路拆成前台 / 文学两个节点后，**一次请求 = N 次运行**（转交那一轮是 2 次）—— 本面板是**运行口径**，不是请求口径，排查时先看 `agent_*` 的 agent 标签定位是哪一段。exit_reason=error 现在**会抛出去**（接口返回 incomplete、客户端看得到失败），不再被兜成 200 的友好话术。成因分两类：上游限流（429）与真实故障，处置完全不同（日志里 `TaskOutcome.error` 会带出异常类型）。对应告警 AgentRunFailureRateHigh。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 36
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (exit_reason) (rate(agent_runs_total[10m]))",
+          "legendFormat": "收尾 {{exit_reason}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (score) (rate(agent_review_outcome_total[10m]))",
+          "legendFormat": "评审 {{score}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "agent 返工率",
+      "description": "未一次通过的任务占比（`agent_rework_total` / `agent_route_total{route=agent}`，**两边都是请求口径**）。⚠️ 别用 `agent_runs_total` 当分母：拆分后它是**运行**数（一次请求 1~2 次），会让这个比率凭空缩小一半。这是 **agent 能力**最直接的代理指标，也直接对应成本 —— 每次返工 = 再跑一整轮模型调用。持续偏高说明规划或执行不稳（prompt / 拓扑问题），而不是「模型慢」。对应告警 AgentReworkRateHigh。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 44
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(agent_rework_total[30m])) / clamp_min(sum(rate(agent_route_total{route=\"agent\"}[30m])), 0.001)",
+          "legendFormat": "返工率"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "agent 单任务模型 / 工具调用（均值）",
+      "description": "平均每次 **agent 运行**花掉多少次模型调用与工具调用（直方图 `_sum` / `_count`，带 agent 标签）。⚠️ 拆分后一次请求 = N 次运行，所以这是**运行口径**均值，不等于「每个用户请求的成本」；要请求口径请乘上 `agent_route_total` 的请求数。两者合起来才能回答「agent 绕圈子时是**模型在想**还是**工具在往返**」—— 前者要收紧 prompt，后者要减少或合并工具。均值贴近 `AGENT_MAX_TURNS`（默认 12）说明相当一部分任务在贴着上限跑，成本与延迟都会显著抬升。对应告警 AgentModelCallsPerRunHigh。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 44
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(agent_model_calls_sum[30m])) / clamp_min(sum(rate(agent_model_calls_count[30m])), 0.001)",
+          "legendFormat": "平均模型调用"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(agent_tool_calls_sum[30m])) / clamp_min(sum(rate(agent_tool_calls_count[30m])), 0.001)",
+          "legendFormat": "平均工具调用"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "agent 跨轮历史后端故障",
+      "description": "会话后端（PostgreSQL，与 LangGraph 检查点共用同一个 DB_URL）读写失败的次数，按异常类型（`agent_session_errors_total` by kind）。⚠️ 这条序列**只在出过错之后才存在** —— 一直为空恰恰是**好事**（与上面 `agent_*` 那几块「为空只说明没流量」的语义相反）。一旦出现，意味着链路还在跑、答案照常 200，但送进模型的**只有用户刚说的这一句**，上文全丢：「接着改上一轮的东西」会被当成全新话题。`kind=ModuleNotFoundError` 是没装 sqlalchemy；`NoSuchModuleError`/`ArgumentError` 是 DB_URL 写法不对（异步前缀要 `postgresql+psycopg://`）；`OperationalError`/`TimeoutError` 是 PG 连不上或探不通。对应告警 AgentHistoryDegraded。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (rate(agent_session_errors_total[5m]))",
+          "legendFormat": "历史故障 {{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "agent 跨轮历史的裁剪与超额",
+      "description": "送进模型的历史被裁剪的次数、其中**裁到底仍超预算**的次数，以及预算算不出来的次数（`agent_history_trimmed_total` / `agent_history_over_budget_total` / `agent_history_budget_errors_total`）。历史是**永久保留**的，所以「一直在裁」是预期行为、不是故障 —— 要盯的是后两条：`over_budget` 表示模型这一轮看不到上文（请求照常 200、答案答非所问），`budget_errors` 表示本轮**整段没裁**、可能超窗被模型侧拒。对应告警 AgentHistoryBudgetExhausted / AgentHistoryBudgetErrors。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(agent_history_trimmed_total[5m]))",
+          "legendFormat": "发生裁剪"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(agent_history_over_budget_total[5m]))",
+          "legendFormat": "裁到底仍超预算"
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (kind) (rate(agent_history_budget_errors_total[5m]))",
+          "legendFormat": "预算算不出来 {{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "agent 输入历史的规模与丢弃量",
+      "description": "裁剪后**实际送进模型**的输入 token 分位数（`agent_history_input_tokens`，含指令），以及每次裁剪平均丢掉的条目数（`agent_history_dropped_items`）。恒定贴着 `AGENT_HISTORY_TOKEN_LIMIT` 是永久保留下的常态；若 P50 也顶到上限、同时上面那条 over_budget 在涨，就该调预算或考虑上摘要。⚠️ 这是**输入**预算，不含工具清单与输出长度。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 68
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(agent_history_input_tokens_bucket[5m])))",
+          "legendFormat": "输入 token P50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(agent_history_input_tokens_bucket[5m])))",
+          "legendFormat": "输入 token P95"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(agent_history_dropped_items_sum[5m])) / clamp_min(sum(rate(agent_history_dropped_items_count[5m])), 0.001)",
+          "legendFormat": "平均丢弃条目数"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "PG 库容量（总量与各表）",
+      "description": "数据库总占用与每张表的体积（`pg_database_size_bytes` / `pg_table_size_bytes`，含索引与 TOAST）。数据由 `pg-stats` 容器每 15 分钟采集，经 node-exporter 的 textfile 通道进入 Prometheus。⚠️ 对话历史是**永久保留**的，所以这些线**不会自己下降** —— 要看的是**斜率**，以及哪一条抬头最快。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 76
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "pg_database_size_bytes",
+          "legendFormat": "库总占用"
+        },
+        {
+          "refId": "B",
+          "expr": "pg_table_size_bytes",
+          "legendFormat": "{{table}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "PG 表 6 小时增长量",
+      "description": "每张表在 6 小时窗口内的增长字节数 —— 与告警 `PgTableGrowthFast` **同一个口径**（`delta(pg_table_size_bytes[6h])`），所以告警响的时候，这张图直接告诉你是哪一张表、涨了多少。恒定为正且持续抬升，说明写入速率在上升（正常业务量增长）；某一晚单点跳高 ⇒ 查那次批量导入或异常流量。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 84
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "delta(pg_table_size_bytes[6h])",
+          "legendFormat": "{{table}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "幂等键：重放 / 冲突 / 载荷不匹配",
+      "description": "客户端带 Idempotency-Key 时的重试去向。**重放**（`idempotency_replay_total`）= 被正确吸收的重试次数，每一条都省下了一整轮生成 —— 这是这套机制唯一的价值体现。**冲突**按 reason 分档：`in_flight` 多 ⇒ 请求比客户端的重试窗口更慢（去对照延迟图）；`not_replayable` 多 ⇒ 上一次已完成但响应超过重放上限没缓存住（看 `idempotency_truncated_total`）。**同键异载荷**（422）在涨是客户端 bug（同键换了请求体），服务端行为正确，不要改服务端。与告警 `IdempotencyConflictsHigh` 同源。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 92
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(idempotency_replay_total[15m])",
+          "legendFormat": "重放（省下的生成次数）"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (reason) (rate(idempotency_conflict_total[15m]))",
+          "legendFormat": "冲突 {{reason}}"
+        },
+        {
+          "refId": "C",
+          "expr": "rate(idempotency_mismatch_total[15m])",
+          "legendFormat": "同键异载荷（422，客户端 bug）"
+        },
+        {
+          "refId": "D",
+          "expr": "sum by (reason) (rate(idempotency_rejected_total[15m]))",
+          "legendFormat": "键被拒 {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "在线答案质量：幻觉率与判定构成",
+      "description": "线上真实流量上跑出来的质量信号 —— **可用性与延迟指标看不见这一类故障**（模型变傻、检索召回变差时，QPS / P95 / 5xx 全都正常）。判据是纯规则（标识符硬判 / 数字只记不判 / 拒答静音），`src/rag/answer_quality.py`，**零模型调用、毫秒级**。⚠️ 需要 `RAG_ONLINE_QUALITY_SAMPLE` > 0（默认 0）才有数据；没开时这三条序列**不存在**而不是 0 ⇒ 面板空白。三条曲线同一个单位（比值）：A 是告警 `OnlineHallucinationDetected` 的原式（30m，> 5% 触发），B 是判定构成 —— **`unknown` 占比过高说明多数回答没有可核标识符，此时 A 的参考价值有限**（先看样本量再看比率，别把 unknown 读成 pass），C 是采样本身失败（非 0 要查 `score_answer` 的异常日志，它被刻意吞掉以免影响作答）。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 100
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(online_answer_hallucinated_total[30m]) / clamp_min(sum(rate(online_answer_judged_total[30m])), 0.001)",
+          "legendFormat": "幻觉率（30m，与告警同式）"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (verdict) (rate(online_answer_judged_total[15m])) / clamp_min(sum(rate(online_answer_judged_total[15m])), 0.001)",
+          "legendFormat": "判定占比 {{verdict}}"
+        },
+        {
+          "refId": "C",
+          "expr": "rate(online_quality_sampling_errors_total[15m]) / clamp_min(sum(rate(online_answer_judged_total[15m])), 0.001)",
+          "legendFormat": "采样失败占比（非 0 要看日志）"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     }
   ]
 }

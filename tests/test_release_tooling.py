@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import shutil
 import subprocess
@@ -36,6 +37,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 DEPLOY = ROOT / "deploy"
 NGINX_CONF = DEPLOY / "app" / "nginx.conf"
+NGINX_TLS_CONF = DEPLOY / "app" / "nginx.tls.conf"
 RELEASE = DEPLOY / "release.sh"
 ROLLBACK = DEPLOY / "rollback.sh"
 CANARY_DOC = DEPLOY / "CANARY.md"
@@ -157,6 +159,97 @@ def test_weight_script_fails_loudly_when_the_readback_disagrees(weight_mod, conf
         "读回值与请求值不一致时脚本没有报错（期望退出码 3）——"
         "那它会在『其实没写进去』的情况下打印『权重已更新』"
     )
+
+
+def test_weight_script_writes_every_entry_conf(weight_mod, tmp_path, monkeypatch):
+    """`set` 必须同时改**两份**入口配置（http 版与 tls 版）。
+
+    2026-10-06 修：脚本原先只改 `nginx.conf`，而公网部署挂的是 `nginx.tls.conf`
+    （`docker-compose.tls.yml` 用 `!override` 挂载）⇒ TLS 部署下 release.sh 的
+    逐档放量一次都没生效，且 `show` 还会回显那份**没被容器读**的文件，
+    给出"已切换"的假象。灰度是发布安全的最后一道闸门，静默失效最不该有。
+    """
+    monkeypatch.delenv("NGINX_CONF", raising=False)
+    a = tmp_path / "nginx.conf"
+    b = tmp_path / "nginx.tls.conf"
+    shutil.copyfile(NGINX_CONF, a)
+    shutil.copyfile(NGINX_TLS_CONF, b)
+    monkeypatch.setattr(weight_mod, "CONF_CANDIDATES", (str(a), str(b)))
+
+    assert _rc(weight_mod.main, ["set", "--stable", "95", "--canary", "5"]) == 0
+    assert weight_mod.read_weights(str(a)) == {"stable": 95, "canary": 5}, "第一份没改到"
+    assert weight_mod.read_weights(str(b)) == {"stable": 95, "canary": 5}, "第二份没改到"
+
+
+def test_show_flags_inconsistent_entry_confs(weight_mod, tmp_path, monkeypatch):
+    """两份配置权重不一致时，`show` 必须报错（3）而不是随便报一个读数。
+
+    不一致时"当前权重是多少"这个问题**没有答案** —— 实际值取决于部署时挂了哪一份。
+    给一个看似确定的读数，值班的人会据此判断"已经是 9:1 了"，而真实流量可能是 1:1。
+    """
+    monkeypatch.delenv("NGINX_CONF", raising=False)
+    a = tmp_path / "nginx.conf"
+    b = tmp_path / "nginx.tls.conf"
+    shutil.copyfile(NGINX_CONF, a)
+    shutil.copyfile(NGINX_TLS_CONF, b)
+    monkeypatch.setattr(weight_mod, "CONF_CANDIDATES", (str(a), str(b)))
+
+    weight_mod.write_weights(str(b), {"stable": 50, "canary": 50})
+    assert _rc(weight_mod.main, ["show"]) == 3, "两份不一致却没有报错"
+
+
+def test_display_falls_back_to_absolute_on_another_drive(weight_mod):
+    """`_display` 的契约：同盘 ⇒ 相对路径；跨盘 ⇒ 原样返回，**不抛异常**。
+
+    这条是上面那条的"单元版"，跑在哪个盘上都成立（把 `ROOT` 换成一个不存在的盘符
+    即可，不需要真的去挂一个盘）。
+    """
+    if os.name != "nt":
+        pytest.skip("跨盘符 relpath 只存在于 Windows 语义下")
+    other = "Z:" + os.sep + "somewhere" + os.sep + "nginx.conf"
+    assert weight_mod._display(other) == other, (
+        "跨盘符路径没有退回绝对形式 —— os.path.relpath 会在 Windows 上抛 ValueError"
+    )
+    inside = os.path.join(weight_mod.ROOT, "deploy", "app", "nginx.conf")
+    assert weight_mod._display(inside) == os.path.join("deploy", "app", "nginx.conf"), (
+        "同盘的路径没有被缩写成相对形式（打印会变得很难读）"
+    )
+
+
+def test_weight_script_survives_a_conf_outside_the_repo_drive(weight_mod, conf_copy,
+                                                              monkeypatch):
+    """`--conf` 指到仓库所在盘之外时，命令**不能崩**（最容易崩的是"打印路径"那一步）。
+
+    `os.path.relpath` 在 Windows 上对不同盘符会抛 `ValueError`，而它只用来打印
+    "改动了哪几份配置"。一旦这里崩掉，**权重其实已经写好**了，调用方却收到非零
+    退出码，会误判成"没生效"然后重试 —— 属于"成功却报失败"。
+
+    2026-10-06 实际踩到：`pytest.ini` 打开 `testpaths` 之后，裸 `pytest` 的 basetemp
+    落在 `C:\\Users\\...\\Temp`（仓库在 `D:`），于是 release 工具链的三条用例变红。
+    """
+    if os.name != "nt":
+        pytest.skip("跨盘符 relpath 只存在于 Windows 语义下")
+    monkeypatch.setattr(weight_mod, "ROOT", "Z:" + os.sep + "not-the-repo")
+
+    assert _rc(weight_mod.main, ["--conf", str(conf_copy), "show"]) == 0, (
+        "`show` 在跨盘符路径上崩了（它要把每份配置的路径打印出来）"
+    )
+    assert _rc(weight_mod.main,
+               ["--conf", str(conf_copy), "set", "--stable", "95", "--canary", "5"]) == 0, (
+        "`set` 在跨盘符路径上崩了（权重已经写好了，却报了非零退出码）"
+    )
+    assert weight_mod.read_weights(str(conf_copy)) == {"stable": 95, "canary": 5}
+
+
+def test_repo_entry_confs_agree_on_weights(weight_mod, monkeypatch):
+    """仓库里的两份入口配置，权重必须一致（否则上面那条守卫迟早会在发布时踩到）。"""
+    monkeypatch.delenv("NGINX_CONF", raising=False)
+    assert weight_mod.read_weights(str(NGINX_CONF)) == \
+        weight_mod.read_weights(str(NGINX_TLS_CONF)), (
+            "deploy/app/nginx.conf 与 nginx.tls.conf 的灰度权重不一致 —— "
+            "实际生效的取决于挂载了哪一份，请用 `python scripts/nginx_weight.py set` "
+            "统一（该命令默认同时改两份）"
+        )
 
 
 # ===========================================================================
@@ -342,3 +435,98 @@ def test_canary_doc_points_at_the_scripts():
     text = CANARY_DOC.read_text(encoding="utf-8")
     for name in ("deploy/release.sh", "deploy/rollback.sh"):
         assert name in text, f"CANARY.md 没有引用 {name}"
+
+
+# ===========================================================================
+# 回滚通知：必须覆盖**所有**退出路径，且通知失败不改回滚的退出码
+# ===========================================================================
+def _rollback_sandbox(tmp_path: Path, *, curl_body: str,
+                      notify_rc: int) -> tuple[Path, Path]:
+    """搭一个能跑到底的 rollback.sh 环境：外部命令全部用 shim 顶替。
+
+    为什么值得这么麻烦：下面三条要验证的都是**进程真实退出时**才成立的性质
+    （`trap` 有没有生效、退出码有没有被通知改写）—— 读脚本文本断言不出来。
+    """
+    repo = tmp_path / "repo"
+    (repo / "deploy").mkdir(parents=True)
+    shutil.copy2(ROLLBACK, repo / "deploy" / "rollback.sh")
+    (repo / ".env").write_text("ALERT_SINK_ROUTES=oncall:wecom\n", encoding="utf-8")
+    (repo / "VERSION").write_text("9.9.9-test\n", encoding="utf-8")
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = (tmp_path / "calls.log").as_posix()
+
+    (bindir / "docker").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "docker %s\\n" "$*" >> "{log}"\n'
+        'case "$*" in\n'
+        f"  *alert_sink.py*--notify*) exit {notify_rc} ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (bindir / "python").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "python %s\\n" "$*" >> "{log}"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    (bindir / "curl").write_text(
+        f"#!/usr/bin/env bash\nprintf '%s' '{curl_body}'\n",
+        encoding="utf-8",
+    )
+    for f in bindir.iterdir():
+        f.chmod(0o755)
+    return repo, tmp_path / "calls.log"
+
+
+def _run_rollback(repo: Path, tmp_path: Path) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env["PATH"] = f"{(tmp_path / 'bin').as_posix()}{os.pathsep}{env.get('PATH', '')}"
+    env["ROLLBACK_ENTRY"] = "http://127.0.0.1:9"   # curl 是 shim，这个地址不会被真的访问
+    return subprocess.run([BASH, str(repo / "deploy" / "rollback.sh")],
+                          capture_output=True, text=True, env=env, cwd=str(repo))
+
+
+@pytest.mark.skipif(not BASH, reason="本机没有 bash（CI 上有）")
+def test_rollback_notifies_on_the_success_path(tmp_path):
+    repo, log = _rollback_sandbox(tmp_path, curl_body='{"release":"stable"}', notify_rc=0)
+    r = _run_rollback(repo, tmp_path)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "--notify" in log.read_text(encoding="utf-8"), "成功路径没有发出回滚通知"
+    assert "已发出回滚通知" in r.stdout
+
+
+@pytest.mark.skipif(not BASH, reason="本机没有 bash（CI 上有）")
+def test_rollback_notifies_even_when_verification_fails(tmp_path):
+    """"回滚了但验证没通过"（退出码 2）也必须通知。
+
+    它恰恰是最需要叫醒人的情形：权重改了、流量可能还有一部分留在灰度。
+    只在成功分支里发通知，等于把最该通知的那一类整批漏掉。
+    """
+    repo, log = _rollback_sandbox(tmp_path, curl_body='{"release":"canary"}', notify_rc=0)
+    r = _run_rollback(repo, tmp_path)
+    assert r.returncode == 2, (
+        f"期望验证失败的退出码 2，实际 {r.returncode}\n{r.stdout}\n{r.stderr}"
+    )
+    assert "--notify" in log.read_text(encoding="utf-8"), (
+        "验证失败路径**没有**发出回滚通知 —— trap 没有覆盖这个出口"
+    )
+
+
+@pytest.mark.skipif(not BASH, reason="本机没有 bash（CI 上有）")
+def test_rollback_exit_code_survives_notify_failure(tmp_path):
+    """alert-sink 没在跑 / 通道没配 ⇒ 通知失败，但回滚本身仍然算成功。
+
+    回滚是**止血动作**。让"通知没发出去"把退出码从 0 改成非 0，会让调用它的
+    release.sh 与人以为回滚失败，进而重复回滚或转人工 ——
+    代价远大于漏一条消息，而消息本身还可以手工补。
+    """
+    repo, log = _rollback_sandbox(tmp_path, curl_body='{"release":"stable"}', notify_rc=1)
+    r = _run_rollback(repo, tmp_path)
+    assert r.returncode == 0, (
+        f"通知失败把回滚退出码改了（实际 {r.returncode}）—— 通知不该影响止血\n"
+        f"{r.stdout}\n{r.stderr}"
+    )
+    assert "没能发出" in (r.stdout + r.stderr), "通知失败时没有明确告知运维"

@@ -24,9 +24,16 @@
     E2E_BASE_URL=http://127.0.0.1:8080 pytest -m e2e       # 对已经起好的栈跑
 
 可选环境变量
-    E2E_API_KEY          栈要求鉴权时带上（`X-API-Key`）；见下方 auth 用例的说明
-    E2E_SAMPLES          分流取样次数（默认 20）
-    E2E_CHAT_TIMEOUT     等 SSE 首帧的秒数（默认 90，LLM 首字节可能十几秒）
+    E2E_USER / E2E_PASSWORD   脚本服务账号 —— 本文件用它**登录换 JWT**（推荐做法）。
+                              没设时回退到 `AGENT_SCRIPT_USER` / `AGENT_SCRIPT_PASSWORD`。
+    E2E_API_KEY               【已废弃】共享密钥 `X-API-Key`；只为过渡期保留
+    E2E_SAMPLES               分流取样次数（默认 20）
+    E2E_CHAT_TIMEOUT          等 SSE 首帧的秒数（默认 90，LLM 首字节可能十几秒）
+
+⚠️ 三种栈配置都能跑，不必改本文件：
+    ① 配了**用户鉴权** ⇒ 给 `E2E_USER` / `E2E_PASSWORD`，本文件登录换令牌后带 Bearer；
+    ② 只配了**共享密钥** ⇒ 给 `E2E_API_KEY`（此时会打印一条废弃提醒）；
+    ③ **完全没配鉴权** ⇒ 什么都不用给，本文件不带任何认证头。
 """
 
 from __future__ import annotations
@@ -39,8 +46,12 @@ from collections import Counter
 
 import pytest
 
+from scripts import script_auth
+
 BASE = os.getenv("E2E_BASE_URL", "").rstrip("/")
 API_KEY = os.getenv("E2E_API_KEY", "").strip()
+USER = (os.getenv("E2E_USER") or os.getenv(script_auth.USER_ENV) or "").strip()
+PASSWORD = (os.getenv("E2E_PASSWORD") or os.getenv(script_auth.PASSWORD_ENV) or "").strip()
 SAMPLES = int(os.getenv("E2E_SAMPLES", "20"))
 CHAT_TIMEOUT = float(os.getenv("E2E_CHAT_TIMEOUT", "90"))
 
@@ -59,23 +70,56 @@ pytestmark = [
 # --------------------------------------------------------------------------
 # 极简 HTTP 辅助（标准库；不引 httpx，免得又多一个"测试专属依赖"）
 # --------------------------------------------------------------------------
+_TOKEN = ""
+
+
+def _auth_configured() -> bool:
+    """这个栈要求鉴权吗？（有凭证 = 要求）—— 供鉴权用例决定该断言 401 还是 200。"""
+    return bool(API_KEY) or script_auth.has_credentials(USER, PASSWORD)
+
+
+def _bearer() -> str:
+    """登录换令牌，进程内只登一次。
+
+    ⚠️ 为什么不在模块级登录：登录要打**运行中的栈**，而这份文件在栈没起来时是整份
+    skip 的（`BASE` 为空）。模块级登录会在 collection 阶段就失败，把"跳过"变成"报错"。
+    """
+    global _TOKEN
+    if not _TOKEN:
+        user, password = script_auth.require_credentials(USER, PASSWORD)
+        _TOKEN = script_auth.access_token(BASE, user, password)
+    return _TOKEN
+
+
 def _headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """按栈的配置挑认证方式，三条路径与 `app/main.py::_authenticate` 的顺序一致。
+
+    ⚠️ `X-API-Key` 那条是**已废弃**的过渡路径（分不出身份、租户自报），
+    保留只为让还没切换的栈继续能跑；`Authorization` 才是目标口径。
+    """
     h = {"Accept": "application/json"}
     if API_KEY:
         h["X-API-Key"] = API_KEY
+    elif script_auth.has_credentials(USER, PASSWORD):
+        h["Authorization"] = f"Bearer {_bearer()}"
     h.update(extra or {})
     return h
 
 
-def _request(path: str, *, method: str = "GET", body=None, timeout: float = 15):
+def _request(path: str, *, method: str = "GET", body=None, timeout: float = 15,
+             headers: dict[str, str] | None = None):
     """返回 (status, body_bytes, headers)。
 
     ⚠️ 4xx/5xx **不抛异常**：这里断言的就是状态码本身，让异常冒出去会丢掉
     body（而 body 里往往写着真正的原因）。
+
+    `headers` 传了就**原样使用**（不叠 `_headers()`）—— "裸请求"必须能构造出来，
+    否则"配了鉴权就应当拒绝未授权"这条不变量就没法验（见鉴权用例的说明）。
     """
     url = BASE + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    hdrs = _headers({"Content-Type": "application/json"} if data else None)
+    hdrs = dict(headers) if headers is not None else _headers(
+        {"Content-Type": "application/json"} if data else None)
     req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -136,23 +180,28 @@ def test_ready_is_green_with_a_persistent_checkpointer():
 # --------------------------------------------------------------------------
 # ② 鉴权：开关与行为必须一致
 # --------------------------------------------------------------------------
-def test_protected_endpoint_auth_matches_the_deployment():
-    """**两种分支都断言，没有 skip**。
+def test_protected_endpoint_rejects_unauthenticated_requests():
+    """**裸请求**必须有确定的处置：配了鉴权就必须 401，完全没配就必须 200。没有 skip。
 
     跳过在这里是有害的：一个"被跳过"的鉴权用例看起来和"通过了"一样。
-    所以改成核对一条真正的不变量 —— "配了 Key 就必须拒、没配 Key 就必须放行"：
-    任何一个方向不成立，都说明**鉴权配置与运行时行为脱节**（比"忘了配"更难发现）。
+
+    ⚠️ 这条必须发**裸请求**（不带任何认证头），所以不能复用 `_headers()`。
+    它原先借 `E2E_API_KEY` 当"探测凭证"、直接把 `_headers()` 的结果当裸请求用；
+    现在 `_headers()` 会带**真实**凭证（登录换来的令牌或那把 Key），
+    那样发出去的就不再是裸请求，断言会退化成"我带着合法凭证却被拒" —— 与要验的东西无关。
     """
-    status, body, _ = _json("/v1/reviews")
-    if API_KEY:
+    status, body, _ = _json("/v1/reviews", headers={"Accept": "application/json"})
+    if _auth_configured():
         assert status == 401, (
-            f"设了 E2E_API_KEY，但 /v1/reviews 返回 {status} —— 鉴权没有生效"
+            f"这个栈配了鉴权（给了 E2E_USER/E2E_PASSWORD 或 E2E_API_KEY），"
+            f"但 /v1/reviews 对**不带凭证的请求**返回 {status} —— 鉴权没有生效"
         )
     else:
         assert status == 200, (
             f"/v1/reviews 返回 {status}：{body}\n"
-            f"两种可能：① 这个栈配了 SERVE_API_KEY / TENANT_KEYS（那请设置 E2E_API_KEY，"
-            f"本用例会自动改为验证'拒未授权'）；② 数据库没接上（看 /health/ready 明细）"
+            f"两种可能：① 这个栈配了鉴权但你没给凭证（请设 E2E_USER/E2E_PASSWORD，"
+            f"或过渡期的 E2E_API_KEY；本用例会自动改为验证'拒未授权'）；"
+            f"② 数据库没接上（看 /health/ready 明细）"
         )
 
 

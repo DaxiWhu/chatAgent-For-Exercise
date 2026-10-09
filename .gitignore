@@ -55,8 +55,22 @@ langgraph_checkpoints*
 # 但模板必须入库：它是唯一能说明"有哪些配置项、为什么这么设"的地方，
 # 被 .env.* 一起忽略的话，所有配置说明就只存在于开发者本机。
 !.env.example
+
+# ⚠️ `secrets/app.sops.env`（SOPS 加密产物）**故意不在**上面的忽略范围内 ——
+# 它必须以 `.env` 结尾（sops 按后缀推断格式，见 `.sops.yaml`），
+# 又不以 `.env.` 打头，所以 `.env` 与 `.env.*` 两条模式都不会命中它。
+# 这一点是**隐式**的（"没被忽略"看起来不像一条规则），所以用守卫把它变成显式：
+# `tests/test_secrets_config.py` 用 `git check-ignore` 实测它**没有**被忽略。
+# 哪天有人加了 `*.env` 之类的宽模式，那个守卫会红 —— 而不是让密文静默地不再被提交。
+#
+# 顺带：解密时的临时文件叫 `.env.tmp`，它**会**被 `.env.*` 吃掉（这是好事）。
+# 而加解密是"先写临时文件、成功才原子替换"（见 scripts/tasks.py 的 _run_to_file），
+# 所以 secrets/ 下也可能留下 app.sops.env.tmp —— 内容是密文，不是泄露，
+# 但它不该被提交（半成品密文比没有更误导人）。
+
 *.key
 *.pem
+secrets/*.tmp
 
 # 部署证书目录（私钥/全链证书都绝不进仓库）
 deploy/app/certs/
@@ -108,6 +122,24 @@ data/.parse_cache/
 # 里面的 pt_* / pytest_tmp 等目录是 pytest tmp_path 的落地结果，
 # 每次跑测试都会重新生成；probe_*.py 是排障用的临时脚本。
 tmp_probe/
+
+# ---- pytest 的 `--basetemp`（有人会把它指到仓库内）----
+# 默认 basetemp 在系统临时目录；但排障时常用 `--basetemp=.tmp_pytest` 把用例的
+# 临时文件留在工作区里看。这个目录是**纯临时产物**，一旦进了版本库，
+# 下次跑测试产生的噪音会以"看不懂的 diff"形式混进提交。
+#
+# ⚠️ 两种拼写都列上（2026-10-06 补）：只用过其中一种的人**不会知道**另一种没被忽略 ——
+# 而漏掉的代价是一条 `?? .pytest_tmp/` 混进 `git status`，看起来像有未完成的工作。
+# 规定一句：`--basetemp` 用相对路径时**父目录必须已存在**（pytest 会先 rmtree 再
+# mkdir，父目录不在就直接 FileNotFoundError，表现成"几百个用例集体 ERROR"）。
+.tmp_pytest/
+.pytest_tmp/
+# ⚠️ 2026-10-06 再补一次：排障时带后缀写过 `--basetemp=.pytest_tmp_149full2`，
+# 从上面两条**底下穿了过去**（`?? .pytest_tmp_149full2/` 一次性冒出十几个）。
+# 列举式忽略和列举式守卫是同一个毛病 —— 漏一项**没有任何症状**。
+# 改成前缀匹配，把 `.pytest_tmp_*` 与 `.pytest_basetemp` 这类变体一并吃掉。
+.pytest_tmp*/
+.pytest_basetemp/
 
 # ---- 告警邮件的 SMTP 密码（**绝不能入库**）----
 # Alertmanager 的配置不支持环境变量插值，邮件密码只能以 `_file` 形式提供；

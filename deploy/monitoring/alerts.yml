@@ -32,6 +32,23 @@ groups:
           description: "服务无响应或 /metrics 不可达，已持续 2 分钟。"
           runbook: "1) docker logs 看进程是否活着；2) curl /health/live 区分'进程死'与'只是 /metrics 被拒'; 3) 若进程活着但探针失败，看 /health/ready 的 checks 明细。"
 
+      # 限流的 IP 维度发现"一个对端地址背后有很多个不同用户"。
+      # 为什么值得一条告警：这两种形态的症状完全一样（一个桶被很多人共用），
+      # 而其中"反代配了但 TRUST_PROXY_HEADERS 没开"是**可以修的**，且不修的话
+      # 一个人就能把所有人挡在登录外面（登录接口也在同一个桶里）。
+      # 只看 trusted="no"：trusted="yes" 那种是 NAT/网关，改配置解决不了，日志里的
+      # warning 足够，不该再往告警通道塞。
+      - alert: RateLimitSharedEgressWithoutTrustedProxy
+        expr: increase(ratelimit_shared_egress_total{trusted="no"}[30m]) > 0
+        for: 0m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "限流 IP 维度检测到共享出口，且未开启 TRUST_PROXY_HEADERS"
+          description: "同一个对端地址背后出现了多个不同用户 ⇒ 这批人的按 IP 额度是**共用一份**的：一个人刷满，其余人（含 `POST /v1/auth/login`）全部 429。最常见的原因是应用在反向代理后面但 `TRUST_PROXY_HEADERS` 没打开，于是每个请求的客户端地址都是那台代理。"
+          runbook: "1) 确认部署形态：前面有反代/网关 ⇒ 设 `TRUST_PROXY_HEADERS=1` 并重启（应用改从 X-Forwarded-For 取真实客户端地址）；直连却出现多个主体 ⇒ 查是不是有中间设备在改对端地址；2) 确认代理是**覆盖式**写 XFF（`proxy_set_header X-Forwarded-For $remote_addr;`）—— 追加式写法下最左段是客户端可控的，等于限流可被伪造绕过（守卫见 tests/test_deploy_topology.py）；3) 改完看本告警是否消失、`rate_limited_total{scope=\"ip\"}` 是否回落；4) 若确认是 NAT（已开 TRUST_PROXY_HEADERS 仍报）⇒ 那是 trusted=\"yes\" 那条路径，改提 `RATE_LIMIT_PER_MINUTE` 或按出口人数评估。"
+
       - alert: ChatAgentReadinessDegraded
         # readiness 失败只会摘流量、不重启容器 —— 但如果一直摘着，
         # 说明实例实际上没在服务（可能被 LB 剔除了却没人注意）。
@@ -195,6 +212,154 @@ groups:
           description: "没有任何 `rag_index_identity_ok` 序列，但有实例正在被抓取（`up == 1`）。持久化向量后端下启动自检一定会写这个指标 —— 它缺席意味着**这项检查根本没在跑**，于是上一条 `IndexIdentityMismatch` 永远不会响，而外观全绿。"
           runbook: "1) 在启动日志里搜 `索引身份自检`：**完全没有这一行** ⇒ `app/main.py::_report_index_identity` 没被调或抛异常（它会打 WARNING，一并看）；2) **有这一行**但 `status=unknown` ⇒ 表/集合还没建（首次灌库之前属正常，灌完就会变成 recorded）；`status=error` ⇒ 自检读不到向量库，按日志里的异常修连接参数；3) 确认 `RAG_VECTOR_STORE` 不是 `memory` —— 内存后端天然没有索引身份，生产不该用它。"
 
+      - alert: SharedBackendDegraded
+        # 多副本下 Redis（限流 / 配额 / 幂等的共享后端）不可达时，实现会**退到
+        # 进程内计数**以保证"仍然会拦"，但各副本各算各的 ⇒ 额度实际被放宽 N 倍。
+        # 这是最需要告警的一类：**保护机制失效，而服务一切正常** —— 请求成功率、
+        # 延迟、错误率全都看不出任何异常，限流看起来也仍在工作。
+        expr: increase(shared_backend_errors_total[15m]) > 0
+        for: 5m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "共享后端降级为进程内计数（component={{ $labels.component }}）"
+          description: "近 15 分钟有 {{ $value }} 次共享后端（{{ $labels.backend }}）调用失败，已退到进程内计数。单副本下只是「计数更准一点」，**多副本下等于把限流/日配额放宽到副本数倍**。"
+          runbook: "1) 按 component 定位：quota ⇒ 查日额度是否被刷穿；ratelimit ⇒ 查是否有来源绕过了限流；2) `redis-cli -h <host> ping` 与 `INFO clients` 确认 Redis 是挂了、还是连接数打满；3) 恢复后**核对这段时间的实际消耗**（日志里的「配额拒绝」与限流触发次数），必要时人工追溯；4) 检查 `REDIS_URL` —— 限流 / 日配额 / 幂等**共用这一个键**，指错地址或不可达时三者会同时静默退化。"
+
+      - alert: RequestTimeoutFrequent
+        # 请求级总时限（REQUEST_TIMEOUT_SECONDS）被顶掉：流被终止、用户拿不到完整回答。
+        # 它**不会**产生 5xx（已经下发了部分正文），所以 HighErrorRate / SLO 都看不见它 ——
+        # 不单独看这条就只剩用户投诉这一条路径。
+        expr: increase(request_timeout_total[15m]) > 3
+        for: 5m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "请求频繁触及总时限（kind={{ $labels.kind }}）"
+          description: "近 15 分钟有 {{ $value }} 次请求因总时限耗尽被终止（响应已开始，故不计入 5xx）。"
+          runbook: "1) 先看 `llm_first_token_seconds` 与 `llm_call_duration_seconds`：首字节慢 ⇒ 上游模型；调用慢 ⇒ 上游整体抖动；2) 看 `rag_stage_duration_seconds` 排除检索段；3) 三者都正常 ⇒ 是 REQUEST_TIMEOUT_SECONDS 配得偏紧（对照 `llm_tokens_per_request` 的 P95 判断合理值）；4) 若确实需要更长，改配置时**同步确认**前端与网关的超时都比它长。"
+
+      - alert: RagRetrievalDegraded
+        # 检索抛异常后**降级为无上下文继续作答**：接口 200、答案照出，只是没有引用。
+        # 过去这里只有一行 warning，于是"检索一直失败"在指标上完全看不出来。
+        expr: increase(rag_retrieval_degraded_total[15m]) > 0
+        for: 5m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "检索失败并降级为无上下文（stage={{ $labels.stage }}）"
+          description: "近 15 分钟有 {{ $value }} 次检索整体失败（stage=graph_retrieve 为主链路，agent_search 为 agent 链路）。用户拿到的是「没有依据」的回答，而**服务零报错**。"
+          runbook: "1) 看 `circuit_open`：若同时为 1，先按那条处置（熔断打开时降级是**预期行为**）；2) 否则查 embedding 网关连通性与 `EMBEDDING_API_KEY`；3) 结合 `rag_stage_duration_seconds` 判断是 embed 段还是 vector 段；4) 语料目录未挂进容器也会走到这里（看启动日志的「RAG 语料为空」）。"
+
+      - alert: RetrievalCircuitOpen
+        # 熔断器打开 ⇒ 出站调用被快速失败 ⇒ 调用方走降级分支（检索回退融合顺序）。
+        # 全过程没有异常抛出、没有 5xx，**只有这个 gauge 能反映它**。
+        expr: circuit_open == 1
+        for: 5m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          # ⚠️ 标签名是 `breaker` 而**不是** `name`：`app/metrics.py` 的读写函数
+          #    第一个形参就叫 `name`，标签再叫 `name` 会在**调用点**当场抛
+          #    TypeError（探针确认：异常抛在观察函数自身，兜底 except 轮不到）。
+          #    熔断器的播报点在 `record_success`（每次成功都走），于是异常会穿透
+          #    `guarded_call` 让检索整体降级 —— 指标一条不存在，业务还跟着坏。
+          summary: "出站熔断器未闭合（{{ $labels.breaker }}）"
+          description: "熔断器 {{ $labels.breaker }}（rerank / embedding）已连续失败到阈值并打开。此后每次调用**不发出请求、直接失败**，由调用方降级：检索回退到融合顺序、精排被跳过。用户侧的感知是「排序变差」「答案依据不足」，而面板上的错误率完全正常。"
+          runbook: "1) 看 `circuit_opened_total` 的增长速率与 `circuit_rejected_total`（省下了多少次白等）；2) 查上游网关健康与配额：rerank ⇒ RERANK_MODEL / RERANK_API_KEY；embedding ⇒ EMBEDDING_MODEL / EMBEDDING_API_KEY；3) 半开状态也会让本告警保持 firing —— 那表示上游**还没真正恢复**，不要为了让告警消失而调大 `CIRCUIT_FAIL_THRESHOLD`；4) 恢复后 gauge 会自行变 0，确认 `rag_stage_duration_seconds{stage=...}` 的量级回到基线。"
+
+      - alert: FirstTokenTooSlow
+        # ★ 流式服务里第一个该看的用户体验指标。端到端延迟（http_request_duration_seconds）
+        #   覆盖整段生成，天然被"回答有多长"主导 —— 它快慢说明不了"用户等了多久才看见第一个字"。
+        #   这正是 `client_disconnected_total` 高企（用户没耐心）最常见的成因。
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(llm_first_token_seconds_bucket{mode="stream"}[10m])) by (le)
+          ) > 8
+        for: 10m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "首字节延迟 P95 超过 8 秒（{{ $labels.kind }}）"
+          description: "近 10 分钟流式请求的首字节 P95 = {{ $value }}s。用户在这段时间里看到的是一个空白的回答区。只看 `mode` 为 stream 的那一档：非流式链路（agent 链路整段返回）的「首字节」其实是整段生成耗时，混进同一个分位数会让这个数失去含义。"
+          runbook: "1) 先分诊：看 `rag_stage_duration_seconds`（检索是不是慢了）与 `llm_call_duration_seconds`（模型调用是不是慢了）；2) 两者都正常 ⇒ 问题在**排队/并发**：看 `http_concurrency_in_flight / http_concurrency_limit` 与 `rate_limited_total`；3) 若同时 `client_disconnected_total` 在涨，说明用户已经在关页面了，优先处理；4) 对照 `llm_tokens_total` 排除「上游整体过载」。"
+
+      - alert: LlmCallErrorsHigh
+        # 模型调用**独立**的失败率。没有它时，上游抖动只能透过
+        # `chat_stream_errors_total` 与 `agent_runs_total{exit_reason=error}` 间接看到 ——
+        # 而这两者都会被重试与"兜底话术"吃掉一部分，系统性低估真实失败率。
+        # 分母用 `llm_call_duration_seconds_count`：每次调用（成功或失败）都会计时，
+        # 因此它与分子的口径天然一致。
+        expr: |
+          rate(llm_call_errors_total[10m])
+          / clamp_min(rate(llm_call_duration_seconds_count[10m]), 0.001) > 0.1
+        for: 10m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "模型调用失败率超过 10%"
+          description: "当前失败率 {{ $value | humanizePercentage }}。stage=evaluate 高 ⇒ 评审环节（有重试兜底，会推高返工）；stage=answer/revise 高 ⇒ 用户直接拿不到答案；stage=step_* ⇒ agent 链路。"
+          runbook: "1) 按 stage 定位环节；2) 看 `llm_call_duration_seconds` 的分布 —— 失败集中在超时（≈timeout 上限）说明上游变慢，否则更可能是 4xx/协议错误（查 `AGNES_API_BASE` 与模型名）；3) 同时看 `llm_budget_exceeded_total` 排除「预算被顶掉被误记成失败」；4) 若为 agent 链路，对照 `agent_runs_total{exit_reason}` 的分档。"
+
+      - alert: CheckpointErrorsHigh
+        # 检查点（LangGraph 持久化）读写失败。它是**硬依赖**：失败意味着会话状态
+        # 读不到/写不进，表现为"续跑拿到旧状态"或"卡住"，而 HTTP 可能仍是 200。
+        # `/health/ready` 的 checkpointer 项是**启动探针**，答不了运行期的读写故障。
+        expr: increase(checkpoint_errors_total[15m]) > 0
+        for: 5m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "检查点读写失败（op={{ $labels.op }}）"
+          description: "近 15 分钟有 {{ $value }} 次检查点操作失败（op=get_tuple 读 / put 写 / put_writes 写中间态）。op=put* 失败意味着**这轮执行的状态没有落库**，断点续跑与人工审核都会拿到过期状态。"
+          runbook: "1) `docker logs` 搜「检查点」，看是连接失败（DB_URL / PG 容器 / 连接池耗尽）还是序列化错误（state 里进了不可 msgpack 的类型）；2) 看 `checkpoint_duration_seconds` 是否同步变慢（慢 ⇒ 连接池或磁盘；不变 ⇒ 逻辑错误）；3) 检查 PG 磁盘空间与 `DiskSpaceLow`；4) 恢复后**核对**这段时间的会话能否正常续跑（`/v1/sessions` 的续传路径）。"
+
+      - alert: OnlineHallucinationDetected
+        # 线上真实流量的幻觉率（**编造标识符 / 编造引用编号**这两类可被代码证明的错误）。
+        # 与上面 `CitationUnsupportedFrequent` 的分工：那条只看引用编号，
+        # 这条还会看 `KEY=VALUE`、路径、常量这类标识符 —— 而且是在**采样**上算比率。
+        #
+        # ⚠️ 需要开 `RAG_ONLINE_QUALITY_SAMPLE`（默认 0）才有数据。没开时这两个
+        #    序列**不存在**（不是 0）⇒ 本规则 inactive。这是刻意的：没开采样时
+        #    "没有异常"与"没在检查"必须能分开。
+        #
+        # 分母用 `sum(rate(...))`：分子是无标签的单序列，不聚合会让两侧标签集
+        # 不匹配，表达式的求值结果为空（**永不触发**，且没有任何报错）。
+        expr: |
+          rate(online_answer_hallucinated_total[30m])
+          / clamp_min(sum(rate(online_answer_judged_total[30m])), 0.001) > 0.05
+        for: 15m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "采样到的线上答案里出现编造（占比 > 5%）"
+          description: "近 30 分钟被采样的回答中，{{ $value | humanizePercentage }} 被判定为**确凿编造**（引用了语料里不存在的标识符，或标了不存在的引用编号）。判据是纯规则的、零模型调用，所以这不是主观判断。"
+          runbook: "1) 先看 `online_answer_judged_total{verdict}` 的构成 —— `unknown` 占比过高说明多数回答没有可核的标识符，此时这个比率本身参考价值有限（先确认样本量）；2) 与 `PROMPT_VERSION` / `EMBEDDING_MODEL` / 上游模型名的最近一次变更对照（换模型或改提示词后这类错误最常见）；3) 用离线入口复现：`python scripts/eval_generation.py --live`；4) 若集中在某类问题，考虑收紧 `answer_prompt` 或打开 `RAG_CITATION_CHECK_ACTION=block` 先止损（它会吞掉不可信引用）。"
+
+      - alert: IdempotencyConflictsHigh
+        # 客户端在拿**同一个 Idempotency-Key** 反复提交 —— 它认为上一次没成功。
+        # 最常见的成因是"请求比客户端的超时窗口更慢"（弱网/网关掐断/上游变慢），
+        # 客户端按正确逻辑重试；幂等键把它挡住了（这正是它存在的意义）。
+        # 为什么值得叫醒人：**挡不住的那部分**会变成重复计费 + 重复历史 + 重复待审项，
+        # 而服务端全程没有任何错误日志、错误率也完全正常 —— 只有这个指标能看见。
+        expr: increase(idempotency_conflict_total[15m]) > 20
+        for: 10m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "同键重试被挡下 {{ $value }} 次（15 分钟）"
+          description: "客户端正在对同一个 Idempotency-Key 重复提交。reason=in_flight 占多数 ⇒ 请求比客户端的重试窗口更慢；reason=not_replayable 占多数 ⇒ 上一次已完成但响应没能缓存下来（重放上限 IDEMPOTENCY_MAX_BODY_BYTES 被撑满）。两者要看的图完全不同。"
+          runbook: "1) 先按 reason 分档：sum by (reason) (increase(idempotency_conflict_total[15m]))；2) in_flight 多 ⇒ 对照 HighLatencyP95 与 llm_first_token_seconds 确认是不是上游变慢导致客户端提前重试（若确实更慢，客户端该调的是自己的超时，而不是让服务端放宽幂等）；3) not_replayable 多 ⇒ 看 idempotency_truncated_total 是否同向在涨，并据此调大 IDEMPOTENCY_MAX_BODY_BYTES；4) 顺手核对 idempotency_replay_total —— 它是被**正确吸收**的重试次数，两条曲线一起看才是全貌；5) idempotency_mismatch_total 在涨说明客户端把键用错了（同键换了载荷）—— 那是客户端 bug，不是服务端故障；6) idempotency_rejected_total 在涨说明客户端没按 IDEMPOTENCY_DOC_URL 公布的格式带键（缺头或含非法字符）。"
+
   # =========================================================================
   # SLO 与错误预算（定义见 SLO.md，本组的表达式与那份文档一一对应）
   # =========================================================================
@@ -236,6 +401,7 @@ groups:
           category: slo
           severity: critical
           slo: availability
+          kind: burn
         annotations:
           summary: "可用性错误预算高速燃尽（1h 燃尽率 > 14.4x，slo=availability）"
           description: "近 5 分钟 5xx 比例 > 7.2%（= 14.4 × 0.5% 错误预算）。按此速度 30 天预算约 8.6 小时烧光。"
@@ -255,6 +421,7 @@ groups:
           category: slo
           severity: critical
           slo: availability
+          kind: burn
         annotations:
           summary: "可用性错误预算持续燃尽（6h 燃尽率 > 6x，slo=availability）"
           description: "近 30 分钟 5xx 比例 > 3%（= 6 × 0.5%）。半天内已烧掉预算的 5%，属于持续性的稳定出错，比尖峰更容易被忽视。"
@@ -274,6 +441,7 @@ groups:
           category: slo
           severity: warning
           slo: availability
+          kind: burn
         annotations:
           summary: "可用性错误预算匀速燃尽（3d 燃尽率 > 1x，slo=availability）"
           description: "3 天内平均 5xx 比例 > 0.5%。不紧急，但若不处理，月末必然违约 —— 这条告警的作用就是提前一周发现问题。"
@@ -300,6 +468,7 @@ groups:
           category: slo
           severity: warning
           slo: latency
+          kind: burn
         annotations:
           summary: "非流式接口延迟预算高速燃尽（1h 燃尽率 > 14.4x）"
           description: "近 5 分钟有 > 14.4% 的非流式请求超过 1 秒（= 14.4 × 1% 预算）。"
@@ -321,10 +490,54 @@ groups:
           category: slo
           severity: warning
           slo: latency
+          kind: burn
         annotations:
           summary: "非流式接口延迟预算匀速燃尽（3d 燃尽率 > 1x）"
           description: "3 天内平均有 > 1% 的非流式请求超过 1 秒。"
           runbook: "排期优化（典型是 PG 查询缺索引或探针串行等待）；若 1 秒的目标本身定得不合理，改 SLO.md 与表达式两处。"
+
+      # ---- 预算**余量**：与上面 5 条是两种问法，别当成同一族 ----
+      # 上面 5 条读的是 `rate`（速率）：回答"按这个速度还要多久烧光"，
+      # 所以能在烧掉 2% 时就叫人 —— 但到窗口末尾它对"还剩多少"完全无感。
+      # 下面 2 条读的是 `slo:budget_remaining_ratio`（录音规则，见 recording.yml）：
+      # 回答"现在还剩多少"，覆盖 `ERROR_BUDGET_POLICY.md` 政策表里那两行
+      # "预算剩余 < 20% ⇒ 冻结" / "预算耗尽 ⇒ 全面冻结 + 48h 复盘"。
+      #
+      # ⚠️ 两条表达式都是**光秃秃的指标名**，不带窗口 —— 30 天窗口在录音规则里，
+      #    不在这里。把它改回内联的 `increase(http_requests_total[30d])` 会让
+      #    每次评估都要把几百条原始序列 × 86400 个点读进内存（见 recording.yml 的说明）。
+      #    守卫：`test_budget_alerts_read_the_recorded_series`。
+      #
+      # ⚠️ 只写一条表达式就覆盖了两种 SLI：录音规则用**同一个指标名 + `slo` 标签**
+      #    分别产出 availability 与 latency 两条序列（政策表写的就是"任一 SLI"）。
+      #    摘要里用 `{{ $labels.slo }}` 点名 —— 与 `RateLimitSurging` 用
+      #    `{{ $labels.scope }}` 是同一手法。守卫：`test_budget_remaining_is_recorded_for_every_sli`。
+      - alert: SLOBudgetLow
+        expr: slo:budget_remaining_ratio < 0.2
+        # 30m：余量是慢变量，抖动只来自录音窗口的滑动，不需要更快。但也不能太慢 ——
+        # 政策要求"剩余 < 20% 就冻结该 SLI 的功能变更"，晚一天发现就多一天带病发布。
+        for: 30m
+        labels:
+          category: slo
+          severity: warning
+          kind: budget
+        annotations:
+          summary: "{{ $labels.slo }} 的 30 天错误预算剩余不足 20%（当前 {{ $value | humanizePercentage }}）"
+          description: "按 `ERROR_BUDGET_POLICY.md`：该 SLI 相关路由的功能变更**冻结**，直到预算回到 50% 以上；只允许修 bug、加监控、调限流阈值、回滚。"
+          runbook: "1) 先确认不是误判：`slo:budget_remaining_ratio` 是**近似值**（录音规则对 rate 取平均，Prometheus 重启后的插值会被平均进去），对照 `rate(...[3d])` 的燃尽率看趋势是否一致；2) 若是真的：执行冻结（该 SLI 相关路由只走修复类变更），并把'下一步解冻条件 = 回到 50%'写进发布记录；3) 若确认剩余量长期低位是因为 SLO 定得过松/过紧，走 SLO.md §7 的正式调整流程，别只改表达式。"
+
+      - alert: SLOBudgetExhausted
+        expr: slo:budget_remaining_ratio <= 0
+        # 15m：比上一条短 —— 它对应的是政策里最重的一档动作（全面冻结 + 48h 复盘）。
+        for: 15m
+        labels:
+          category: slo
+          severity: critical
+          kind: budget
+        annotations:
+          summary: "{{ $labels.slo }} 的 30 天错误预算已耗尽（当前 {{ $value | humanizePercentage }}）"
+          description: "按 `ERROR_BUDGET_POLICY.md`：**全面冻结**功能变更（只做恢复与加固），并在 48 小时内产出复盘。⚠️ 这里的 critical 指\"必须当天有人做出冻结决定\"，不是\"服务正在坏\"（服务可能已经完全恢复，只是账已经花光了）。"
+          runbook: "1) 执行全面冻结，把冻结范围与批准人写进发布记录；2) 48 小时内产出复盘：根因、影响范围（多少请求 / 多少租户）、**为什么现有告警没更早发现**、加固项 —— 加固项必须落到 alerts.yml / tests/ / RUNBOOK.md 里（见 ERROR_BUDGET_POLICY.md §6）；3) 复核是不是 SLI 口径本身错了（例如把流式接口算进延迟 SLI），是则走 SLO.md §7 的正式调整；4) 这条会以 24h 的节奏重复提醒（专属路由），不要在确认前静音。"
 
   # =========================================================================
   # 成本与配额
@@ -350,7 +563,7 @@ groups:
           severity: warning
         annotations:
           summary: "多个租户触发日配额上限"
-          description: "1 小时内 {{ $value }} 次配额拒绝。可能是业务增长（该加额度），也可能是被刷（该查 TENANT_KEYS 是否泄漏）。"
+          description: "1 小时内 {{ $value }} 次配额拒绝。可能是业务增长（该加额度），也可能是被刷 —— 看涉及几个租户、集中在谁身上：租户少而量集中像业务增长；租户多而零散则怀疑令牌共享或脚本通行证泄漏。"
           runbook: "查日志 '配额拒绝：tenant=xxx'，看是几个租户、集中在谁身上。"
 
       - alert: AbnormalTokenBurn
@@ -388,6 +601,28 @@ groups:
           description: "待审内容超过 20 条且持续 30 分钟没人处理 —— 对业务来说等于工单积压。"
           runbook: "1) GET /v1/reviews 看具体内容；2) 检查 REVIEW_NOTIFY_WEBHOOK 是否失效（通知没到人手里就会一直积压）。"
 
+      - alert: ReviewWaitTooLong
+        # `review_pending`（还有多少条）与这条（**等了多久**）是两个独立的问题：
+        # 积压 20 条各等 10 分钟，与积压 2 条各等 3 天，前者在 `review_pending` 上
+        # 完全一样。而 human-in-the-loop 服务里，用户实际承受的延迟主体就是这段等待
+        # （生成只占一小段）—— 所以"等太久"必须有自己的信号。
+        #
+        # 分母/样本说明：观测点写在 `review_queue.resolve()`（唯一知道 `created_at`
+        # 的地方），因此**只有被处理过的记录**才有样本 —— 长期没人处理的那些
+        # 恰好看不到，由上面的 `ReviewBacklog` 兜住。两者互为补充，不能只留一条。
+        expr: |
+          histogram_quantile(0.9,
+            sum(rate(review_wait_seconds_bucket[6h])) by (le)
+          ) > 28800
+        for: 15m
+        labels:
+          category: cost
+          severity: warning
+        annotations:
+          summary: "人工审核等待时长 P90 超过 8 小时（action={{ $labels.action }}）"
+          description: "近 6 小时被处理掉的待审记录里，P90 的等待时长 = {{ $value }}s。用户在拿到回答前等了这么久；而模型生成通常只占其中几秒。"
+          runbook: "1) 对照 `review_pending` 判断是「处理得慢」还是「根本没人处理」（后者看 `REVIEW_NOTIFY_WEBHOOK` 是否失效）；2) 看 `action=revised` 与 `accepted` 的分布差异 —— 被打回的那些若明显更久，说明来回沟通成本高，应考虑在 `need_review` 载荷里一次给全判据；3) 若业务上确实不需要人工把关，考虑调低触发评审的阈值而不是让人一直等。"
+
       - alert: FrequentClientDisconnects
         expr: rate(client_disconnected_total[10m]) > 0.5
         for: 10m
@@ -412,8 +647,8 @@ groups:
           severity: critical
         annotations:
           summary: "检测到租户冒用尝试（{{ $value }} 次）"
-          description: "有客户端用某个租户的 API Key，却声明了另一个租户的 X-Tenant-Id。已按 403 拒绝，但这说明有人在探测越权。"
-          runbook: "1) 查日志 '租户自报与 Key 不符' 定位来源 IP；2) 若来自内部服务 ⇒ 是配置写错；若来自外部 ⇒ 该轮换对应的 Key（TENANT_KEYS）。"
+          description: "有客户端带着某个租户的令牌，却声明了另一个租户的 X-Tenant-Id。已按 403 拒绝，但这说明有人在探测越权。"
+          runbook: "1) 查日志 '租户自报与用户凭证不符' 定位来源 IP 与 sub；2) 来自内部 ⇒ 调用方把别的租户 id 写进了 X-Tenant-Id；来自外部 ⇒ 有人用自己租户的令牌试探别的租户，按越权处置（必要时停用该账号）。注意：本指标只有一个来源 —— 令牌与请求头不符；租户**不可能**被请求头改掉（取值只认令牌载荷）。"
 
       - alert: SessionOwnershipViolation
         expr: increase(session_owner_mismatch_total[15m]) > 0
@@ -492,6 +727,31 @@ groups:
           description: "**这一条本身可能送不出去**（Alertmanager 挂了时）。它的首要用途是 `up` 面板与告警历史里的留痕，以及配合 Watchdog 的心跳缺失来定位断在哪一环。"
           runbook: "1) 按 job 定位：alertmanager ⇒ 告警从此发不出（先恢复它，再补发）；blackbox-exporter ⇒ ExternalProbeFailing 也**不会触发**（`probe_success` 停止产出而不是变 0，这是最隐蔽的一种失效）；node-exporter ⇒ 磁盘告警静默失效；2) `docker compose --env-file .env -f deploy/app/docker-compose.yml ps` + `logs` 看是崩了还是资源被限；3) 恢复后**核对这段时间的业务是否真的有故障** —— 监控盲区里的故障只能从用户侧或日志里补回来。"
 
+      - alert: TLSCertProbeDown
+        # 为什么必须单独有这一条（2026-10-06 补）
+        # ------------------------------------------------
+        # `TLSCertExpiringSoon` 读的是 blackbox 给出的 `probe_ssl_earliest_cert_expiry`，
+        # 而**这个序列只在探活成功时才产出**。探活本身坏了 ⇒ 表达式匹配到空序列 ⇒
+        # 证书告警**永远 inactive 且没有任何报错** —— 又一次"用缺失表达故障"。
+        # 而 `MonitoringStackDown` 的 `up{}` 里是**逐个列举** job 名的
+        # （prometheus|alertmanager|node-exporter|blackbox-exporter），
+        # 新增的探活 job 不在列举里，于是从判据下面穿了过去 ——
+        # 这个仓库今天已经因为"列举式判据"栽过两次，所以除了这条规则，
+        # `tests/test_monitoring_config.py` 里还加了"每个 scrape job 都必须有人盯"的守卫。
+        #
+        # 两种触发原因的处置完全不同，必须由人区分（所以 runbook 从"先看报错"开始）：
+        #   ① 域名还是 `REPLACE-WITH-YOUR-DOMAIN` 占位符（配置步骤没做完）；
+        #   ② 域名填了，但 https_2xx 探活失败（证书/入口/网络问题）。
+        expr: up{job="blackbox-tls"} == 0
+        for: 30m
+        labels:
+          category: platform
+          severity: warning
+        annotations:
+          summary: "TLS 证书探活没有在工作（blackbox-tls 抓取失败）"
+          description: "blackbox-tls 取不到数据 ⇒ `probe_ssl_earliest_cert_expiry` 一条序列都没有 ⇒ `TLSCertExpiringSoon` 变成**哑弹**。持续下去，证书到期那天全站会被浏览器直接拦下，而监控里一切正常。"
+          runbook: "1) 先看 `localhost:9090/targets` 里 blackbox-tls 那行的报错：DNS 解析失败 ⇒ 多半是域名还是占位符（见 `deploy/monitoring/prometheus.yml` 里这个 job 的注释，替换后 restart prometheus）；2) 确认 `blackbox-exporter` 容器活着（`docker compose --env-file .env -f deploy/app/docker-compose.yml ps`）—— 它挂了时 `MonitoringStackDown` 也会一起响；3) 若你的 HTTPS 入口不在本编排内（TLS 由外部 LB 终结），正确做法是**删掉 blackbox-tls 这个 job 与这条规则**，而不是留一条常年 firing 的告警（常年 firing 等于没有告警）；4) 修好后用 `curl -s --noproxy '*' localhost:9090/api/v1/targets | python -m json.tool | grep -A3 blackbox-tls` 复核其为 UP。"
+
       - alert: AlertDeliveryFailing
         # Alertmanager 自己暴露的投递失败计数。它回答的问题是
         # "**告警在响，但发不出去**" —— 这正是本项目当前（通道未配）所处的状态，
@@ -532,7 +792,7 @@ groups:
         annotations:
           summary: "备份已超过 15 小时没有成功过（target={{ $labels.target }}）"
           description: "`backup_last_success_timestamp_seconds` 太久没更新，且最近一轮并非\"后端未启用\"（否则会被 `backup_backend_skipped` 排除）。持续下去等于**没有备份**，而这只有在真要恢复时才会被发现。"
-          runbook: "1) `docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=100 backup-pg backup-qdrant` 看失败原因（PG 连不上 / Qdrant 报错 / 磁盘满）；2) `ls -lt backups/ | head` 看最后一次成功文件的时间；3) 手工补一次：`python scripts/pg_backup.py backup`（它同时会更新指标文件）；4) 恢复后**必须**跑一次 `python scripts/pg_backup.py drill` —— 没恢复过的备份不算备份。"
+          runbook: "1) `docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=100 backup-pg backup-qdrant` 看失败原因（PG 连不上 / Qdrant 报错 / 磁盘满）；2) `ls -lt backups/ | head` 看最后一次成功文件的时间；3) 修好根因后让**循环**重跑一轮以推进指标：`docker compose --env-file .env -f deploy/app/docker-compose.yml restart backup-pg`（循环是『启动即跑一轮』）—— ⚠️ 单跑 `python scripts/pg_backup.py backup` 只落一个 dump 文件、**不会**刷新这个指标（.prom 由循环写），只做它告警不会停；4) 恢复后**必须**跑一次 `python scripts/pg_backup.py drill` —— 没恢复过的备份不算备份。"
 
       - alert: BackupMetricsMissing
         # 与上一条的分工：上一条管"指标说很久没成功"，这一条管"**指标本身不见了**"。
@@ -549,6 +809,32 @@ groups:
           summary: "备份指标完全不存在（textfile 链路断了）"
           description: "Prometheus 里找不到任何 `backup_last_success_timestamp_seconds` 序列。也就是说：**备份是否在跑，已经完全不可观测**。此时 BackupLoopFailing 也一定不会触发（它依赖同一个指标）。"
           runbook: "1) `docker compose --env-file .env -f deploy/app/docker-compose.yml ps` 看 backup-pg / backup-qdrant / node-exporter 是否都在运行；2) `ls -la backups/*.prom` 看循环有没有写出指标文件（没有 ⇒ 循环没走到写文件那步，看它的日志）；3) `curl -s localhost:9100/metrics | grep backup_` 看 node-exporter 有没有读到（读不到 ⇒ textfile 目录挂载或参数不对）；4) 三处依次修，别跳过第 3 步 —— 它是唯一能区分『没写』与『没读到』的检查。"
+
+      - alert: PgTableGrowthFast
+        # DiskSpaceLow 的**提前量**。那条响的时候余量往往只剩几小时，而且它只说
+        # "盘要满了"、不说"是谁在吃" —— 而在这个库里，某张表涨得快，与
+        # 备份窗口变长、VACUUM 跟不上，是同一条因果链上的前后段。
+        #
+        # ⚠️ 为什么这条现在特别需要：2026-10-03 起对话历史改为**永久保留**
+        #   （RETENTION_DAYS=0，清理任务整体停用）⇒ agent_messages / agent_sessions /
+        #   检查点三张表 / review_queue / session_owners 全部只增不减。那是**有意为之**
+        #   的设计，而它唯一必须配套的东西就是"看得见它在涨"。
+        #
+        # 数据来源与备份指标同一条链路：pg-stats 容器每 15 分钟写
+        # backups/pg-tables.prom，node-exporter 的 textfile collector 抓走。
+        #
+        # 阈值（6 小时 1.5GB ≈ 6GB/天）刻意偏宽松：正常业务的对话历史到不了这个量级，
+        # 到了就说明被刷、或某类内容在异常膨胀。**按盘容量与业务量调整**，
+        # 调小是有意义的（越早看见越有余地），但别关掉它 —— 它是磁盘告警唯一的提前量。
+        expr: delta(pg_table_size_bytes[6h]) > 1.5e9
+        for: 15m
+        labels:
+          category: platform
+          severity: warning
+        annotations:
+          summary: "PG 表 6 小时内增长超过 1.5GB（table={{ $labels.table }}）"
+          description: "{{ $labels.table }} 在 6 小时内增长了 {{ $value }} 字节。历史数据是**永久保留**的（刻意如此），所以增长本身不是故障 —— 要判断的是**跑得快的那一张**是不是在异常膨胀。"
+          runbook: "1) 先确认采集链路还活着：`curl -s localhost:9100/metrics | grep pg_table_size_bytes`；为空 ⇒ 修 pg-stats 容器（`docker compose --env-file .env -f deploy/app/docker-compose.yml logs pg-stats`），否则这条告警本身就是哑的；2) `docker compose exec pgvector psql -U langgraph_app -d langgraph_checkpoints -c \"SELECT relname, pg_size_pretty(pg_total_relation_size(oid)) FROM pg_class WHERE relkind='r' ORDER BY pg_total_relation_size(oid) DESC LIMIT 10\"` 看排名；3) agent_messages 涨得快 ⇒ 对照 http_requests_total 看是否被刷；checkpoints 涨得快 ⇒ 长会话变多，属预期；4) 确认是预期增长就调大阈值，**不要**关掉这条规则。"
 
       - alert: DiskSpaceLow
         # 为什么这条必须有：compose 里每个容器的 json-file 日志默认**无上限**，
@@ -620,4 +906,174 @@ groups:
           summary: "上一次恢复演练**未通过**（target={{ $labels.target }}）"
           description: "`backup_drill_result{target=...} == 0`：演练执行了但结果不通过（行数不一致、表缺失、快照结构损坏）。这意味着**当前的备份很可能恢复不出可用的库**。"
           runbook: "1) 看演练输出里的 `✗` 标记，确定是哪些表缺失或行数不一致；2) 常见成因：备份时用了 `--schema-only`、目标库 PG 版本与源不一致、备份文件被截断（`verify` 能查出来）；3) 修好后重跑 drill，确认 `backup_drill_result` 变回 1。"
+
+  # =========================================================================
+  # agent 能力链路（所有请求都走它；文学 / PPT / 插图是它内部会叫的帮手）
+  # =========================================================================
+  # 这一组回答的是"**agent 链路到底有没有被正确地跑起来**"，与其余四组的分工：
+  # availability 管"服务活没活"，cost 管"这轮花了多少 token"。
+  # 一个只用问答的服务，这一组的全部序列都不存在（不是 0）—— 那正是它与
+  # "agent 悄悄失灵"之间的区别：前者是**没有这个能力**，后者是**有这个能力但没跑起来**。
+  #
+  # 判据全部来自 `src/agents/*` 的埋点经 `app/main.py` 翻译（`_record_agent_metrics`
+  # 与降级面的 `agent_unavailable_total`）。标签一律是**有限取值**
+  # （route / reason / exit_reason / guardrail），绝不包含 thread_id 或用户输入。
+  #
+  # ⚠️ 这些序列**只在真的走了 agent 链路时才有**。没有 agent 流量 ⇒ 序列不存在 ⇒
+  #    规则不触发（而不是"报 0"）。这是刻意的：没有能力与能力失灵要能分开。
+  - name: chatagent-agent
+    rules:
+      - alert: AgentLinkDegraded
+        # ★ 这一组里最该看的一条：**想走 agent，但走不了**。
+        #   module_unavailable ⇒ 装了开关却没装 openai-agents；
+        #   runtime_not_ready ⇒ 装了但模型 / Key 没配成功。
+        # 两种情形下请求都会**静默退回问答链路** —— 用户收到一段看起来
+        # 合理的答复，服务零报错、探针全绿。没有这条告警，只能靠用户抱怨"答得不对"。
+        expr: increase(agent_unavailable_total[15m]) > 0
+        for: 5m
+        labels:
+          category: agent
+          severity: critical
+        annotations:
+          summary: "agent 链路不可用，请求正降级为问答链路（reason={{ $labels.reason }}）"
+          description: "过去 15 分钟有 {{ $value }} 次路由判定为走不了 agent 链路。reason=module_unavailable ⇒ 未安装 openai-agents；reason=runtime_not_ready ⇒ 已安装但模型未装配成功。"
+          runbook: "1) 看启动自检里的 agents 段（enabled / ready / reason 三个字段分开回显）；2) module_unavailable ⇒ pip install openai-agents 后重启；3) runtime_not_ready ⇒ 核对 AGNES_API_KEY / AGNES_MODEL / AGNES_API_BASE；4) 观察 agent_unavailable_total 停止增长即为恢复。"
+
+      - alert: AgentHistoryDegraded
+        # ★ 与 AgentLinkDegraded 同一类：**能力悄悄少了一半**。
+        #   这条盯的是**跨轮历史存不上**：链路照常跑、答案照常出、延迟与错误率全正常，
+        #   只是模型看不到上文 —— 用户说"接着改上一轮的东西"时它会反问"改什么的"。
+        #   正因为没有任何异常信号，它是这一组里最容易被漏掉的一条。
+        # 触发源有两处（同一个 PG 后端故障的不同表现）：
+        #   ① 启动自检 `跨轮对话历史**不可用**`（ERROR，只打一次）；
+        #   ② 每轮取会话失败（`session_for` 建引擎 / 建会话，日志去首条、其余只计数）。
+        #   ⚠️ 刻意**不**含"表不存在"那类运行期故障 —— 它发生在 Runner 内部、被宽 except
+        #   接住，走的是 `exit_reason=error`（由 AgentRunFailureRateHigh 发现），但降级
+        #   行为一样：本轮没有历史。
+        expr: increase(agent_session_errors_total[15m]) > 0
+        for: 5m
+        labels:
+          category: agent
+          severity: warning
+        annotations:
+          summary: "跨轮对话历史不可用，模型看不到上文（kind={{ $labels.kind }}）"
+          description: "过去 15 分钟有 {{ $value }} 次会话后端故障。此时**每轮只剩用户新说的这一句**，服务照常运行、指标与延迟都正常。kind 是异常类型名（ModuleNotFoundError / OperationalError / TimeoutError…），用它区分「没装 sqlalchemy」「DB_URL 写法不对」与「PG 连不上 / 探不通」。"
+          runbook: "1) 启动日志搜「跨轮对话历史」——就绪那行有实际后端名（postgres / none）与输入预算，不可用那行带原因；2) 后端=none ⇒ 没配 DB_URL，跨轮历史整体关闭，配上即恢复；3) kind=ModuleNotFoundError ⇒ 装 sqlalchemy（requirements.txt 已声明，pip install -r 没跑过会漏）；kind=NoSuchModuleError / ArgumentError ⇒ DB_URL 写法不对，异步前缀必须 postgresql+psycopg://（本仓库只装 psycopg 3 一套驱动；to_async_dsn 会自动补，手写 +asyncpg 会报驱动没装）；kind=OperationalError / TimeoutError ⇒ 核 DB_URL 主机端口、PG 容器状态与网络；4) 启动日志若报 relation \"agent_sessions\" does not exist ⇒ 迁移没跑，用 python -m app.migrations status 确认版本到 7；注意这一条**不会**计入本指标，而是走 exit_reason=error（由 AgentRunFailureRateHigh 发现）；5) 观察 agent_session_errors_total 停止增长即为恢复。"
+
+      - alert: AgentHistoryBudgetExhausted
+        # ★ 与 AgentHistoryDegraded 是**同一个症状的两个来源**：那条是"历史取不到"，
+        #   这条是"历史取到了、但塞不进预算"。
+        #   计数点是"已经裁到只剩用户刚说的这一句，仍然超预算" —— 也就是模型这一轮
+        #   确实答不出"上面说的那个"（因为它根本没看到上面）。
+        #   服务不会因此报错：请求照常 200，只是答案答非所问。
+        # ⚠️ 它指向的是**配置**，不是故障：典型原因是 AGENT_HISTORY_TOKEN_LIMIT
+        #   配得比模型真实窗口还大（那样裁剪永远不触发，请求被模型侧拒），或者单条
+        #   输入本身就很长。启动日志里有实际生效的预算值。
+        expr: increase(agent_history_over_budget_total[15m]) > 0
+        for: 5m
+        labels:
+          category: agent
+          severity: warning
+        annotations:
+          summary: "跨轮历史裁不下去：只剩本轮输入仍超预算（15 分钟 {{ $value }} 次）"
+          description: "裁剪已经保到「最后一条必须留」的底线，输入总量仍超过 AGENT_HISTORY_TOKEN_LIMIT。此时该轮的模型输入超预算被原样发出，由模型侧判定 —— 常见结果是这一轮答不出来，或答案与上文无关。"
+          runbook: "1) 启动日志搜「跨轮对话历史就绪」，确认**实际生效**的输入预算是多少；2) 与模型真实窗口核对：这是**输入**预算，工具清单与输出长度不在它的视野里，必须留余量（配成窗口大小等于每轮必超）；3) 看 agent_history_input_tokens 的分布确认「裁剪后到底多大」；4) 单条输入过长时搜日志「跨轮历史预算不足」，那条 warning 会打出当轮的实际 token 数与预算。"
+
+      - alert: AgentHistoryBudgetErrors
+        # 预算**算不出来** ⇒ 本轮**整段不裁剪**（代码刻意不因为算 budget 失败就把请求打挂）。
+        # 后果是输入可能超过模型窗口而被模型侧拒 —— 表现为"这次答不出来"，
+        # 而错误类型（kind）能区分是分词器问题还是形状问题。
+        # 与 AgentHistoryBudgetExhausted 的区别：那条是"算出来了、裁不够"，
+        # 这条是"压根没算"。
+        expr: increase(agent_history_budget_errors_total[15m]) > 0
+        for: 5m
+        labels:
+          category: agent
+          severity: warning
+        annotations:
+          summary: "跨轮历史的 token 预算算不出来，本轮未裁剪（kind={{ $labels.kind }}）"
+          description: "过去 15 分钟有 {{ $value }} 次预算计算失败，失败时**原样把历史交给模型**。日志只打首条（详情搜「跨轮历史的 token 预算算不出来」），其余只计数。"
+          runbook: "1) 日志搜「跨轮历史的 token 预算算不出来」，那里有完整异常；2) kind=ModuleNotFoundError ⇒ 没装 tiktoken（requirements.txt 已声明）；OfflineTiktokenError / 网络类 ⇒ 拉不到词表，此时会自动退化成**字符数近似**并打一条 warning，功能不中断；3) kind=TypeError / AttributeError ⇒ SDK 升级后 shape 变了，看 src/agents/history_budget.py 的 _trim_sync；4) 观察该序列停止增长即为恢复。"
+
+      - alert: AgentRunFailureRateHigh
+        # 与 availability 组的 HighErrorRate 分工：那条看的是 HTTP 5xx，
+        # 而 agent 内部失败会**被兜成一封得体的话术**（synthize 里降级为
+        # ERROR_REPORT 交人工），HTTP 状态仍是 200 —— 不单独看这条就完全看不见。
+        # 分母 clamp_min 保护：没有 agent 流量时不出结果（而不是除零报警）。
+        expr: |
+          rate(agent_runs_total{exit_reason=~"error|evaluator_error|max_turns"}[10m])
+          / clamp_min(rate(agent_runs_total[10m]), 0.001) > 0.2
+        for: 10m
+        labels:
+          category: agent
+          severity: warning
+        annotations:
+          summary: "agent 链路异常收尾比例过高（> 20%）"
+          description: "当前比例 {{ $value | humanizePercentage }}。exit_reason 为 error（上游抖动 / 真实故障）/ evaluator_error（评审解析失败）/ max_turns（步数耗尽）—— 三者都代表流程没跑完。⚠️ 2026-10-03 起 error **不再**被兜成一句得体话术：节点会抛 AgentRunFailed，接口返回 incomplete（客户端看得到失败），所以它可能同时抬高 5xx / 失败占比。"
+          runbook: "按 exit_reason 分头查：error 多为上游超时/协议错误，看 AGNES_API_BASE 连通性；evaluator_error 看评审的结构化输出是否稳定（可提 AGENT_EVALUATOR_TRIES）；max_turns 看单任务模型调用分布（agent_model_calls），必要时提 AGENT_MAX_TURNS。⚠️ 链路已拆成前台 / 文学两个节点，**一次请求 = N 次运行**，所以先看 agent_* 的 agent 标签定位是哪一段在失败，再动手。"
+
+      - alert: AgentReworkRateHigh
+        # 返工率 = 未一次通过的**请求** / 总请求。这是"agent 能力"最直接的代理指标：
+        # 高返工说明规划或执行不稳（prompt / 拓扑问题），而不是"模型慢"。
+        #
+        # ⚠️ 分母**必须**是 agent_route_total{route="agent"}（请求口径），不能是
+        # agent_runs_total：拆分后后者是**运行**数（一次请求 1~2 次），拿它当分母
+        # 会让返工率凭空缩小一半 —— 而"腰斩的返工率"看起来像是能力提升了。
+        expr: |
+          rate(agent_rework_total[30m])
+          / clamp_min(rate(agent_route_total{route="agent"}[30m]), 0.001) > 0.5
+        for: 15m
+        labels:
+          category: agent
+          severity: warning
+        annotations:
+          summary: "agent 返工率过高（超过一半的任务需要多轮）"
+          description: "当前 {{ $value | humanizePercentage }} 的任务在第 2 轮及以后才交付。它直接对应成本（每次返工 = 再跑一整轮模型调用）。"
+          runbook: "1) 看 agent_review_outcome_total{score=...} 是 needs_improvement 居多还是 pass 居多；2) 若集中在文学节点，检查文学 agent 的 instructions 是否给了足够的篇幅/基调约束；3) 若集中在 PPT 那串工具调用，检查结构化输出（SlideDeck）的字段约束是否过严导致反复重试。"
+
+      - alert: AgentModelCallsPerRunHigh
+        # 平均每次任务的模型调用次数（histogram 的 _sum/_count）。
+        # 用它而不是总调用量：总调用量涨可能是"用户变多了"（正常），
+        # 而**每次**调用数涨一定是"agent 在绕圈子"（异常）。
+        expr: |
+          rate(agent_model_calls_sum[30m])
+          / clamp_min(rate(agent_model_calls_count[30m]), 0.001) > 12
+        for: 15m
+        labels:
+          category: agent
+          severity: warning
+        annotations:
+          summary: "单次任务的平均模型调用次数偏高（{{ $value | humanize }} 次）"
+          description: "AGENT_MAX_TURNS 默认 12。平均值已超过它就说明相当一部分任务在**贴着上限跑**，成本和延迟都会显著抬升，且更易触发 max_turns 收尾。"
+          runbook: "1) 对照 agent_runs_total{exit_reason=max_turns} 确认是否已出现步数耗尽；2) ⚠️ 拆分之后一次请求 = N 次运行，`agent_model_calls` 是**各行运行之和** —— 先看 agent_runs_total 的 agent 标签确认是**哪一段**在涨（前台还是文学），只看总数会把「文学那段绕圈」误读成「整体变慢」；3) 检查专家 instructions 里的 Routine 是否被写得过长（每多一条规则就多一次工具调用）；4) 对照 agent_tool_calls 的平均值 —— 它与 agent_model_calls 同向上涨说明是「工具用得越来越多」（拓扑/提示词问题），只有模型调用涨而工具调用不涨则更可能是「模型在原地自说自话」。"
+
+      - alert: AgentGuardrailTripsFrequent
+        # 出口护栏（引用可追溯 / 长度）与入口护栏（注入扫描）的拦截次数。
+        # 引用护栏拦截 = 产出里出现了本轮没检索到的编号 ⇒ 正在编造。
+        expr: increase(agent_guardrail_trips_total[30m]) > 5
+        for: 5m
+        labels:
+          category: agent
+          severity: warning
+        annotations:
+          summary: "agent 护栏频繁拦截（{{ $labels.guardrail }}）"
+          description: "30 分钟内被拦下 {{ $value }} 次。guardrail=citation_traceability_guardrail ⇒ 模型在编造引用编号（最典型的幻觉形态）。"
+          runbook: "1) 若为引用护栏：检查 research 工具是否稳定返回带编号的结论（看 agent_output_check_total 的 status 分布）；2) 若为长度护栏：核对 AGENT_MAX_ANSWER_CHARS 是否与业务期望的篇幅匹配；3) 注意护栏拦截是**正确行为**，要修的是产出质量，不是把护栏关掉。"
+
+      - alert: AgentRetrievalEmptyHigh
+        # agent 链路里的检索空召回率。与 RAG 链路的同名问题分开看：
+        # 两者共用检索器，但**触发条件不同**（agent 的查询由模型改写，
+        # 措辞往往更偏、更容易打空）。空召回率高时答案会变成"依据不足"，
+        # 用户看到的是"答不上来"，而检索器本身没有任何错误日志。
+        expr: |
+          rate(rag_hits_total{via="agent", result="empty"}[15m])
+          / clamp_min(rate(rag_hits_total{via="agent"}[15m]), 0.001) > 0.5
+        for: 15m
+        labels:
+          category: agent
+          severity: warning
+        annotations:
+          summary: "agent 链路检索空召回率过高（> 50%）"
+          description: "当前 {{ $value | humanizePercentage }} 的 agent 检索打空。常见成因：语料目录未挂进容器（DOCS_DIR 指向空目录），或模型改写出的检索式与语料用词偏离较大。"
+          runbook: "1) 先排除语料问题：看启动日志有无 RAG 语料为空的告警；2) 看 agent_retrieved_chunks 的分布确认是不是**全部**打空；3) 若只是部分打空，检查 researcher 的 instructions 里检索式改写的要求是否过于自由（可要求优先复用用户原词）。"
 

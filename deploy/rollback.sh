@@ -26,6 +26,12 @@
 #   0  回滚完成且验证通过
 #   1  执行失败（**必须人工接手**：可能 nginx 起不来了）
 #   2  权重已改，但验证没通过（流量可能仍有一部分进灰度）
+#
+# 通知
+# ----
+# 脚本结束时（**任何退出路径**，包括失败）会向 `alert-sink` 发一条"回滚已执行"，
+# 把这次动作记进值班群。receiver 默认 oncall，可用 ROLLBACK_RECEIVER 覆盖。
+# **通知失败不影响回滚结果** —— 它是记录，不是止血的一部分。
 # =============================================================================
 set -euo pipefail
 
@@ -60,6 +66,40 @@ done
 
 [ -f .env ] || die "找不到 .env（必须在仓库根执行）"
 command -v docker >/dev/null 2>&1 || die "找不到 docker"
+
+# --- 回滚通知 ---------------------------------------------------------------
+# 通知走 alert-sink，而不是把 webhook URL 从这里读出来直接用：通道选择
+# （wecom/feishu/generic）与凭据只存在于网关进程的环境里，在这里再实现一遍
+# 渲染 + 通道分支，等于让同一套约定有两个实现 —— 而它们早晚会漂。
+# alert-sink 只挂在 monitor 网络上、没有宿主端口映射，所以从容器内部调它自己。
+ROLLBACK_RECEIVER="${ROLLBACK_RECEIVER:-oncall}"
+
+notify_rollback() {
+  local rc="$1" verdict
+  case "$rc" in
+    0)  verdict="✅ 回滚完成且验证通过" ;;
+    2)  verdict="⚠️ 权重已改，但**验证未通过**（可能仍有流量进灰度）" ;;
+    *)  verdict="❌ 回滚**执行失败**，需要人工接手" ;;
+  esac
+  local summary="回滚已执行：${verdict}。原因：${REASON}。版本：${APP_VERSION}${TO_IMAGE:+；目标镜像：${TO_IMAGE}}"
+
+  if "${COMPOSE[@]}" exec -T alert-sink python alert_sink.py \
+       --notify "$ROLLBACK_RECEIVER" --summary "$summary" >/dev/null 2>&1; then
+    echo "（已发出回滚通知 → receiver=$ROLLBACK_RECEIVER）"
+  else
+    echo "⚠️ 回滚通知**没能发出**（alert-sink 未运行 / 通道未配置）。" >&2
+    echo "   这不影响回滚结果 —— 但「刚刚回过滚」这件事没进群，请手工同步一次。" >&2
+  fi
+}
+
+# 用 trap 覆盖**所有**退出路径。只在成功分支里发通知，会刚好漏掉最需要通知的
+# 两种情形：验证未通过（2）与执行失败（1）—— 而它们才是要叫醒人的那些。
+on_exit() {
+  local rc=$?
+  notify_rollback "$rc"
+  exit "$rc"
+}
+trap on_exit EXIT
 
 echo "=========================================="
 echo "回滚：把 canary 权重归零"
@@ -152,5 +192,6 @@ echo "  1) 把现场记下来（告警值、日志片段、时间点）——"
 echo "     回滚前的那几分钟证据是**唯一**能定位根因的东西，重启/重建会抹掉它。"
 echo "  2) 在 deploy/monitoring/ERROR_BUDGET_POLICY.md 的框架下判断这次要不要"
 echo "     触发发布冻结，并约一次复盘。"
+echo "  3) 确认下面那行回滚通知**已发出** —— 没发出就手工同步一次。"
 echo "=========================================="
 exit "$RC_OK"

@@ -208,7 +208,13 @@ def cmd_backup(args) -> int:
 
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = _backup_dir(args) / f"{admin.collection}-{ts}.snapshot"
-    out.write_bytes(data)
+    # 与 `pg_backup.py` 同一口径：先写 `.part`，再原子改名（2026-10-06 修）。
+    # `data` 虽然已经全在内存里，但 `write_bytes` 仍可能被中途打断（磁盘满、
+    # 容器被 kill、断电）—— 而截断的 `.snapshot` 从文件名上完全看不出来，
+    # 等到真要恢复的那一天才发现它是坏的，那时已经没有别的备份了。
+    part = out.with_name(out.name + ".part")
+    part.write_bytes(data)
+    os.replace(part, out)
     print(f"已保存：{out}（{len(data) / 1024:.1f} KB）")
 
     # 服务端快照不清的话会一直堆积在容器卷里 —— 卷写满的后果是

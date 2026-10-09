@@ -50,8 +50,17 @@ python scripts/bench_local.py --n 40000 --json # 机器可读，便于留档
 
 ## 二、端到端压测（**尚未执行**）
 
-需要：一个运行中的实例 + 真实模型密钥。本机目前两者都没有，所以这一节是
-**待办**，不是结论。
+需要：一个运行中的实例 + 真实模型密钥 + 一笔**被批准过的**模型花费。
+
+> 2026-10-04 复核：**密钥这一项已经就位** —— `.env` 里的 `AGNES_API_KEY` 与 `.env.example`
+> 不同（已填过值，不是占位符）。还差的是"把实例起起来"（`DB_URL` 指向 `localhost:5433`）
+> 与"批准这笔花费"。所以这一节仍是**待办**，不是结论 —— 但障碍已经从"三件"缩到
+> "两件"，且两件都在人手上，不在技术侧。
+>
+> ⚠️ 压测**只有**账号密码换令牌一条路（`SERVE_API_KEY` 与 `--api-key` 都已整体
+> 删除，见 `CHANGELOG.md`）：先建一个服务账号
+> （`python -m scripts.hash_password -u svc-loadtest -t <租户>`，不给 `-r` 即无角色），
+> 设 `AGENT_SCRIPT_USER` / `AGENT_SCRIPT_PASSWORD`，脚本会登录换令牌（见下）。
 
 ```bash
 # 1) 起服务。压测必然撞限流，量到的会是限流器而不是服务能力 —— 先关掉
@@ -61,12 +70,13 @@ RATE_LIMIT_ENABLED=0 python -m app.serve
 python scripts/load_test.py --endpoint health --requests 2000 --concurrency 50
 
 # 3) 花钱：真实对话（会调用大模型，注意费用）
-python scripts/load_test.py --endpoint chat --requests 50 --concurrency 4 \
-    --api-key "$SERVE_API_KEY" --yes-spend
+#    凭证走服务账号登录换令牌；密码只从环境变量读（明文进 shell history 是常见泄漏形态）
+AGENT_SCRIPT_PASSWORD='...' python scripts/load_test.py --endpoint chat \
+    --requests 50 --concurrency 4 --user svc-loadtest --yes-spend
 
 # 4) 断连止损验证（省钱能力的直接证据）
-python scripts/load_test.py --endpoint chat --requests 10 --concurrency 2 \
-    --disconnect-after 3 --api-key "$SERVE_API_KEY" --yes-spend
+AGENT_SCRIPT_PASSWORD='...' python scripts/load_test.py --endpoint chat \
+    --requests 10 --concurrency 2 --disconnect-after 3 --user svc-loadtest --yes-spend
 ```
 
 ⚠️ 运维脚本对 loopback **必须**关代理（`scripts/net.py` 已处理）。否则本机开着
@@ -114,12 +124,98 @@ N 副本"横向扩，而不是调大 worker 数 —— 后者会让每个进程�
 端到端压测要专门记录"模型首 token 时间"与"完整生成时间"两个分量，
 否则超标时分不清该找谁。
 
+**PG 连接数的核算式（2026-10-06 新增）**：本服务对 PG 的连接来自**三处**，加起来才是
+对 `max_connections` 的压力：
+
+    总连接数 ≈ 副本数 × ( PG_POOL_MAX + 检查点池 + 跨轮历史池 )
+              + 运维连接（psql / 迁移 / 备份）
+
+- `PG_POOL_MAX`（默认 8）是**每副本**上限，供会话归属 / 账号 / 审核队列三个同步
+  存储共用（见 `app/pg.py`）—— 三者共用一个池，不是各一个，所以这一项不乘 3；
+- 检查点走 langgraph 的 `AsyncPostgresSaver`（自带池），跨轮历史走 SQLAlchemy 引擎
+  自带池，两者的池大小由各自库决定，**不在本文件控制**，但必须计入总和；
+- ⚠️ 这三项都是"每副本"的：**副本数翻倍，PG 侧连接数就翻倍**。
+  PG 的 `max_connections` 默认 100，按上式计算，10 个副本就会逼近上限。
+
+观测点：`/health/ready` 的 `pg_pool` 一项会回显 `available/size`，出现
+`waiting` 说明**已打满、请求在排队**（表现是延迟上升而**没有任何错误**）。
+如果多副本下连接数成为瓶颈，正确做法是引入 PgBouncer 做跨副本统一控制，
+而不是继续调大 `PG_POOL_MAX`（那只是把压力推给 PG）。
+
 ---
 
-## 四、待补清单
+## 四、存储：永久保留下的增长（2026-10-03 新增）
+
+这一节回答一个**此前没有任何指标能回答**的问题：库现在多大、涨得多快、是谁在涨。
+
+### 哪些数据只增不减
+
+2026-10-03 起对话历史改为**永久保留**（`RETENTION_DAYS=0`，`retention-sweep` 整体停用）。
+以下五组表从此**没有回收路径**：
+
+| 表 | 谁在写 | 一行代表什么 |
+|---|---|---|
+| `agent_messages` | 官方 SDK，每次模型调用前后 | 一条对话条目（用户话 / 模型回答 / 工具调用与返回 / 交接记录） |
+| `agent_sessions` | 官方 SDK | 一个会话的名册行 |
+| `checkpoints` / `checkpoint_blobs` / `checkpoint_writes` | 图框架，每个节点边界 | 一次图运行的状态快照（含消息、评分、引用、检索上下文） |
+| `review_queue` | 本项目 | 一条待审 / 已审草稿 |
+| `session_owners` | 本项目 | 一个会话的归属登记 |
+
+> ⚠️ 这是**刻意的产品决定**，不是漏配。它唯一必须配套的东西，就是下面这套观测。
+>
+> ⚠️ 表里这五组的**寿命并不相同**，显式启用清理时会分开：
+> `agent_messages` / `agent_sessions` 是**永久保留**（`scripts/retention_sweep.py` 的
+> `AGENT_HISTORY_TABLES` 刻意不纳入，因为丢了就是用户可见内容消失、不可恢复）；
+> 其余四组是"默认不清理"，但一旦有人显式 `--days N`，它们**会被删**（本意是清检查点
+> 这类中间态）。读这张表时别把它们当成一个整体。
+
+### 怎么观测
+
+`pg-stats` 容器每 15 分钟跑一次 `scripts/pg_table_stats.py`，写 `backups/pg-tables.prom`，
+由 node-exporter 的 textfile collector 抓走（**与备份指标同一条链路，没有新增监控组件**）。
+产出三条序列：
+
+| 指标 | 含义 | 精度 |
+|---|---|---|
+| `pg_table_size_bytes{table=...}` | 每张表总占用（含索引与 TOAST） | **精确** |
+| `pg_table_rows_estimate{table=...}` | 行数 | **估算**（`pg_class.reltuples`，`ANALYZE` 之后才准） |
+| `pg_database_size_bytes` | 库总占用 | 精确 |
+
+- 看板：`chatagent-overview` 最后两张（PG 库容量 / PG 表 6 小时增长）；
+- 告警：`PgTableGrowthFast`（6 小时涨超 1.5GB），处置入口在 `deploy/RUNBOOK.md` §3.5。
+
+> **为什么行数是估算而不是精确 count**：精确 `count(*)` 在大表上要全表扫（秒级到分钟级），
+> 而本脚本每 15 分钟跑一次 —— 那是拿在线库的性能换一个展示用的数字。
+> **体积是精确的，容量判据用它**；行数只用来看趋势。
+
+### 怎么估"还能撑多久"
+
+不要凭感觉，用两个现成的量算：
+
+1. **当前增速** = 看板"PG 表 6 小时增长量"的最后一段（等价于 `delta(pg_table_size_bytes[6h])`）；
+2. **剩余空间** = `node_filesystem_avail_bytes`（`DiskSpaceLow` 用的就是它）。
+
+`剩余空间 ÷ 增速` 即粗算的可支撑时间。⚠️ 两个必须一起看：磁盘**不是匀速填满的**
+（WAL 与 autovacuum 在接近满盘时会加速），所以算出来的时间要**再打个折**。
+
+### 什么时候该动手
+
+| 现象 | 说明 | 动作 |
+|---|---|---|
+| 某张表 6 小时涨超 1.5GB | 超出正常业务量级 | 先查是不是被刷（对照 `http_requests_total`） |
+| `pg_database_size_bytes` 持续抬升且从不回落 | 永久保留下的**正常形态** | 只需确认增速在预期内 |
+| `DiskSpaceLow` 响了 | 余量通常只剩几小时 | 按 RUNBOOK §3.5 处置；容量图告诉你先看哪张表 |
+| 备份耗时明显变长 | 备份开销是 O(库大小) | 见第一节；考虑调 `BACKUP_INTERVAL_HOURS` |
+
+---
+
+## 五、待补清单
 
 - [ ] 端到端压测三组数字（`/health/live`、真实对话、断连对照），填进上面的模板
 - [ ] 记录上游模型的并发上限与首 token 时间的实测分布
 - [ ] 用实测值回填 `RATE_LIMIT_PER_MINUTE` 与 `USER_DAILY_TOKEN_QUOTA`
 - [ ] 语料规模增长到 10 万片段时重跑检索基准，确认是否需要切向量后端
 - [ ] 把这份文件与 `deploy/monitoring/SLO.md` 的数字对齐（SLO 超标时先查这里）
+- [ ] 实测「每轮对话在 `agent_messages` 里落多少字节」：用 `pg_table_size_bytes` 的差值与
+      `agent_runs_total` 的差值相除得到，据此把 `PgTableGrowthFast` 的阈值（现为 6 小时 1.5GB）
+      调到贴合真实业务量 —— 现在的值是**偏宽松的起点**，不是标定值

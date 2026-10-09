@@ -301,7 +301,7 @@ def test_editorconfig_agrees_with_gitattributes_on_line_endings():
         assert want == "crlf", f".gitattributes 里 {pat} 的 eol 应为 crlf，实际 {want!r}"
     ec_bat = next((v for k, v in ec.items() if "bat" in k or "cmd" in k), {})
     assert ec_bat.get("end_of_line") == "crlf", (
-        f".editorconfig 没有把 Windows 脚本段设为 crlf：{[k for k in ec]}"
+        f".editorconfig 没有把 Windows 脚本段设为 crlf：      {list(ec)}"
     )
 
 
@@ -313,6 +313,35 @@ def test_shell_scripts_are_not_pinned_to_crlf():
     """
     eol = _gitattribute_eol("*.sh")
     assert eol != "crlf", "`.sh` 被钉成 CRLF —— 容器里会报 bad interpreter"
+
+
+def test_python_sources_use_lf_on_disk():
+    """工作区里的 Python 源码必须是 LF —— 上一条只钉住了"规则"，这条钉"实际"。
+
+    为什么必须有
+    ----------
+    Windows 上 `open(path, "w")` 会把 `\\n` 转成 `\\r\\n`（`Path.write_text` 同理），
+    而 `.gitattributes` 钉的是 `eol=lf`。两者不一致时，任何"读出来再写回去"的脚本
+    （变异验证、批量改写）都会把**整个文件**的行尾改掉，而它在功能上完全无感：
+    测试全绿、diff 甚至可能是空的（取决于 core.autocrlf），只有 `git status`
+    反复显示"已修改"或整个文件被标红时才看得出来。
+
+    实测发生过一次：变异验证把 5 个文件（`app/auth.py`、`app/main.py`、
+    `app/sessions.py`、`scripts/eval_scorecard.py`、`src/rag/answer_quality.py`）
+    整体换成了 CRLF —— 而那个脚本的自证哈希只对照"它自己读到的内容"，
+    当文件**本来就已经是** CRLF 时会自洽通过，于是这个偏差一路潜伏。
+    """
+    bad = []
+    for d in ("src", "app", "tests", "scripts"):
+        for p in (ROOT / d).rglob("*.py"):
+            if "__pycache__" in p.parts:
+                continue
+            if b"\r\n" in p.read_bytes():
+                bad.append(str(p.relative_to(ROOT)))
+    assert not bad, (
+        f"这些 Python 源码含 CRLF（仓库钉的是 LF）：{bad}\n"
+        f"修法：写文件一律用 bytes 级 `write_bytes`，或 `open(..., newline=\"\")`"
+    )
 
 
 # --------------------------------------------------------------------------

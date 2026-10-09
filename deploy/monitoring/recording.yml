@@ -1,0 +1,138 @@
+# 录音规则（recording rules）—— SLO 错误预算的**余量**口径
+#
+# 为什么单独一个文件（而不是写进 alerts.yml）
+# ------------------------------------
+# `alerts.yml` 里每一条都必须是告警：`tests/test_monitoring_config.py` 会逐组断言
+# "组名 = 组内规则的 category"、每条都要有 summary/description/runbook。
+# 录音规则没有这些字段，混进去只有两种结局：要么被硬塞一堆无意义的注解，
+# 要么把那些守卫整批放宽 —— 后者等于把"每条告警都得写处置办法"这条纪律拆掉。
+#
+# 这个文件解决什么
+# ----------------
+# `ERROR_BUDGET_POLICY.md` 的政策表里有两行是**余量**口径：
+#   任一 SLI 的 30 天预算剩余 < 20% ⇒ 冻结该 SLI 相关路由的功能变更；
+#   任一 SLI 的 30 天预算耗尽     ⇒ 全面冻结 + 48 小时内复盘。
+# 在这之前，这两行唯一的触发器是**每周一次的人工复核**（最长 7 天滞后）：
+# `chatagent-slo` 组里的 5 条全是**速率**（燃尽率）问法，回答"按这个速度还要多久烧光"，
+# 与"现在还剩多少"是两个不同的问题（见 SLO.md §4 与 §4b）。
+#
+# 现在把这两个问题都接上：本文件算出"还剩多少"，`alerts.yml` 的
+# `SLOBudgetLow` / `SLOBudgetExhausted` 读它。
+#
+# ⚠️ 三条硬约束（改这个文件之前先读）
+# --------------------------------
+# 1. **必须被 `prometheus.yml` 的 `rule_files` 加载，且被 compose 挂进容器。**
+#    少任何一处，录音序列**永远不存在** ⇒ 读它的告警**永远 inactive 且没有任何报错** ——
+#    这就是"哑弹"（与 `job=` 指向不存在的 scrape job 同一类故障）。
+#    守卫：`test_recording_rules_are_loaded_and_mounted`。
+#
+# 2. **`interval` 必须远小于 `--query.lookback-delta`（默认 5m）。**
+#    录音规则的产物是**普通样本**，写进 TSDB 之后按同样的 lookback 规则被查询。
+#    录音间隔若等于/接近 5m，告警取数时那一瞬间最近的样本可能"刚过期"⇒
+#    查询返回**空序列** ⇒ 告警从 firing 掉回 inactive ⇒ `for` 重新计时。
+#    表现是"告警每 5 分钟闪一下"，而任何日志里都没有异常。1m 留了 5 倍余量。
+#    守卫：`test_recording_interval_is_within_the_lookback_delta`。
+#
+# 3. **预算窗口不能超过 Prometheus 的保留期。** 30 天窗口要求保留期 > 30 天，
+#    而 Prometheus 的默认保留期是 **15 天**（`docker-compose.yml` 里已显式设为 40d）。
+#    保留期不够时不会报错：`avg_over_time(...[30d])` 只是**拿到半个月的数据**，
+#    于是"上周烧掉的那一段"随时间滑出保留期、预算看起来自己恢复了。
+#    守卫：`test_prometheus_retention_covers_the_longest_budget_window`（按本文件里的
+#    窗口字面量反推，改窗口而忘了改保留期会立刻测红）。
+#
+# 为什么是两级（而不是一条 `increase(http_requests_total[30d])`）
+# -------------------------------------------------------------
+# 一条内联的 30 天窗口要读 **原始序列**：`http_requests_total`（含 path/status/release
+# 等标签）在 30s 抓取间隔下每条序列 86400 个点，几百条序列就是千万级样本 ——
+# 每次评估都要把它们全部读进内存，在 compose 给 Prometheus 的 512MB 上限下是
+# 真实的风险，而且这条规则每分钟都要跑一次。
+#
+# 两级之后，**长窗口只读两条聚合序列**：
+#   一级（`rate([5m])`，只需 5 分钟数据）⇒ 成本可忽略，顺便把标签集合合并成空集；
+#   二级读一级产物的 30 天平均 ⇒ 2 条序列 × 43200 个点，而不是几百条 × 86400 个点。
+#
+# 一级记的是**每秒速率**，所以二级对它们取平均再相除是**有意义的**：
+#   avg(错误速率) / avg(总速率) = (窗口内错误数) / (窗口内请求数)
+# 两个平均的采样权重相同，比值恰好是窗口内的错误占比 —— 不需要按流量再加权。
+# （如果一级记的是"每天的错误数"这类**累计量**，就不能这么平均：那需要按天求和。）
+#
+# 顺带一个好处：`rate()` 自己处理计数器重置，平均它对重启的容忍度比单次
+# 30 天 `increase()` 的插值外推更好（后者在重启频繁时误差会累积）。
+
+groups:
+  - name: chatagent-slo-budget
+    # 见上面第 2 条：必须 ≤ lookback delta（默认 5m）的一大截。
+    interval: 1m
+    rules:
+      # ================= 一级：把 SLI 的分子/分母合并成两条序列 =================
+      # 标签只留 `slo`（availability / latency），其余标签（path/status/release/
+      # instance…）都在 sum() 里被合并掉 —— 这正是"跨实例聚合、只对全局错误率负责"
+      # 这个口径的落地点（见 SLO.md §8 第 1 条）。
+      #
+      # ⚠️ 可用性 SLI 的分子必须用 `http_requests_total{status=~"5.."}`，
+      # **不能**用 `http_errors_total`（它只在未捕获异常时自增，会系统性低估错误率，
+      # 让 SLO 永远显示达标）。守卫：`test_slo_numerator_does_not_use_unhandled_exception_counter`。
+      - record: slo:bad_rate_5m
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m]))
+        labels:
+          slo: availability
+
+      - record: slo:total_rate_5m
+        expr: sum(rate(http_requests_total[5m]))
+        labels:
+          slo: availability
+
+      # 延迟 SLI 的"坏事件"= 非流式请求中耗时 > 1s 的那部分。
+      # 两个口径与 `alerts.yml` 里的燃尽率规则**逐字一致**：
+      #   - `path!~"/v1/chat.*"`：流式接口的耗时等于整段生成的时长，算进来会恒不达标；
+      #   - `le="1.0"`：桶边界必须写 `1.0`，写成 `1` 会因**全串匹配**而永不命中
+      #     （指标渲染出来的就是 `le="1.0"`，见 `app/metrics.py` 与 SLO.md §2）。
+      - record: slo:bad_rate_5m
+        expr: |
+          sum(rate(http_request_duration_seconds_count{path!~"/v1/chat.*"}[5m]))
+            - sum(rate(http_request_duration_seconds_bucket{path!~"/v1/chat.*",le="1.0"}[5m]))
+        labels:
+          slo: latency
+
+      - record: slo:total_rate_5m
+        expr: sum(rate(http_request_duration_seconds_count{path!~"/v1/chat.*"}[5m]))
+        labels:
+          slo: latency
+
+      # ================= 二级：30 天窗口的预算剩余比例 =================
+      # 两条规则**同一个指标名、只有 `slo` 标签不同** —— 这样告警可以只用一条表达式
+      # 覆盖两种 SLI（政策表写的就是"任一 SLI"），摘要里用 `{{ $labels.slo }}` 点名。
+      # 别把其中一条删掉：删了它只是"少覆盖一种 SLI"，不会有任何报错。
+      # 守卫：`test_budget_remaining_is_recorded_for_every_sli`。
+      #
+      # ⚠️ 这里**必须**用 `{slo="..."}` 把一级序列限定住。一级的两条 SLI 用的是
+      # 同一个指标名、只有 `slo` 标签不同，所以不带过滤的 `slo:bad_rate_5m[30d]`
+      # 会同时匹配到两种 SLI 的序列 ⇒ 下面的静态标签 `slo: ...` 会让两条结果的标签集
+      # 撞成同一个（重复样本）⇒ 这条规则每次评估都**报错、什么都不产出**。
+      # 守卫：`test_budget_rules_scope_the_level_one_series_by_sli`。
+      #
+      # `clamp_min(..., 0.001)`：分母趋零时（完全没有流量）不产生 NaN。
+      # 阈值取 0.001 与 `alerts.yml` 里各条燃尽率规则**同一个量级**（那里 clamp 的
+      # 也是每秒速率、不是比例）—— 两边的量纲别改岔。
+      #
+      # `(1 - 0.995)` / `(1 - 0.99)` 是错误预算本身（0.5% / 1%），
+      # 与 `SLO.md` §3 的目标表一一对应。改目标要同时改三处：
+      # SLO.md、`alerts.yml` 的燃尽率倍数（`14.4 * (1 - 0.995)`）以及这里。
+      # 守卫：`test_budget_targets_match_the_slo_document`。
+      - record: slo:budget_remaining_ratio
+        expr: |
+          1 - (
+            avg_over_time(slo:bad_rate_5m{slo="availability"}[30d])
+              / clamp_min(avg_over_time(slo:total_rate_5m{slo="availability"}[30d]), 0.001)
+          ) / (1 - 0.995)
+        labels:
+          slo: availability
+
+      - record: slo:budget_remaining_ratio
+        expr: |
+          1 - (
+            avg_over_time(slo:bad_rate_5m{slo="latency"}[30d])
+              / clamp_min(avg_over_time(slo:total_rate_5m{slo="latency"}[30d]), 0.001)
+          ) / (1 - 0.99)
+        labels:
+          slo: latency

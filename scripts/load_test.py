@@ -20,34 +20,40 @@
 
 用法
 ----
+    # 凭证：从环境变量取（推荐）—— 账号密码换 JWT，见 scripts/script_auth.py
+    export AGENT_SCRIPT_USER=svc-loadtest AGENT_SCRIPT_PASSWORD='...'
+
     # 轻量：连接与框架开销（不花钱）
     python scripts/load_test.py --requests 500 --concurrency 20
 
     # 真实对话：注意费用
-    python scripts/load_test.py --endpoint chat --requests 20 --concurrency 4 \
-        --api-key $SERVE_API_KEY --yes-spend
+    python scripts/load_test.py --endpoint chat --requests 20 --concurrency 4 --yes-spend
 
     # 断连止损验证：每个请求收到 3 个 token 就断开
     python scripts/load_test.py --endpoint chat --requests 10 --concurrency 2 \
-        --disconnect-after 3 --api-key $SERVE_API_KEY --yes-spend
+        --disconnect-after 3 --yes-spend
+
+⚠️ `--api-key` 已**整体删除**（2026-10-05）：那条路径分不出身份、撤不掉、
+   租户由请求头自报，三条缺陷都是结构性的。现在**只有**账号密码换 JWT 一条路，
+   传 `--api-key` 会被 argparse 直接拒掉（见 `scripts/script_auth.py` 文件头）。
 """
 
 import argparse
 import asyncio
-import os
-import statistics
 import sys
 import time
 
 try:
     import httpx
 except ImportError:  # pragma: no cover
-    raise SystemExit("需要 httpx：pip install httpx")
+    raise SystemExit("需要 httpx：pip install httpx") from None
 
 # 兼容"python scripts/load_test.py"与"python -m scripts.load_test"两种跑法
 try:
+    import scripts.script_auth as script_auth
     from scripts.net import trust_env_for
 except ImportError:  # pragma: no cover
+    import script_auth
     from net import trust_env_for
 
 
@@ -60,13 +66,13 @@ def _pct(values, p):
     return s[k]
 
 
-async def _fetch_metrics(client, base, api_key) -> dict:
+async def _fetch_metrics(client, base, headers) -> dict:
     """拉一次 /metrics，解析出 `指标名 -> 值`（只取单行无标签的样本）。
 
     失败返回空 dict（不影响压测本身）—— 指标是"证据"，缺了不该让压测跑不下去。
     """
     try:
-        r = await client.get(base + "/metrics", headers={"X-API-Key": api_key}, timeout=10)
+        r = await client.get(base + "/metrics", headers=headers, timeout=10)
         if r.status_code != 200:
             return {}
         out = {}
@@ -84,18 +90,17 @@ async def _fetch_metrics(client, base, api_key) -> dict:
         return {}
 
 
-async def _hit_health(client, base, api_key):
+async def _hit_health(client, base, headers):
     """打一次存活探针，返回 (ok, 耗时, 状态码)。"""
     t0 = time.perf_counter()
     try:
-        r = await client.get(base + "/health/live", timeout=15,
-                             headers={"X-API-Key": api_key} if api_key else None)
+        r = await client.get(base + "/health/live", timeout=15, headers=headers or None)
         return (r.status_code < 500, time.perf_counter() - t0, r.status_code)
     except Exception:  # noqa: BLE001
         return (False, time.perf_counter() - t0, 0)
 
 
-async def _hit_chat(client, base, api_key, thread_id, disconnect_after=None):
+async def _hit_chat(client, base, headers, thread_id, disconnect_after=None):
     """打一次 /v1/chat，读完 SSE 或按需提前断开。
 
     返回 (ok, 耗时, 收到的 token 数, 是否主动断开, 是否被限流)。
@@ -104,7 +109,6 @@ async def _hit_chat(client, base, api_key, thread_id, disconnect_after=None):
     "用户关掉页面"在传输层的表现，服务端应当据此停止生成。
     """
     payload = {"thread_id": thread_id, "message": "请用一句话介绍你自己"}
-    headers = {"X-API-Key": api_key} if api_key else {}
     tokens = 0
     t0 = time.perf_counter()
     try:
@@ -127,10 +131,28 @@ async def _hit_chat(client, base, api_key, thread_id, disconnect_after=None):
         return (False, time.perf_counter() - t0, tokens, False, False)
 
 
+def _resolve_headers(base: str, args) -> dict:
+    """决定所有请求用的请求头：**登录换令牌**（唯一路径）。
+
+    ⚠️ 2026-10-05：`--api-key` 与 `X-API-Key` 已整体删除（共享密钥路径不复存在）。
+    现在只有一种拿凭证的方式 —— 服务账号 + 密码换 JWT。它顺带解决了压测的一个
+    老问题：租户来自**令牌载荷**，所以压测跑的是该账号真实所属的租户，
+    不会因为漏传 `--tenant` 而把流量打到错误的租户桶里。
+    """
+    user, password = script_auth.require_credentials(args.user)
+    data = script_auth.login(base, user, password)
+    token = str(data.get("access_token") or "")
+    if not token:
+        raise SystemExit(f"登录响应里没有 access_token：{data}")
+    print(f"已用服务账号 {data.get('user') or user} 登录换令牌"
+          f"（tenant={data.get('tenant') or '（无）'}，租户来自令牌载荷而非自报）。")
+    return {"Authorization": f"Bearer {token}"}
+
+
 async def run(args) -> int:
     """并发跑完所有请求并打印报告；返回进程退出码（0 = 无失败）。"""
     base = args.target.rstrip("/")
-    api_key = args.api_key or os.getenv("SERVE_API_KEY", "")
+    headers = _resolve_headers(base, args)
     latencies, failures, rate_limited, total_tokens, disconnects = [], 0, 0, 0, 0
 
     limits = httpx.Limits(max_connections=args.concurrency * 2,
@@ -143,7 +165,7 @@ async def run(args) -> int:
         print(f"目标 {base} 判定为本机地址：已禁用环境代理，直连测量。")
     async with httpx.AsyncClient(limits=limits, http2=False, trust_env=trust) as client:
         # ---- 压测前的指标基线：用来证明"断连止损真的发生了" ----
-        before = await _fetch_metrics(client, base, api_key)
+        before = await _fetch_metrics(client, base, headers)
         if not before:
             print("提示：拉不到 /metrics（可能未启用或不可达），断连止损将无法由服务端证实。")
 
@@ -161,12 +183,12 @@ async def run(args) -> int:
                     n = counter["n"]
                 async with sem:
                     if args.endpoint == "health":
-                        ok, dt, code = await _hit_health(client, base, api_key)
+                        ok, dt, code = await _hit_health(client, base, headers)
                         limited = code == 429
                         tokens, disc = 0, False
                     else:
                         ok, dt, tokens, disc, limited = await _hit_chat(
-                            client, base, api_key, f"load-{idx}-{n}",
+                            client, base, headers, f"load-{idx}-{n}",
                             disconnect_after=args.disconnect_after)
                 async with lock:
                     latencies.append(dt)
@@ -182,7 +204,7 @@ async def run(args) -> int:
         await asyncio.gather(*[worker(i) for i in range(args.concurrency)])
         wall = time.perf_counter() - t0
 
-        after = await _fetch_metrics(client, base, api_key)
+        after = await _fetch_metrics(client, base, headers)
 
     # ---- 报告 ----
     done = len(latencies)
@@ -232,7 +254,9 @@ def main(argv=None) -> int:
                    help="health（默认，不花钱）| chat（**会消耗模型额度**）")
     p.add_argument("--requests", type=int, default=200, help="总请求数")
     p.add_argument("--concurrency", type=int, default=10, help="并发数")
-    p.add_argument("--api-key", default="", help="X-API-Key（默认取 SERVE_API_KEY）")
+    p.add_argument("--user", default="",
+                   help="脚本服务账号的用户名（默认取 AGENT_SCRIPT_USER；"
+                        "密码只从 AGENT_SCRIPT_PASSWORD 读，避免进 shell history）")
     p.add_argument("--disconnect-after", type=int, default=None,
                    help="chat 场景：收到 N 个 token 后主动断开，用于验证止损")
     p.add_argument("--yes-spend", action="store_true",

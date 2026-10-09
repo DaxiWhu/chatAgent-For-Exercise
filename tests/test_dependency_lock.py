@@ -17,8 +17,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parent.parent
 REQ = ROOT / "requirements.txt"
 LOCK = ROOT / "requirements.lock"
@@ -52,6 +50,33 @@ def _lock_pins() -> dict[str, str]:
 def test_lock_file_exists():
     """缺了锁定清单，构建就回到"每次装什么都看运气"的状态。"""
     assert LOCK.exists(), "缺少 requirements.lock；跑 `python scripts/lock_requirements.py --write` 生成"
+
+
+def test_lock_has_no_extras():
+    """lock 里**不能**出现 extras（`psycopg[binary]==3.3.3`）。
+
+    这条不是风格要求，是 pip 的**解析期**硬错误：
+
+        ERROR: Constraints cannot have extras
+
+    退出码 1，且在碰索引之前就失败 —— 它不会表现为"装不上某个包"，
+    而是整条 `pip install -r requirements.txt -c requirements.lock` 当场退出，
+    报错信息和"哪一行写错了"离得很远。extras 只能写在 `requirements.txt` 里。
+
+    ⚠️ 这条守卫此前**并不存在**：`requirements.lock` 的注释里写着"由
+    `tests/test_dependency_hashes.py` 的解析期守卫钉住"，但那个文件从来没有过
+    （真实文件叫 `test_dependency_lock.py`）。**一条指向不存在守卫的注释，
+    比没有注释更危险** —— 它让人以为已经被保护了。
+
+    ⚠️ 判据必须直接看**原始行**而不能走 `_parse`：那个解析器的正则会把
+    `[...]` 当成"可选 extras 段"吃掉，于是 extras 恰好检测不出来。
+    """
+    bad = [ln.strip() for ln in LOCK.read_text(encoding="utf-8").splitlines()
+           if "[" in ln.split("#", 1)[0]]
+    assert not bad, (
+        "requirements.lock 里出现 extras —— pip 会在解析期直接报 "
+        "`ERROR: Constraints cannot have extras` 并退出 1：\n  " + "\n  ".join(bad)
+    )
 
 
 def test_every_declared_package_is_pinned():

@@ -1,5 +1,22 @@
 name: CI
 
+# ⚠️ 所有 `uses:` 都钉在 **40 位 commit SHA** 上，后面用注释标真实版本号。
+# ------------------------------------------------------------------
+# 为什么不能用 `@v4` 这种可变 tag：tag 是**可以被上游重指向**的，而 action 的代码
+# 会拿到本仓库的 secrets 与 `GITHUB_TOKEN`（`publish` job 还有 `packages: write`
+# 与 `id-token: write`）。上游账号被盗或恶意重打 tag 一次，就等于在我们的流水线里
+# 执行任意代码、并把发布凭证交出去。commit SHA 不可变，是唯一能钉住的形态。
+#
+# 怎么升级：不用手抄 SHA。`.github/dependabot.yml` 已接管 `github-actions`，
+# 它会**理解 SHA 钉法**并连同后面的 `# vX.Y.Z` 注释一起更新（每周一次 PR）。
+# 要手动升某个 action，用它自己的 `uses:` 引用即可，例如：
+#   gh api repos/actions/checkout/commits/v5 --jq .sha
+#
+# 守卫：`tests/test_ci_config.py` 里有两条 —— ①任何 `uses:` 都不允许可变引用；
+# ②`aquasecurity/trivy-action` 的引用必须存在（曾经写成 `@0.28.0`，而该仓库
+# 只有 `v0.28.0` ⇒ 依赖解析失败，整道镜像漏洞门禁**从未真正跑过**，
+# 而 workflow 本身不会因此报"配置错"，只在执行到那一步时失败）。
+
 on:
   push:
     branches: ["**"]
@@ -18,14 +35,47 @@ on:
 
 jobs:
   # ------------------------------------------------------------------
+  # 0) 静态检查：配置与工具早就在仓库里，但此前**从没被执行过**
+  # ------------------------------------------------------------------
+  # 2026-10-04 补。`ruff.toml`（规则逐条写了理由）与 `requirements-dev.txt`
+  # （ruff/mypy/pytest-cov 都钉了版本）一直都在，唯独**没有任何地方跑它们** ——
+  # 一个从未执行的 lint 配置，价值等于零：它既不拦人，也没人知道它是否还对。
+  #
+  # 为什么现在接就不用"还债"：接入时的实测基线是 **10 处**（6 个一行多语句、
+  # 3 个导入顺序、1 个 datetime.UTC 别名），已在本轮清零。所以这个 job 从第一天
+  # 起就是绿的，不会给任何人留下"先欠着"的修复量。
+  #
+  # 为什么是独立 job 而不是并进 test：见 `scripts/tasks.py::task_lint` 的说明
+  # （本地 `make check` 与 CI 的 test job 必须逐条对应，那条守卫在
+  # tests/test_tasks_entrypoint.py）。放最前面是为了让几秒内能发现的错最先反馈。
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # 只装开发工具（不进生产镜像）。版本是 `==` 钉死的：ruff 的**判定结果**
+      # 随版本变（实测 0.16 的默认规则集比旧版宽得多），不钉的话"CI 是绿是红"
+      # 会取决于流水线哪天跑的 install，而不是取决于代码。
+      - name: 安装静态检查工具
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: ruff check
+        run: ruff check .
+
+  # ------------------------------------------------------------------
   # 1) 单元测试：**完全离线**，不需要任何密钥与网络
   # ------------------------------------------------------------------
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.13"
           cache: pip
@@ -33,6 +83,14 @@ jobs:
       # 刻意**不装 docling/transformers**：那几个包几个 GB、CI 上装十几分钟，
       # 而测试对它们本来就是 importorskip 的（装了才跑那些用例）。
       # 这里装的是"跑通全部离线用例所必需"的最小集合。
+      #
+      # ⚠️ **openai-agents / sqlalchemy 必须在这里**（2026-10-03 补）：
+      #   agent 链路的测试是 `pytest.importorskip("agents", ...)` 的，缺了这两包
+      #   会被**静默跳过**（不是失败）—— 于是 PR 门禁里"跨轮对话历史 + 输入预算"
+      #   整块零条断言，而那正是最容易悄悄坏掉的一层（降级都不报错）。
+      #   它们都是纯 Python 小包，与 docling 那几个 GB 的解析栈完全不是一回事，
+      #   没有任何理由省掉。`sqlalchemy` 是官方 PG 会话后端的依赖
+      #   （`openai-agents[sqlalchemy]` extra），用于建异步引擎。
       - name: 安装最小依赖
         run: |
           python -m pip install --upgrade pip
@@ -44,7 +102,8 @@ jobs:
             "fastapi>=0.110" "uvicorn>=0.30" sse-starlette \
             "scikit-learn>=1.4" "numpy>=1.26" "pgvector>=0.3" \
             pdfminer.six python-docx openpyxl python-pptx beautifulsoup4 lxml \
-            "pytest>=8.0" "httpx>=0.27" tiktoken
+            "pytest>=8.0" "httpx>=0.27" tiktoken \
+            "openai-agents>=0.20" "sqlalchemy>=2.0"
 
       # 依赖锁定一致性：requirements.txt 声明的包必须都在 requirements.lock 里有精确版本。
       # 放在装依赖之后、跑测试之前 —— 这样"漂移"以最明确的方式失败，
@@ -64,14 +123,76 @@ jobs:
         run: pytest tests/ -q -p no:cacheprovider
 
   # ------------------------------------------------------------------
+  # 1.5) 跨轮对话历史的**真库**测试
+  # ------------------------------------------------------------------
+  # 为什么单独一个 job，而不是并进上面的 test：
+  #   上面的 test 刻意**离线**（显式清空 DB_URL、不连任何服务），而 agent 链路的
+  #   单元测试用的是内存假会话 ⇒ "跨轮"这条链路在那里**永远碰不到真库**。
+  #   在补上这个 job 之前，能证明"历史真的落库了"的地方**一处都没有** ——
+  #   而这一层的失效是**静默的**：取不到历史就降级成"本轮没有历史"，
+  #   服务照常返回 200、错误率与延迟全正常。
+  #
+  # 为什么用真 PG 而不是 mock：这条的全部价值就是"真的写进去、换个连接读回来"。
+  #   把库 mock 掉等于什么都没验 —— 与下面 drill job 必须用真 PG 是同一条理由。
+  #
+  # ⚠️ 依赖清单与 test job 保持一致：`tests/conftest.py` 会 import `src.graph`，
+  #   少装一个包会让**收集阶段**就失败（不是跳过，是红）。
+  agent-session-pg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      pg:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: sess
+          POSTGRES_PASSWORD: sess
+          POSTGRES_DB: sessdb
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sess"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: 安装最小依赖（与 test job 同清单）
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "langgraph>=0.3" "langgraph-checkpoint-postgres>=2" \
+            "langchain-openai>=0.3" "langchain-community>=0.3" \
+            "langchain-text-splitters>=0.3" "psycopg[binary]>=3.2" \
+            "pydantic>=2.7" python-dotenv \
+            "fastapi>=0.110" "uvicorn>=0.30" sse-starlette \
+            "scikit-learn>=1.4" "numpy>=1.26" "pgvector>=0.3" \
+            pdfminer.six python-docx openpyxl python-pptx beautifulsoup4 lxml \
+            "pytest>=8.0" "httpx>=0.27" tiktoken \
+            "openai-agents>=0.20" "sqlalchemy>=2.0"
+
+      - name: 跨轮历史的真库测试
+        env:
+          # 专用变量、**刻意不复用 DB_URL**：把"被测库"与"日常开发库"分开，
+          # 免得有人把 DB_URL 指向真实环境时，这个测试跑去建表写数据。
+          AGENT_SESSION_TEST_DSN: postgresql://sess:sess@127.0.0.1:5432/sessdb?sslmode=disable
+          # 其余外部依赖一律清空：这个 job 只验数据库那条链路。
+          DB_URL: ""
+          AGNES_API_KEY: ""
+          EMBEDDING_API_KEY: ""
+        run: pytest tests/test_agent_session_pg.py -q -p no:cacheprovider
+
+  # ------------------------------------------------------------------
   # 2) 检索质量门禁：改 prompt / 换模型 / 调切分后，召回率不该悄悄掉
   # ------------------------------------------------------------------
   eval-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.13"
           cache: pip
@@ -83,6 +204,13 @@ jobs:
             "scikit-learn>=1.4" "numpy>=1.26" python-dotenv "httpx>=0.27"
 
       # 只用 bm25 后端：纯本地、零外部调用、结果确定，适合做 CI 门禁。
+      #
+      # ⚠️ 口径是由 `scripts/eval_backend.local_eval()` 在**代码里**钉死的，不是靠
+      #    "这台机器恰好没配密钥"。本地跑 `make eval` 会 `load_dotenv()` 读到 .env，
+      #    那里**没有**下面这道清空 env 的防线 —— 没有代码级的锁，同一份代码在
+      #    "有密钥的机器"和 CI 上会给出两套结论且**两边都不报错**（实测：材料层
+      #    0.841 红 / 0.955 绿，而阈值只按 bm25 校准过）。清空 env 是第二道防线。
+      #
       # 阈值 0.55 是**当前基线（61%）下留出余量**的值；语料/质量提升后应逐步上调，
       # 这样门槛才真正起到"防退化"的作用。
       # 注：换 BM25 后 Top1 基线仍是 61%（Top3 64%→68%、MRR +0.018），故阈值不变。
@@ -99,7 +227,7 @@ jobs:
       # 而不是 Top1 召回。两者不能互相替代 —— 检索对不等于答案对：
       # 召回回来的块可能压根不含回答问题需要的事实，那时模型只能漏掉或编。
       #
-      # 同样只用 tfidf：确定性、零外部调用。模型侧的**忠实度**评测需要
+      # 同样只用 bm25：确定性、零外部调用。模型侧的**忠实度**评测需要
       # LLM-as-judge，那有噪声、要密钥、结果不可复现，不能当 CI 门禁。
       #
       # 它读的是**随仓库分发的 `data/`**（与线上语料同源）—— 语料被改坏、
@@ -110,6 +238,20 @@ jobs:
           EMBEDDING_API_KEY: ""
           AGNES_API_KEY: ""
         run: python scripts/eval_answer.py
+
+      # 生成侧质量门禁：测的是**答案本身**（编造标识符 / 该拒答时拒答）。
+      # 上面两层都停在模型之前 ——「找对文档」与「材料够用」都推不出「答案忠实」：
+      # 模型完全可以拿着含答案的材料，写出一段与材料无关的话。
+      #
+      # 离线模式对**人工参考答案**跑指标，纯本地、零密钥、结果确定，所以能进 CI；
+      # 模型质量（`--live`）要密钥且随模型漂移，不进（随机红的下场是被关掉）。
+      # 它守的是「指标本身没坏」+「忠实答案不被误报成编造」。
+      - name: 生成侧质量门禁（编造与拒答）
+        env:
+          DB_URL: ""
+          EMBEDDING_API_KEY: ""
+          AGNES_API_KEY: ""
+        run: python scripts/eval_generation.py
 
   # ------------------------------------------------------------------
   # 3) 全量依赖（每日定时 / 手动）：补上主流程刻意跳过的那批用例
@@ -130,9 +272,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.13"
           cache: pip
@@ -185,9 +326,8 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.13"
           cache: pip
@@ -258,26 +398,67 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.13"
 
-      # 只需要能跑 `scripts/tasks.py`（纯标准库）+ pytest
+      # 只需要能跑 `scripts/tasks.py`（纯标准库）+ pytest。另外为了让
+      # `scripts/hash_password` 能 import `app.auth`，实测其依赖链
+      # （app/auth → app/config、app/metrics）**全是标准库**（哈希是 `hashlib.pbkdf2_hmac`），
+      # 唯一的外部依赖是 `python-dotenv`（用于读 `.env`；缺失时会静默退化，但装上更贴近真实部署）。
       - name: 安装最小依赖
         run: |
           python -m pip install --upgrade pip
-          pip install "pytest>=8.0"
+          pip install "pytest>=8.0" python-dotenv
 
-      # 栈从 .env 读配置，示例值即可：
+      # 栈从 .env 读配置。**这里刻意让栈"要求用户鉴权"**：
+      #
       #   · AGNES_API_KEY 是**非空占位符** ⇒ /health/ready 的 llm 检查通过
       #     （它只查"配置在不在"，不发请求）。真去调 LLM 会失败并回 `error` 事件，
       #     而 SSE 用例接受的正是"合法帧"—— 见 tests/test_e2e_stack.py 的说明。
-      #   · SERVE_API_KEY 非空 ⇒ 鉴权用例自动切到「必须拒绝未授权」那个分支
-      #     （两个分支都有断言，没有 skip）。
-      - name: 准备 .env
-        run: cp .env.example .env
+      #   · 配 AUTH_*（会话签名密钥 + 一个服务账号）⇒ 栈要求鉴权，于是：
+      #       - 用例会用 E2E_USER/E2E_PASSWORD 登录换 Bearer（真正跑一遍 JWT 路径）；
+      #       - 裸请求必须得 **401**（test_protected_endpoint_rejects_unauthenticated_requests）。
+      #
+      #     ⚠️ 2026-10-05：这里**不再**写 `REQUIRE_AUTH=1`。该开关已随"匿名兜底"
+      #     一起**删除** —— 鉴权要求现在是结构性的（没配 AUTH_* 的服务在启动期就被拦），
+      #     没有任何变量能关掉它。而且残留这个键会让服务**拒绝启动**（守卫：
+      #     `app/main.py::_assert_no_legacy_auth_knobs`），留着的唯一后果是 e2e 起不来。
+      #     （更早的 2026-10-04 之前，这个效果还是靠 `.env.example` 里 `SERVE_API_KEY`
+      #     的非空占位符达成的；那把共享密钥废弃、模板改成空值之后本 job 一度静默
+      #     退化成"无鉴权栈"—— CI 照常绿，但生产口径的鉴权再也没人守。）
+      #   · 刻意**不设** `APP_ENV=production`：目标只是"要求鉴权"，不是把 e2e 变成
+      #     生产全量口径测试（那会连带关掉 /docs、隐藏错误详情，干扰其它断言）。
+      #     生产启动期检查由 `tests/test_identity.py` 的守卫覆盖。
+      - name: 准备 .env（含一个 e2e 服务账号）
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          # 会话签名密钥：每次现生成，不进仓库
+          printf 'AUTH_SESSION_SECRET=%s\n' "$(openssl rand -hex 32)" >> .env
+          # 服务账号：**不给角色**（最小权限，与 scripts/script_auth.py 的指引一致）。
+          # 密码每次随机、写进 GITHUB_ENV 供后续 pytest 步骤读，不落仓库。
+          PW="e2e-$(openssl rand -hex 12)"
+          printf 'E2E_USER=svc-e2e\nE2E_PASSWORD=%s\n' "$PW" >> "$GITHUB_ENV"
+          # `hash_password` 输出两行（提示行 + `AUTH_USERS='...'`），取最后一行。
+          # 必须保留单引号：PBKDF2 串里的 `$` 会被 docker compose 插值吃掉。
+          ENTRY=$(printf '%s\n' "$PW" \
+            | python -m scripts.hash_password -u svc-e2e -t e2e --stdin | tail -n 1)
+          printf '%s\n' "$ENTRY" >> .env
+          # 自检：两样都写进去了（只打键名，不打值 —— CI 日志是公开的）
+          for k in AUTH_SESSION_SECRET AUTH_USERS; do
+            grep -q "^${k}=" .env || { echo "✗ .env 缺少 ${k}"; exit 1; }
+          done
+          # 反向自检：已删除的开关**不许**出现 —— 存在即拒绝启动，那会让 e2e 卡在
+          # "容器起不来"上，报错信息藏在容器日志里，排查成本远高于在这里拦一下。
+          for k in SERVE_API_KEY REQUIRE_AUTH; do
+            if grep -q "^${k}=" .env; then
+              echo "✗ .env 含有已删除的鉴权开关 ${k}（存在即拒绝启动）"
+              exit 1
+            fi
+          done
+          echo "[e2e] .env 就绪：要求鉴权 + 服务账号 svc-e2e（密码每次随机，不落仓库）"
 
       # 一条命令包办：构建 → 起栈 → 等就绪 → 跑检查 → 失败时打印容器日志 → 收栈
       - name: 起栈并跑端到端检查
@@ -311,14 +492,11 @@ jobs:
     # 构建本身含几个 GB 的 pip 安装。没超时的话，一次卡死会白烧 6 小时 runner。
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-
-      # buildx 是 GHA 缓存的载体：pip 安装那一层几个 GB，
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       # 没缓存的话每次 push 都重装十几分钟，这个 job 很快会被绕过或删掉。
-      - uses: docker/setup-buildx-action@v3
-
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
       - name: 构建镜像
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
         with:
           context: .
           file: deploy/app/Dockerfile
@@ -357,7 +535,7 @@ jobs:
           docker logs chatagent-ci || true
 
       - name: 漏洞扫描（镜像）
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2  # v0.28.0
         with:
           image-ref: chatagent:ci
           format: table
@@ -401,9 +579,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.13"
           cache: pip
@@ -434,16 +611,29 @@ jobs:
           VER=8.18.4
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" \
             | tar -xz gitleaks
-          # --no-git：扫**当前工作树**而不是全部 git 历史。历史里翻出的东西
-          # （早已废弃的示例凭据）只会制造噪声并让人习惯性忽略这条门禁；
-          # 而"现在还在仓库里的密钥"才是必须当场处理的。
-          # 允许清单见仓库根 .gitleaks.toml（.env.example 是**示例文件**，
-          # 里面的默认口令是刻意公开的）。
-          ./gitleaks detect --source . --no-git --redact --config .gitleaks.toml -v
+          # ⚠️ 扫**全部 git 历史**（2026-10-05 改；此前是 `--no-git`，只扫当前工作树）
+          # ----------------------------------------------------------------
+          # 那时的理由写的是"历史里翻出的都是早已废弃的示例凭据，只会制造噪声"。
+          # **这个理由在本仓库是错的**，而且错得很具体：历史里真的躺着两个可用的
+          # 第三方 embedding 密钥（`rag/vectorSaveTest.py`，见 CHANGELOG）。
+          # `--no-git` 让这条门禁**永远看不到它们** —— 于是"密钥不进仓库"这条
+          # 最强的门禁，在它最该生效的那个场景里恰好失效了，且没有任何症状。
+          #
+          # 教训：允许清单/扫描范围这类"我刻意不扫某些东西，因为 X"的决定，
+          # 必须拿数据验一遍 X。凭直觉判断"历史里大概只有噪声"是会错的。
+          #
+          # ⚠️ 这条红了怎么办：**不要**去放行，去处理。历史里的密钥只能靠
+          #   ① 轮换（在对端控制台作废）+ ② 重写历史（git filter-repo + force push）
+          #   两步解决；只删文件、只加 .gitignore 都不行 —— 对象还在 .git 里。
+          #   步骤见 deploy/SECRETS.md 的「历史泄露处置」。
+          #
+          # 允许清单见仓库根 .gitleaks.toml。⚠️ 那里**故意没有**放行
+          # `.env.example`：它是随仓库分发的公开模板，恰恰最容易被顺手粘进真密钥。
+          ./gitleaks detect --source . --redact --config .gitleaks.toml -v
 
       - name: 上传扫描报告
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: security-reports
           path: bandit-report.json
@@ -460,10 +650,19 @@ jobs:
   # 而且事后**没有任何记录**能回答"线上跑的到底是哪个 commit"。
   # 本 job 把"CI 验证过的那个镜像"变成唯一制品，并给它一个可验证的身份证（签名）。
   #
-  # ⚠️ 依赖 image + test + security：**没通过冒烟、漏洞扫描或密钥扫描的镜像
-  #    不允许发布**。这是 `needs:` 的真正意义 —— 不是"顺序好看"，
-  #    而是"没验证过的东西不许出门"。少了 security 就会出现这种洞：
-  #    gitleaks 拦下了一个提交进仓库的密钥、CI 变红，而镜像**照样发出了**。
+  # ⚠️ 依赖**全部**质量门禁 job：**没验证过的东西不许出门**。这才是 `needs:` 的
+  #    真正意义 —— 不是"顺序好看"。逐条说清少了谁会出什么洞：
+  #      · security  —— gitleaks 拦下一个提交进仓库的密钥、CI 变红，而镜像**照样发出**；
+  #      · lint      —— ruff 抓到未定义名字 / 导入顺序错，镜像照样发出（那类错在运行期才炸）；
+  #      · eval-gate —— 改提示词 / 换模型 / 调切分导致召回或答案质量退化，质量门禁红着
+  #                     而镜像照样发出 ⇒ 线上质量静默下降，且事后无法归因到哪次发布；
+  #      · agent-session-pg —— 真库上的跨轮历史（落库 / 恢复）坏了，离线样例测试看不出来；
+  #      · image / test —— 构建与冒烟本身。
+  #    2026-10-06 修：原值是 `[image, test, security]`，上面三条全在门外 ——
+  #    而这段注释当时就已经写着"没验证过的东西不许出门"，即**注释与实现不符**。
+  #    守卫：`tests/test_ci_config.py::test_publish_depends_on_every_gate`，
+  #    它按"所有在 push 事件下会跑的 job 都必须在 needs 里"**推导**（不写死清单），
+  #    所以以后新增 job 会自动被纳入要求，不会静默过期。
   #
   # 缺凭据时的行为：**跳过而非失败**
   # ------------------------------
@@ -480,7 +679,7 @@ jobs:
       github.event_name == 'push'
       && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
       && vars.PUBLISH_IMAGE != 'false'
-    needs: [image, test, security]
+    needs: [lint, test, agent-session-pg, eval-gate, image, security]
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -488,10 +687,8 @@ jobs:
       packages: write     # 推 GHCR 需要
       id-token: write     # cosign keyless 签名（走 OIDC，无需私钥）
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
       - name: 预检 registry 可用性（不可用则跳过，不判失败）
         id: pre
         run: |
@@ -527,7 +724,7 @@ jobs:
       - name: 构建并推送镜像
         id: push
         if: steps.pre.outputs.ok == '1'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
         with:
           context: .
           file: deploy/app/Dockerfile
@@ -542,7 +739,7 @@ jobs:
 
       - name: 生成 SBOM（软件物料清单）
         if: steps.pre.outputs.ok == '1'
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c  # v0.24.3
         with:
           image: ${{ steps.meta.outputs.digest_tag }}
           format: spdx-json
@@ -553,8 +750,7 @@ jobs:
 
       - name: 安装 cosign
         if: steps.pre.outputs.ok == '1'
-        uses: sigstore/cosign-installer@v3
-
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5  # v3.10.1
       - name: 签名镜像（keyless，走 OIDC）
         if: steps.pre.outputs.ok == '1'
         run: |
@@ -570,9 +766,38 @@ jobs:
           cosign attach sbom --sbom sbom.spdx.json \
             "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
 
+      # ----------------------------------------------------------------
+      # 验签：证明"确实签上了、且能被验过"
+      # ----------------------------------------------------------------
+      # 为什么签完还要验一次 —— 只签不验等于没有签名保证：
+      #   - 签错了对象（tag 而不是 digest）、身份/issuer 与预期不符、
+      #     仓库没开 OIDC…… 这些情况下 `cosign sign` 可能仍然返回 0，
+      #     而**使用方** `cosign verify` 时会失败。
+      #   那时才会有人发现"这批镜像根本验不过"，而它已经在生产里跑了很久。
+      # 这一步把"验签"从**消费方的期待**变成**发布方每次都要自证的条件**。
+      #
+      # 下面这两个参数同时是**给运维的验证命令模板** —— 部署前请用同一条命令核对
+      # 你要拉的那个 digest（换掉 IMAGE@DIGEST）：
+      #   cosign verify \
+      #     --certificate-identity-regexp '^https://github.com/<org>/<repo>/\.github/workflows/ci\.yml@' \
+      #     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+      #     IMAGE@DIGEST
+      # ⚠️ identity 用 regexp 而不是精确串：它含 **run 的 ref**（分支/tag），
+      #    精确串会在每次换分支时失效；而"只验 issuer 不验 identity"又等于没验 ——
+      #    任何人都能用自己仓库的 workflow 签一个同名镜像。
+      - name: 验证签名（发布方自证 + 给运维的命令模板）
+        if: steps.pre.outputs.ok == '1'
+        run: |
+          set -eu
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/\.github/workflows/ci\.yml@" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
+          echo "签名验证通过：${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
+
       - name: 上传 SBOM
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: sbom
           path: sbom.spdx.json

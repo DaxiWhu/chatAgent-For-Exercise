@@ -51,6 +51,9 @@ _PROMQL_KEYWORDS = {
 _KNOWN_LABELS = {
     "job", "instance", "le", "status", "path", "method", "kind", "scope",
     "phase", "target", "fstype", "mountpoint", "reason",
+    # agent 链路的标签（有限取值，见 app/main.py::_record_agent_metrics）。
+    # `src` / `dst` 是 handoff 的两端（frontline_agent → literary_writer 这类）。
+    "route", "src", "dst", "agent", "guardrail", "exit_reason", "score", "via", "result",
 }
 
 _IDENT_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b")
@@ -62,14 +65,29 @@ _HIST_SUFFIXES = ("_bucket", "_sum", "_count")
 _APP_PREFIXES = (
     "http_", "llm_", "chat_stream_", "client_", "review_", "quota_",
     "rag_", "rate_limited", "request_", "session_", "tenant_", "shared_backend_",
-    "citation_",
+    "citation_", "agent_", "idempotency_",
+    # `online_*` 是**在线质量采样**那三条。2026-10-03 补：此前没有面板引用它们，
+    # 所以这个缺口一直没暴露 —— 前缀不在名单里 ⇒ 面板里的指标名被 `continue` 跳过、
+    # **完全不被校验**，写错一个字母也不会红。
+    "online_",
 )
 
 
 def _app_metric_names() -> set[str]:
-    """扫 app/ 与 src/ 里所有 `inc/observe/set_gauge("名字")` 调用。"""
+    """扫 app/ 与 src/ 里所有上报指标的调用。
+
+    ⚠️ 必须同时认两种写法，它们是**两个上报通道**：
+      * `app/metrics.py` 的 `metrics.inc/observe/set_gauge(...)`；
+      * `src/observability.py` 的 `observability.counter/histogram/gauge(...)`
+        —— `src/` 经过**可注入出口**上报，不能直接 import `app.metrics`
+        （依赖方向是 `app/` → `src/`）。
+
+    只认前一种时，凡是在 `src/agents/`（以及任何 `src/` 模块）里上报的指标名都
+    扫不到 ⇒ 面板引用它们会被判成"不存在的指标"而误红；更糟的是反过来 ——
+    有人为了让守卫变绿，把面板里正确的指标删掉。
+    """
     names: set[str] = set()
-    pat = re.compile(r'(?:inc|observe|set_gauge)\(\s*"([a-z_]+)"')
+    pat = re.compile(r'(?:inc|observe|set_gauge|counter|histogram|gauge)\(\s*"([a-z_]+)"')
     for base in ("app", "src"):
         for py in (ROOT / base).rglob("*.py"):
             names |= set(pat.findall(py.read_text(encoding="utf-8")))

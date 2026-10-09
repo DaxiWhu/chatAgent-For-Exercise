@@ -33,9 +33,16 @@
 # 后果全是静默的（没有任何报错，只有默认值悄悄生效）：
 #   - `ALERT_SINK_*_WEBHOOK` 为空 ⇒ alert-sink 只记日志、接口照回 200
 #     ⇒ **告警永远送不到人**，而按文档"把 webhook 填进 .env"这一步事实上没生效；
-#   - `POSTGRES_PASSWORD` 退回 `123456` ⇒ 库用弱口令，而你以为已经换了；
 #   - `BACKUP_INTERVAL_HOURS` / `BACKUP_KEEP` / `RETENTION_DAYS` 全退回默认；
 #   - `CANARY_TAG` 为空 ⇒ 发布脚本传的标签被忽略，灰度跑的还是旧镜像。
+#
+# ⚠️ **口令类不再参与这种静默**（2026-10-05）：`POSTGRES_PASSWORD` /
+# `REDIS_PASSWORD` / `GRAFANA_PASSWORD` / `STAGING_REDIS_PASSWORD` 一律写成
+# `${VAR:?...}` —— **没设就直接报错退出**，而不是退回一个 `123456` / `admin`。
+# 理由：漏写 `--env-file` 这件事本身已经足够隐蔽了，再叠一个"用弱口令把库起起来"
+# 就把"没生效"变成了"上线了且口令是公开的"，而且**数据卷一旦初始化，口令就固化了**
+# （改环境变量也换不掉）。宁可起不来，也不要静默用弱口令起来。
+# 剩下那些"退回默认"是安全的：它们是超时/间隔/级别，退回也不会变成安全事件。
 #
 # 所以本文件里所有 `${VAR}` 的**唯一**取值途径就是 `--env-file .env`（在仓库根执行）
 # 或者 `export VAR=...`（shell 环境优先级最高）。`env_file:` 那几处是另一回事：
@@ -49,7 +56,7 @@
 #   它会打印**插值之后**的完整配置，是唯一能自证"值到底传进去没有"的方式。
 #
 # 拓扑：
-#        :8080 ──► nginx（权重灰度 9:1）
+#   127.0.0.1:8080 ──► nginx（权重灰度 9:1；**只绑回环**，对外请用 docker-compose.tls.yml）
 #                    ├── app-stable（APP_RELEASE=stable）
 #                    └── app-canary（APP_RELEASE=canary）
 #                            ├── pgvector（PG16 + vector 扩展）—— 检查点（不可再生）
@@ -139,7 +146,7 @@ services:
     networks: [data]
     environment:
       POSTGRES_USER: langgraph_app
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-123456}   # ⚠️ 见文件顶部说明：生产必须改
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须显式设置（本文件不再提供默认口令，请用 --env-file .env 或在环境中导出）}   # ⚠️ 见文件顶部说明：生产必须改
       POSTGRES_DB: langgraph_checkpoints
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -172,7 +179,7 @@ services:
   #
   # 启用：把 .env 的 RAG_VECTOR_STORE 设为 qdrant（默认 memory，不改则本服务只是空跑）。
   # 不启用时也**不建议删掉**：删了以后想切 qdrant 又要重新加回来，而它带来的
-  # 影响只是几百 MB 内存；真要省资源可以 `docker compose stop qdrant`。
+  # 影响只是几百 MB 内存；真要省资源可以 `docker compose --env-file .env -f deploy/app/docker-compose.yml stop qdrant`。
   #
   # ⚠️ 改 QDRANT_DIM / QDRANT_SPARSE_DIM 必须换 QDRANT_COLLECTION 名重灌 ——
   #    维度落进集合的 schema，无法原地改（与 pgvector 换表名同一条纪律）。
@@ -202,8 +209,12 @@ services:
       start_period: 10s
 
   # ---------------- 限流 / 配额的共享后端（Redis）----------------
-  # 为什么必须有它：限流与配额都是**进程内**计数。本编排是 2 worker × 2 副本
-  # （stable + canary）= 最多 4 份独立计数 ⇒ 用户实际可用额度是配置值的约 4 倍。
+  # 为什么必须有它：限流与配额都是**进程内**计数。本编排的独立计数份数 =
+  # app-stable 的 2 个 worker + app-canary 的 1 个 worker = **3 份**。
+  # ⚠️ 这里**不能**用"副本数 × 每副本 worker 数"去算（那是 2 × 2 = 4）——
+  #    两个 app 服务的 WEB_CONCURRENCY 刻意不同（stable=2、canary=1，见各自服务上的
+  #    注释：灰度只承载 10% 流量，不该拿和工作副本一样多的并发额度）。
+  #    改任何一处的并发数或副本数，都要回来重算这个乘积，否则"额度与配置对不上"。
   # 这个缺陷很隐蔽：单机跑完全看不出，一上多副本就"额度和配置对不上"。
   #
   # 后端不可用时 app 会退到进程内计数（**不是放行**）—— 宁可暂时放宽，
@@ -219,7 +230,7 @@ services:
     command:
       - redis-server
       - --requirepass
-      - ${REDIS_PASSWORD:-chatagent-redis}
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD 必须显式设置（本文件不再提供默认口令）}
       - --appendonly
       - "yes"
       - --maxmemory
@@ -239,7 +250,7 @@ services:
         limits: { memory: 320m, cpus: "0.5", pids: 128 }
     healthcheck:
       # --no-auth-warning：否则每次探活都往日志里写一行 "Using a password with -a..."
-      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a ${REDIS_PASSWORD:-chatagent-redis} ping | grep -q PONG"]
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a ${REDIS_PASSWORD:?REDIS_PASSWORD 必须显式设置（本文件不再提供默认口令）} ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -293,20 +304,23 @@ services:
     volumes:
       - ../../data:/app/data
     env_file:
-      - ../../.env                       # 机密（AGNES_API_KEY / EMBEDDING_* / SERVE_API_KEY）
+      - ../../.env                       # 机密（AGNES_API_KEY / EMBEDDING_* / AUTH_SESSION_SECRET）
     environment:
       APP_RELEASE: stable
-      # 部署场景默认 production：推导 REQUIRE_AUTH=1（无任何 Key 会**拒绝启动**）
-      # + ENABLE_DOCS=0（/docs 返回 404）。刻意放在 compose 而不是 .env ——
+      # 部署场景默认 production：**未启用用户鉴权（AUTH_*）就拒绝启动**，
+      # 且**环境里残留已删除的 `SERVE_API_KEY` / `REQUIRE_AUTH` 键也拒绝启动**
+      # （见 app/main.py 的 `_assert_auth_policy` 与 `_assert_no_legacy_auth_knobs`）；
+      # 同时 ENABLE_DOCS=0（/docs 返回 404）。
+      # 刻意放在 compose 而不是 .env ——
       # 本地 `python -m app.serve` 读 .env 要保持 development 才不会被鉴权挡住，
       # 两者互不干扰。
       APP_ENV: ${APP_ENV:-production}
       # 容器内用服务名连库（会覆盖 .env 里的 DB_URL）
-      DB_URL: postgresql://langgraph_app:${POSTGRES_PASSWORD:-123456}@pgvector:5432/langgraph_checkpoints?sslmode=disable
+      DB_URL: postgresql://langgraph_app:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须显式设置（本文件不再提供默认口令，请用 --env-file .env 或在环境中导出）}@pgvector:5432/langgraph_checkpoints?sslmode=disable
       # ⚠️ 多副本/多 worker 必须配：不配时限流与配额是**进程内**计数，
       # WEB_CONCURRENCY=2 就等于用户实际可用额度 ×2（灰度副本再叠一份）。
       # 后端不可用时 app 会退到进程内计数（**不是放行**）。
-      REDIS_URL: redis://:${REDIS_PASSWORD:-chatagent-redis}@redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD 必须显式设置（本文件不再提供默认口令）}@redis:6379/0
       # 容器内必须用**服务名**连 Qdrant —— .env 里的 QDRANT_URL 通常是
       # http://localhost:6333（本机开发用），在容器里 localhost 指容器自身，
       # 会导致连不上后**静默回退 memory**（检索仍可用，但向量库等于没接上）。
@@ -365,9 +379,9 @@ services:
       # 灰度同样跑 production 语义（否则灰度版的鉴权行为与稳定版不一致，
       # "灰度没发现问题"就失去了意义）
       APP_ENV: ${APP_ENV:-production}
-      DB_URL: postgresql://langgraph_app:${POSTGRES_PASSWORD:-123456}@pgvector:5432/langgraph_checkpoints?sslmode=disable
+      DB_URL: postgresql://langgraph_app:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须显式设置（本文件不再提供默认口令，请用 --env-file .env 或在环境中导出）}@pgvector:5432/langgraph_checkpoints?sslmode=disable
       # 与 stable 共用同一个 Redis：若各用各的，等于额度又翻倍
-      REDIS_URL: redis://:${REDIS_PASSWORD:-chatagent-redis}@redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD 必须显式设置（本文件不再提供默认口令）}@redis:6379/0
       QDRANT_URL: http://qdrant:6333
       WEB_CONCURRENCY: "1"
       TRUST_PROXY_HEADERS: "1"
@@ -419,7 +433,10 @@ services:
       ALERT_SINK_WECOM_WEBHOOK: ${ALERT_SINK_WECOM_WEBHOOK:-}
       ALERT_SINK_FEISHU_WEBHOOK: ${ALERT_SINK_FEISHU_WEBHOOK:-}
       ALERT_SINK_GENERIC_WEBHOOK: ${ALERT_SINK_GENERIC_WEBHOOK:-}
-      # 配了则要求请求头 X-Alert-Sink-Secret 匹配（内网也建议配，防误打）
+      # ⚠️ **刻意保持为空，别单独填。** 非空时网关要求请求头 X-Alert-Sink-Secret
+      # 匹配，而 alertmanager.yml 的四个 receiver 没有 http_config、不会送这个头
+      # ⇒ 填了等于把**全部告警**打成 403（Alertmanager 重试后放弃，表现成
+      # "配置全对但没人收到"）。要用必须两处一起改，详见 .env.example 同名字段。
       ALERT_SINK_SHARED_SECRET: ${ALERT_SINK_SHARED_SECRET:-}
     ports:
       # 只绑回环：本端口除可选的 shared secret 外**没有任何鉴权**，不该对公网开放。
@@ -480,9 +497,27 @@ services:
     restart: unless-stopped
     logging: *default-logging
     networks: [monitor]
+    # ⚠️ 写了 `command:` 就会**整体覆盖**镜像默认的那两个参数
+    #    （prom/prometheus 的默认 CMD 是 `--config.file=/etc/prometheus/prometheus.yml
+    #    --storage.tsdb.path=/prometheus`），所以必须把两个都补回来 ——
+    #    只写新增项会让 Prometheus 读不到配置、或把数据写进容器根目录（重启即丢）。
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # ⚠️ 保留期是 SLO 的**前提**，不是调优项：slo:budget_remaining_ratio 读 30 天窗口，
+      #    而 Prometheus 的默认保留期是 **15 天**。不够时不会报错 ——
+      #    `avg_over_time(...[30d])` 只是拿到半个月数据，"上周烧掉的那段"会随时间
+      #    滑出保留期、预算看起来自己恢复了（比不监控更糟：它给的是错误的安全感）。
+      #    40d = 窗口(30d) + 30% 余量，顺带覆盖"Prometheus 停机几天"的情况。
+      #    守卫：tests/test_monitoring_config.py::test_prometheus_retention_covers_the_longest_budget_window
+      - --storage.tsdb.retention.time=40d
     volumes:
       - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ../monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      # 录音规则（SLO 预算余量）。**漏挂它不会有任何报错**：Prometheus 启动时
+      # 找不到这个文件会直接起不来（fail loud，见 prometheus.yml 的 rule_files）——
+      # 这正是刻意不用"可选加载"的理由。
+      - ../monitoring/recording.yml:/etc/prometheus/recording.yml:ro
       - promdata:/prometheus
     ports:
       - "127.0.0.1:9090:9090"     # 只绑回环：它自身无鉴权
@@ -629,7 +664,7 @@ services:
     networks: [monitor]
     environment:
       # 口令从 .env 取；默认 admin 只用于第一次本机登录，生产必须改
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD 必须显式设置（本文件不再默认 admin）}
       # 关掉注册与匿名访问：Grafana 面板能读到全部指标与日志，等于内网的情报面板
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"
@@ -669,7 +704,7 @@ services:
     volumes:
       - ../../backups:/backups
     environment:
-      PGPASSWORD: ${POSTGRES_PASSWORD:-123456}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须显式设置（本文件不再提供默认口令，请用 --env-file .env 或在环境中导出）}
       # ⚠️ 间隔 × 保留份数 = 实际可回溯的时间窗。改一个**必须**改另一个：
       #    原来 24h × 14 = 14 天；把间隔压到 6h（RPO 24h→6h）而份数不动，
       #    可回溯窗口会**静默缩到 3.5 天** —— 而那正是最容易需要"回到上周"的时候。
@@ -755,7 +790,14 @@ services:
     environment:
       # 未启用 Qdrant 后端时它照样起得来，只是每轮明确播报"跳过"（退出码 2）——
       # 刻意不做成"检测不到就退出"：静默退出会让人以为备份在跑。
-      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      # ⚠️ **必须硬编码服务名，不能透传 .env 里的 QDRANT_URL**（2026-10-06 修）。
+      # .env 里那一份通常是 http://localhost:6333（给**本机直跑**用），容器里
+      # localhost 指容器自身 ⇒ 连不上 ⇒ 每轮 rc=2 播报"跳过"；而
+      # `BackupLoopFailing` 的判据 `(backup_backend_skipped != 1)` 又会**主动排除**
+      # 这种情形（那条是为"Qdrant 未启用"设计的）⇒ 结果是一条**从不出声**的
+      # 数据安全事故：向量库从未被备份，恢复时只剩几个钟头前的 pg。
+      # app 服务那边本来就是硬编码（见上面的 QDRANT_URL 注释），这里与它对齐。
+      QDRANT_URL: http://qdrant:6333
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-rag_chunks}
       BACKUP_DIR: /backups/qdrant
@@ -842,7 +884,7 @@ services:
   # ⚠️ 它复用 app 镜像（与 `app-stable` 同一个 tag，由 `APP_VERSION` 插值决定）
   #    —— 脚本里有 `os.chdir(ROOT)` 与
   #    `from app import config`，所以**必须**在镜像里那个 `/app` 结构下运行。
-  #    若你还没构建过 app 镜像，先 `docker compose ... up -d --build app-stable`。
+  #    若你还没构建过 app 镜像，先 `docker compose --env-file .env -f deploy/app/docker-compose.yml up -d --build app-stable`。
   retention-sweep:
     image: chatagent:${APP_VERSION:-0.2.0}
     restart: unless-stopped
@@ -852,7 +894,7 @@ services:
       - ../../.env
     environment:
       # 容器内用服务名连库（覆盖 .env 里指向 localhost 的写法）
-      DB_URL: postgresql://langgraph_app:${POSTGRES_PASSWORD:-123456}@pgvector:5432/langgraph_checkpoints?sslmode=disable
+      DB_URL: postgresql://langgraph_app:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须显式设置（本文件不再提供默认口令，请用 --env-file .env 或在环境中导出）}@pgvector:5432/langgraph_checkpoints?sslmode=disable
       RETENTION_DAYS: ${RETENTION_DAYS:-0}
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -886,16 +928,89 @@ services:
       resources:
         limits: { memory: 256m, cpus: "0.25", pids: 64 }
 
+  # ======================================================================
+  # 库容量采集（把"表在涨"变成一条有趋势、能告警的指标）
+  # ======================================================================
+  # 为什么必须有：2026-10-03 起对话历史改为**永久保留**（`RETENTION_DAYS=0`，
+  # 清理任务整体停用）—— `agent_messages` / `agent_sessions` / 检查点三张表 /
+  # `review_queue` / `session_owners` 全部只增不减。
+  #
+  # 在那之前整个部署面**没有一条指标能回答"库多大、涨多快"**：唯一相关的
+  # `DiskSpaceLow` 只说"盘要满了"，既没有提前量、也不说是哪张表在吃。
+  # 而容量问题属于"几个月后才疼、疼起来最难查"的一档 —— 等到发现时，
+  # 症状是备份窗口从分钟级变成小时级，却没有任何东西指向"表太大了"。
+  #
+  # 为什么是独立服务、不塞进 retention-sweep：那个容器的职责是"删"，
+  # 在 `RETENTION_DAYS=0` 时它是刻意保留运行的空转件（只播报"未配置"）。
+  # 把采集塞进去，会让"这个容器到底在干嘛"变得必须读代码才知道。
+  #
+  # 频率 15 分钟：体积查询走的是元数据（`pg_class`），开销可忽略；而告警窗口是 6 小时
+  # —— 采集间隔必须**显著小于**窗口，否则 `delta()` 只有一两个样本，算出来的斜率不可信。
+  pg-stats:
+    image: chatagent:${APP_VERSION:-0.2.0}
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [data]
+    env_file:
+      - ../../.env
+    environment:
+      # 容器内用服务名连库（覆盖 .env 里指向 localhost 的写法）
+      DB_URL: postgresql://langgraph_app:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须显式设置（本文件不再提供默认口令，请用 --env-file .env 或在环境中导出）}@pgvector:5432/langgraph_checkpoints?sslmode=disable
+      PG_STATS_INTERVAL_SECONDS: ${PG_STATS_INTERVAL_SECONDS:-900}
+    volumes:
+      # 与备份容器写同一个目录：node-exporter 的 textfile collector
+      # 已经以只读方式挂了 `backups/`，所以**不需要改监控拓扑**。
+      - ../../backups:/app/backups
+    command:
+      - python
+      - /app/scripts/pg_table_stats.py
+      - --loop
+      - --out
+      - /app/backups/pg-tables.prom
+    depends_on:
+      pgvector:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits: { memory: 256m, cpus: "0.25", pids: 64 }
+
   # ---------------- 入口（权重灰度 + SSE 友好的反代）----------------
   nginx:
-    image: nginx:1.27-alpine
+    # ⚠️ 这个版本号与 `nginx.conf` / `nginx.tls.conf` 里的 `resolve` 参数**绑定**（2026-10-06）。
+    #    `resolve` 参数在开源版是 **1.27.3** 起才有的（官方原文："Prior to version 1.27.3,
+    #    this parameter was available only as part of our commercial subscription"），
+    #    且要求 upstream 位于共享内存（所以我们加了 `zone`）。**降这个版本会让 nginx
+    #    因为配置语法错直接起不来** —— 不是"灰度退回旧行为"，是入口整个没了。
+    #    所以从 `1.27-alpine`（浮动到该分支最新补丁）改成**钉到具体补丁版**：
+    #    `1.27-alpine` 今天解析到 1.27.5（1.27 分支的最后一个版本，已 EOL 不再更新），
+    #    但"今天恰好等于"不是保证 —— 私有 registry / 镜像加速站 / 本机旧缓存里
+    #    完全可能是 1.27.0~1.27.2，而那种情况下配置会直接失败。
+    #    守卫：`tests/test_deploy_topology.py::test_nginx_upstream_is_dynamically_resolved`
+    #    会核对"镜像版本 ≥ 1.27.3"与"配置里确实用了三件套"两件事**同时**成立。
+    image: nginx:1.27.5-alpine
     restart: unless-stopped
     logging: *default-logging
     networks: [edge]
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
-      - "8080:80"
+      # ⚠️ 只绑回环（与下面 prometheus / alertmanager / grafana 同一个口径）。
+      #
+      # 为什么不能是裸 `"8080:80"`：那会把**明文 HTTP** 入口绑到全网卡，于是
+      # `POST /v1/auth/login` 的密码、`Authorization: Bearer <token>` 全都明文过网 ——
+      # 任何同一网段的人抓包即可拿到可用的会话令牌。而"本地能访问"这个正当需求
+      # 用 `127.0.0.1:` 已经满足了（`http://localhost:8080` 照常可用）。
+      #
+      # 要对外提供服务，请叠加 TLS 覆盖文件（80 跳 443 + HSTS）：
+      #   docker compose --env-file .env \
+      #     -f deploy/app/docker-compose.yml -f deploy/app/docker-compose.tls.yml up -d
+      # 它会挂 `nginx.tls.conf` 并把 443 接出来 —— 也可以让宿主机上**已有的**
+      # 反代/负载均衡终结 TLS，此时保持回环绑定即为正确形态。
+      - "127.0.0.1:8080:80"
     depends_on:
       - app-stable
       - app-canary

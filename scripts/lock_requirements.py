@@ -77,7 +77,6 @@ def check() -> int:
     pins = _parse_lock(LOCK)
 
     missing: list[str] = []
-    unpinned: list[str] = []
     for name, spec in declared:
         key = _norm(name)
         if key not in pins:

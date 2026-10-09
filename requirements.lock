@@ -35,12 +35,18 @@
 # 重新生成，它会校验"清单里的包都装了"且"版本可解析"。CI 会检查两者不漂移。
 
 # ---- 核心运行时 ----
+# ⚠️ 约束文件里**只能**写 `包名==版本`，不能带 extras（`psycopg[binary]==...` 会被
+#    pip 直接拒绝：`ERROR: Constraints cannot have extras`，退出码 1）。
+#    这是**解析期**错误 —— 在碰索引之前就失败，所以它不会表现为"装不上某个包"，
+#    而是整条 `pip install` 命令当场退出。extras 只写在 `requirements.txt` 里
+#    （那里写着 `psycopg>=3.2`；要二进制 wheel 就在那边加 extras）。
+#    这条由 `tests/test_dependency_lock.py::test_lock_has_no_extras` 钉住。
 langgraph==1.1.2
 langgraph-checkpoint-postgres==3.0.5
 langchain-openai==1.1.11
 langchain-community==0.4.1
 langchain-text-splitters==1.1.1
-psycopg[binary]==3.3.3
+psycopg==3.3.3
 pydantic==2.12.5
 python-dotenv==1.2.1
 
@@ -49,6 +55,11 @@ fastapi==0.135.1
 uvicorn==0.46.0
 sse-starlette==3.3.4
 redis==8.1.0
+
+# ---- 用户鉴权（第二档）----
+# JWKS 的 RS256/ES256 验签走 [crypto] extra（cryptography 是它的传递依赖，
+# 按本文件惯例只锁直接声明的那一个）。
+PyJWT==2.10.1
 
 # ---- RAG：检索 ----
 scikit-learn==1.8.0
@@ -74,3 +85,12 @@ tiktoken==0.12.0
 pytest==9.0.3
 httpx==0.28.1
 fakeredis==2.38.0
+# fakeredis 执行 Lua（EVAL）必须有 lupa，否则 app/auth.py 的 touch / pop 两条
+# 安全语义在测试里只能跳过（见 tests/test_session_redis.py 的 _HAS_LUA）
+lupa==2.8
+
+# ---- agent 链路 ----
+# 官方 Agents SDK：Runner / 跨轮历史会话 / 护栏 / handoff。
+openai-agents==0.20.0
+# 官方 SQLAlchemySession 的异步引擎（PG 会话表）。
+sqlalchemy==2.0.48

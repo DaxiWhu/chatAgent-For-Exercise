@@ -69,6 +69,19 @@ CHECK_STEPS: tuple[tuple[str, str], ...] = (
     ("全量测试（与 CI 的 test job 同款命令）", "pytest tests/ -q -p no:cacheprovider"),
 )
 
+# 质量评测：三层各自有门禁，最后一步把三层汇总成一页。
+#
+# 与 CI 的 `eval-gate` job 的关系：CI 跑前三个（它是门禁），**不跑 scorecard**
+# —— scorecard 会把三层各重跑一遍，CI 上纯属重复；它的用途是本地/发版前
+# 「一眼看全 + 与上次对比」。所以这里比 CI 多一步是**有意为之**，不是漂移。
+EVAL_STEPS: tuple[tuple[str, str], ...] = (
+    ("检索召回：Top1/Top3/MRR/Recall@k/nDCG@k（bm25 门禁）",
+     "python scripts/eval_retrieval.py --only bm25 --fail-under 0.55"),
+    ("材料充足：来源覆盖 / 关键点覆盖 / 引用可回溯", "python scripts/eval_answer.py"),
+    ("生成忠实：编造标识符与拒答正确性", "python scripts/eval_generation.py"),
+    ("三层汇总 scorecard（含与基线的对比提示）", "python scripts/eval_scorecard.py"),
+)
+
 DRILL_STEPS: tuple[tuple[str, str], ...] = (
     ("PG：备份 → 恢复到临时库 → 逐表比对", "python scripts/pg_backup.py drill"),
     ("Qdrant：快照 → 校验（无服务时跳过）", "python scripts/qdrant_backup.py drill"),
@@ -154,7 +167,7 @@ def task_setup(args: list[str]) -> int:
             "否则服务能起但会在运行时才报缺少配置。",
             flush=True,
         )
-    return run(f"python -m pip install -r requirements.txt -c requirements.lock")
+    return run("python -m pip install -r requirements.txt -c requirements.lock")
 
 
 def task_test(args: list[str]) -> int:
@@ -170,6 +183,37 @@ def task_test_fast(args: list[str]) -> int:
 def task_check(args: list[str]) -> int:
     """提交前门禁 —— 与 CI 的 test job 等价（见 CHECK_STEPS 的说明）。"""
     return _steps(CHECK_STEPS, args)
+
+
+def task_lint(args: list[str]) -> int:
+    """静态检查（ruff，配置见 ruff.toml；`--` 之后的参数原样透传）。
+
+    为什么是独立目标、不并进 `check`：`ruff` **不在**默认运行环境里 ——
+    生产镜像只装 `requirements.txt`，而这几个工具在 `requirements-dev.txt`。
+    并进 check 会让"没装开发依赖的人"在跑测试之前先撞上 `No module named ruff`。
+    而 CI 里 lint 本来就是**独立 job**（不是 test job 的一部分），所以 `check`
+    与 CI 的 test job 仍然逐条对应（那条守卫见 tests/test_tasks_entrypoint.py）。
+    """
+    if not require("ruff", "装开发依赖：pip install -r requirements-dev.txt"
+                           "（静态检查工具刻意不进生产镜像，所以已装依赖 ≠ 已装 ruff）"):
+        return 127
+    # ⚠️ 上面的 `require` 查的是 **PATH**，而真正执行的 `ruff` 会被 `run()` 换成
+    # `当前解释器 -m ruff`。两者可能不一致（PATH 里有 ruff，但当前解释器不是装了
+    # 它的那个）—— 那时真实报错是一句 `ModuleNotFoundError: No module named ruff`，
+    # 看不出该怎么修。所以按**实际执行方式**再探一次，把话说到能照做。
+    probe = subprocess.run([PY, "-m", "ruff", "--version"],
+                           capture_output=True, text=True)
+    if probe.returncode != 0:
+        print(f"✗ 当前解释器里没有 ruff。\n  解释器：{PY}\n"
+              "  装它：pip install -r requirements-dev.txt",
+              file=sys.stderr, flush=True)
+        return 127
+    return run("ruff check ." + (" " + " ".join(args) if args else ""))
+
+
+def task_eval(args: list[str]) -> int:
+    """跑三层质量评测（检索召回 / 材料充足 / 生成忠实）并汇总 scorecard。"""
+    return _steps(EVAL_STEPS, args)
 
 
 def task_version(args: list[str]) -> int:
@@ -257,33 +301,12 @@ def task_logs(args: list[str]) -> int:
     return compose("logs -f --tail=100", args)
 
 
-def _dotenv_value(key: str) -> str | None:
-    """从仓库根的 `.env` 读一个键（只取字面值，不做 `${VAR}` 插值）。"""
-    try:
-        for raw in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            if k.strip() == key:
-                return v.strip().strip("'\"")
-    except OSError:
-        return None
-    return None
-
-
-def _e2e_api_key() -> str | None:
-    """推断这个栈用的是哪个 Key，好让 E2E 的鉴权用例自动变成"验证拒未授权"。
-
-    优先 `TENANT_KEYS` 的第一个（形如 `acme:<key>,globex:<key>`），其次 `SERVE_API_KEY`；
-    都取不到就返回 None —— 此时那条用例会断言"**应当放行**"（两个方向都有断言，没有 skip）。
-    """
-    tenant_keys = _dotenv_value("TENANT_KEYS")
-    if tenant_keys:
-        first = tenant_keys.split(",")[0]
-        if ":" in first:
-            return first.split(":", 1)[1].strip() or None
-    return _dotenv_value("SERVE_API_KEY") or None
+def _has_script_credentials() -> bool:
+    """命令行是否已给出脚本账号（E2E_* 优先，其次 AGENT_SCRIPT_*）。"""
+    return bool(
+        os.environ.get("E2E_USER")
+        or os.environ.get("AGENT_SCRIPT_USER")
+    )
 
 
 def _wait_ready(base: str, timeout: float) -> bool:
@@ -338,10 +361,17 @@ def task_e2e(args: list[str]) -> int:
         return 1
 
     env = dict(os.environ, E2E_BASE_URL=base)
-    key = os.environ.get("E2E_API_KEY") or _e2e_api_key()
-    if key:
-        env["E2E_API_KEY"] = key
-        print("[e2e] 检测到该栈要求鉴权，已自动带上 E2E_API_KEY", flush=True)
+    if _has_script_credentials():
+        print("[e2e] 已检测到脚本账号（E2E_USER / AGENT_SCRIPT_USER）⇒ "
+              "用例会登录换令牌后带 Bearer 访问。", flush=True)
+    else:
+        # 没有账号就不能跑业务用例 —— 服务端现在**没有**任何"不用登录也能进"的路径，
+        # 所以这里不再有"自动补一个共享密钥"的回退（那条路径已删除）。
+        # 明确说清楚：需要人给出账号，因为密码在 .env 里是 PBKDF2 哈希，反推不出来。
+        print("[e2e] ⚠️ 未提供脚本账号（E2E_USER / E2E_PASSWORD 或 AGENT_SCRIPT_*）⇒ "
+              "需要鉴权的用例会**跳过**，只验证'裸请求被拒'这条。"
+              "要跑完整链路，请设 E2E_USER / E2E_PASSWORD —— 服务账号密码在 .env 里是 "
+              "PBKDF2 哈希，反推不出来，只能由你给出。", flush=True)
 
     print("[e2e] 跑检查：tests/test_e2e_stack.py", flush=True)
     rc = run(["pytest", "tests/test_e2e_stack.py", "-q", "-m", "e2e"], env=env)
@@ -400,6 +430,120 @@ def task_clean(args: list[str]) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# 密钥：明文 .env ↔ 仓库里的密文
+#
+# ⚠️ 密文的名字**必须以 `.env` 结尾**，这不是风格问题：sops 靠**后缀**推断输入
+#    输出格式（`cmd/sops/formats.FormatForPath` 只认 `.yaml/.yml/.json/.env/.ini`，
+#    其余一律落到 Binary）。实测过的差别是**粒度**不是"能不能解"：
+#      app.sops.env（Dotenv） → `AGNES_API_KEY=ENC[...]` 逐键一个信封；
+#      app.env.enc（Binary）  → `{"data": "ENC[...]", "sops": {...}}` 整块一坨，
+#                               **也能解回来**，但看不到有哪些键、没法按单键增删改。
+#    不以 `.env.` 打头则是有意的：那样它才不会被 `.gitignore` 的 `.env.*` 吃掉。
+#    完整推理（含实测记录）见 `.sops.yaml` 顶部注释。
+# --------------------------------------------------------------------------
+SECRETS_PLAIN = ".env"
+SECRETS_CIPHER = "secrets/app.sops.env"
+
+_SOPS_MISSING = (
+    "需要 SOPS 与 age（都是单文件，放到 PATH 即可）：\n"
+    "  sops  https://github.com/getsops/sops/releases\n"
+    "  age   https://github.com/FiloSottile/age/releases（取 age-keygen）\n"
+    "首次使用：`age-keygen -o ~/.config/sops/age/keys.txt`，"
+    "再把打印出来的公钥填进 .sops.yaml 的 `age:` 一行。"
+)
+
+
+def _run_to_file(argv: list[str], dest: Path, *, mode: int = 0o600) -> int:
+    """把命令的 stdout 落到文件里 —— **先写临时文件，成功才原子替换**。
+
+    为什么不直接 `> dest`：shell 的重定向在命令**开始之前**就把目标截断了。
+    对 `secrets/app.sops.env` 这种要提交进仓库的产物，一次失败的加密会留下一个
+    空文件，而它看起来"文件还在"（比没有更糟：下一个人会以为密钥已经入库了）。
+    临时文件与目标同目录，`os.replace` 才是原子的；失败时删掉临时文件、不动目标。
+    """
+    tmp = dest.with_name(dest.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            rc = subprocess.run(argv, cwd=ROOT, stdout=fh).returncode
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    if rc != 0:
+        tmp.unlink(missing_ok=True)
+        print(f"\n✗ 命令失败（退出码 {rc}），未改动 {dest.relative_to(ROOT)}", file=sys.stderr)
+        return rc
+    os.replace(tmp, dest)
+    os.chmod(dest, mode)
+    return 0
+
+
+def task_secrets_encrypt(args: list[str]) -> int:
+    """把仓库根的 .env 加密成 secrets/app.sops.env（改完密钥后跑一次）。"""
+    if not require("sops", _SOPS_MISSING):
+        return 127
+    if not (ROOT / SECRETS_PLAIN).is_file():
+        print(
+            f"✗ 找不到 {SECRETS_PLAIN} —— 先 `cp .env.example .env` 填好，再加密。",
+            file=sys.stderr, flush=True,
+        )
+        return 1
+    (ROOT / "secrets").mkdir(exist_ok=True)
+
+    # ⚠️ `--filename-override` **不是可选项**：creation_rules 的 `path_regex` 是按
+    #    **输入路径**匹配的，而输入是 `.env`（不匹配 `^secrets/`），不传就会报
+    #    "no matching creation rules found"。官方文档在"从 stdin / 改名输出"一节
+    #    明确说这个参数的作用就是"告诉 sops 用哪条 creation rule"，并且它同时决定
+    #    输入与输出格式 —— 所以不能写成 `sops -e .env > secrets/app.sops.env`。
+    print(f"\n$ sops --encrypt --filename-override {SECRETS_CIPHER} {SECRETS_PLAIN}"
+          f"  >  {SECRETS_CIPHER}", flush=True)
+    rc = _run_to_file(
+        ["sops", "--encrypt", "--filename-override", SECRETS_CIPHER, SECRETS_PLAIN],
+        ROOT / SECRETS_CIPHER,
+    )
+    if rc == 0:
+        print(
+            f"\n✓ 已写入 {SECRETS_CIPHER}（可以提交）\n"
+            f"  明文 {SECRETS_PLAIN} 仍被 .gitignore 忽略，只存在于本机。"
+        )
+    return rc
+
+
+def task_secrets_decrypt(args: list[str]) -> int:
+    """从 secrets/app.sops.env 解出仓库根的 .env（换机器 / 部署时跑）。"""
+    if not require("sops", _SOPS_MISSING):
+        return 127
+    if not (ROOT / SECRETS_CIPHER).is_file():
+        print(
+            f"✗ 找不到 {SECRETS_CIPHER} —— 先在有 {SECRETS_PLAIN} 的机器上跑 `secrets-encrypt`。",
+            file=sys.stderr, flush=True,
+        )
+        return 1
+
+    # 本机那份明文里可能有"还没加密进去"的改动（比如刚拿到的 webhook）。
+    # 直接覆盖是不可逆的数据丢失，所以默认拒绝，必须显式 `--force`。
+    if (ROOT / SECRETS_PLAIN).exists() and "--force" not in args:
+        print(
+            f"✗ {SECRETS_PLAIN} 已存在，解密会**整份覆盖**它。\n"
+            f"  如果本地改过密钥但还没跑 `secrets-encrypt`，那些改动会丢。\n"
+            f"  确认要覆盖就加 `--force`。",
+            file=sys.stderr, flush=True,
+        )
+        return 1
+
+    print(f"\n$ sops --decrypt {SECRETS_CIPHER}  >  {SECRETS_PLAIN}", flush=True)
+    rc = _run_to_file(["sops", "--decrypt", SECRETS_CIPHER], ROOT / SECRETS_PLAIN, mode=0o600)
+    if rc == 0:
+        print(f"\n✓ 已写入 {SECRETS_PLAIN}（权限 600）")
+        if os.name == "nt":
+            print(
+                "  注意：Windows 上 os.chmod 只改只读位，不等于真正的权限收紧 ——\n"
+                "  部署机请把工作目录放在只有部署用户可读的位置。"
+            )
+    return rc
+
+
 def task_help(args: list[str]) -> int:
     print(__doc__.strip().split("\n\n")[0])
     print("\n任务：")
@@ -421,6 +565,8 @@ TASKS: dict[str, tuple[str, Callable[[list[str]], int]]] = {
     "test": ("跑全量测试", task_test),
     "test-fast": ("只重跑上次失败的用例", task_test_fast),
     "check": ("提交前门禁（与 CI 的 test job 等价）", task_check),
+    "lint": ("静态检查（ruff，需先装 requirements-dev.txt）", task_lint),
+    "eval": ("三层质量评测：检索召回 / 材料充足 / 生成忠实", task_eval),
     "version": ("打印当前版本", task_version),
     "sync-version": ("把 VERSION 同步到各副本", task_sync_version),
     "openapi": ("重新生成 OpenAPI 契约快照", task_openapi),
@@ -438,6 +584,8 @@ TASKS: dict[str, tuple[str, Callable[[list[str]], int]]] = {
     "logs": ("跟踪本地栈日志", task_logs),
     "release": ("灰度发布（bash）", task_release),
     "rollback": ("回滚镜像（bash）", task_rollback),
+    "secrets-encrypt": ("把 .env 加密成 secrets/app.sops.env（改完密钥后跑）", task_secrets_encrypt),
+    "secrets-decrypt": ("从 secrets/app.sops.env 解出 .env（换机器/部署时跑）", task_secrets_decrypt),
     "clean": ("清理构建缓存（默认预演）", task_clean),
 }
 

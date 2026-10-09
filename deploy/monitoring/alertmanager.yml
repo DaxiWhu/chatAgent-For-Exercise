@@ -107,6 +107,22 @@ route:
 
     # ③ SLO 错误预算：多窗口多燃尽率告警（定义见同目录 SLO.md）
     #    复用 oncall —— 处置的人相同（先看是不是故障），只是"该多急"由 severity 区分。
+    #
+    #    ⚠️ **预算余量告警（`kind = "budget"`）必须排在下面两条之前**。
+    #    Alertmanager 是**首个匹配生效**，而预算告警同时满足 `category = "slo"`
+    #    与一条 severity —— 排在后面时它会继承下面那条的 repeat_interval（1h）。
+    #    余量是**慢变量**：预算耗尽可能一直持续到月底，每小时重复一次的结果是
+    #    一周内被静音，而它恰是"冻结发布"这个动作唯一的自动触发器。
+    #    （这里的推理与 §⑥ 的 Watchdog 专属路由完全同源。）
+    #    守卫：`test_budget_route_precedes_the_generic_slo_routes`。
+    - matchers:
+        - category = "slo"
+        - kind = "budget"
+      receiver: oncall
+      group_wait: 1m
+      group_interval: 6h
+      repeat_interval: 24h
+
     - matchers:
         - category = "slo"
         - severity = "critical"
@@ -131,7 +147,18 @@ route:
       group_interval: 30m
       repeat_interval: 24h
 
-    # ⑤ 平台自身：监控栈坏了 / 备份断了 / 磁盘满了。
+    # ⑤ agent 能力链路：请求有没有被正确地走完 agent 链路。
+    #    复用 oncall —— 处置的人和可用性同一批（先判断是不是"功能坏了"），
+    #    但等待更长：agent 的问题极少需要立刻叫醒人，多是"这一轮产出质量不对"。
+    #    ⚠️ AgentLinkDegraded 是这条路由下的 critical，真要叫醒时由 severity 区分。
+    - matchers:
+        - category = "agent"
+      receiver: oncall
+      group_wait: 1m
+      group_interval: 15m
+      repeat_interval: 12h
+
+    # ⑥ 平台自身：监控栈坏了 / 备份断了 / 磁盘满了。
     #    ⚠️ Watchdog 必须**单独一条路由且放在最前**（下面这条必须在通配的
     #    category=platform 之前 —— Alertmanager 是"首个匹配生效"）。
     #    它永远 firing，所以 repeat_interval 就是"你多久该收到一次心跳"：

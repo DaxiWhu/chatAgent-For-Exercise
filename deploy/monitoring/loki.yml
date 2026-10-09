@@ -11,6 +11,13 @@
 #   3. **无法与指标关联**：告警说"5xx 升高"，你需要能立刻按 request_id 找到那条链路。
 #      应用侧已经打好结构化 JSON（LOG_FORMAT=json），缺的只是"有东西在收"。
 
+# ⚠️ 关掉鉴权的前提是：**Loki 绝不发布端口**（只在 compose 的 `monitor` 网络里
+#    被 Grafana/Promtail 访问）。理由：这里存的是**应用日志**，可能含用户原文，
+#    以及能把整条链路串起来的 request_id。一旦给它加 `ports:`，它就在编排网络
+#    之外也可读了 —— 而"日志泄漏"没有任何运行期信号（服务照常、指标照常）。
+#    这条耦合由 `tests/test_deploy_topology.py` 的两条守卫钉住：
+#    「内部组件不得发布端口」+「本注释必须存在」。多租户/多团队共用一套 Loki 时，
+#    必须改为 `auth_enabled: true` 并发 `X-Scope-OrgID`。
 auth_enabled: false
 
 server:

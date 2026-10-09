@@ -10,14 +10,27 @@
 #    在云主机上就是"对整个互联网开放一个口令很弱的数据库"。容器之间互通**不需要**
 #    发布端口（靠服务名 + 容器网络即可），发布端口只是为了从宿主机连上去调试。
 #    确需远程直连，请走 SSH 隧道或改成 "内网IP:5433:5432"，不要用 0.0.0.0。
-# ② 口令来自 `POSTGRES_PASSWORD`，默认 123456 仅供本机开发：
-#        POSTGRES_PASSWORD=$(openssl rand -hex 24) \
-#          docker compose -f deploy/pgvector/docker-compose.yml up -d
-#    注意它**只在数据卷首次初始化时生效**；卷已存在时改这个变量没有任何效果
+# ② 口令**没有默认值** —— 不设 `POSTGRES_PASSWORD` 就直接拒绝启动，与主编排
+#    `deploy/app/docker-compose.yml` 同一口径。为什么不留一个"仅供本机开发"的默认值：
+#    有默认弱口令的编排文件迟早会被当成生产库起起来，而那时没人会回来看注释；
+#    更糟的是它 bind 在 `langgraph_app` 这个**超级用户**上（见下面的 environment）。
+#    本机开发这样起（口令随机生成，不需要记住，每次新卷都换一个）：
+#        export POSTGRES_PASSWORD=$(openssl rand -hex 24)
+#        docker compose -f deploy/pgvector/docker-compose.yml up -d
+#    不想每次 export：写进 `deploy/pgvector/.env`。compose 会自动加载**第一个 -f
+#    所在目录**里的 `.env`（官方行为，见 compose 文档的变量插值一节），而该文件已被
+#    仓库根的 .gitignore 忽略（`.env` 与 `.env.*` 两条模式都是无锚点的）。
+#    注意口令**只在数据卷首次初始化时生效**；卷已存在时改这个变量没有任何效果
 #    （PG 只认初始化时写进 pg_authid 的口令），得 ALTER USER 或删卷重来：
 #        docker compose -f deploy/pgvector/docker-compose.yml exec pgvector \
 #          psql -U langgraph_app -d langgraph_checkpoints \
 #          -c "ALTER USER langgraph_app PASSWORD '新口令'"
+#
+# ⚠️ 本文件里的命令**刻意不写** `--env-file .env`（主编排的文档里每条都写）。
+#    原因：`-f` 指向的是 `deploy/pgvector/`，compose 的项目目录就是它，会自动读
+#    `deploy/pgvector/.env`；而仓库根的 `.env` **不是**这个项目目录里的文件。
+#    照抄主编排那种写法反而会把"仓库根 .env 的口令"引进来（两套部署共用同一个
+#    变量名但意图不同）。这里要的是 shell 里的 `POSTGRES_PASSWORD` 或本目录的 .env。
 # ---------------------------------------------------------------------------
 #
 # 启动:  docker compose -f deploy/pgvector/docker-compose.yml up -d
@@ -25,7 +38,9 @@
 # 日志:  docker compose -f deploy/pgvector/docker-compose.yml logs -f
 # 停止:  docker compose -f deploy/pgvector/docker-compose.yml down
 # 清库:  加 -v 参数（会删数据卷）
-# 连库:  psql "postgresql://langgraph_app:123456@localhost:5433/langgraph_checkpoints?sslmode=disable"
+# 连库:  PGPASSWORD="$POSTGRES_PASSWORD" psql -h localhost -p 5433 \
+#          -U langgraph_app -d langgraph_checkpoints
+#        （用 PGPASSWORD 而不是把口令拼进 URL —— 后者会出现在 `ps` 的输出里）
 #
 # 国内拉不动镜像时，把 image 换成加速地址，例如：
 #   image: docker.m.daocloud.io/pgvector/pgvector:pg16
@@ -40,7 +55,7 @@ services:
     environment:
       # 该用户会被建成超级用户 → 具备 CREATE EXTENSION 权限（本机 PG 的 langgraph_app 不是超级用户）
       POSTGRES_USER: langgraph_app
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-123456}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须设置（本机开发先 export 一个随机口令，例如 openssl rand -hex 24 的输出；或写进 deploy/pgvector/.env，该文件已被 .gitignore 忽略）}
       POSTGRES_DB: langgraph_checkpoints
     volumes:
       - pgvector_data:/var/lib/postgresql/data

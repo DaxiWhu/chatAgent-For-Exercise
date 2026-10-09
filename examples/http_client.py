@@ -7,23 +7,25 @@
 
 跑之前
 ------
-服务端要先起来，并且**密钥要与服务端一致**：
+服务端要先起来。**唯一**的拿凭证方式是登录换令牌：
 
     # 服务端（另开一个终端）
     python -m app.serve
 
-    # 单租户（服务端设了 SERVE_API_KEY=<key>）
-    python examples/http_client.py chat --api-key <key> --message "你好"
+    # ① 用账号密码换 JWT
+    python examples/http_client.py login --user svc-loadtest
+    #    密码从环境变量 AGENT_SCRIPT_PASSWORD 读（避免进 shell history）
 
-    # 多租户（服务端设了 TENANT_KEYS=acme:<key>）
-    python examples/http_client.py chat --api-key <key> --tenant acme --message "你好"
+    # ② 拿上一步的 access_token 调其它子命令
+    python examples/http_client.py whoami --token <access_token>
+    python examples/http_client.py chat --token <access_token> --message "你好"
+    python examples/http_client.py reviews --token <access_token>
+    python examples/http_client.py review --token <access_token> \
+        --thread-id <id> --action revise --feedback "第二段要给出数据来源"
 
-    # 列出待人工审核的会话
-    python examples/http_client.py reviews --api-key <key>
-
-    # 对某会话做人工审核（会续跑被挂起的图，返回的仍是 SSE 流）
-    python examples/http_client.py review --api-key <key> --thread-id <id> \
-        --action revise --feedback "第二段要给出数据来源"
+⚠️ 2026-10-05：`--api-key` / `--tenant` 两个参数**已删除**。共享密钥（`X-API-Key`）
+与自报租户（`X-Tenant-Id`）在服务端已不存在 —— 不带令牌的请求一律 401，
+租户一律取自令牌载荷，客户端无法指定。
 
 也可以不用命令行，直接改下面的 `_demo()` 里的参数。
 
@@ -53,6 +55,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import os
 import sys
 from urllib.parse import urlparse
 
@@ -150,10 +153,10 @@ def decode(event: str, raw: str):
 # ---------------------------------------------------------------------------
 # 三个端点
 # ---------------------------------------------------------------------------
-def chat(base_url: str, api_key: str, tenant: str, thread_id: str, message: str) -> dict:
+def chat(base_url: str, token: str, thread_id: str, message: str) -> dict:
     """流式对话，把事件打到 stdout，返回汇总（正文 + 引用 + 是否需审核）。"""
     body = {"thread_id": thread_id, "message": message}
-    headers = _headers(api_key, tenant)
+    headers = _headers(token)
     answer: list[str] = []
     result = {"answer": "", "citations": [], "need_review": None, "error": None}
 
@@ -208,11 +211,11 @@ def chat(base_url: str, api_key: str, tenant: str, thread_id: str, message: str)
     return result
 
 
-def review(base_url: str, api_key: str, tenant: str, thread_id: str,
+def review(base_url: str, token: str, thread_id: str,
            action: str, feedback: str) -> None:
     """提交人工审核结论。**返回的同样是 SSE 流**（revise 会续跑生成）。"""
     body = {"thread_id": thread_id, "action": action, "feedback": feedback}
-    headers = _headers(api_key, tenant)
+    headers = _headers(token)
     timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
 
     with _client_for(base_url, timeout) as client:
@@ -232,9 +235,9 @@ def review(base_url: str, api_key: str, tenant: str, thread_id: str,
                     print(f"\n\n--- 服务端异常：{data} ---")
 
 
-def reviews(base_url: str, api_key: str, tenant: str, limit: int = 50) -> None:
+def reviews(base_url: str, token: str, limit: int = 50) -> None:
     """列出待人工审核的会话（普通 JSON 接口，不是 SSE）。"""
-    headers = _headers(api_key, tenant)
+    headers = _headers(token)
     with _client_for(base_url, httpx.Timeout(15.0)) as client:
         r = client.get(f"{base_url}/v1/reviews", params={"limit": limit}, headers=headers)
     if r.status_code != 200:
@@ -249,25 +252,88 @@ def reviews(base_url: str, api_key: str, tenant: str, limit: int = 50) -> None:
 # ---------------------------------------------------------------------------
 # 小工具
 # ---------------------------------------------------------------------------
-def _headers(api_key: str, tenant: str) -> dict:
+def _headers(token: str = "") -> dict:
+    """构造请求头：只有 `Authorization: Bearer`。
+
+    ⚠️ 2026-10-05：这里原先还会发 `X-API-Key`（共享密钥）与 `X-Tenant-Id`（自报租户），
+    两者都已删除 —— 服务端现在**只认已验签的 JWT**，租户也来自令牌载荷。
+    调用方不再需要、也不应该自报租户。
+    """
     h = {"Content-Type": "application/json"}
-    if api_key:
-        h["X-API-Key"] = api_key
-    if tenant:
-        # 只在服务端配了 TENANT_KEYS 时才有意义（此时它与 Key 必须一致，否则 403）
-        h["X-Tenant-Id"] = tenant
+    if token:
+        h["Authorization"] = f"Bearer {token}"
     return h
+
+
+def whoami(base_url: str, token: str) -> None:
+    """查当前身份；服务端说"该重新登录了"就把它**弹出来**。
+
+    ⚠️ 这是接入方**必须实现**的一步，不是可选装饰。JWT 里的租户与角色是
+    **签发那一刻的快照**：管理员改了它们、或批准了你的入租申请之后，你手上那张
+    令牌仍按旧值生效（"批准入租"刻意不断会话）。不实现这个检查的症状是 ——
+    用户"申请明明通过了却还是搜不到东西"，然后反复重试、提工单。
+
+    真实客户端在这里弹窗（页面横幅 / 应用内弹层 / 登录页重定向）；
+    这里用一段醒目的文本代替。关键是**别默默忽略**。
+    """
+    with _client_for(base_url, httpx.Timeout(10.0)) as c:
+        r = c.get(f"{base_url}/v1/auth/me", headers=_headers(token))
+        if r.status_code != 200:
+            _die(r.status_code, r.text)
+        me = r.json()
+    print(json.dumps(me, ensure_ascii=False, indent=2))
+    if me.get("relogin_required"):
+        print("\n" + "!" * 64)
+        print(f"请重新登录：{me.get('relogin_reason')}")
+        print("!" * 64)
+
+
+def login(base_url: str, user: str) -> None:
+    """用账号密码换 JWT —— **这是唯一的拿凭证方式**（共享密钥路径已整体删除）。
+
+    令牌比曾经的共享密钥多三样东西，而且都是**载荷带来的**：
+      - 身份：`sub` 在令牌里 ⇒ 审计日志与审核留痕能归到人；
+      - 可撤销：令牌在服务端会话白名单里 ⇒ 能单独作废，不必"改密钥 + 重启"；
+      - 租户不可自报：`tenant` 来自已验签的载荷 ⇒ 请求头改不动它。
+
+    真实客户端要把 `refresh_token` 存起来（长期、单次使用、每次刷新轮换），
+    本示例只打印 `access_token`：refresh token 是长期凭证，不该在终端回显。
+    """
+    password = os.getenv("AGENT_SCRIPT_PASSWORD", "")
+    if not user or not password:
+        raise SystemExit(
+            "缺少账号或密码。用法：AGENT_SCRIPT_PASSWORD='...' \\\n"
+            "    python examples/http_client.py login --user <账号>\n"
+            "密码刻意只从环境变量读（明文进 shell history 与 ps 输出是最常见的泄漏方式）。\n"
+            "还没有服务账号：`python -m scripts.hash_password -u svc-loadtest -t <租户>`"
+            "（不给 -r 即**无角色**）。"
+        )
+    body = {"username": user, "password": password}
+    with _client_for(base_url, httpx.Timeout(15.0)) as client:
+        r = client.post(f"{base_url}/v1/auth/login", json=body)
+    if r.status_code != 200:
+        _die(r.status_code, r.text)
+    data = r.json()
+    print(f"已登录：user={data.get('user')} tenant={data.get('tenant') or '（无）'} "
+          f"roles={data.get('roles')} 有效期={data.get('expires_in')}s")
+    print()
+    print("access_token：")
+    print(data.get("access_token", ""))
+    print()
+    print("接着用它调其它子命令，例如：")
+    print(f"    python examples/http_client.py whoami --token {data.get('access_token', '')[:16]}…")
 
 
 def _die(status: int, body: str) -> None:
     """把 4xx/5xx 讲清楚：这些状态码各自对应一种配置问题，直接报码很难排查。"""
     hint = {
-        401: "API Key 不对（检查 --api-key 是否与服务端 SERVE_API_KEY/TENANT_KEYS 一致）",
-        403: "X-Tenant-Id 与 Key 不匹配，或该会话属于其他租户",
+        401: "缺少凭证或凭证无效（没带 --token、令牌已过期、或已被登出/撤销）；"
+             "用 login 子命令重新换一张",
+        403: "权限不足：需要对应角色（审稿/管理），或该会话属于别的租户或用户",
         404: "路径不对（旧版服务只有 /chat，不带 /v1 前缀）",
         409: "该会话当前不在人工审核状态（已处理过，或从未触发低分）",
         429: "触发限流或当日配额已用尽（响应头 Retry-After 有建议等待秒数）",
-        503: "服务未配置鉴权但 REQUIRE_AUTH=1 —— 属于部署问题，需补 Key",
+        503: "服务端没配会话签名密钥（AUTH_SESSION_SECRET）—— 属于部署问题",
     }.get(status, "")
     print(f"\n[HTTP {status}] {hint}\n{body[:500]}", file=sys.stderr)
     raise SystemExit(1)
@@ -276,9 +342,12 @@ def _die(status: int, body: str) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="chatAgent HTTP 客户端示例")
     ap.add_argument("--base-url", default="http://localhost:8000")
-    ap.add_argument("--api-key", default="", help="X-API-Key")
-    ap.add_argument("--tenant", default="", help="X-Tenant-Id（多租户时与 Key 必须匹配）")
+    ap.add_argument("--token", default="", help="Bearer 令牌（来自 login 子命令）")
     sub = ap.add_subparsers(dest="cmd")
+
+    lg = sub.add_parser("login", help="用账号密码换 JWT（推荐路径）")
+    lg.add_argument("--user", default=os.getenv("AGENT_SCRIPT_USER", ""),
+                    help="账号（默认取 AGENT_SCRIPT_USER）")
 
     c = sub.add_parser("chat", help="流式对话")
     c.add_argument("--thread-id", default="demo-thread")
@@ -290,19 +359,24 @@ def main(argv=None) -> int:
     v.add_argument("--feedback", default="")
 
     sub.add_parser("reviews", help="列出待审会话")
+    sub.add_parser("whoami", help="查当前身份（含「该重新登录了」的提示）")
 
     args = ap.parse_args(argv)
     if not args.cmd:
         ap.print_help()
         return 1
 
-    if args.cmd == "chat":
-        chat(args.base_url, args.api_key, args.tenant, args.thread_id, args.message)
+    if args.cmd == "login":
+        login(args.base_url, args.user)
+    elif args.cmd == "chat":
+        chat(args.base_url, args.token, args.thread_id, args.message)
     elif args.cmd == "review":
-        review(args.base_url, args.api_key, args.tenant, args.thread_id,
+        review(args.base_url, args.token, args.thread_id,
                args.action, args.feedback)
     elif args.cmd == "reviews":
-        reviews(args.base_url, args.api_key, args.tenant)
+        reviews(args.base_url, args.token)
+    elif args.cmd == "whoami":
+        whoami(args.base_url, args.token)
     print()
     return 0
 

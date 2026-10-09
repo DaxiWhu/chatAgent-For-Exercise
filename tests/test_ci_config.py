@@ -18,6 +18,7 @@ CI 配置的错误和监控配置一样是**静默的**：YAML 合法、job 显�
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -488,6 +489,19 @@ def test_security_job_scans_for_committed_secrets_and_gates(ci):
     assert not g[0].get("continue-on-error"), (
         "密钥扫描设了 continue-on-error —— 它永远不会让 CI 变红，等于没有这道门禁"
     )
+    # ⚠️ 只看**命令行**，不看注释：注释里解释"为什么不再用 --no-git"时当然会出现
+    # 这个词，按整段文本断言会把说明文字当成违规 —— 这条断言自己踩过一次。
+    commands = "\n".join(
+        ln for ln in str(g[0].get("run", "")).splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+    assert "--no-git" not in commands, (
+        "密钥扫描又加回了 `--no-git`：它只看**当前工作树**，看不到 git 历史里的密钥。\n"
+        "而历史里的泄露恰恰是最该被发现的一种 —— 文件可以从 HEAD 删掉，对象仍在\n"
+        "`.git` 里可 `git show` 取出，凭据也没有因此失效（只能轮换）。\n"
+        "本仓库曾因此整整漏掉两个真实的 embedding 密钥（rag/vectorSaveTest.py）。\n"
+        "实测：加 `--no-git` 时 0 命中，扫全历史时 2 命中。"
+    )
 
 
 def test_security_advisory_steps_stay_non_gating_until_baselined(ci):
@@ -534,5 +548,266 @@ def test_gitleaks_config_keeps_default_rules(ci):
     assert (cfg.get("allowlist") or {}).get("paths"), (
         "允许清单里没有任何路径项，无法解释 .env.example 的占位值"
     )
+
+
+def test_gitleaks_allowlist_does_not_exempt_the_shipped_template():
+    """路径放行不许把**随仓库分发**的文件整类豁免掉，`.env.example` 尤其不行。
+
+    `.env.example` 是被复制出去用的模板 —— 恰恰是最容易被人"顺手试一下新配置项"
+    而粘进真密钥的地方。此前那条 `^\\.env(\\..*)?$` 看着只是在忽略"本地 .env"，
+    实际把 `.env.example` 一起放过了（`.env` + `.example`）。放行一个随仓库走的
+    文件，等于把门禁在这条路径上整个关掉，而且**没有任何提示** —— 那行正则看起来
+    人畜无害。
+
+    两个方向都钉：`.env.example` 不许被路径放行；本地 `.env` 仍必须被放行
+    （否则本机口令会一路报警，把真泄露淹掉 —— 那也是一种失效）。
+    """
+    import re
+    import tomllib
+
+    cfg = tomllib.loads((ROOT / ".gitleaks.toml").read_text(encoding="utf-8"))
+    paths = (cfg.get("allowlist") or {}).get("paths") or []
+
+    bad = [p for p in paths if re.match(p, ".env.example")]
+    assert not bad, (
+        f".env.example 被路径允许清单放行了：{bad}\n"
+        "它是随仓库分发的公开模板，必须继续被扫描"
+    )
+    assert any(re.match(p, ".env") for p in paths), (
+        "本地 .env 不再被放行 —— 本机口令会变成常驻假阳性，反而把真泄露淹掉"
+    )
+    assert (cfg.get("allowlist") or {}).get("regexes"), (
+        "允许清单里没有正则项 —— .env.example 的占位值只能靠正则规则挡住，"
+        "不能靠路径规则"
+    )
+
+
+def test_gitleaks_path_allowlist_is_cross_platform():
+    """路径放行必须同时认 `/` 与 `\\`，否则它只在 CI（Linux）上生效。
+
+    实测（gitleaks 8.18.4 / Windows）：把 `tmp_probe/` 写成只带正斜杠时，
+    Windows 传进来的 `tmp_probe\\sops_scratch\\...` **完全不匹配** ⇒ 本地扫工作树
+    得到 28 处命中，全部落在本该被放行的目录里。
+
+    危害不在"本地多几条告警"，而在于它会训练出"本地那堆告警都是假的"这个习惯，
+    而那条习惯正好会盖掉真泄露。同一个跨平台分隔符的坑，本仓库在 sops 的判据里
+    已经踩过一次（那里写的就是 `[/\\\\]`）。
+    """
+    import tomllib
+
+    cfg = tomllib.loads((ROOT / ".gitleaks.toml").read_text(encoding="utf-8"))
+    paths = (cfg.get("allowlist") or {}).get("paths") or []
+    offenders = [p for p in paths if "/" in p and "[/\\\\]" not in p]
+    assert not offenders, (
+        "这些路径放行只认正斜杠，在 Windows 上不生效：\n  " + "\n  ".join(offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# ⑪ action 引用必须钉在 commit SHA 上 / 发布产物必须验签
+# ---------------------------------------------------------------------------
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_USES_RE = re.compile(r"^\s*-?\s*uses:\s*(\S+)(.*)$", re.M)
+
+
+def _workflow_files() -> list[Path]:
+    """所有 workflow（不只 ci.yml）—— 新增一个 workflow 就绕过守卫是最典型的漏。"""
+    return sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+
+
+def test_every_action_is_pinned_to_a_commit_sha():
+    """任何 `uses:` 都不允许用可变引用（tag / 分支 / 主版本号）。
+
+    tag 是**可以被上游重指向**的，而 action 的代码拿得到本仓库的 secrets、
+    `GITHUB_TOKEN`，`publish` job 还额外有 `packages: write` 与 `id-token: write`。
+    上游账号被盗或恶意重打 tag 一次，就等于在我们的流水线里执行任意代码。
+    commit SHA 不可变，是唯一能钉住的形态。
+
+    本地 action（`./path`）与 `docker://` 引用不算 —— 前者随仓库一起评审，
+    后者是镜像引用（应另按 digest 钉，不属本条范围）。
+    """
+    offenders: list[str] = []
+    for wf in _workflow_files():
+        for i, line in enumerate(wf.read_text(encoding="utf-8").splitlines(), 1):
+            m = _USES_RE.match(line)
+            if not m:
+                continue
+            ref = m.group(1)
+            if ref.startswith("./") or ref.startswith("docker://"):
+                continue
+            if "@" not in ref:
+                offenders.append(f"{wf.name}:{i} 缺少 @ref：{ref}")
+                continue
+            _, _, version = ref.rpartition("@")
+            if not _SHA_RE.match(version):
+                offenders.append(f"{wf.name}:{i} 用了可变引用 @{version}：{ref}")
+    assert not offenders, (
+        "以下 action 没有钉在 40 位 commit SHA 上（上游可重指向该 ref ⇒ 可执行任意代码）：\n  "
+        + "\n  ".join(offenders) + "\n"
+        "升级请用 `gh api repos/<org>/<repo>/commits/<tag> --jq .sha`，"
+        "或交给 .github/dependabot.yml（它理解 SHA 钉法）"
+    )
+
+
+def test_pinned_actions_carry_a_readable_version_comment():
+    """钉了 SHA 就必须在后面标注真实版本号。
+
+    只留一串 SHA 的后果：下一次 CVE 响应时，没人能一眼看出用的是哪个版本、
+    该不该升；而逐个去 GitHub 反查的成本高到不会有人做 —— 于是这些 pin 会
+    长期停在旧版本上，"钉住"变成了"冻住"。
+    """
+    offenders: list[str] = []
+    for wf in _workflow_files():
+        for i, line in enumerate(wf.read_text(encoding="utf-8").splitlines(), 1):
+            m = _USES_RE.match(line)
+            if not m:
+                continue
+            ref, rest = m.group(1), m.group(2)
+            if ref.startswith("./") or ref.startswith("docker://"):
+                continue
+            _, _, version = ref.rpartition("@")
+            if _SHA_RE.match(version) and not re.search(r"#\s*v?\d", rest):
+                offenders.append(f"{wf.name}:{i} {ref}")
+    assert not offenders, (
+        "以下 SHA 钉住的行没有 `# vX.Y.Z` 注释（将来无法一眼看出是哪个版本）：\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def _publish_steps(ci) -> list[dict]:
+    """publish job 的全部步骤。
+
+    ⚠️ 必须**限定在 publish job 内**查找，不能用全局的 `_find_step`：
+    后者返回 `(job_name, job, step)` 三元组、且按 job 顺序返回**第一个**命中 ——
+    任何别的 job 里出现同样的字符串都会让它指到别处去（例如测试脚本里的一句
+    `cosign verify`），于是断言检查的根本不是发布链路。
+    """
+    return list(_publish_job(ci).get("steps") or [])
+
+
+def _run_commands(step) -> str:
+    """step 的 `run` 里**真正会被执行**的行（去掉注释与空行）。
+
+    ⚠️ 不能直接在原始 `run` 文本上搜关键字：注释里出现 `cosign verify`
+    （比如解释为什么签完要验）就会被当成"这一步在执行验签"。
+    本仓库在 gitleaks 门禁上踩过同一个坑 —— 断言扫到了 ci.yml **注释里**的
+    `--no-git`，于是"禁止用 --no-git"的守卫被自己的说明文字撞红。
+    """
+    return "\n".join(
+        ln.strip() for ln in str(step.get("run", "")).splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    )
+
+
+def _publish_step(ci, needle: str):
+    return next((s for s in _publish_steps(ci) if needle in _run_commands(s)), None)
+
+
+def _publish_step_running(ci, command: str):
+    """找 publish job 里**以该命令开头执行**的那一步。
+
+    ⚠️ 为什么不能用"文本里含 `cosign verify`"来定位：发布摘要那一步会用
+    `echo "cosign verify \\" ...` 把它打印出来给运维看，于是**提到**它的步骤
+    先于/后于**执行**它的步骤出现。用子串匹配会认错步骤 ——
+    更糟的是：把真正的验签步骤删掉之后，摘要那一步仍然满足断言（它同样含
+    `--certificate-identity-regexp`），守卫会**假装通过**。
+    """
+    for step in _publish_steps(ci):
+        for line in _run_commands(step).splitlines():
+            if line.startswith(command):
+                return step
+    return None
+
+
+def test_publish_verifies_the_signature_it_produced(ci):
+    """发布链路必须**验证**自己签出来的签名，而不是只签。
+
+    只签不验等于没有签名保证：签错对象（tag 而不是 digest）、identity/issuer
+    与预期不符、仓库 OIDC 没开 —— 这些情况下 `cosign sign` 仍可能返回 0，
+    而**使用方** `cosign verify` 时才失败。那时才会有人发现"这批镜像根本验不过"，
+    而它已经在生产里跑了很久。这一步同时充当给运维的命令模板。
+    """
+    step = _publish_step_running(ci, "cosign verify")
+    assert step, "publish job 里没有**真的执行** `cosign verify` 的步骤 —— 签名从未被验证过"
+
+    run = _run_commands(step)
+    assert "--certificate-identity-regexp" in run, (
+        "验签没校验 identity：任何人都能用**自己仓库**的 workflow 签一个同名镜像，"
+        "只验 issuer 等于没验"
+    )
+    assert "--certificate-oidc-issuer" in run, "验签没校验 OIDC issuer"
+    assert "token.actions.githubusercontent.com" in run, (
+        "issuer 不是 GitHub Actions 的 OIDC 发行方 —— 等于允许别处签发的证书"
+    )
+    assert "steps.push.outputs.digest" in run, (
+        "验签验的不是本次构建产物的 digest —— 那验的是别的东西"
+    )
+
+
+def test_publish_signs_the_digest_not_the_tag(ci):
+    """签名对象必须是 **digest**：tag 可以被重新指向，签 tag 等于签了一个会变的东西。"""
+    step = _publish_step_running(ci, "cosign sign")
+    assert step, "publish job 里没有执行 `cosign sign` 的步骤"
+    run = _run_commands(step)
+    assert "steps.push.outputs.digest" in run, (
+        "签名没有签在构建产物的 digest 上（签名对象会随 tag 漂移）：\n" + run
+    )
+
+
+def test_publish_depends_on_every_gate(ci):
+    """`publish` 的 `needs` 必须覆盖**所有**在 push 事件下会跑的质量门禁 job。
+
+    这条守的洞：门禁 job 红了，镜像照样推送 + 签名发布。
+    2026-10-06 修前实测就是 `needs: [image, test, security]`，而
+    `lint` / `agent-session-pg` / `eval-gate` 三个门禁全在门外 ——
+    其中 `eval-gate`（检索召回 / 答案质量）意味着"改提示词导致质量退化"这件事
+    挡不住发布；而同一段注释当时就已经写着"没验证过的东西不许出门"。
+
+    ⚠️ 判据是**推导**而不是写死一串名字：写死的清单在新增 job 时会静默过期
+    （新门禁不在 needs 里 → 它红了没人管 → 且不会有任何报错）。这里的规则是
+    "凡是没有 schedule/workflow_dispatch 专属 `if` 的 job，都必须在 needs 里"，
+    新增 job 会自动被纳入要求。
+    """
+    jobs = ci.get("jobs") or {}
+    publish = jobs.get("publish")
+    assert publish is not None, "publish job 不见了"
+
+    needs = publish.get("needs") or []
+    if isinstance(needs, str):            # YAML 允许 `needs: foo` 的单值写法
+        needs = [needs]
+    needs = set(needs)
+
+    assert needs <= set(jobs), (
+        f"publish 的 needs 里有无此 job 的名字：{sorted(needs - set(jobs))} —— "
+        "GitHub Actions 会因此直接判整个工作流配置无效"
+    )
+
+    # 只在定时/手动触发下才跑的 job：push 时它们是 skipped，纳入 needs 会
+    # 让 publish **一起被跳过**（skipped 会传染依赖方），所以必须排除。
+    scheduled_only = set()
+    always_on = set()
+    for name, job in jobs.items():
+        if name == "publish":
+            continue
+        cond = str(job.get("if") or "")
+        if "schedule" in cond or "workflow_dispatch" in cond:
+            scheduled_only.add(name)
+        else:
+            always_on.add(name)
+
+    missing = sorted(always_on - needs)
+    assert not missing, (
+        f"publish 的 needs 少了这些门禁：{missing}\n"
+        f"（当前 needs={sorted(needs)}；push 时会跑的 job={sorted(always_on)}）\n"
+        "这些 job 红了，镜像仍会被推送 + 签名发布 —— 门禁等于不存在。"
+    )
+
+    # 反向锁：被排除的那几个必须是"确实只在定时触发"的，否则上面的排除逻辑会变成万能免死牌
+    assert scheduled_only == {"full-deps", "drill", "e2e"}, (
+        f"被当成『定时专属』排除的 job 集合变了：{sorted(scheduled_only)}。"
+        "如果不是它们真的都只在 schedule/dispatch 跑，请同步复核本守卫的排除规则 —— "
+        "否则任何 job 只要加一句 if 就能绕过发布门禁。"
+    )
+
 
 

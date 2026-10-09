@@ -19,13 +19,19 @@
 #    你在 staging 里跑的迁移/灌库清洗会作用在生产数据上。
 #    改 name 之后卷名变成 `chatagent-staging_pgdata`，才是真正隔离的一套。
 #
-# 2) `APP_ENV` 必须显式写 `production`，**不能**写 `staging`。
-#    这不是笔误 —— `app/config.py` 里 `IS_PRODUCTION = APP_ENV in ("production", "prod")`，
-#    也就是说 `APP_ENV=staging` 会被当作**非生产**：`REQUIRE_AUTH` 默认关闭、
-#    `ENABLE_DOCS` 默认打开。
-#    于是 staging 唯一与生产不同的地方，恰好落在**鉴权与接口暴露**这一层 ——
-#    而那正是"上线前最需要验证"的部分。你会在 staging 上验证通过，
-#    然后在生产上第一次看到 401/403 或者"生产 + 无密钥拒绝启动"。
+# 2) `APP_ENV` 必须**显式**写 `production`，不要靠插值、也不要写 `staging`。
+#    ⚠️ 判据 2026-10-05 已从"白名单认生产"改为"**黑名单认开发**"：
+#    只有 `development`/`dev`/`local`/`test`/`testing` 算非生产，
+#    **其余任何取值（含 `staging`）一律视为生产**。
+#    所以写 `staging` 现在**不会再**静默打开 /docs —— 那条老坑
+#    （staging 唯一与生产不同的地方恰好是"鉴权与接口暴露"这一层）已经堵上；
+#    同期还删掉了共享密钥与匿名兜底两扇门 ⇒ **没有任何配置能关掉鉴权**，
+#    「staging 忘了"开鉴权"」这类事故已经不可能发生。
+#    但仍然要求显式写死，两个理由：
+#      · 主文件用的是 `${APP_ENV:-production}` 插值，部署机上 export 过 `APP_ENV`
+#        就会把它带偏 —— 而插值不受上面那条判据保护；
+#      · **显式声明优于依赖判据的宽容度**：staging 的安全性不该建立在
+#        "判据恰好在别的取值上偏保守"之上。
 #    ⇒ 环境标识用 `APP_RELEASE`（只影响回显/指标标签），
 #      `APP_ENV` 保持与生产同语义。
 #
@@ -47,7 +53,9 @@ services:
     environment:
       APP_RELEASE: staging
       # ⚠️ 刻意显式写死（见文件头第 2 点）：不能沿用 ${APP_ENV:-production}，
-      #    否则部署机上只要 export 过 APP_ENV=staging 就会静默关掉鉴权。
+      #    否则部署机上 export 过 `APP_ENV=development` 就会把它带偏成开发口径
+      #    （判据改为"黑名单认开发"之后，带偏只可能来自插值 —— 不再来自
+      #     "写了一个看起来像生产的词"）。
       APP_ENV: production
       # 单副本 + 单 worker：staging 是"验证正确性"的环境，不是压测环境。
       # 少开 worker 也让限流/配额在 Redis 上的行为更容易观察。
@@ -81,7 +89,7 @@ services:
     command:
       - redis-server
       - --requirepass
-      - ${STAGING_REDIS_PASSWORD:-staging-redis}
+      - ${STAGING_REDIS_PASSWORD:?STAGING_REDIS_PASSWORD 必须显式设置（本文件不再提供默认口令）}
       - --appendonly
       - "yes"
       - --maxmemory
@@ -93,7 +101,10 @@ services:
   nginx:
     ports: !override
       # 生产是 8080；staging 用 8082（8081 被 alert-sink 占着）
-      - "8082:80"
+      # ⚠️ 与主文件同一个口径：**只绑回环**。staging 上跑的是**真实凭据**
+      #    （真实账号、真实 token），明文绑全网卡等于把登录口令与 Bearer 令牌
+      #    摊在同一网段上。`http://localhost:8082` 照常可用。
+      - "127.0.0.1:8082:80"
 
   # ======================================================================
   # 关掉的部分：监控与备份

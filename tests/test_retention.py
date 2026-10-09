@@ -33,8 +33,9 @@ import app.main as M  # noqa: E402
 from app.ratelimit import RateLimiter  # noqa: E402
 from app.review_queue import ReviewQueue  # noqa: E402
 from app.sessions import SessionRegistry  # noqa: E402
+from tests.auth_util import TEST_USER, auth_headers  # noqa: E402
 
-client = TestClient(M.app)
+client = TestClient(M.app, headers=auth_headers())
 
 
 # ---------------- 归属登记的注销 ----------------
@@ -47,13 +48,13 @@ def test_release_frees_the_thread_id_for_reuse():
     """
     reg = SessionRegistry(enabled=True)
     reg.claim("t-1", "acme")
-    assert reg.owner_of("t-1") == "acme"
+    assert reg.owner_of("t-1") == ("acme", "")
 
     assert reg.release("t-1") is True
     assert reg.owner_of("t-1") is None
 
     ok, owner = reg.claim("t-1", "globex")
-    assert ok is True and owner == "globex", "注销后 thread_id 没有被释放"
+    assert ok is True and owner == ("globex", ""), "注销后 thread_id 没有被释放"
 
 
 def test_release_of_unknown_session_is_false_not_an_error():
@@ -76,6 +77,12 @@ def test_claim_refreshes_activity_only_for_the_matching_tenant(monkeypatch):
 
     这里断言的是**发出去的 SQL 文本**：这条约束只存在于语句里，
     没有任何返回值的差异能反映它（`claim` 照常返回 False）。
+
+    ⚠️ 桩件返回的是 **2 元组**（真实表的 `SELECT tenant, owner_user` 就是两列）。
+    此前它返回 1 元组 `("acme",)`，而 `claim` 里 `row[0], row[1]` 会 IndexError ——
+    这个错误当时被"存储异常一律放行"的 fail-open 吞掉了，于是用例**靠 bug 通过**。
+    2026-10-05 归属校验改成 fail-closed 之后，桩件的缺陷立刻暴露成
+    `SessionError`。修桩件而不是放宽断言：它本来就该长得像真实返回。
     """
     executed: list[str] = []
 
@@ -86,7 +93,7 @@ def test_claim_refreshes_activity_only_for_the_matching_tenant(monkeypatch):
             executed.append(" ".join(sql.split()))
 
         def fetchone(self):
-            return ("acme",)
+            return ("acme", "")
 
         def __enter__(self):
             return self
@@ -104,9 +111,10 @@ def test_claim_refreshes_activity_only_for_the_matching_tenant(monkeypatch):
         def __exit__(self, *a):
             return False
 
-    import psycopg
+    from app import pg
 
-    monkeypatch.setattr(psycopg, "connect", lambda *a, **kw: _Conn())
+    # 打桩点在**连接池**这一层（见 app/pg.py）：存储类已改为借池，不再直接连。
+    monkeypatch.setattr(pg, "connect", lambda dsn: _Conn())
 
     reg = SessionRegistry(dsn="postgresql://fake", enabled=True)
     reg.claim("t-1", "acme")
@@ -186,24 +194,57 @@ def open_limits(monkeypatch):
     monkeypatch.setattr(M, "_LIMITER", RateLimiter(per_minute=1000))
 
 
-def test_delete_removes_all_three_kinds_of_data(monkeypatch, open_limits):
-    """一次删除必须同时清掉检查点、审核队列、归属登记 —— 缺一类都不算删干净。"""
+@pytest.fixture()
+def fake_history_delete(monkeypatch):
+    """顶掉 agent 侧历史删除，记录它被谁调了。
+
+    为什么要顶掉真实的那个：真实实现取决于 `DB_URL` 在不在、后端可不可达 ——
+    断言会随环境变化（本机没配库就是 False，CI 配了就是 True）。
+    这里要钉的是**端点有没有把它接上、有没有用同一个 thread_id**，
+    那件事与后端无关。`clear_session` 自身的行为另有单测。
+    """
+    seen: list[str] = []
+
+    async def _fake(thread_id: str) -> bool:
+        seen.append(thread_id)
+        return True
+
+    monkeypatch.setattr(M, "_delete_agent_session", _fake)
+    return seen
+
+
+def test_delete_removes_all_four_kinds_of_data(monkeypatch, open_limits, fake_history_delete):
+    """一次删除必须同时清掉检查点、**agent 侧跨轮历史**、审核队列、归属登记。
+
+    ⚠️ 四类，不是三类：`agent_sessions` / `agent_messages` 与检查点是**两份独立的数据**
+    （一份给图、一份给下一轮的模型）。删除端点此前只动检查点那几张表，于是"删除请求"
+    之后还完整留着用户说过的每一句与助手产出过的每一段 —— 而接口告诉调用方"已删除"。
+    这条用例的意义正是"缺一类都不算删干净"，所以它断的是**完整的四键**而不是只看子集。
+    """
     fake = _FakeGraph()
     q = ReviewQueue(enabled=True)
     reg = SessionRegistry(enabled=True)
 
     q.add("del-1", "acme", "草稿", 50, "太短")
-    reg.claim("del-1", "acme")
+    # ⚠️ 属主要写成 **(tenant, user) 元组且用户那一维写全**：归属在 2026-10-01
+    # 下沉到用户维度，而下面的请求身份是 `tester@acme`。只写 `("acme", "")` 会让
+    # 属主判定为假 ⇒ 403（实测踩到：日志里是 `owner=acme/ requester=acme/tester`）。
+    reg.claim("del-1", "acme", TEST_USER)
 
     monkeypatch.setattr(M, "graph", fake)
     monkeypatch.setattr(M, "_REVIEW_QUEUE", q)
     monkeypatch.setattr(M, "_SESSIONS", reg)
 
-    r = client.delete("/v1/sessions/del-1", headers={"X-Tenant-Id": "acme"})
+    # 身份必须**真的**属于 acme：租户只能来自已验签的令牌载荷，`X-Tenant-Id`
+    # 只是"确认"（不符即 403）。2026-10-05 之前这里靠 `X-Tenant-Id: acme` 单头自报，
+    # 那条路已删除 —— 所以改成签一张 acme 的令牌。
+    r = client.delete("/v1/sessions/del-1", headers=auth_headers(tenant="acme"))
     assert r.status_code == 200
     body = r.json()
-    assert body["deleted"] == {"checkpoints": True, "review": True, "ownership": True}
+    assert body["deleted"] == {"checkpoints": True, "agent_history": True,
+                               "review": True, "ownership": True}
     assert fake.deleted == ["del-1"]
+    assert fake_history_delete == ["del-1"], "agent 侧的跨轮历史没有被删（或用了别的 id）"
     assert q.record("del-1") is None
     assert reg.owner_of("del-1") is None
 
@@ -236,18 +277,26 @@ def test_delete_is_forbidden_for_another_tenant(monkeypatch, open_limits):
     monkeypatch.setattr(M, "_SESSIONS", reg)
     monkeypatch.setattr(M, "graph", _FakeGraph())
 
-    # 以另一个租户的身份发起（单租户头自报模式下 tenant 即请求头值）
-    r = client.delete("/v1/sessions/other-1", headers={"X-Tenant-Id": "globex"})
+    # 以**另一个租户的身份**发起。⚠️ 必须签一张 globex 的令牌，不能只带
+    # `X-Tenant-Id: globex` —— 后者会被"自报与令牌不符"当场 403，于是这条用例
+    # 就算归属校验整个失效也照样通过（断言与它声称要守的东西脱钩）。
+    # 用真令牌时，403/404 只可能来自归属校验本身。
+    r = client.delete("/v1/sessions/other-1", headers=auth_headers(tenant="globex"))
     assert r.status_code in (403, 404), (
         f"越权删除没有被拦住（{r.status_code}）—— 归属校验缺失或失效"
     )
 
 
-def test_delete_is_idempotent_in_single_tenant_mode(monkeypatch, open_limits):
+def test_delete_is_idempotent_in_single_tenant_mode(monkeypatch, open_limits,
+                                                    fake_history_delete):
     """单租户下删不存在的会话返回 200 + 全 False（幂等），而不是 404。
 
     返回 404 会把端点变成"这个 thread_id 存在吗"的枚举探针。
     删除本身是幂等的，`deleted` 明细已经如实说明每一项删掉没有。
+
+    ⚠️ 这里 agent 侧历史被 fixture 顶成"总能删掉"（True），所以它在这条用例里不是
+    要断言的重点 —— 重点是**明细的键必须齐全**：少一个键，调用方就无从知道
+    "这一项到底删没删"，而"接口说删了、其实没删"正是这个端点最贵的失效方式。
     """
     monkeypatch.setattr(M, "_SESSIONS", SessionRegistry(enabled=False))
     monkeypatch.setattr(M, "_REVIEW_QUEUE", ReviewQueue(enabled=True))
@@ -255,8 +304,9 @@ def test_delete_is_idempotent_in_single_tenant_mode(monkeypatch, open_limits):
 
     r = client.delete("/v1/sessions/no-such-session")
     assert r.status_code == 200
-    assert r.json()["deleted"] == {"checkpoints": True, "review": False,
-                                   "ownership": False}
+    assert r.json()["deleted"] == {"checkpoints": True, "agent_history": True,
+                                   "review": False, "ownership": False}
+    assert fake_history_delete == ["no-such-session"]
 
 
 # ---------------- 清理脚本的安全默认 ----------------
@@ -457,6 +507,80 @@ def test_missing_updated_at_column_is_reported_not_silently_skipped(sweep, monke
     assert "updated_at" in err, "缺列时没有给出任何提示"
 
 
+# ---------------- agent 对话历史的保留口径（永久保留） ----------------
+
+#: SDK 那份对话历史的两张表。它们的生命周期与检查点**不同**：
+#: 检查点丢了只影响续跑，历史丢了是用户可见的内容消失。
+AGENT_HISTORY_TABLES = ("agent_sessions", "agent_messages")
+
+
+def _cur_with_agent_history(sweep):
+    """假游标，表清单里**含** agent 两表 —— 这是它们在真实库里的样子。"""
+    return _FakeCursor(tables=("session_owners", "review_queue",
+                               *sweep.CHECKPOINT_TABLES, *AGENT_HISTORY_TABLES))
+
+
+def test_agent_history_is_never_deleted_even_with_an_explicit_window(
+        sweep, monkeypatch):
+    """**无论 `--days` 给多少，都不许删 agent 对话历史。**
+
+    2026-10-03 拍板的产品口径是"对话历史永久保留"（用户隔多久回来都应该还能接上
+    上一轮）。所以这两张表不在清理名单里是一个**决定**，不是遗漏 —— 而"不是遗漏"
+    这件事只有测试能保证：后人看到清理脚本时会很自然地想"这两张表怎么漏了"，
+    顺手加进白名单，然后一次 `--days 30` 就把用户的对话记录删了。
+
+    与检查点的不对称是**故意的**：即便有人显式启用清理（本意是清中间态、省空间），
+    也不该顺带删掉用户的对话内容。要整段消失，正确入口是
+    `DELETE /v1/sessions/{id}`（用户主动发起、四类一起删）。
+    """
+    cur = _cur_with_agent_history(sweep)
+    _with_fake_db(sweep, monkeypatch, cur)
+    monkeypatch.setattr(sweep.config, "DB_URL", "postgresql://x")
+
+    rc = _run_sweep(sweep, monkeypatch, ["--days", "1", "--apply"])
+    assert rc == 0
+    for sql in cur.deletes():
+        table = sql.split()[2]
+        assert table not in AGENT_HISTORY_TABLES, (
+            f"清理脚本删到了 agent 对话历史（{table}）—— 产品口径是永久保留。\n"
+            "如果这是有意的口径变更，请同时改：本断言、retention_sweep.py 的\n"
+            "AGENT_HISTORY_TABLES 注释、session.py 的「历史的寿命」、"
+            "PRODUCTION_CONFIG.md 的 RETENTION_DAYS 条目。"
+        )
+
+
+def test_agent_history_tables_are_declared_outside_the_cleanup_whitelist(sweep):
+    """两份常量必须**互不重叠** —— 叠上就意味着有人把历史塞进了清理名单。"""
+    assert set(sweep.AGENT_HISTORY_TABLES).isdisjoint(sweep.CHECKPOINT_TABLES)
+    # `sweep()` 里能被删的表就是这两组 + 归属表 + 审核队列，没有别的来源。
+    assert set(sweep.CHECKPOINT_TABLES) == {"checkpoints", "checkpoint_blobs",
+                                            "checkpoint_writes"}
+
+
+def test_agent_history_is_reported_as_untouched(sweep, monkeypatch, capsys):
+    """不清理这件事**必须被播报出来**。
+
+    脚本输出是运维判断"清理有没有按预期工作"的依据。若它对 agent 两表只字不提，
+    读的人会合理地认为"这两张表也被清过了"，下次容量告警就往错方向查
+    （以为历史不会再涨）。让每一轮都明说一遍，比写进文档更难被忽略。
+    """
+    cur = _cur_with_agent_history(sweep)
+    _with_fake_db(sweep, monkeypatch, cur)
+    monkeypatch.setattr(sweep.config, "DB_URL", "postgresql://x")
+
+    rc = _run_sweep(sweep, monkeypatch, ["--days", "30"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    for table in AGENT_HISTORY_TABLES:
+        assert table in out, f"预演输出里没有提到 {table}，读的人会以为它被清理了"
+    assert "永久保留" in out, "没有说明这张表为什么不清理"
+
+
+def test_agent_history_line_says_so_when_the_tables_do_not_exist(sweep):
+    """没有这两张表时也要说清楚，而不是让那一行凭空消失。"""
+    assert "未启用" in sweep._agent_history_line({})
+
+
 # ---------------- 迁移版本的一致性 ----------------
 
 def test_schema_version_matches_the_latest_migration():
@@ -468,7 +592,7 @@ def test_schema_version_matches_the_latest_migration():
     from app import migrations
 
     latest = max(m.version for m in migrations.MIGRATIONS)
-    assert migrations.SCHEMA_VERSION == latest, (
+    assert latest == migrations.SCHEMA_VERSION, (
         f"SCHEMA_VERSION={migrations.SCHEMA_VERSION} 与最新迁移 v{latest} 不一致 —— "
         "老库不会补列，而 --status 会谎报可以部署"
     )

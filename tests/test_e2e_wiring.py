@@ -153,23 +153,40 @@ def test_e2e_services_exist_in_compose():
     )
 
 
+def _host_port(entry) -> str | None:
+    """取 compose 端口条目里的**宿主机端口**（不带协议后缀）。
+
+    支持 `8080:80`、`127.0.0.1:8080:80`、`[::1]:8080:80`、`8080:80/tcp`，
+    以及长语法 `{target: 80, published: "8080", host_ip: "127.0.0.1"}`。
+
+    ⚠️ 用"取右侧最后两段"而不是 `^(\\d+):(\\d+)$` 这种正则：后者只认不带 IP 前缀
+    的**两段式**写法，一旦入口按最佳实践绑成 `127.0.0.1:8080:80`（甚至 IPv6），
+    它就取不到端口 ⇒ 断言走进另一个分支**静默过掉** —— 守卫还在，但已经不管事了。
+    """
+    if isinstance(entry, dict):
+        pub = entry.get("published")
+        return str(pub) if pub is not None else None
+    text = str(entry).split("#")[0].strip()
+    m = re.search(r"(?:^|:)(\d+):(\d+)(?:/\w+)?\s*$", text)
+    return m.group(1) if m else None
+
+
 def test_e2e_default_base_url_matches_the_nginx_port_mapping():
     """默认地址的端口必须与 compose 里 nginx 的宿主机端口一致。
 
     不一致时表现为"永远连不上"，而 E2E 的失败信息会把人引向"栈没起来"这个错误方向。
     """
     ports = _compose()["services"]["nginx"]["ports"]
-    host_port = None
-    for entry in ports:
-        m = re.match(r"^\s*(\d+):(\d+)\s*$", str(entry))
-        if m:
-            host_port = m.group(1)
-            break
+    host_port = next((p for p in (_host_port(e) for e in ports) if p), None)
     assert host_port, f"nginx 没有 `宿主机:容器` 形式的端口映射，实际是 {ports}"
 
     assert f":{host_port}" in tasks.E2E_DEFAULT_BASE, (
         f"compose 把 nginx 映射到宿主机的 {host_port}，"
         f"而 E2E 的默认地址是 {tasks.E2E_DEFAULT_BASE}"
+    )
+    assert tasks.E2E_DEFAULT_BASE.startswith("http://127.0.0.1"), (
+        f"E2E 默认地址应指向回环（入口现在是回环绑定，见 "
+        f"tests/test_deploy_topology.py）：{tasks.E2E_DEFAULT_BASE}"
     )
 
 

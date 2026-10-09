@@ -26,7 +26,7 @@
 | Prometheus 没抓到 | `http://localhost:9090/targets` 里 target 是 DOWN | 查网络、服务名、`/metrics` 是否被 nginx 限制（只允许内网段） |
 | 规则不触发 | `/alerts` 页面里规则长期 inactive，连 pending 都没有 | 表达式里的标签值格式写错了（如 `le="1"` vs `le="1.0"`）—— **不报错，只是永不匹配** |
 | Alertmanager 收不到 | `/status` 页里 Alertmanagers 一节是 DOWN | 服务名/网络不对；`prometheus.yml` 少了 `alerting.alertmanagers` |
-| 送到了但没转 | Alertmanager 里能看到 FIRING，机器人没消息 | `docker compose logs alert-sink` 看是否有转换失败 |
+| 送到了但没转 | Alertmanager 里能看到 FIRING，机器人没消息 | `docker compose --env-file .env -f deploy/app/docker-compose.yml logs alert-sink` 看是否有转换失败 |
 | 通道没配 | alert-sink 日志里只有"未配置通道，仅记日志" | `.env` 里 `ALERT_SINK_*_WEBHOOK` 为空 |
 | 邮件没收到（仅在启用邮件后） | 群/机器人正常，邮箱一封都没有 | 看 `logs alertmanager` 里的投递失败；重点查 `smtp_smarthost` 的**端口写法**（465 需配 `force_implicit_tls`）与密码文件**是否真的挂进容器** —— 见 §3.5 |
 | **链路整体死了** | **该来的 `Watchdog` 心跳没来** | 见 §3.5 —— 这是唯一能穿透"Alertmanager 自己挂了"的信号 |
@@ -87,6 +87,40 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml logs alertmanage
 它要起一整套容器（几分钟），所以刻意不放进每次 CI 的 push 上，而是手动 / 每晚定时
 （`ci.yml` 的 `e2e` job）。
 
+#### 后端地址现在是**请求时**解析的（2026-10-06 改；在此之前要手工 reload 才更新）
+
+`nginx.conf` 的 upstream 用了 `resolver` + `zone` + 每个 `server` 上的 `resolve`：
+容器换 IP 后**最多 10 秒** nginx 就会自己发现（`valid=10s`），**不需要**再手工 reload。
+
+以前不是这样，而那时的故障形态值得记下来 —— 它决定了那三行为什么必须写在配置里：
+
+- `server app-stable:8000` 只在**加载配置那一刻**解析一次 ⇒ 谁重建了 app 容器
+  （换镜像 tag / 手工 `up -d`）换了 IP，nginx 会继续往**旧地址**发；
+- 后果一：走 nginx 那条路**全站 502 且不自愈**（不是灰度那 10%：目标地址是错的，
+  权重再大也没用）；
+- 后果二：那个旧 IP 还可能被**别的容器**拿走 ⇒ 用户请求被发到一个完全无关的服务上；
+- 而**诊断极其容易误判**：`/health/ready` 正常、容器都在跑、Prometheus 的 `up` 全是 1、
+  日志里没有错误 —— 只有经 nginx 的那条路是死的。
+
+```bash
+# 复核（任何时候想知道"nginx 现在把流量发到哪儿"）：
+docker compose --env-file .env -f deploy/app/docker-compose.yml exec -T nginx \
+  nginx -T 2>/dev/null | grep -A8 "upstream chatagent_backend"
+```
+
+⚠️ **配置与镜像版本是绑定的，不能只改一边**：`resolve` 参数在**开源版是 1.27.3 起**才有的
+（官方原文："Prior to version 1.27.3, this parameter was available only as part of our
+commercial subscription"），所以 compose 里钉的是 `nginx:1.27.5-alpine`。
+**降这个版本不是"退回旧行为"，是 nginx 因为配置语法错直接起不来（入口整个没了）。**
+守卫：`tests/test_deploy_topology.py::test_nginx_upstream_is_dynamically_resolved`
+同时核对"镜像 ≥ 1.27.3"与"配置里确实用了 `zone`/`resolver`/`resolve` 三件套"。
+
+**仍然存在的一个窗口（已知，刻意没处理）**：冷启动时 nginx 起得来、但应用进程还没开始
+监听（init、导入、连库要几秒）⇒ 那几秒里请求会 502。它**自己会恢复**，
+与上面那个"永久 502"是两件不同的事。要消掉它得给 app 加健康检查、并让 nginx 等
+`condition: service_healthy` 才启动 —— 代价是健康检查一旦判错，nginx 就永远不启动
+（全站不可用），属于要单独拍板的改动（`ASSESSMENT_production_readiness.md` §5）。
+
 Grafana 要在 `chatAgent` 文件夹下看到这四个面板（它们随仓库走，不是手工建的；
 `--profile observability` 才会起）：
 
@@ -108,8 +142,14 @@ Grafana 要在 `chatAgent` 文件夹下看到这四个面板（它们随仓库�
 |---|---|---|---|
 | **P0** | 用户在报障 / `ExternalProbeFailing` / `ChatAgentDown` 两个实例都挂 / 安全组告警（`TenantMismatchDetected`、`SessionOwnershipViolation`） | 立即（15 分钟内动手） | 值班 + 负责人 |
 | **P1** | `HighErrorRate` / `StreamErrorsHigh` / `SLOAvailabilityBurnFast` | 1 小时内 | 值班 |
-| **P2** | `SLO*BurnMedium` / `HighLatencyP95` / 成本组告警 / 平台组 warning（`BackupLoopFailing`、`BackupMetricsMissing`） | 当天 | 值班（可异步） |
-| **P3** | `SLO*BurnSlow` / `TLSCertExpiringSoon` | 排期（一周内） | 记录，不必叫人 |
+| **P2** | `SLO*BurnMedium` / `SLOBudgetExhausted` / `HighLatencyP95` / 成本组告警 / 平台组 warning（`BackupLoopFailing`、`BackupMetricsMissing`、`TLSCertProbeDown`） | 当天 | 值班（可异步） |
+| **P3** | `SLO*BurnSlow` / `SLOBudgetLow` / `TLSCertExpiringSoon` | 排期（一周内） | 记录，不必叫人 |
+
+⚠️ `SLOBudgetExhausted` 的标签是 `severity: critical`，但它**不是 P1**：
+critical 在这里指"**必须当天有人做出冻结决定**"（错误预算已经花光，按
+`ERROR_BUDGET_POLICY.md` 要全面冻结功能变更 + 48 小时内复盘），
+而不是"服务正在坏" —— 服务很可能早就恢复了，只是账没了。
+把它当成 P1 冲上去查故障，会查到一个"系统一切正常"的现场。
 
 平台组的 critical 单独记：`MonitoringStackDown` / `AlertDeliveryFailing` /
 `DiskSpaceLow` 都按 **P1** 处理（1 小时内），但有一个例外 ——
@@ -156,8 +196,13 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml ps
 docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 app-stable
 curl -sS localhost:8080/health/live | python -m json.tool
 ```
-- 进程死了 ⇒ 看日志里的最后一屏。**特别注意启动期的拒绝启动**：
-  `APP_ENV=production` 且没有任何密钥时，服务**故意**拒绝启动（这是特性不是 bug）。
+- 进程死了 ⇒ 看日志里的最后一屏。**特别注意启动期的两类拒绝启动**（都是特性不是 bug）：
+  ① `APP_ENV=production` 且**未启用用户鉴权（`AUTH_*`）** ⇒ 没有任何人能登录，
+     于是**故意**拒绝启动；
+  ② 环境里残留了**已删除的鉴权开关**（`SERVE_API_KEY` / `REQUIRE_AUTH`，**留空也算**）
+     ⇒ 同样拒绝启动，日志会逐条列出该删哪一行。
+  ⚠️ 这两条**都不受任何环境变量影响**，只能去配 `AUTH_*` / 去删那两行 ——
+  没有任何开关能把鉴权要求关掉（那正是这两个变量被删除的原因）。
 - 进程活着但探针失败 ⇒ 看 `/health/ready` 的 `checks` 明细，定位是哪个依赖。
 - 只是 `/metrics` 被拒 ⇒ nginx 的 `location = /metrics` 只允许内网段；
   Prometheus 若在宿主机上跑，源 IP 可能不在白名单里。
@@ -238,6 +283,35 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=500 
 > 这类问题**不会**在 HTTP 状态码上体现（响应头早就发出去了），
 > 所以只看 `HighErrorRate` 会完全漏掉它 —— 这就是这条规则独立存在的原因。
 
+#### `IdempotencyConflictsHigh`（warning，10m）
+**客户端在拿同一个 `Idempotency-Key` 反复提交。** 两种含义完全不同的成因，
+先分档再动手：
+
+```bash
+# ① 分档：是在途重试（客户端等不及）还是不可重放（服务端没缓存住）
+curl -s 'localhost:9090/api/v1/query?query=sum by (reason) (increase(idempotency_conflict_total[15m]))' | python -m json.tool
+# ② 被正确吸收的重试有多少（与上面一起看才是全貌）
+curl -s 'localhost:9090/api/v1/query?query=increase(idempotency_replay_total[15m])' | python -m json.tool
+# ③ 有没有因为回答太长而没能缓存下来
+curl -s 'localhost:9090/api/v1/query?query=increase(idempotency_truncated_total[15m])' | python -m json.tool
+```
+
+- `reason=in_flight` 占多数 ⇒ **请求比客户端的重试窗口更慢**。对照
+  `HighLatencyP95` 与 `llm_first_token_seconds`（`mode="stream"`）确认上游是不是变慢了。
+  ⚠️ 正确做法是让客户端把超时调长，**不是**放宽服务端的幂等 —— 放宽等于把
+  "重复计费"重新放出来。
+- `reason=not_replayable` 占多数 ⇒ 上一次已完成，但响应超过
+  `IDEMPOTENCY_MAX_BODY_BYTES` 没被缓存。若 `idempotency_truncated_total` 同向在涨，
+  按回答的实际大小调大它（这是**内存换重放能力**的取舍）。
+- `idempotency_mismatch_total` 在涨 ⇒ **客户端 bug**（同键换了载荷）。
+  服务端行为正确（草案 2.2 的 MUST NOT），要改的是客户端。
+- `idempotency_rejected_total` 在涨 ⇒ 客户端没按 `IDEMPOTENCY_DOC_URL`
+  公布的格式带键（缺头 = 开了 `IDEMPOTENCY_REQUIRE_KEY` 却没发；含非法字符 = 键里有
+  控制字符/引号/空格）。把它当**接入事故**处理，不要放宽校验。
+
+> 这条规则只在客户端真的带幂等键时才有数据。序列为空 ⇒ 规则不触发，
+> 那说明**当前没有任何客户端在用这个能力**（不是"没问题"）。
+
 #### `ExternalProbeFailing`（critical，2m）
 **用户那条路断了**，但容器内部可能一切正常。
 
@@ -250,7 +324,7 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml exec app-stable 
 ```
 - 外部失败 + 内部正常 ⇒ **一定是入口/网络层**：nginx 配置、端口映射、安全组、DNS。
 - 两边都失败 ⇒ 回到 `ChatAgentDown` 的处置。
-- 顺手看 nginx 的错误日志：`docker compose logs --tail=100 nginx`。
+- 顺手看 nginx 的错误日志：`docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=100 nginx`。
 
 #### `TLSCertExpiringSoon`（warning，1h）
 证书过期是唯一"必然发生且能提前几十天发现"的故障。
@@ -259,6 +333,29 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml exec app-stable 
 openssl s_client -connect <域名>:443 </dev/null 2>/dev/null | openssl x509 -noout -dates
 ```
 自动续期（Let's Encrypt）时先查**续期任务本身**是否失败 —— 这比证书本身常见得多。
+
+#### `TLSCertProbeDown`（warning，30m）
+**证书探活自己挂了** —— 它与上一条的分工要说清楚：上一条回答"证书快到期了吗"，
+这一条回答"**证书监控还在工作吗**"。只有这一条是健康的，上一条才是可信的：
+`TLSCertExpiringSoon` 读的 `probe_ssl_earliest_cert_expiry` **只在探活成功时才产出序列**，
+探活一挂，上一条就变成哑弹，而它不会以任何方式表现出来。
+
+```bash
+curl -s --noproxy '*' localhost:9090/api/v1/targets | python -m json.tool | grep -A6 blackbox-tls
+```
+
+按报错分成三种，处置不同：
+
+| targets 里的报错 | 含义 | 怎么做 |
+|---|---|---|
+| DNS / 域名解析失败 | 域名还是 `REPLACE-WITH-YOUR-DOMAIN` 占位符（配置步骤没做完） | 替换它，然后 `docker compose --env-file .env -f deploy/app/docker-compose.yml restart prometheus` |
+| TLS / HTTP 失败 | 域名填了，但 `https_2xx` 模块没拿到 200 | 按 `ExternalProbeFailing` 那套查入口链路（DNS、证书、安全组、端口） |
+| 连不上 blackbox-exporter | 探活组件本身不可达 | 看 `MonitoringStackDown`（它也会同时响），先恢复组件 |
+
+⚠️ 若你的 HTTPS 入口**不在本编排内**（TLS 由宿主机上已有的 LB / 云负载均衡终结），
+那这个 job 在本编排里永远探测不到东西 —— 正确做法是**删掉 `blackbox-tls` 这个 job
+和这条规则**，而不是留一条常年 firing 的告警。常年 firing 的告警等于没有告警：
+所有人都会学会忽略它，那时真问题也一起被忽略。
 
 #### `IndexIdentityMismatch`（warning，5m）
 库里存着的向量与当前 `EMBEDDING_MODEL` **不是同一个模型灌的**。
@@ -334,6 +431,164 @@ curl -s localhost:8000/metrics | grep '^citation_check'
    后者是"源文件被删"的数据状态，都不该拿拦用户答案）—— 它们只进
    `citation_check_total{status=...}`，用于巡检而非告警。
 
+#### `SharedBackendDegraded`（warning，5m）
+
+**Redis（限流 / 日配额 / 幂等的共享后端）不可达，实现退到了进程内计数。**
+这是最需要告警的一类：**保护机制失效，而服务一切正常** —— 请求成功率、延迟、错误率
+全都看不出异常，限流看起来也仍在工作。单副本下只是"计数更准一点"，
+**多副本下等于把限流与日配额放宽到副本数倍**。
+
+```bash
+# 1) 定位是哪个组件在退回
+curl -s localhost:8000/metrics | grep '^shared_backend_errors_total'
+# 2) 直接验 Redis 可达性与连接数
+redis-cli -h <host> -p 6379 ping
+redis-cli -h <host> -p 6379 info clients | grep -E 'connected_clients|maxclients'
+```
+
+1. 按 `component` 标签定位：`quota` ⇒ 查这段时间的日额度是否被刷穿；
+   `ratelimit` ⇒ 查是否有来源绕过了限流（`rate_limited_total` 会明显下降）。
+2. 看启动自检里的 `shared_configured` 与 `backend` 两栏 —— 前者是"打算用共享后端"、
+   后者是"**实际在用**"。配了却常年 `backend=memory`，说明地址/密码就没连上。
+3. 恢复后**必须人工核对**这段时间的实际消耗（日志里的「配额拒绝」与限流触发次数），
+   必要时追溯。**不要只看到告警消失就收工**。
+4. ⚠️ 别为了让告警消失而去掉 `REDIS_URL` —— 那等于永久放弃多副本保护
+   （限流 / 日配额 / 幂等三者共用它，去掉之后三者会一起退回进程内计数）。
+
+#### `RequestTimeoutFrequent`（warning，5m）
+
+**请求级总时限被顶掉：流被终止，用户拿到半个回答。** 它**不产生 5xx**（正文已经下发
+一部分了），所以 `HighErrorRate` 与 SLO 燃尽**都看不见它** —— 不单独看这条，
+就只剩"等用户投诉"这一条路径。
+
+分诊顺序（这条告警的 runbook 只有一件事：判断"该改配置"还是"该修上游"）：
+
+```bash
+curl -s localhost:8000/metrics | grep -E '^llm_first_token_seconds|^llm_call_duration_seconds|^rag_stage_duration_seconds'
+```
+
+1. `llm_first_token_seconds` 慢 ⇒ 上游模型首字节慢（按 `FirstTokenTooSlow` 处置）。
+2. `llm_call_duration_seconds` 整体变慢 ⇒ 上游抖动（按 `LlmCallErrorsHigh` 的分诊走）。
+3. `rag_stage_duration_seconds` 某一段变慢 ⇒ 按 `RagRetrievalDegraded` 处置。
+4. 三者都正常 ⇒ 是 `REQUEST_TIMEOUT_SECONDS` 配得偏紧。对照
+   `llm_tokens_per_request` 的 P95 估算合理值。
+   ⚠️ **改大它之前先确认前端 fetch 与 nginx 的 `proxy_read_timeout` 都比它长** ——
+   否则用户侧会先在别处超时，问题只是从"服务端超时"搬到"入口超时"。
+
+#### `RagRetrievalDegraded`（warning，5m）
+
+**检索抛异常后降级为"无上下文继续作答"**：接口 200、答案照出，只是没有引用，
+用户看到的是"依据不足"。此前这里只有一行 warning 日志，于是"检索一直失败"
+在指标上**完全看不出来**。
+
+1. **先看 `RagRetrievalDegraded` 的 `stage` 标签**：`graph_retrieve` 是主问答链路、
+   `agent_search` 是 agent 链路。只有一条在涨 ⇒ 问题在对应链路的调用姿势，不是检索器本身。
+2. 看 `circuit_open` 是否同时为 1 —— 是则按 `RetrievalCircuitOpen` 处置
+   （**熔断打开时降级是预期行为**，别把两条告警当成两个问题）。
+3. 查 embedding 网关连通性与 `EMBEDDING_API_KEY`；再看 `rag_stage_duration_seconds`
+   是 `embed` 段还是 `vector` 段。
+4. **语料目录没挂进容器**也会走到这里：看启动日志有没有「RAG 语料为空」。
+5. ⚠️ 这条**只在"整体检索失败"时涨**。空召回（检索成功但没命中）走的是
+   `rag_hits_total{result="empty"}`，是另一个问题、另一套处置（见 `AgentRetrievalEmptyHigh`）。
+
+#### `RetrievalCircuitOpen`（warning，5m）
+
+**出站熔断器（rerank / embedding）未闭合 ⇒ 调用被快速失败 ⇒ 调用方降级。**
+全程没有异常抛出、没有 5xx，**只有这个 gauge 能反映它**。用户侧的感知是
+"排序变差""答案依据不足"，而面板上的错误率完全正常。
+
+```bash
+# gauge：0=闭合，1=打开**或半开**（半开也算未闭合）
+curl -s localhost:8000/metrics | grep '^circuit_'
+```
+
+1. 看 `circuit_opened_total` 的增长速率与 `circuit_rejected_total`
+   （后者 = **省下了多少次白等**，可用于估算熔断帮你挡掉的延迟）。
+2. 查上游网关健康与配额：`rerank` ⇒ `RERANK_MODEL` / `RERANK_API_KEY`；
+   `embedding` ⇒ `EMBEDDING_MODEL` / `EMBEDDING_API_KEY`。
+3. ⚠️ **半开状态也会让本告警保持 firing** —— 那表示上游**还没真正恢复**
+   （每次试探又失败一次）。**不要为了让告警消失而调大 `CIRCUIT_FAIL_THRESHOLD`**，
+   那只是让"熔断"这件事也一起变得不可见。
+4. 恢复后 gauge 会自行变 0；确认 `rag_stage_duration_seconds{stage="rerank"}`
+   的量级回到基线，再收工。
+5. **`breaker` 是标签名，不是 `name`**：`app/metrics.py` 的读写函数第一个形参就叫
+   `name`，标签再叫 `name` 会让上报当场抛 `TypeError`（本项目实测踩过：
+   三个熔断指标从未落地，而且异常穿透 `guarded_call` 让检索整体降级）。
+   写 PromQL 过滤时用 `circuit_open{breaker="rerank"}`。
+
+#### `FirstTokenTooSlow`（warning，10m）
+
+**流式请求的首字节 P95 超过 8 秒。** 这是流式服务里第一个该看的用户体验指标：
+端到端延迟（`http_request_duration_seconds`）覆盖整段生成、天然被"回答有多长"主导，
+它快慢**说明不了**"用户等了多久才看见第一个字" —— 而这正是
+`client_disconnected_total` 高企（用户没耐心）最常见的成因。
+
+1. 先分诊：`rag_stage_duration_seconds`（检索慢？）与 `llm_call_duration_seconds`（模型慢？）。
+2. 两者都正常 ⇒ 问题在**排队/并发**：看
+   `http_concurrency_in_flight / http_concurrency_limit` 与 `rate_limited_total`。
+3. 若 `client_disconnected_total` 同时在涨 ⇒ **用户已经在关页面了**，优先处理。
+4. 对照 `llm_tokens_total` 排除"上游整体过载"。
+5. ⚠️ 本告警**只看 `mode="stream"`**。非流式链路（agent 链路整段返回）的"首字节"其实是
+   **整段生成耗时**，混进同一个分位数会让这个数失去含义 —— 那部分看
+   `mode="buffered"` 的分布，不进本告警。
+
+#### `LlmCallErrorsHigh`（warning，10m）
+
+**模型调用自身的失败率超过 10%。** 没有它时，上游抖动只能透过
+`chat_stream_errors_total` 与 `agent_runs_total{exit_reason="error"}` 间接看到 ——
+而这两者都会被重试与"兜底话术"吃掉一部分，**系统性低估真实失败率**。
+
+1. **先按 `stage` 定位环节**：`evaluate` 高 ⇒ 评审环节（有重试兜底，主要推高返工与成本）；
+   `answer` / `revise` 高 ⇒ **用户直接拿不到答案**（最急）；`step_get` / `step_stream`
+   ⇒ agent 链路。
+2. 看 `llm_call_duration_seconds` 的分布：失败集中在**超时附近**（≈ `REQUEST_TIMEOUT_SECONDS`）
+   说明上游变慢；否则更可能是 4xx / 协议错（查 `AGNES_API_BASE` 与模型名是否被换掉）。
+3. 同时看 `llm_budget_exceeded_total`，排除"预算被顶掉被误记成失败"。
+4. agent 链路的话，对照 `agent_runs_total{exit_reason}` 的分档：
+   `error` 会把限流(429)/超时/协议错/代码 bug 压成同一桶，**要看日志里的 `error` 字段**
+   （`TaskOutcome.error` 形如 `"类型: 消息"`）才能分开处置 —— 限流该退避、bug 该改代码。
+
+#### `CheckpointErrorsHigh`（warning，5m）
+
+**检查点（LangGraph 持久化）读写失败。** 它是**硬依赖**：失败意味着会话状态读不到 /
+写不进去，表现成"续跑拿到旧状态"或"请求卡住"，而 HTTP 可能仍是 200。
+⚠️ `/health/ready` 里的 `checkpointer` 项是**启动探针**，答不了"此刻的读写有没有失败"。
+
+```bash
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 app-stable | grep '检查点'
+```
+
+1. 看是**连接类**失败（`DB_URL` / PG 容器 / 连接池耗尽）还是**序列化**失败
+   （state 里进了不可 msgpack 的类型）。
+2. 看 `checkpoint_duration_seconds{op=...}` 是否同步变慢：慢 ⇒ 连接池或磁盘；
+   不变 ⇒ 更可能是逻辑/序列化错误。
+3. 检查 PG 磁盘空间（见 `DiskSpaceLow`）与连接数上限。
+4. ⚠️ 恢复后**必须核对**这段时间的会话能否正常续跑（走一遍 `thread_id` 续传路径）——
+   `op=put*` 失败意味着**那一轮的状态根本没落库**，指标只告诉你发生了，
+   具体哪些会话受影响要自己查。
+5. 指标里出现 `checkpoint_*` 本身是个信号：接不上时 `main._instrument_checkpointer`
+   会**降级为原样返回**（宁可不埋点也不能把持久化换掉），日志里会有
+   「检查点计时未能接入」。**看不到这些序列时先去日志确认是"没接上"还是"没流量"。**
+
+#### `OnlineHallucinationDetected`（warning，15m）
+
+**采样到的线上回答里出现了"可被代码证明的编造"**（引用了语料里不存在的标识符，
+或标了不存在的引用编号）。判据是**纯规则的、零模型调用**，所以这不是主观判断。
+它与 `CitationUnsupportedFrequent` 的分工：后者只看引用编号，这条还会看
+`KEY=VALUE`、路径、常量这类标识符。
+
+1. ⚠️ **先确认采样开着**：`RAG_ONLINE_QUALITY_SAMPLE` 默认 **0**。没开时这两个序列
+   **不存在**（不是 0）⇒ 本规则 inactive。**先看 `online_answer_judged_total` 有没有序列**，
+   没有就是"没在检查"，不是"没问题"。
+2. 看 `online_answer_judged_total{verdict}` 的构成：`unknown` 占比过高说明多数回答
+   没有可核的标识符，此时这个**比率本身参考价值有限**（先确认有效样本量再说）。
+   ⚠️ `unknown` 是**刻意**单列的 —— 把"无从判断"并进 `pass` 会让线上 ok_rate 朝好看的方向偏。
+3. 与最近一次变更对照：`PROMPT_VERSION` / `EMBEDDING_MODEL` / 上游模型名
+   （换模型或改提示词后这类错误最常见）。
+4. 用离线入口复现：`python scripts/eval_generation.py --live`。
+5. 集中在某类问题时，考虑收紧 `answer_prompt`，或先打开
+   `RAG_CITATION_CHECK_ACTION=block` 止损（会吞掉不可信引用，**答案照常返回**）。
+
 ### 3.2 SLO 与错误预算（category: slo）
 
 先读 `deploy/monitoring/SLO.md` 的处置表，这里只给补充：
@@ -345,9 +600,36 @@ curl -s localhost:8000/metrics | grep '^citation_check'
 | `SLOAvailabilityBurnSlow`（warning） | 排期。若确认是常态，**正式**下调 SLO（改 `SLO.md` + 表达式两处），别让它长期挂着 |
 | `SLOLatencyBurnFast`（warning） | 按 `path` 定位：`/v1/reviews` 慢 ⇒ 审核队列表与 PG；`/health/*` 慢 ⇒ 探针在等外部依赖 |
 | `SLOLatencyBurnSlow`（warning） | 排期优化（典型是 PG 查询缺索引） |
+| `SLOBudgetLow`（warning） | 该 SLI 的**功能变更冻结**（按 `ERROR_BUDGET_POLICY.md`），解冻条件是预算回到 50% |
+| `SLOBudgetExhausted`（critical） | **全面冻结**功能变更 + 48 小时内复盘。⚠️ 按 **P2** 处理，不是 P1（见 §1.3 的说明） |
 
 > **错误预算烧到什么程度要冻结发布**：见 `deploy/monitoring/ERROR_BUDGET_POLICY.md`。
-> 一句话版：`Fast` 触发即冻结发布并优先回滚；`Slow` 触发则本周期只允许修复类变更。
+> 一句话版：`Fast` 触发即冻结发布并优先回滚；`Slow` 触发则本周期只允许修复类变更；
+> **`SLOBudget*` 触发则按预算余量的两档动作执行**（20% ⇒ 冻结该 SLI 的变更，
+> 耗尽 ⇒ 全面冻结 + 复盘）。
+
+#### 预算余量的两条（与上面 4 条不是同一族）
+
+上面那几条问的是"**按这个速度还要多久烧光**"（燃尽率），它们对
+"**现在还剩多少**"完全无感；`SLOBudgetLow` / `SLOBudgetExhausted` 问的是后者。
+余量由 `recording.yml` 的**录音规则**按 30 天窗口算出（SLO 定义见
+`deploy/monitoring/SLO.md` §4b）。
+
+```bash
+# 两个 SLI 各自还剩多少（与告警读的是同一个数）
+curl -s --noproxy '*' 'localhost:9090/api/v1/query?query=slo:budget_remaining_ratio' \
+  | python -m json.tool
+# 先确认录音规则本身在跑（它哑掉时告警只会"永远不触发"，看起来像预算很健康）
+curl -s --noproxy '*' localhost:9090/api/v1/rules \
+  | python -m json.tool | grep -A3 'slo:budget_remaining_ratio'
+```
+
+- `health` 不是 `ok` 或 `lastEvaluation` 不动 ⇒ 问题在录音规则侧（见 `SLO.md` §8 第 6 条），
+  而不是"预算健康"；
+- 数值是**近似值**（平均的是每 5 分钟桶的速率），用来判断"过没过 20% / 耗尽"足够，
+  不要拿它算精确额度；
+- 这两条走 `kind = "budget"` 的**专属路由**，`repeat_interval` 是 **24h**：
+  余量是月级慢变量，按小时重复只会让它在被处置前就被静音。**别在确认前静音它**。
 
 ### 3.3 成本与配额（category: cost）
 
@@ -355,12 +637,36 @@ curl -s localhost:8000/metrics | grep '^citation_check'
 看 `scope`：`ip` ⇒ 单来源刷量，保持限流并考虑在 nginx 层收紧；
 `session` ⇒ 某客户端多开或循环重试。**是误伤就调阈值**，不要长期容忍正常用户被拒。
 
+#### `RateLimitSharedEgressWithoutTrustedProxy`（warning，0m）
+限流的 IP 维度发现**同一个对端地址背后有多个不同用户**，且当前没有信任转发头。
+含义：这批人的按 IP 额度是**共用一份**的 —— 一个人刷满，同出口的其他人（含
+`POST /v1/auth/login`）全部 429。最常见的成因是应用部署在反向代理后面却漏配
+`TRUST_PROXY_HEADERS`（配错的表现只有"额度算错了"，不报错、不崩溃）。
+
+第一句话：**先确认部署形态，别急着调额度。**
+```bash
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 app-stable | grep '共享出口'
+```
+- 前面有反代/网关 ⇒ 设 `TRUST_PROXY_HEADERS=1` 后重启，应用改从 `X-Forwarded-For`
+  取真实客户端地址；**确认代理是覆盖式写 XFF**（`proxy_set_header X-Forwarded-For
+  $remote_addr;`），追加式写法下最左段是客户端可控的 —— 那等于限流可被伪造绕过
+  （守卫见 `tests/test_deploy_topology.py`）；
+- 确认是 NAT / 公司出口（已开 `TRUST_PROXY_HEADERS` 仍报）⇒ 那条走 warning 日志而不是
+  本告警，处置是提 `RATE_LIMIT_PER_MINUTE` 或按出口人数评估；
+- 验证：告警消失且 `rate_limited_total{scope="ip"}` 回落。认证端点另有一道按真实 IP 的
+  nginx 硬帽子（`deploy/app/nginx.conf` 的 `chatagent_auth` zone）兜底，它保证**单个**
+  客户端占不满应用侧那个桶 —— 但它不解决"全站共用一个桶"这件事。
+
 #### `QuotaExhausted`（warning，1h）
 ```bash
-docker compose logs --tail=200 app-stable | grep '配额拒绝'
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 app-stable | grep '配额拒绝'
 ```
 - 少数几个租户集中 ⇒ 业务增长，该加额度；
-- 大量不同租户零散出现 ⇒ 怀疑 `TENANT_KEYS` 泄漏（走 `deploy/SECRETS.md` 的轮换流程）。
+- 大量不同租户零散出现 ⇒ **用户令牌被共享/盗用**（查
+  `/v1/auth/logout?all=true` 清场、核对 `auth_login_total` 的来源）。
+  ⚠️ 曾经的第二个怀疑对象"脚本通行证泄漏（它不带租户、可自报任意租户）"已不存在：
+  共享密钥路径整体删除后，就只剩"令牌被共享/盗用"这一种解释，而令牌**是可撤销的**
+  —— 处置动作因此从"轮换一把全局密钥"变成"停用那个账号并清掉它的全部会话"。
 
 #### `AbnormalTokenBurn`（warning，15m）
 ```bash
@@ -374,10 +680,34 @@ curl -s 'localhost:9090/api/v1/query?query=sum(rate(llm_tokens_total[15m]))' | p
 
 #### `ReviewBacklog`（warning，30m）
 ```bash
-curl -sS -H "X-API-Key: $SERVE_API_KEY" localhost:8080/v1/reviews | python -m json.tool
+# 按服务账号登录换令牌再查（共享密钥 X-API-Key 已**删除**，不是"废弃"，见 deploy/SECRETS.md §4.2.1）
+TOKEN=$(curl -sS -X POST localhost:8080/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$AGENT_SCRIPT_USER\",\"password\":\"$AGENT_SCRIPT_PASSWORD\"}" \
+  | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+curl -sS -H "Authorization: Bearer $TOKEN" localhost:8080/v1/reviews | python -m json.tool
 ```
 **先查通知通道**（`REVIEW_NOTIFY_WEBHOOK`）——积压最常见的成因是通知没送到人手里，
 而不是没人愿意审。
+
+#### `ReviewWaitTooLong`（warning，15m）
+
+**被处理掉的那些待审记录里，P90 的等待时长超过 8 小时。**
+⚠️ 它与 `ReviewBacklog` 是**两个不同的问题，不可互替**：
+"积压 20 条各等 10 分钟"与"积压 2 条各等 3 天"，在 `review_pending` 上**完全一样**。
+而 human-in-the-loop 服务里，用户实际承受的延迟主体就是这段等待
+（模型生成通常只占其中几秒）。
+
+1. 对照 `review_pending` 判断是**「处理得慢」**还是**「根本没人处理」** ——
+   后者最常见，先查 `REVIEW_NOTIFY_WEBHOOK` 是否失效。
+2. 看 `action=revised` 与 `accepted` 的分布差异：被打回的那些若明显更久，
+   说明来回沟通成本高，应在 `need_review` 载荷里**一次给全判据**。
+3. 业务上确实不需要人工把关的话，**调低触发评审的阈值**，而不是让人一直等。
+4. ⚠️ 本指标的观测点只在 `review_queue.resolve()`（唯一知道 `created_at` 的地方），
+   所以**只有被处理过的记录才有样本** —— 长期没人处理的那些恰好看不到，
+   由 `ReviewBacklog` 兜住。两条必须都在。
+   同理它的判定窗口写成 **6 小时**：小时级窗口会被"上批刚处理完"的样本填满，
+   P90 一直偏低 ⇒ 长期无人处理的积压永远不触发。
 
 #### `FrequentClientDisconnects`（warning，10m）
 服务侧已及时止损（不再计费），但用户没拿到回答。通常是首字节太慢或前端超时太短。
@@ -387,11 +717,18 @@ curl -sS -H "X-API-Key: $SERVE_API_KEY" localhost:8080/v1/reviews | python -m js
 
 #### `TenantMismatchDetected`（critical，单条即报）
 ```bash
-docker compose logs --tail=500 app-stable | grep '租户自报与 Key 不符'
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=500 app-stable | grep '租户自报与用户凭证不符'
 ```
-- 来自内部服务 ⇒ 配置写错（改配置即可）；
-- 来自外部 ⇒ **按密钥泄漏处置**：立即轮换对应的 `TENANT_KEYS` 条目，
-  并检查该租户的用量（`llm_tokens_total` 无租户标签，需查日志）。
+- **含义已变（2026-10-05）**：这个指标**只有一个来源** —— 请求头
+  `X-Tenant-Id` 与 JWT 载荷里的租户不一致时 403 并计数。
+  ⚠️ 曾经的"脚本通行证那条路不受它约束（它的租户本来就来自请求头自报）"已经不存在：
+  共享密钥路径整体删除后，**没有任何路径**能从请求头自报租户，所以这条告警
+  不再有"误报来源"，出现即可疑。
+- 来自内部服务 ⇒ 客户端把另一个租户的 id 写进了请求头（改配置/改调用方即可）；
+- 来自外部 ⇒ 有人在**用自己租户的令牌试探别的租户**。按越权处置：定位 IP 与
+  `sub`（日志里有 `token_tenant=... claimed=...`），必要时
+  `POST /v1/admin/users/{username}` 把该账号 `status=disabled`（会同时清掉它的全部会话）。
+  ⚠️ 这里**没有"轮换租户密钥"这个动作了** —— 租户与密钥的绑定表（TENANT_KEYS）已删除。
 
 #### `SessionOwnershipViolation`（critical，单条即报）
 有人在猜/撞 `thread_id`。确认 id 是否可枚举：
@@ -445,7 +782,7 @@ grep -rn "def _new_thread_id\|thread_id =" app/ src/ | head
 
 | job | 后果 | 第一件事 |
 |---|---|---|
-| `alertmanager` | **告警从此发不出去**（Watchdog 也会停） | `docker compose ... logs --tail=200 alertmanager`；先恢复，再补发消息 |
+| `alertmanager` | **告警从此发不出去**（Watchdog 也会停） | `docker compose --env-file .env -f deploy/app/docker-compose.yml --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 alertmanager`；先恢复，再补发消息 |
 | `blackbox-exporter` | `probe_success` **停止产出**（不是变 0）⇒ `ExternalProbeFailing` 也**不会触发** | 恢复它，然后**回看这段时间入口是否真的断过** |
 | `node-exporter` | 磁盘指标与备份指标一起消失 | 恢复它；期间 `df -h` 要人工看 |
 | `prometheus` | 所有指标停止更新（但这条规则本身也靠它求值 ⇒ 通常看不到它响） | 以 Watchdog 缺失为准 |
@@ -471,7 +808,7 @@ python deploy/monitoring/alert_sink.py --selftest     # 真发一条，看对方
 | 现象 | 根因 | 确认方式 |
 |---|---|---|
 | `no such host` / 连接超时 | `smtp_smarthost` 写错端口：**465 是 implicit TLS**，需要额外 `smtp_force_implicit_tls: true`；587 才是 STARTTLS | `openssl s_client -connect <host>:465 </dev/null \| head -1` |
-| 认证失败 | 密码文件没挂进容器，或 `smtp_from` 与 `smtp_auth_username` 不一致（多数邮件服务要求两者相同） | `docker compose ... exec alertmanager cat /etc/alertmanager/smtp_password`（**只在排障时**，别把输出粘进工单） |
+| 认证失败 | 密码文件没挂进容器，或 `smtp_from` 与 `smtp_auth_username` 不一致（多数邮件服务要求两者相同） | `docker compose --env-file .env -f deploy/app/docker-compose.yml --env-file .env -f deploy/app/docker-compose.yml exec alertmanager cat /etc/alertmanager/smtp_password`（**只在排障时**，别把输出粘进工单） |
 | 对方拒收 | 收件人被机器人/网关列入拒收名单、或进了垃圾箱 | 看 `failed notifications` 里 SMTP 的原始错误码 |
 
 > 邮件**默认是关闭的**（启用步骤与四个坑写在 `alertmanager.yml` 末尾）。如果你从没启用过
@@ -482,8 +819,19 @@ python deploy/monitoring/alert_sink.py --selftest     # 真发一条，看对方
 ```bash
 docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=100 backup-pg backup-qdrant
 ls -lt backups/ | head
-python backups/../scripts/pg_backup.py backup     # 手工补一次（会同时刷新指标文件）
+python scripts/pg_backup.py backup                # ① 手工存一份 dump（**不刷新指标**，见下）
+docker compose --env-file .env -f deploy/app/docker-compose.yml restart backup-pg   # ② 让指标推进
 ```
+
+⚠️ **① 和 ② 解决的是两件不同的事，别只做①就以为修好了。**
+`backup_last_success_timestamp_seconds` 是**备份循环**（compose 里的 `backup-pg` /
+`backup-qdrant` 服务）每轮写进 `backups/backup-pg.prom` 的；`scripts/pg_backup.py backup`
+只产出一个 dump 文件，**完全不碰**那个 `.prom`。所以只跑 ① 的话：磁盘上多了一份备份，
+但指标仍是旧时间戳、`BackupLoopFailing` 照旧 firing —— 运维会误以为"备份已修好"，
+而真正的原因（循环没在成功）还挂着。要让指标推进，必须让**循环自己成功跑完一轮**。
+`restart backup-pg` 之所以有效，是因为循环的结构是"**启动即跑一轮**，然后才对齐到
+槽位睡眠"（见 compose 里 `backup-pg` 的 `command`），不是先睡再跑。
+
 `target=qdrant` 且日志里是"跳过：Qdrant 不可达" ⇒ 说明该后端**本来就没启用**，
 这条告警会被 `backup_backend_skipped` 自动排除；若仍收到，说明那个 gauge 没写出去
 （回头查 `backups/backup-qdrant.prom` 是否存在）。
@@ -520,6 +868,241 @@ du -sh backups/ promdata/ 2>/dev/null
 
 清理完成后确认告警**自动恢复**（receiver 上应收到 resolved 通知）；
 并回头查这段时间是否有**被掩盖的写入失败**（磁盘满时 PG 会先转只读）。
+
+#### `PgTableGrowthFast`（warning，15m）—— 磁盘告警的提前量
+某张表 6 小时增长超过 1.5GB（`delta(pg_table_size_bytes[6h]) > 1.5e9`）。
+数据来自 `pg-stats` 容器每 15 分钟写的 `backups/pg-tables.prom`。
+
+> ⚠️ 这是**永久保留**（`RETENTION_DAYS=0`）配套的可见性。历史数据只增不减是
+> **刻意的设计**，所以"在涨"本身不是故障 —— 要判断的是**跑得最快的那张**
+> 是不是在异常膨胀。`DiskSpaceLow` 只在低于 15% 时响，那时余量往往只剩几小时；
+> 这条的价值是**提前几天**看见，并且直接指出是哪张表。
+
+```bash
+# ① 采集链路还活着吗（为空 ⇒ 先修 pg-stats，否则这条告警本身就是哑的）
+curl -s localhost:9100/metrics | grep pg_table_size_bytes
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=100 pg-stats
+# ② 谁在吃空间
+docker compose --env-file .env -f deploy/app/docker-compose.yml exec pgvector psql -U langgraph_app -d langgraph_checkpoints \
+  -c "SELECT relname, pg_size_pretty(pg_total_relation_size(oid)) FROM pg_class WHERE relkind='r' ORDER BY pg_total_relation_size(oid) DESC LIMIT 10"
+```
+- `agent_messages` 涨得快 ⇒ 对照 `http_requests_total` 看是不是被刷（真被刷时
+  `agent_history_dropped_items` 也会同步放大）；
+- `checkpoints` 涨得快 ⇒ 长会话变多，通常属预期；
+- 确认是预期增长就**调大阈值**（按盘容量与业务量定），**不要**关掉这条规则 ——
+  它是磁盘告警唯一的提前量。
+
+### 3.6 agent 能力链路（category: agent）—— "请求有没有被正确地跑完 agent 链路"
+
+前面几组管的是"服务活没活 / 花了多少 token"，这一组管的是
+"**这个能力有没有跑起来、跑得好不好**"。
+
+> ⚠️ **拓扑（2026-10-03 起）**：链路是图里的两个节点 —— **前台**（决定自己答还是
+> 把创作交给下一个节点）与**文学**。检索 / PPT / 插图仍然只是前台手里的**工具**，
+> 不是节点。于是指标的**口径也分了两种**，看板时必须分清：
+> * **请求口径**：`agent_route_total`、`agent_handoff_total`、`agent_rework_total`
+>   （一次用户请求算一次）；
+> * **运行口径**：`agent_runs_total`、`agent_model_calls`、`agent_tool_calls`
+>   （一次请求可能算 1~2 次，带 `agent` 标签）。
+>
+> 拿分母时混用这两者，算出来的比率会错得没有告警能发现。
+
+> ⚠️ 先分清两种"看起来正常"：
+> - **指标序列不存在** ⇒ 从没走过 agent 链路（可能没有流量，也可能被关了）；
+> - **`agent_unavailable_total` 在涨** ⇒ 有人要用，但**链路起不来**（配置缺失）。
+>
+> 前者不是故障，后者是。分不清就会把"没有这个能力"读成"能力正常"。
+
+#### `AgentLinkDegraded`（critical，5m）—— 这一组最优先看的一条
+**想走 agent，但走不了**。此时请求会**静默退回问答链路**，
+服务零报错、探针全绿、答案看起来"像那么回事"。
+
+```bash
+# ① 启动自检里 agents 段的 enabled / ready / reason（三者分开回显）
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 app-stable | grep -A6 '"agents"'
+# ② 指标侧确认是哪个 reason 在涨
+curl -s --noproxy '*' localhost:8000/metrics | grep agent_unavailable_total
+```
+- `reason=module_unavailable` ⇒ **没装 `openai-agents`**：
+  ```bash
+  docker compose --env-file .env -f deploy/app/docker-compose.yml exec app-stable python -c "import agents; print(agents.__version__)"
+  ```
+  装包时**必须看版本**：它受 `langchain-openai` 的 `openai<3` 约束牵制
+  （本仓库钉 `0.20.0`），装高了会在**导入期**与 `openai` 冲突 ⇒ 照样 unavailable。
+- `reason=runtime_not_ready` ⇒ 装了但模型没装配成功：核 `AGNES_API_KEY` /
+  `AGNES_MODEL` / `AGNES_API_BASE`（缺 Key 即不 ready）。
+- 恢复判据：`agent_unavailable_total` **停止增长**，且自检里 `ready=true`。
+
+> **不要**把 `disabled` 也算进这条：主动关掉开关是灰度回退的正常操作，刻意不告警。
+
+#### `AgentHistoryDegraded`（warning，5m）—— 链路活着，但模型"失忆"了
+15 分钟内有会话后端故障（`increase(agent_session_errors_total[15m]) > 0`）。
+此时链路**照常跑、答案照常返回 200**，但送进模型的**只有用户刚说的这一句**，
+上文全丢 —— 也就是"带完整上下文"这个能力悄悄退回了单轮。
+
+> **和 `AgentLinkDegraded` 的区别**：那条是"走不了 agent"（整体退回问答链路），
+> 这条是"走得动，但没有记忆"。用户侧最典型的症状：
+> 用户说「**接着上一轮那个方案，把篇幅压一半**」，模型回一句「不知道您指的是什么」，
+> 或者干脆当作一个全新话题从头写 —— 因为它真的没看到上文。
+
+```bash
+# ① 看是哪个 kind 在涨（ModuleNotFoundError / OperationalError / TimeoutError 等）
+curl -s --noproxy '*' localhost:8000/metrics | grep agent_session_errors_total
+# ② 启动自检的结论行（就绪 / 不可用，各一条，直接 grep 得到）
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=300 app-stable | grep -E '跨轮对话历史(就绪|不可用)'
+# ③ 首条故障的完整原因（后续同类故障只计数、不再重复打日志）
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=300 app-stable | grep '跨轮对话历史不可用'
+```
+- `kind=ModuleNotFoundError` ⇒ 没装 `sqlalchemy`：装包（`requirements.txt` 里已声明，
+  但 `pip install -r` 没跑过就会漏）。
+- `kind=NoSuchModuleError` / `ArgumentError` ⇒ `DB_URL` 的写法不对：本项目只装了 psycopg 3
+  一套驱动，异步前缀必须是 `postgresql+psycopg://`（`src.agents.session.to_async_dsn`
+  会自动补；如果你手写了 `+asyncpg`，报的就是"驱动没装"）。
+- `kind=OperationalError` / `TimeoutError` ⇒ **PG 不可达 / 探不通**：核 `DB_URL` 指向的
+  主机端口、PG 容器状态与网络。⚠️ 特别注意：`create_async_engine` 是**懒连接** ——
+  地址写错在构造期完全不报错，要到"第一次取历史"才炸，而那一步在 `Runner.run` 内部、
+  会被 `run_agent` 的宽 `except` 接住 ⇒ 节点抛 `AgentRunFailed`，接口返回 `incomplete`
+  （检查点停在当前节点之前，可续跑）。
+  **别从"agent 链路答不出来"开始排查，先看这条指标**（启动自检那条 ERROR 也直接给结论）。
+
+> ⚠️ **"表不存在"（`relation "agent_sessions" does not exist`）不在这条指标里**：
+> 它发生在 `Runner.run` 内部的第一次 `get_items`，同样被 `run_agent` 的宽 `except` 接住
+> ⇒ 同样抛 `AgentRunFailed`（由 `AgentRunFailureRateHigh` 发现），但**降级行为完全一样**：
+> 本轮没有历史。先跑 `python -m app.migrations status` 确认版本到了 `7`
+> （`agent_sessions` / `agent_messages` 两张表由 v7 迁移建）。
+
+> ⚠️ **`kind` 标签是故障类型的闭集**（异常类名），**绝不含 `thread_id` 或用户输入** ——
+> 这是刻意的：否则基数会随会话数爆炸。
+
+恢复判据：`agent_session_errors_total` **停止增长**，且启动自检重新打出 `跨轮对话历史就绪：后端=...`。
+
+> **降级行为是设计好的，不是 bug**：后端挂了就当"本轮没有历史"，**不退化成 5xx**。
+> 所以它必须靠这条告警被发现，而不是靠错误率。
+
+#### `AgentHistoryBudgetExhausted`（warning，5m）—— 历史取到了，但塞不进去
+裁剪已经保到"最后一条必须留"的底线，输入总量**仍然**超预算
+（`increase(agent_history_over_budget_total[15m]) > 0`）。请求照常返回 200，
+但这一轮的模型**没看到上文**。
+
+> **和 `AgentHistoryDegraded` 的区别**：那条是"历史**取不到**"，这条是"**取到了但装不下**"。
+> 用户侧症状一样（「接着上一轮改」被当成新话题），而排查方向完全不同 ——
+> 这条指向**配置**，不是故障。
+
+> ⚠️ 最常见的一种成因：`AGENT_HISTORY_TOKEN_LIMIT` 配得**比模型的真实窗口还大**
+> —— 那样裁剪永远不触发，每轮都超窗，而服务侧看不出任何异常。
+
+```bash
+# ① 实际生效的预算（启动自检那条结论行）
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=300 app-stable | grep '跨轮对话历史就绪'
+# ② 当轮到底多大（那条 warning 里带实际 token 数与预算）
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=300 app-stable | grep '跨轮历史预算不足'
+```
+- 先核对"预算是多少 / 模型窗口多大"：这是**输入**预算，工具清单与输出长度
+  **不在**它的视野里，必须留余量 —— 配成窗口大小就等于每轮必超；
+- 预算确实偏小 ⇒ 调大 `AGENT_HISTORY_TOKEN_LIMIT`；
+- 单条输入过长 ⇒ 看该次请求的输入与入口体积闸门（`http_request_body_too_large_total`）。
+
+恢复判据：该序列**停止增长**。
+
+#### `AgentHistoryBudgetErrors`（warning，5m）—— 预算压根没算出来
+（`increase(agent_history_budget_errors_total[15m]) > 0`）
+
+算不出来时**整段不裁剪**（刻意不因为算预算失败就把整轮请求打挂），于是输入可能超窗
+被模型侧拒 —— 表现是"**这次答不出来**"。日志**只打首条**，其余只计数（防日志放大）。
+
+```bash
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=300 app-stable | grep '跨轮历史的 token 预算算不出来'
+curl -s --noproxy '*' localhost:8000/metrics | grep agent_history_budget_errors_total
+```
+- `kind=ModuleNotFoundError` ⇒ 没装 `tiktoken`（`requirements.txt` 里已声明）；
+- 拉不到词表（离线环境）⇒ 自动退化成**字符数近似**并打一条 warning，功能不中断；
+- `kind=TypeError` / `AttributeError` ⇒ SDK 升版后形状变了，看 `src/agents/history_budget.py`。
+
+恢复判据：该序列**停止增长**。
+
+#### `AgentRunFailureRateHigh`（warning，10m）
+异常收尾比例 > 20%（`exit_reason` ∈ `error` / `evaluator_error` / `max_turns`）。
+
+> ⚠️ **口径在 2026-10-03 变更过，别照旧笔记理解**：此前异常会被节点兜成一句得体的
+> 话术、接口照常 200；现在**异常直接抛出**（节点抛 `AgentRunFailed`），接口返回
+> `incomplete` / 失败事件，**客户端会看到一次失败**。这是刻意换的 —— 把"没跑成"
+> 伪装成"跑成了"，会让观测面与重试逻辑一起失真（表现成"接口说完成了、其实什么都没产出、
+> 连『继续生成』的按钮都不弹"）。
+>
+> 指标这一侧**不变**：`agent_runs_total{exit_reason="error"}` 在抛之前就已播报。
+> 所以这条告警仍然是发现"DB_URL 配错 / 上游限流 / 协议不兼容"的**第一条线索**，
+> 而不是靠错误率兜底。
+
+```bash
+# 按 exit_reason 看是哪一类在涨（agent 标签能进一步定位是哪一段在空转）
+curl -s --noproxy '*' localhost:8000/metrics | grep 'agent_runs_total'
+# 真实异常原因在日志里（TaskOutcome.error 会把「类型: 消息」带出来）
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=300 app-stable | grep -E 'agent 链路执行异常|评审链路失败'
+```
+- `error` 且消息含 `RateLimitError` ⇒ **上游限流，不是链路缺陷**：等额度或退避重试；
+- `error` 且为超时 / 协议错 ⇒ 查 `AGNES_API_BASE` 连通性与 `AGENT_TIMEOUT_SECONDS`；
+- `evaluator_error` ⇒ 评审的结构化输出不稳定，可提高 `AGENT_EVALUATOR_TRIES`；
+- `max_turns` ⇒ 单任务步数耗尽，见下下条的处置。
+
+#### `AgentReworkRateHigh`（warning，15m）
+返工率 > 50%（未一次通过的任务占比）。这是**能力**最直接的代理指标，
+而且它直接对应成本 —— 每次返工 = 再跑一整轮模型调用。
+
+> ⚠️ 分母是 `agent_route_total{route="agent"}`（**请求**口径），不是 `agent_runs_total`。
+> 拆分之后一次请求 = N 次运行，拿运行数当分母会让返工率凭空缩小一半 ——
+> 而"腰斩的返工率"看起来像是能力提升了。
+
+```bash
+curl -s --noproxy '*' localhost:8000/metrics | grep -E 'agent_review_outcome_total|agent_rework_total|agent_route_total'
+```
+- `score=needs_improvement` 居多 ⇒ 评审判据与产出不匹配：
+  文学节点查篇幅/基调约束是否够明确；PPT 那串工具调用查 `SlideDeck` 的结构化字段是否过严；
+- 同时看 `agent_participants_total` —— 若某个专家**从不出现**，说明它从没被调用
+  （多是对它的工具描述写得不够明确，模型不知道什么时候该用）。
+
+#### `AgentModelCallsPerRunHigh`（warning，15m）
+平均每次 **agent 运行**的模型调用 > 12（`AGENT_MAX_TURNS` 的默认值）。
+均值贴着上限，说明相当一部分任务在**贴着上限跑**，成本与延迟都会显著抬升。
+
+> ⚠️ 直方图是**运行口径**（带 `agent` 标签）。拆分后一次请求 = N 次运行，
+> 所以它不等于"每个用户请求的成本" —— 要请求口径得乘上 `agent_route_total` 的请求数。
+
+```bash
+curl -s --noproxy '*' localhost:8000/metrics | grep -E 'agent_model_calls_(sum|count)'
+# 哪一段在涨（前台 / 文学）—— 拆分后这一步不能省
+curl -s --noproxy '*' localhost:8000/metrics | grep 'agent_runs_total'
+```
+- 先按 `agent` 标签定位，再看是"模型在想"（`agent_model_calls` 涨）还是"工具在往返"
+  （`agent_tool_calls` 同向涨）；
+- `agent_handoff_total` 现在只可能是 **前台 → 文学** 这一种组合（请求口径）。
+  ⚠️ 别再去查"A→B→A 的往返"：文学节点**没有回程边**（2026-10-03 拍板丢掉），
+  图里不可能出现环 —— 拿一个结构上不可能发生的模式去排查，只会浪费时间；
+- 检查专家 instructions 的 Routine 是否过长 —— **每多一条规则就多一次工具调用**。
+
+#### `AgentGuardrailTripsFrequent`（warning，5m）
+30 分钟内护栏拦截 > 5 次。
+
+> ⚠️ **护栏拦截是正确行为**，要修的是产出质量，不是把护栏关掉。
+
+```bash
+curl -s --noproxy '*' localhost:8000/metrics | grep -E 'agent_guardrail_trips_total|agent_output_check_total'
+```
+- `guardrail=citation_traceability_guardrail` ⇒ 模型在**编造引用编号**
+  （最典型的幻觉形态）。检查 `research` 是否稳定返回带编号的结论；
+- `guardrail=length_guardrail` ⇒ 核对 `AGENT_MAX_ANSWER_CHARS` 与业务期望的篇幅。
+
+#### `AgentRetrievalEmptyHigh`（warning，15m）
+agent 链路的检索空召回率 > 50%。答案会退化成"依据不足"，而**检索器本身
+不会记任何错误日志** —— 这正是它需要单独一条告警的原因。
+
+```bash
+curl -s --noproxy '*' localhost:8000/metrics | grep -E 'rag_hits_total|agent_retrieved_chunks'
+# ① 先排除"语料根本没挂"（容器部署最常见的原因）
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 app-stable | grep 'RAG 语料为空'
+```
+- 全部打空 ⇒ `DOCS_DIR` 指向空目录 / 语料没挂进容器；
+- 部分打空 ⇒ 模型改写出的检索式与语料用词偏离较大，
+  在 `researcher` 的 instructions 里要求**优先复用用户原词**。
 
 ---
 
@@ -604,7 +1187,12 @@ curl -s localhost:9100/metrics | grep node_filesystem_avail_bytes
 容器日志现在有轮转（每个服务 ≤ 30MB），若 `docker system df` 的 LOGS 一列
 明显超出"服务数 × 30MB"，说明有服务漏挂 `logging`（新增服务时的常见疏漏）。
 
-`promdata` 不设 retention 会一直长（见 `prometheus.yml` 的说明）。
+`promdata` 的保留期是**显式设成 40 天**的（`docker-compose.yml` 里 prometheus 的
+`--storage.tsdb.retention.time=40d`），不是"不设就无限长"—— Prometheus 的默认值是
+**15 天**。这个 40 天是 **SLO 的前提**而不是调优项：预算余量规则读 30 天窗口，
+调小它会让预算静默只算半个月（"上周烧掉的那一段"滑出保留期、预算自己涨回来），
+所以它有守卫钉着（`test_prometheus_retention_covers_the_longest_budget_window`）。
+要按容量反推能留多久，看 `deploy/CAPACITY.md`。
 
 ### 4.3 故障演练（每季度挑一条做）
 
@@ -615,8 +1203,8 @@ curl -s localhost:9100/metrics | grep node_filesystem_avail_bytes
 |---|---|---|
 | embedding 熔断 | 把 `EMBEDDING_API_BASE` 指到一个黑洞地址 | 检索走 BM25 回退，服务不崩，日志有熔断告警 |
 | rerank 熔断 | 把 `RERANK_API_BASE` 指到黑洞 | `HybridRetriever.last_rerank_ok is False`，结果退回 RRF 融合顺序 |
-| Redis 不可用 | `docker compose stop redis` | 退到进程内计数（**不是放行**），启动日志有明确提示 |
-| PG 不可用 | `docker compose stop pgvector` | `/health/ready` 报 `db ok=false`；在途 SSE 被止损而非挂死 |
+| Redis 不可用 | `docker compose --env-file .env -f deploy/app/docker-compose.yml stop redis` | 退到进程内计数（**不是放行**），启动日志有明确提示 |
+| PG 不可用 | `docker compose --env-file .env -f deploy/app/docker-compose.yml stop pgvector` | `/health/ready` 报 `db ok=false`；在途 SSE 被止损而非挂死 |
 | 外部入口断 | 改 nginx 端口映射后 reload | `ExternalProbeFailing` 触发，而 `ChatAgentDown` **不**触发（这是两条规则分工的验证） |
 
 演练完把结论记进当天的 `.workbuddy/memory/YYYY-MM-DD.md`。
@@ -652,8 +1240,10 @@ python scripts/tasks.py kb-prune -- --include-stale --apply   # 连「内容已�
 1. **"面板上 FIRING 了，说明通知过了"** —— Fire 与"送达"是两件事，见 1.1 的表。
 2. **"容器在运行，所以备份在做"** —— 见 4.1。
 3. **"staging 也是 production 语义，所以 staging 通过 = 生产通过"** ——
-   前提是 staging 真的写了 `APP_ENV=production`。写成 `staging` 会**静默关掉鉴权、
-   打开 /docs**，于是 staging 唯一不同的地方恰好是最该验证的那层（见 `deploy/CANARY.md`）。
+   前提是 staging 真的显式写了 `APP_ENV=production`。判据 2026-10-05 已改为
+   「认不出来的取值一律当生产」（写 `staging`/`prd` 不再静默降级），但靠插值取值
+   的地方仍会被部署机上残留的 `APP_ENV` 带偏 ⇒ **显式写死才是可靠前提**
+   （见 `deploy/CANARY.md`）。
 4. **"灰度只影响 10% 用户"** —— 灰度真正的价值是**在影响 10% 的时候拿到证据**。
    不看证据的灰度只是"慢一点的发布"。
 5. **"`/health/live` 绿了就是健康的"** —— liveness 刻意只回进程标识、不查依赖

@@ -8,9 +8,18 @@
 # ⚠️ 三者的职责边界（少任何一环，告警都送不到人）
 #   prometheus.yml    —— 抓谁、多久抓一次、规则从哪读、**把触发的事件发给谁**
 #   alerts.yml        —— 判定条件（什么算异常）
+#   recording.yml     —— **录音规则**：把跨 30 天的预算余量先算成一条序列，
+#                        供 alerts.yml 读取（见该文件头部：为什么不能内联）
 #   alertmanager.yml  —— 路由与接收人（谁被叫醒、多快去叫、怎么降噪）
 # 只有前两个时，告警会被**触发**但不会**送达** —— 这是最容易漏的一环，
 # 因为面板上能看到 FIRING，会让人以为"已经通知过了"。
+#
+# ⚠️ 保留期（`--storage.tsdb.retention.time`）在 **docker-compose.yml** 里设置，
+# 不在本文件。它是 SLO 的**前提**而不是调优项：30 天窗口的预算余量规则要求
+# 保留期 > 30 天，而 Prometheus 的默认值是 **15 天** —— 不够时不会报错，
+# 只是 `avg_over_time(...[30d])` 拿到半个月的数据，"上周烧掉的那段"会随时间
+# 滑出保留期、预算看起来自己恢复。守卫：
+# `tests/test_monitoring_config.py::test_prometheus_retention_covers_the_longest_budget_window`。
 #
 # 起法（与业务同网络）：
 #   # ① 先起告警路由（否则 Prometheus 会一直报 "no Alertmanager found"）
@@ -20,14 +29,23 @@
 #     prom/alertmanager:v0.27.0
 #
 #   # ② 再起 Prometheus
+#   #   ⚠️ 这里必须**同时**做两件事：挂上 recording.yml，且显式给保留期。
+#   #      裸跑（不给 --storage.tsdb.retention.time）时默认只留 15 天，
+#   #      而预算余量规则要读 30 天 —— 少了它不会报错，只是预算只算半个月。
 #   docker run -d --name chatagent-prom --network chatagent_default \
 #     -p 9090:9090 \
 #     -v "$PWD/deploy/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
 #     -v "$PWD/deploy/monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro" \
-#     prom/prometheus:v2.54.1
+#     -v "$PWD/deploy/monitoring/recording.yml:/etc/prometheus/recording.yml:ro" \
+#     prom/prometheus:v2.54.1 \
+#     --config.file=/etc/prometheus/prometheus.yml \
+#     --storage.tsdb.path=/prometheus \
+#     --storage.tsdb.retention.time=40d
 #
 # 怎么确认"链路真的通了"（三步，都别省）
 #   a) Prometheus  → http://localhost:9090/alerts    能看到规则处于 inactive/pending/firing
+#                    （录音规则在 /rules 那一页，`Health=ok` 且 `Last Evaluation` 在动；
+#                     它报错时**只有那一页和日志里能看到** —— 告警侧表现为永远不触发）
 #   b) Prometheus  → http://localhost:9090/status      "Alertmanagers" 一节里目标状态为 UP
 #   c) Alertmanager→ http://localhost:9093/#/alerts   规则触发后这里能看到，
 #                  "Status" 页无解析错误
@@ -44,6 +62,11 @@ global:
 
 rule_files:
   - /etc/prometheus/alerts.yml
+  # 录音规则（SLO 预算余量）。**漏加载它不会有任何报错**：预算告警会一直
+  # inactive（读不到序列 = 条件不成立），看起来"预算一直很健康"。
+  # 这是本仓库反复出现的"哑弹"类别之一，所以有守卫钉住：
+  # `test_recording_rules_are_loaded_and_mounted`。
+  - /etc/prometheus/recording.yml
 
 # 把触发的事件交给 Alertmanager —— 缺了这段，规则只在 Prometheus 页面里亮灯。
 alerting:
@@ -109,8 +132,20 @@ scrape_configs:
   # ⚠️ 唯一需要你替换的是下面的域名。换完执行：
   #     docker compose --env-file .env -f deploy/app/docker-compose.yml restart prometheus
   #     curl -s --noproxy '*' localhost:9090/api/v1/targets | python -m json.tool | grep -A3 blackbox-tls
-  #   target 为 UP 即说明证书探活生效（域名还没配好时它会是 DOWN，这在 /targets 页面上可见，
-  #   是**刻意保留的可见信号** —— 比静默失效好）。
+  #   target 为 UP 即说明证书探活生效。
+  #
+  # ⚠️ 占位符没换掉时**会有人被告警**（2026-10-06 修）。
+  #   这里原来写的是"域名还没配好时它会是 DOWN，在 /targets 页面上可见，是刻意保留的
+  #   可见信号"—— 那句话是错的，而且错得有害：**没有人日常看 /targets 页面**，
+  #   所以"可见"实际等于"不可见"。更糟的是它把这件事描述成有意为之，
+  #   于是没人会去修。真实后果是：blackbox-tls 抓不到数据 ⇒
+  #   `probe_ssl_earliest_cert_expiry` 一条序列都没有 ⇒ `TLSCertExpiringSoon`
+  #   **永远 inactive**，证书到期监控整条失效，而面板上什么异常都看不出来。
+  #   现在 platform 组里有 `TLSCertProbeDown`（`up{job="blackbox-tls"} == 0`）
+  #   专门盯它，30 分钟后就会叫人 —— 这是刻意的：替换域名是**配置步骤**，
+  #   不该存在"忘了做也没人知道"的状态。
+  #   如果你的 HTTPS 入口不在本编排内（TLS 由外部 LB 终结），正确做法是
+  #   **删掉这个 job 与那条规则**，而不是留着一条常年 firing 的告警。
   - job_name: blackbox-tls
     metrics_path: /probe
     params:

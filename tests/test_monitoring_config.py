@@ -387,6 +387,44 @@ def slo_rules(alerts_cfg):
             if rule.get("labels", {}).get("category") == "slo"}
 
 
+# SLO 规则分两个**家族**，靠 `kind` 标签区分（`category: slo` 只说明它属于哪个组）：
+#   burn   —— 燃尽率（**速率**问法）：形状固定为"长窗口 + 短窗口 + 倍数"，
+#             能与 SLO.md 的 8 列表格逐行对齐；
+#   budget —— 预算余量（**余量**问法）：读录音序列（`recording.yml`），
+#             窗口、阈值、严重度的形状与 burn 完全不同，没法套同一张表。
+# 为什么非要这个标签：下面的断言要按家族分开。没有它时，新加的一条规则会从
+# **所有**分类断言里漏出去（既不进燃尽率表的对齐，也不进余量表），而在这里
+# "漏出去"就等于"没有任何守卫看着它" —— 所以下面有一条守卫专门要求每条都声明 `kind`。
+_BURN, _BUDGET = "burn", "budget"
+
+#: 预算余量的录音序列名。**唯一**一处定义，测试与文档都以它为准。
+BUDGET_METRIC = "slo:budget_remaining_ratio"
+
+
+def _of_kind(rules: dict, kind: str) -> dict:
+    return {n: r for n, r in rules.items()
+            if (r.get("labels") or {}).get("kind") == kind}
+
+
+def _series_in(expr: str) -> set[str]:
+    """表达式里出现的**录音序列名**，按完整的 `slo:` 标识符取。
+
+    ⚠️ 不能用 `name in expr` 判"读了哪条序列"：`slo:budget_remaining_ratio` 是
+    `slo:budget_remaining_ratioo` 的**子串** —— 拼错一个字母时 `in` 照样为真，
+    于是"序列名写错 ⇒ 匹配空序列 ⇒ 规则永远 inactive"这类缺陷完全扫不到。
+    变异验证实测过：用 `in` 时，"把序列名打错一个字母"只有按 token 取的那条守卫会红。
+    （同一个坑在 `tests/test_runtime_metrics.py::test_every_new_metric_is_emitted_in_source`
+    里已经踩过一次，那里记的是'指标名必须带引号才算数'。）
+    """
+    return set(re.findall(r"\b(slo:[a-z_0-9:]+)", expr))
+
+
+BURN_COLS = ["alert", "slo", "target", "burn", "long", "short", "budget", "severity"]
+#: ⚠️ 列数**必须与燃尽率表（8 列）不同**：`_doc_table` 是按列数识别表格的，
+#: 两张表同列数时会互相污染 —— 燃尽率表的 schema 会跑去解析余量表的行。
+BUDGET_COLS = ["alert", "metric", "window", "threshold", "slo", "severity"]
+
+
 def _secs(dur: str) -> int:
     """把 Prometheus 的窗口字面量（`30s` / `5m` / `6h` / `3d`）换算成秒。"""
     m = re.fullmatch(r"(\d+)([smhd])", str(dur).strip())
@@ -400,14 +438,12 @@ def _windows(expr: str) -> list[str]:
     return re.findall(r"\[(\d+[smhd])\]", expr)
 
 
-def _doc_table(text: str) -> list[dict]:
-    """解析 SLO.md 的燃尽率表（唯一一张 8 列的表格）。
+def _doc_table(text: str, cols: list[str]) -> list[dict]:
+    """解析 SLO.md 里**列数等于 `len(cols)`** 的表格。
 
     为什么靠"列数 + 表头"识别而不是靠标题定位：改标题不该让测试失效，
     但把表格列删一列必须被发现（那意味着某条口径没写下来）。
     """
-    cols = ["alert", "slo", "target", "burn", "long", "short",
-            "budget", "severity"]
     out = []
     for line in text.splitlines():
         s = line.strip()
@@ -418,8 +454,16 @@ def _doc_table(text: str) -> list[dict]:
             continue
         if cells[0] in ("告警", cols[0]) or set(cells[0]) <= set("-: "):
             continue
-        out.append(dict(zip(cols, cells)))
+        out.append(dict(zip(cols, cells, strict=False)))
     return out
+
+
+def _burn_rows() -> list[dict]:
+    return _doc_table(SLO_DOC.read_text(encoding="utf-8"), BURN_COLS)
+
+
+def _budget_rows() -> list[dict]:
+    return _doc_table(SLO_DOC.read_text(encoding="utf-8"), BUDGET_COLS)
 
 
 def test_slo_doc_exists():
@@ -432,13 +476,18 @@ def test_slo_doc_matches_alert_expressions(slo_rules):
     这是防"文档与实现脱节"的核心断言：只改表达式不改文档（或反过来）立刻测红。
     断言三件事：燃尽率倍数、SLO 目标、长短两个窗口。
     """
-    rows = _doc_table(SLO_DOC.read_text(encoding="utf-8"))
+    rows = _burn_rows()
     assert rows, "SLO.md 里没有解析到燃尽率表（表头/列数变了？）"
+    burn = _of_kind(slo_rules, _BURN)
+    assert burn, "alerts.yml 里没有任何 kind: burn 的规则 —— 家族划分被改掉了？"
 
     for row in rows:
         name = row["alert"]
-        assert name in slo_rules, f"SLO.md 提到了 {name}，但 alerts.yml 里没有这条规则"
-        expr = slo_rules[name]["expr"]
+        assert name in burn, (
+            f"SLO.md 的燃尽率表里提到了 {name}，但它不是一条 `kind: burn` 的规则："
+            f"{'alerts.yml 里没有这条规则' if name not in slo_rules else '它的 kind 是 ' + repr((slo_rules[name].get('labels') or {}).get('kind'))}"
+        )
+        expr = burn[name]["expr"]
 
         want = f"> {row['burn']} * (1 - {row['target']})"
         assert want in expr, (
@@ -457,10 +506,16 @@ def test_slo_doc_covers_every_slo_alert(slo_rules):
 
     少了这条，新增一条燃尽率告警却忘了写文档就会漏过 ——
     而值班的人遇到没文档的告警只能靠猜。
+
+    ⚠️ 两个家族各有自己的表（燃尽率表 8 列、预算余量表 6 列）。
+    只查其中一张时，另一族的新规则会**静默漏过** ——
+    所以这里要求落在两张表的**并集**里，而不是只对燃尽率表。
     """
-    documented = {r["alert"] for r in _doc_table(SLO_DOC.read_text(encoding="utf-8"))}
+    documented = {r["alert"] for r in _burn_rows()} | {r["alert"] for r in _budget_rows()}
     missing = set(slo_rules) - documented
-    assert not missing, f"以下 SLO 规则没有写进 SLO.md：{sorted(missing)}"
+    assert not missing, (
+        f"以下 SLO 规则没有写进 SLO.md（既不在燃尽率表也不在预算余量表里）：{sorted(missing)}"
+    )
 
 
 def test_slo_rules_use_multi_window_burn_rate(slo_rules):
@@ -470,9 +525,13 @@ def test_slo_rules_use_multi_window_burn_rate(slo_rules):
       - 只留长窗口 ⇒ 已过去的尖峰让告警继续挂很久（恢复慢、误报长）；
       - 只留短窗口 ⇒ 30 秒抖动就能把人叫醒（噪音，很快被忽略）。
     两者都必须能区分开，所以断言"窗口数 >= 2 **且** 表达式里有 and"。
+    ⚠️ 只适用于 `kind: burn` 这一族。预算余量规则（`kind: budget`）**本来就只有
+    一个窗口** —— 它要回答的正是"这一个月下来还剩多少"，拆成长短两个窗口反而
+    回到速率问法上去了（见 SLO.md §4 与 §4b）。
     """
-    assert slo_rules, "没有任何 category: slo 的规则"
-    for name, rule in slo_rules.items():
+    burn = _of_kind(slo_rules, _BURN)
+    assert burn, "没有任何 kind: burn 的规则"
+    for name, rule in burn.items():
         wins = _windows(rule["expr"])
         assert len(set(wins)) >= 2, (
             f"{name} 只用了 {set(wins)} 一个窗口 —— 单窗口燃尽率告警不是多窗口多燃尽率"
@@ -488,8 +547,10 @@ def test_slo_burn_alerts_do_not_stack_a_long_for(slo_rules):
     窗口已经承担了"持续多久才算"的职责，再叠一个 >= 短窗口的 `for`
     只会让告警更晚、更钝；而 `for` 为 0 又容易在单次抓取抖动上误报。
     所以要求落在 (0, 短窗口] 这个区间。
+
+    只适用于 `kind: burn`：余量规则的 `for` 与窗口没有这种关系（窗口在录音规则里）。
     """
-    for name, rule in slo_rules.items():
+    for name, rule in _of_kind(slo_rules, _BURN).items():
         wins = sorted({_secs(w) for w in _windows(rule["expr"])})
         short = wins[0]
         hold = _secs(rule.get("for", "0s"))
@@ -499,18 +560,384 @@ def test_slo_burn_alerts_do_not_stack_a_long_for(slo_rules):
         )
 
 
-def test_slo_numerator_does_not_use_unhandled_exception_counter(slo_rules):
+def test_slo_numerator_does_not_use_unhandled_exception_counter(slo_rules, recording_cfg):
     """可用性 SLI 的分子不得用 `http_errors_total`。
 
     它只在**未捕获异常**时自增（见 `app/middleware.py`），503 这类
     "正常返回的失败"不计入 —— 拿它当分子会系统性低估错误率，
     SLO 会**永远显示达标**，这是最危险的一种假绿。
+
+    ⚠️ 必须**两个文件一起扫**：接上录音规则之后，预算那一族的分子搬进了
+    `recording.yml`（`slo:bad_rate_5m`）。只扫 alerts.yml 时，
+    "有人在那条录音规则里改用 http_errors_total"完全不会被发现 ——
+    而这与本条要防的是**同一个错**，只是换了个文件、换了一族。
     """
     bad = [name for name, rule in slo_rules.items()
            if "http_errors_total" in rule["expr"]]
+    bad += [f"recording.yml:{r['record']}"
+            for g in recording_cfg["groups"] for r in g["rules"]
+            if "http_errors_total" in r.get("expr", "")]
     assert not bad, (
         f"以下 SLO 规则用 http_errors_total 当分子：{bad}；"
         "应改用 http_requests_total{status=~\"5..\"}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 录音规则（recording.yml）与「预算余量」这一族
+#
+# 背景：`ERROR_BUDGET_POLICY.md` 的政策表里有两行是**余量**口径（剩余 < 20% 冻结 /
+# 耗尽全面冻结），但 `chatagent-slo` 组里 5 条规则全是**速率**问法，问不出"还剩多少"。
+# 2026-10-03 起补上：录音规则算余量、两条告警读它。
+#
+# 这一节钉的都是"错了也不报错"的类型 —— 录音规则最典型的失败模式是**哑弹**：
+# 没被加载 / 序列名写错 / 规则报错，三种都表现为"告警永远不触发"，
+# 看起来就像"预算一直很健康"。
+# ---------------------------------------------------------------------------
+RECORDING = MON / "recording.yml"
+
+#: Prometheus 的 `--query.lookback-delta` 默认值（5m）。录音规则的产物按同一套
+#: lookback 规则被查询，所以它的间隔必须远小于这个数（理由见下面那条用例）。
+LOOKBACK_SECS = 300
+
+
+@pytest.fixture(scope="module")
+def recording_cfg():
+    return yaml.safe_load(RECORDING.read_text(encoding="utf-8"))
+
+
+def test_every_slo_rule_declares_its_kind(slo_rules):
+    """每条 `category: slo` 的规则都必须声明 `kind`（burn / budget）。
+
+    这是**元守卫**：下面所有按家族分开的断言都靠 `kind` 过滤。某条规则若没打这个
+    标签，它会从**每一族**里同时漏出去 —— 既不被燃尽率的形状断言看住，
+    也不被余量表的文档对齐看住，而"没红"会被读成"没问题"。
+    新增规则时忘了打标签，是最自然的疏忽。
+    """
+    bad = {n: (r.get("labels") or {}).get("kind") for n, r in slo_rules.items()
+           if (r.get("labels") or {}).get("kind") not in (_BURN, _BUDGET)}
+    assert not bad, (
+        f"以下 SLO 规则没有声明 kind（或取值不在 {(_BURN, _BUDGET)} 内）：{bad}\n"
+        "kind 决定它归哪一族、被哪组断言看着；缺失等于从所有断言里漏出去。"
+    )
+
+
+def test_recording_rules_live_in_their_own_file(alerts_cfg, recording_cfg):
+    """两个文件各装一种规则：alerts.yml 只有告警，recording.yml 只有录音。
+
+    为什么必须钉住：
+      * 录音规则混进 alerts.yml ⇒ 本文件里所有按 `rule["alert"]` 遍历的断言直接
+        抛 KeyError（报错指向守卫而不是真正的错处），或者为了绕开它给录音规则
+        编一套 `alert:`/`severity:`/`runbook:` 的假标签 —— 后者会把
+        "每条告警都要写处置办法"这条纪律稀释掉；
+      * **告警混进 recording.yml ⇒ 不会有任何报错**：它会正常触发、正常送达，
+        只是绕过了告警侧全部的守卫（category 路由、runbook 覆盖、与文档对齐）。
+    """
+    stray_records = [r.get("record") for g in alerts_cfg["groups"]
+                     for r in g["rules"] if "record" in r]
+    assert not stray_records, (
+        f"alerts.yml 里出现了录音规则：{stray_records}（应放进 recording.yml）"
+    )
+    stray_alerts = [r.get("alert") for g in recording_cfg["groups"]
+                    for r in g["rules"] if "alert" in r]
+    assert not stray_alerts, (
+        f"recording.yml 里出现了告警规则：{stray_alerts}（应放进 alerts.yml，"
+        "否则它会绕过告警侧所有守卫且不报错）"
+    )
+    for g in recording_cfg["groups"]:
+        for r in g["rules"]:
+            assert r.get("record") and r.get("expr"), (
+                f"recording.yml 的 {g['name']} 里有条目既不是录音也不是告警：{r}"
+            )
+
+
+def test_recording_rules_are_loaded_and_mounted(prom_cfg, recording_cfg):
+    """recording.yml 必须**同时**被 prometheus.yml 加载、且被 compose 挂进容器。
+
+    少任何一处，录音序列**永远不存在** ⇒ 读它的两条预算告警**永远 inactive，
+    且没有任何报错**（空序列让条件不成立，而不是让规则报错）——
+    与"告警表达式引用了不存在的 scrape job"完全同类。
+    最坏的地方在于它看起来像"预算一直很健康"。
+    """
+    files = prom_cfg.get("rule_files") or []
+    assert any("recording.yml" in f for f in files), (
+        f"prometheus.yml 的 rule_files 没有加载 recording.yml（当前：{files}）"
+    )
+    text = COMPOSE.read_text(encoding="utf-8")
+    for path in files:
+        # 挂载目标必须与 rule_files 里的**容器内路径逐字相同**：写岔时 Prometheus
+        # 在启动期就失败，而报错只有一句 "no such file"，很难判断是哪一处错了。
+        assert re.search(rf"\.\./monitoring/{re.escape(Path(path).name)}\s*:\s*"
+                         rf"{re.escape(path)}:ro", text), (
+            f"compose 没有把 {path} 按这个路径挂进 prometheus 容器 —— "
+            "Prometheus 会在启动期直接失败（只有一个 no such file 的报错）"
+        )
+
+
+def test_recording_interval_is_within_the_lookback_delta(prom_cfg, recording_cfg):
+    """录音组的间隔必须**远小于** lookback delta（默认 5m）。
+
+    ⚠️ 这是最不直观、也最容易踩的一条：录音规则的产物就是**普通样本**，
+    写进 TSDB 之后按同样的 lookback 规则被查询。间隔若等于/接近 5m，
+    告警取数的那一瞬间最近的样本可能"刚好过期" ⇒ 查询返回**空序列** ⇒
+    告警从 firing 掉回 inactive、`for` 重新计时。
+    表现是"告警每 5 分钟闪一下"，而日志里没有任何异常。
+    """
+    default_eval = _secs(prom_cfg.get("global", {}).get("evaluation_interval", "1m"))
+    for g in recording_cfg["groups"]:
+        iv = g.get("interval")
+        secs = _secs(iv) if iv else default_eval
+        shown = str(iv) if iv else f"继承全局 evaluation_interval（{default_eval}s）"
+        assert secs * 2 <= LOOKBACK_SECS, (
+            f"录音组 {g['name']} 的间隔（{shown}）太接近 lookback delta（{LOOKBACK_SECS}s）："
+            "告警会因为间歇性取不到序列而反复翻转（firing → inactive → 重新计时）"
+        )
+
+
+def test_prometheus_retention_covers_the_longest_budget_window(recording_cfg):
+    """Prometheus 的保留期必须**长于**预算窗口（默认 15d 会让预算只算半个月）。
+
+    ⚠️ 这是一条典型的"不报错的错"：保留期不够时 `avg_over_time(...[30d])`
+    不会失败，它只是**拿到现有数据上的平均** ⇒ "上周烧掉的那一段"随时间滑出保留期、
+    预算会慢慢**自己涨回来**。这比没有监控更糟 —— 它给的是错误的安全感，
+    而"冻结发布"这个动作恰恰要靠这个数字。
+
+    窗口字面量直接从 recording.yml 反推（不写死 30），所以
+    "把窗口改大、却忘了改保留期"会立刻测红。
+    """
+    windows = [_secs(w) for g in recording_cfg["groups"] for r in g["rules"]
+               for w in _windows(r.get("expr", ""))]
+    assert windows, "recording.yml 里没有任何窗口字面量（窗口被搬走了？）"
+    need = max(windows)
+
+    text = COMPOSE.read_text(encoding="utf-8")
+    m = re.search(r"--storage\.tsdb\.retention\.time=(\d+[smhd])", text)
+    assert m, (
+        "compose 没有给 prometheus 设 --storage.tsdb.retention.time —— "
+        f"默认保留期只有 15 天，而预算规则要读 {need // 86400} 天，"
+        "预算会静默只算半个月（且看起来一切正常）"
+    )
+    got = _secs(m.group(1))
+    assert got >= need * 1.2, (
+        f"Prometheus 保留期（{m.group(1)}）不足以覆盖预算窗口 {need // 86400} 天："
+        f"至少要留 20% 余量（>= {int(need * 1.2)}s）"
+    )
+
+
+def test_budget_alerts_read_the_recorded_series(slo_rules):
+    """预算告警必须读录音序列；**不许**把 30 天窗口搬回告警表达式里。
+
+    搬回来的代价不是"算错"，而是**每次评估都要重算整个窗口**：
+    `http_requests_total` 那几百条原始序列 × 86400 个点全部进内存 ——
+    在 compose 给 Prometheus 的 512MB 上限下是真风险，而这条规则每 30 秒就要跑一次。
+    录音规则那条每 60 秒跑一次，却只读两条聚合序列。
+    """
+    budget = _of_kind(slo_rules, _BUDGET)
+    assert budget, "alerts.yml 里没有任何 kind: budget 的规则"
+    for name, rule in budget.items():
+        expr = rule["expr"]
+        assert BUDGET_METRIC in _series_in(expr), (
+            f"{name} 没有读录音序列 {BUDGET_METRIC}（它读到的是 {sorted(_series_in(expr))}），"
+            f"实际表达式：{expr!r}"
+        )
+        for forbidden in ("increase(", "avg_over_time(", "http_requests_total",
+                          "http_request_duration"):
+            assert forbidden not in expr, (
+                f"{name} 的表达式里出现了 {forbidden!r} —— 窗口计算属于录音规则"
+                "（recording.yml）；搬回告警里会让每次评估都重算一遍整个 30 天窗口"
+            )
+
+
+def test_recorded_series_used_by_alerts_are_declared(alerts_cfg, recording_cfg):
+    """alerts.yml 里引用的 `slo:*` 序列，必须在 recording.yml 里真的被 record 出来。
+
+    这是**哑弹**守卫：引用一个不存在的序列名不会报错 —— 表达式匹配到**空序列** ⇒
+    规则永远 inactive。与"告警表达式里 `job=` 指向不存在的 scrape job"完全同类，
+    只是换了个命名空间。多打一个字母、或录音规则改了名而告警没跟着改，
+    都会落到这里。
+
+    只扫 `slo:` 前缀（录音规则自己的命名空间）；其余指标名由
+    `tests/test_runtime_metrics.py` 那几条按各自的口径看着。
+    """
+    declared = {r["record"] for g in recording_cfg["groups"] for r in g["rules"]}
+    used: set[str] = set()
+    for _, rule in _all_rules(alerts_cfg):
+        used |= set(re.findall(r"\b(slo:[a-z_0-9:]+)", rule.get("expr", "")))
+    assert used, "没有任何告警引用 slo: 录音序列（预算那两条被删了？）"
+    missing = sorted(used - declared)
+    assert not missing, (
+        f"以下录音序列被告警引用，但 recording.yml 里没有 record 出它们：{missing}\n"
+        f"实际声明的：{sorted(declared)}\n"
+        "引用不存在的序列 ⇒ 表达式匹配空序列 ⇒ 规则**永远 inactive 且不报错**。"
+    )
+
+
+def test_budget_rules_scope_the_level_one_series_by_sli(recording_cfg):
+    """二级录音规则必须用 `{slo="..."}` 限定一级序列。
+
+    一级刻意把两种 SLI 记成**同一个指标名**（这样告警一条表达式就能覆盖两者，
+    与政策表的"任一 SLI"对齐），代价是：不带过滤的引用会同时取到两条序列 ⇒
+    再叠上静态标签 `slo: ...` 之后两条结果的标签集完全撞车 ⇒ **重复样本** ⇒
+    这条规则每次评估都报错、**什么都不产出**。
+    告警随之永远不触发，而 Prometheus 只在 /rules 页与日志里说这件事。
+
+    ⚠️ 断言必须落在**每一个**一级引用上，而不是"表达式里出现过 `{slo=...}`"：
+    一条二级规则会引用两个一级序列（bad / total），只给其中一个加过滤时，
+    "表达式里含 `{slo=...}`"依然成立 —— 变异验证实测：那样改**一条测试都不红**。
+    """
+    #: 一级序列的引用形式：序列名 + 紧随其后的可选标签过滤。
+    ref = re.compile(r"(slo:(?:bad|total)_rate_5m)((?:\{[^}]*\})?)\[")
+    for g in recording_cfg["groups"]:
+        for r in g["rules"]:
+            if r.get("record") != BUDGET_METRIC:
+                continue
+            slo = (r.get("labels") or {}).get("slo")
+            assert slo, f"{BUDGET_METRIC} 的录音规则没有 slo 标签"
+            refs = ref.findall(r["expr"])
+            assert refs, f"slo={slo} 的预算规则没有引用任何一级序列：{r['expr']!r}"
+            for series, matcher in refs:
+                assert matcher == f'{{slo="{slo}"}}', (
+                    f"slo={slo} 的预算规则里 {series} 的标签过滤是 "
+                    f"{matcher or '（没有）'}，应为 {{slo=\"{slo}\"}} —— "
+                    "不带过滤（或过滤成另一种 SLI）会同时取到两种 SLI 的序列，"
+                    "再叠上静态标签就产生重复样本，规则每次评估都报错"
+                )
+
+
+def test_budget_remaining_is_recorded_for_every_sli(recording_cfg, slo_rules):
+    """必须**每个 SLI 各一条**预算录音规则，且告警确实覆盖了全部 SLI。
+
+    两种失败都是静默的：
+      * 少了 latency 那条 ⇒ 延迟预算永远不被检查（政策表写的是"任一 SLI"）；
+      * 告警表达式里加了 `{slo="availability"}` 过滤 ⇒ 覆盖范围悄悄减半，
+        而摘要里的 `{{ $labels.slo }}` 照常打印那个唯一的取值，看不出少了什么。
+    """
+    slis = {r.get("labels", {}).get("slo")
+            for g in recording_cfg["groups"] for r in g["rules"]
+            if r.get("record") == BUDGET_METRIC}
+    assert slis == {"availability", "latency"}, (
+        f"预算录音规则覆盖的 SLI 是 {slis}，应为 availability 与 latency 两种"
+    )
+    for name, rule in _of_kind(slo_rules, _BUDGET).items():
+        assert 'slo="' not in rule["expr"], (
+            f"{name} 的表达式带了 SLI 过滤（{rule['expr']!r}）—— 政策要求覆盖**任一 SLI**，"
+            "过滤会把另一种 SLI 悄悄排除在外（而摘要里的 {{ $labels.slo }} 照常打印）"
+        )
+
+
+def test_budget_alerts_and_records_agree_with_the_slo_document(slo_rules, recording_cfg):
+    """SLO.md 的预算余量表必须与 alerts.yml / recording.yml 逐项对得上。
+
+    断言四件事：告警存在且是 `kind: budget`；表达式读的正是表里写的序列；
+    严重度一致；表里声明的 SLI 覆盖 = 录音规则实际产出的 `slo` 标签集合；
+    以及文档声明的窗口字面量真的出现在表达式里（否则"30 天"只是文档里的说法）。
+    """
+    rows = _budget_rows()
+    assert rows, "SLO.md 里没有解析到预算余量表（表头/列数变了？）"
+    budget = _of_kind(slo_rules, _BUDGET)
+    for row in rows:
+        name = row["alert"]
+        assert name in budget, (
+            f"SLO.md 的余量表提到了 {name}，但它不是一条 kind: budget 的规则"
+            f"（{'alerts.yml 里没有' if name not in slo_rules else '它的 kind 是 ' + repr((slo_rules[name].get('labels') or {}).get('kind'))}）"
+        )
+        rule = budget[name]
+        labels = rule.get("labels") or {}
+        assert row["metric"] in _series_in(rule["expr"]), (
+            f"{name} 的表达式没有读文档里写的序列 {row['metric']}"
+            f"（它读到的是 {sorted(_series_in(rule['expr']))}）"
+        )
+        assert row["severity"] == labels.get("severity"), (
+            f"{name} 的 severity 与 SLO.md 不符：文档 {row['severity']}、规则 {labels.get('severity')}"
+        )
+        # 窗口在**录音规则**里（告警只读序列），所以窗口要对录音规则去查 ——
+        # 在告警表达式里找 `[30d]` 是找不到的，那会是一条永远修不好的假红。
+        sources = [r for g in recording_cfg["groups"] for r in g["rules"]
+                   if r.get("record") == row["metric"]]
+        assert sources, f"{row['metric']} 在 recording.yml 里没有被 record 出来"
+        assert all(f"[{row['window']}]" in r["expr"] for r in sources), (
+            f"{name}：文档声明窗口 [{row['window']}]，但 {row['metric']} 的录音规则里没有"
+        )
+        declared = {s.strip() for s in row["slo"].split("/")}
+        recorded = {r.get("labels", {}).get("slo") for r in sources}
+        assert declared == recorded, (
+            f"{name}：SLO.md 说覆盖 {declared}，而 {row['metric']} 实际只录了 {recorded}"
+        )
+
+
+def test_budget_targets_match_the_slo_document(recording_cfg):
+    """预算录音规则里的错误预算（`1 - 目标`）必须与 SLO.md §3 的目标表一致。
+
+    目标现在写在三个地方：SLO.md §3、燃尽率倍数（`14.4 * (1 - 0.995)`）、
+    预算分母（`(1 - 0.995)`）。改一处而漏另外两处时**不会报错** ——
+    预算照算，只是算的是**另一个 SLO** 的预算，于是"剩余 20%"这个阈值
+    与实际承诺脱钩。
+    """
+    text = SLO_DOC.read_text(encoding="utf-8")
+    rows = _doc_table(text, ["sli", "target", "budget", "meaning"])
+    assert rows, "SLO.md 里没有解析到 §3 的目标表（4 列表格）"
+    targets: dict[str, float] = {}
+    for row in rows:
+        sli = row["sli"].strip().strip("`")
+        # 只认「裸 SLI 名」的行：本文件里别的 4 列表格（若有）不该被当成目标表，
+        # 认不出来时宁可跳过也不要误报成"目标列解析不了"。
+        if not re.fullmatch(r"[a-z_]+", sli):
+            continue
+        m = re.match(r"(\d+(?:\.\d+)?)%", row["target"])
+        assert m, f"目标表里 {sli} 的目标列解析不了：{row['target']!r}"
+        targets[sli] = float(m.group(1)) / 100
+    assert {"availability", "latency"} <= set(targets), (
+        f"SLO.md §3 的目标表里没有解析到 availability 与 latency（解析到：{sorted(targets)}）"
+    )
+
+    win = re.search(r"目标（窗口：(\d+)\s*天）", text)
+    assert win, "SLO.md §3 的表头没有声明窗口（形如『目标（窗口：30 天）』）"
+    window = f"[{win.group(1)}d]"
+
+    recorded = [r for g in recording_cfg["groups"] for r in g["rules"]
+                if r.get("record") == BUDGET_METRIC]
+    assert recorded, f"recording.yml 里没有 {BUDGET_METRIC}"
+    for r in recorded:
+        slo = (r.get("labels") or {}).get("slo")
+        assert slo in targets, f"预算规则的 slo={slo} 在 SLO.md §3 的目标表里没有"
+        expected = f"(1 - {targets[slo]})"
+        assert expected in r["expr"], (
+            f"slo={slo}：SLO.md §3 的目标是 {targets[slo]}（错误预算 {1 - targets[slo]:.3g}），"
+            f"表达式里应出现 {expected!r}，实际：{r['expr']!r}"
+        )
+        assert window in r["expr"], (
+            f"slo={slo} 的预算规则没有读 SLO.md §3 声明的 {window} 窗口"
+        )
+
+
+def test_budget_route_precedes_the_generic_slo_routes(am_cfg):
+    """`kind = "budget"` 的专属路由必须排在通用 slo 路由之前，且 repeat 更长。
+
+    Alertmanager 是**首个匹配生效**：预算告警同时满足 `category = "slo"`
+    与一条 severity，排在后面就会继承通用路由的 `repeat_interval`（1h）。
+    余量是**慢变量**（耗尽可能持续到月底），每小时重复一次的结果是一周内被静音 ——
+    而它恰是"冻结发布"这个动作**唯一**的自动触发器。
+    （推理与 `test_watchdog_route_precedes_the_platform_wildcard` 完全同源。）
+    """
+    routes = am_cfg["route"].get("routes") or []
+
+    def _has(r, needle):
+        return any(needle in m for m in (r.get("matchers") or []))
+
+    budget = [i for i, r in enumerate(routes) if _has(r, 'kind = "budget"')]
+    generic = [i for i, r in enumerate(routes)
+               if _has(r, 'category = "slo"') and not _has(r, 'kind = "budget"')]
+    assert budget, "没有为 kind=budget 定义专属路由 —— 它会落进通用 slo 路由（repeat 1h）"
+    assert generic, "没有 category=slo 的通用路由（燃尽率告警无处可去）"
+    assert min(budget) < min(generic), (
+        "预算告警的专属路由排在通用 slo 路由之后 —— 首个匹配生效，"
+        "它会继承通用路由的 repeat_interval，预算耗尽的提醒频率不再是 24h"
+    )
+    hold = routes[min(budget)].get("repeat_interval")
+    assert hold, "预算路由没有显式 repeat_interval（'多久提醒一次'这个约定没写下来）"
+    assert _secs(hold) >= 6 * 3600, (
+        f"预算路由的 repeat_interval（{hold}）太短：余量是月级慢变量，"
+        "频繁重复只会让它在被处置之前就被静音"
     )
 
 
@@ -560,6 +987,7 @@ COMPOSE = ROOT / "deploy" / "app" / "docker-compose.yml"
 PLATFORM_ALERTS = {
     "Watchdog",            # 心跳（唯一能穿透"Alertmanager 自己挂了"的信号）
     "MonitoringStackDown",  # 监控栈组件不可达
+    "TLSCertProbeDown",    # 证书探活自己挂了（否则 TLSCertExpiringSoon 是哑弹）
     "AlertDeliveryFailing",  # 告警在响但发不出去
     "BackupLoopFailing",   # 备份很久没成功
     "BackupMetricsMissing",  # 备份指标本身不见了（textfile 链路断了）
@@ -671,6 +1099,80 @@ def test_alerts_reference_only_existing_scrape_jobs(alerts_cfg, prom_cfg):
         f"告警引用了 prometheus.yml 里不存在的 job：{sorted(unknown)}\n"
         f"实际存在的 job：{sorted(jobs)}\n"
         "引用不存在的 job ⇒ 表达式匹配空序列 ⇒ 规则**永远 inactive 且不报错**。"
+    )
+
+
+#: 这些 scrape job **不需要**单独的 `up` 规则 —— 每一项都必须写清理由。
+#: 之所以要写理由而不是静默跳过：静默跳过 == 看不见，而那正是这次要修的毛病本身。
+_JOB_UP_NOT_NEEDED = {
+    "blackbox-chatagent": (
+        "它的 up==0 只可能由 blackbox-exporter 自身不可达引起，已被 MonitoringStackDown "
+        "覆盖；而目标 URL 不可达会让 probe_success 变成 0 ⇒ ExternalProbeFailing 覆盖。"
+    ),
+}
+
+
+def test_every_scrape_job_has_someone_watching_it(alerts_cfg, prom_cfg):
+    """反向的那一半：prometheus.yml 里**每个** scrape job 都必须有规则盯着它的 `up`。
+
+    上面那条防的是"告警指着不存在的 job ⇒ 哑弹"。这里防的是另一侧，同样静默：
+    **抓取目标新增了，但没有任何规则看它的抓取存活**。抓取失败是 Prometheus 自己
+    产生的 `up == 0`，有规则匹配就会响；没有规则就完全没有信号 —— 面板上那块图是空的，
+    而"图是空的"和"一切正常"长得一模一样。
+
+    为什么现在才补（2026-10-06）：`MonitoringStackDown` 的表达式是**逐个列举** job 名的
+    （`up{job=~"prometheus|alertmanager|node-exporter|blackbox-exporter"} == 0`）。
+    后加的 `blackbox-tls` 不在列举里，于是证书探活挂掉时**没有任何告警**，连带
+    `TLSCertExpiringSoon` 一起成了哑弹（它读的序列根本不产出）。列举式判据漏一项没有症状，
+    所以这里改成"发现式"：把 prometheus.yml 里的 job 全抓出来，逐个确认有规则覆盖。
+    （同一个毛病今天已经在别处栽过两次 —— 见 `test_deploy_topology.py` 的
+    `test_every_compose_file_is_registered`。清单必须配一条一致性检查，否则它会慢慢失效。）
+
+    ⚠️ 判据必须是"**读 `up{...}` 的规则**"，不能放宽成"表达式里提到过这个 job"
+    ---------------------------------------------------------------------------
+    第一版就是这么写的（从所有 expr 里抓 `job="x"` / `job=~"x"`），结果**在修复前就是绿的**：
+    `TLSCertExpiringSoon` 的 `probe_ssl_earliest_cert_expiry{job=~"blackbox-.*"}`
+    也提到了 `blackbox-tls`，于是它被算成"有人盯"。可那条规则读的是**证书指标**，
+    抓取本身停掉它一点办法都没有 —— 把"引用过"当成"盯住了"，正好放走了这次要修的缺陷。
+    同理 `=~` 的正则在 Prometheus 里是**全串锚定**的，所以这里用 `re.fullmatch`
+    而不是 `re.match`，否则 `chatagent-.*` 会被误判成也能覆盖 `chatagent-typo` 之类。
+    """
+    jobs = {sc["job_name"] for sc in prom_cfg["scrape_configs"]}
+    assert jobs, "prometheus.yml 里没有定义任何 scrape job"
+
+    # 只承认 `up{...}` 选择器里的 job 匹配器 —— `up` 是"这次抓取成功了没有"的唯一来源。
+    up_matchers: list = []
+    for _, rule in _all_rules(alerts_cfg):
+        expr = rule.get("expr", "") or ""
+        for selector in re.findall(r"\bup\{([^}]*)\}", expr):
+            up_matchers += re.findall(r'job\s*(=~|=)\s*"([^"]*)"', selector)
+
+    assert up_matchers, (
+        "没有任何规则读 `up{...}` —— 抓取存活完全不可观测（`MonitoringStackDown` / "
+        "`ChatAgentDown` 都不在了？）"
+    )
+
+    unwatched = [
+        job for job in sorted(jobs)
+        if job not in _JOB_UP_NOT_NEEDED
+        and not any((job == pat if op == "=" else re.fullmatch(pat, job))
+                    for op, pat in up_matchers)
+    ]
+    assert not unwatched, (
+        f"这些 scrape job 没有任何规则盯着它的 `up`：{unwatched}\n"
+        "抓取失败不会产生任何可匹配的序列 ⇒ 该目标挂掉时**完全不可观测**。\n"
+        '要么加一条 `up{job="..."} == 0` 的规则，要么登记进 _JOB_UP_NOT_NEEDED '
+        "并写明它被哪条规则间接覆盖。\n"
+        "⚠️ 只在别的表达式里「被提到」（比如读该 job 的某个业务指标）**不算**盯住了 —— "
+        "那些规则在抓取停掉时同样匹配不到序列。"
+    )
+
+    # 反向：登记表里的 job 必须还在 —— 否则它会慢慢积成死条目，
+    # 而它本来是"为什么这个可以不盯"的唯一记录。
+    stale = sorted(set(_JOB_UP_NOT_NEEDED) - jobs)
+    assert not stale, (
+        f"_JOB_UP_NOT_NEEDED 里登记了 prometheus.yml 中已不存在的 job：{stale}\n"
+        "（删掉这些条目，或它们对应的 job 被误删了）"
     )
 
 

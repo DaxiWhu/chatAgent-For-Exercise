@@ -26,10 +26,33 @@ sse-starlette>=2.1
 # `shared_configured`（打算用）与 `backend`（实际在用），二者不一致会打 ERROR。
 # 装成硬依赖可以直接消灭这一整类误配（纯 python，无编译依赖）。
 redis>=5.0
+# 用户鉴权（第二档，app/auth.py）：OIDC / JWT 验签。
+# PyJWT 做编解码与算法实现，[crypto] 拉入 cryptography —— JWKS 里的
+# RS256/ES256 验签必须靠非对称实现，纯 Python 做不到。
+# 只用本地用户表 + 自签会话（HS256）时其实用不到非对称部分，但不装就**无法验
+# 外部 IdP 的 token**；列成硬依赖的理由同 redis：宁可让缺失直接暴露，
+# 也不要"配了 OIDC 却静默不生效"（那会表现为"用户全都登不上"而无一行报错）。
+# 注意 PyJWT 2.10 起自己会拒绝"用非对称公钥做 HMAC 密钥"，这层防护**不能依赖**
+# （换版本就没了），服务端的算法白名单才是防线（见 app/auth.py 的 verify）。
+PyJWT[crypto]>=2.8
 # LLM 链路 tracing（二选一即可）。不装则完全不上报，行为与没有这层代码一致。
 # langfuse>=2.0
 # LangSmith 走 LangChain 原生环境变量，只需 langchain 本身（已在上面）。
 # 指标：app/metrics.py 自带 Prometheus 文本输出，**无需** prometheus-client。
+
+# ---- agent 链路（src/agents/，官方 openai-agents SDK）----
+# 官方 Agents SDK：Runner / 跨轮历史会话 / 护栏 / handoff 全靠它。
+# ⚠️ 它**曾经漏在本清单外**（2026-10-03 补上）：容器只按 requirements.txt 安装，
+# 于是镜像里 `import agents` 直接失败 ⇒ `AGENTS_ENABLED=true` 但运行时未就绪 ⇒
+# **整条 agent 链路静默回落到原问答链路**，日志里只有一条 agent_reason，没有 ERROR。
+# 而跨轮对话历史的后端（官方 SQLAlchemySession）就在这个 SDK 的扩展里 ——
+# 少了它，历史一份也不会有。
+openai-agents>=0.20
+# 官方 SQLAlchemySession 用它建异步引擎（PG 的 agent_sessions / agent_messages 两张表）。
+# SDK 把它列为可选 extra（`pip install "openai-agents[sqlalchemy]"`），这里显式列出：
+# **选了 PostgreSQL 会话后端它就必需**。漏装的症状是运行期才炸（`session_for` 建不起来
+# ⇒ 每轮没有历史，模型看不到上文，而所有指标正常）。
+sqlalchemy>=2.0
 
 # ---- RAG：检索（src/retrieval.py）----
 scikit-learn>=1.4
@@ -68,10 +91,15 @@ tiktoken>=0.7                # 离线 tokenizer 兜底(拉不到 HF tokenizer �
 # ---- 测试 ----
 pytest>=8.0
 httpx>=0.27                  # fastapi.testclient（tests/test_api.py）依赖
-# 进程内假 Redis：让共享后端（限流/配额）的代码路径**在没有真实 Redis 的环境里也能被断言**。
-# 这正是它长期"从未实测"的原因 —— 依赖一个需要在 CI 里额外起容器/服务的前提。
-# fakeredis 也支持多客户端共享同一个 FakeServer，因此能验证"两个实例共享计数"这个核心语义。
+# 进程内假 Redis：让共享后端（限流/配额/会话白名单）的代码路径**在没有真实 Redis 的
+# 环境里也能被断言**。这正是它长期"从未实测"的原因 —— 依赖一个需要在 CI 里额外起容器/服务的前提。
+# fakeredis 也支持多客户端共享同一个 FakeServer，因此能验证"两个实例共享计数/会话"这个核心语义。
 fakeredis>=2.20
+# ⚠️ fakeredis 执行 Lua（EVAL）**必须**有 lupa，否则返回
+# `ResponseError: unknown command 'eval'` —— 看起来像环境噪声而不是缺依赖。
+# 而 `app/auth.py` 的 `touch`（条件续期）与 `pop`（GETDEL）走的都是 Lua，
+# 少了它这两条安全语义就退化成"无法断言"（见 tests/test_session_redis.py 的 _HAS_LUA）。
+lupa>=2.0
 
 # ---- 可选：装了更准，不装也能跑（自动回退标点正则）----
 # nltk>=3.8                  # 英文断句更准；未安装/无 punkt 数据时回退正则

@@ -1,0 +1,82 @@
+# Ruff 配置（工具本身在 requirements-dev.txt，**不进生产镜像**）
+#
+# 为什么单独一份 `ruff.toml`，而不是塞进 `pyproject.toml`
+# -------------------------------------------------------
+# 本仓库没有 `pyproject.toml` —— 它不是可安装的包（部署是
+# `pip install -r requirements.txt` + Dockerfile）。为一个 linter 新建一个
+# "会被所有工具解读"的根文件，收益是零、影响面却不确定（构建后端发现、
+# pytest rootdir 判定都可能被它改变）。`ruff.toml` 的配置优先级**高于**
+# `pyproject.toml`，所以将来真加了 pyproject.toml 也不会被它悄悄接管。
+#
+# 为什么 `select` 是**显式列出**的，不用默认值
+# -------------------------------------------
+# 默认集随 ruff 版本变。实测：ruff 0.16 的默认集比旧版宽得多，同一份代码
+# 从"零报错"变成 **746 个**。显式声明才能让"升级 ruff"变成一次有意识的决定，
+# 而不是某天 CI 突然红一片、然后有人急着加 `# noqa` 把它压下去。
+
+target-version = "py313"
+
+# 只在 isort 的折行决策上起作用（本配置**不**检查 E501 行长，理由见下）。
+# 取 120 是为了少折行：折行会把 import 块整块重排，diff 一变大就看不出
+# "到底改了什么"。
+line-length = 120
+
+extend-exclude = [
+    "tmp_probe",    # 一次性探针脚本，不是交付物
+    "backups",
+    "models",
+    "examples",     # 教程原型，刻意保持"能看懂的写法"（见 PROJECT_STRUCTURE.md）
+    "notebooks",
+    ".workbuddy",
+]
+
+[lint]
+# 选规则的原则：**只开那些"报了就是真问题"或"报了就没有争议"的**。
+# 每条后面的理由是"为什么值得让 CI 为它变红"，而不是"它属于某个类别"。
+select = [
+    "E4",   # 导入层面的错（重复导入、通配导入……）
+    "E7",   # 语句层面的错（`==` 当赋值用、一行多语句……）
+    "E9",   # 语法级错误（运行到才会炸的那种）
+    "F",    # pyflakes：未使用的导入/变量、未定义的名字 —— 全是**真错**，不是风格偏好
+    "I",    # 导入排序：让 review 不用再讨论顺序，也消掉"合并时谁先谁后"的冲突
+    "UP",   # pyupgrade：跟着语言版本（本项目 3.13）淘汰旧写法
+    "B",    # flake8-bugbear：那些"看起来对、其实会咬人"的写法
+    "C4",   # 推导式简化
+    "SIM",  # 等价但更简的写法
+]
+ignore = [
+    # 嵌套 `with` 在**内层表达式依赖外层资源**时不可合并：
+    #   with psycopg.connect(...) as conn:
+    #       with conn.cursor() as cur:      # 合并后 `conn` 还没绑定 ⇒ 直接 NameError
+    # 实测本仓库 16 处里有 9 处正是这种依赖关系（ruff 同样不给自动修）。
+    # 留着这条会逼人对每一处做语义判断，而"合并嵌套 with"本身并不指向任何缺陷。
+    "SIM117",
+    # `try/except X: pass` → `contextlib.suppress(X)`。两者**语义完全等价**，
+    # 收益只是少写两行；代价是这 10 处散落在 10 个不同模块里，每一处都要新加一次
+    # `import contextlib`（其中 3 处还带着 `# noqa: BLE001`，得同步删掉）。
+    # 在"引入 lint"这一次提交里，它会贡献 20 处纯格式改动，把真正有意义的那些
+    # （注解现代化、导入排序、死变量）淹没在 diff 里。想开它随时可以单独一轮做。
+    "SIM105",
+]
+# 刻意**没有**开的几条，以及理由
+# ------------------------------
+#   E501(行长)  —— 881 处超长行。改它意味着把大段中文注释重新折行，diff 会淹没
+#                  真正的改动。行长的价值在 review 时人眼就能发现，不需要机器拦。
+#   RUF001/2/3  —— "注释里有歧义 Unicode 字符"。本项目注释与字符串大量使用中文
+#                  全角标点（，。：（）），这条会报 **26000+** 处，且全是误报。
+#   S(bandit)   —— 已经在 CI 的 `security` job 里跑 bandit 本体；在 lint 层再来
+#                  一遍只会让同一条问题有两个出处、两个不同的处置口径。
+#   LOG015      —— 要求用 `logging.getLogger(__name__)` 而不是模块级 `logging.xxx`。
+#                  本项目的日志配置是集中式 setup（app/logging_setup.py），
+#                  按 logger 名分流不是当前设计，改 235 处属于**改设计**，
+#                  不该混在"引入 lint"这一轮里。
+
+[lint.per-file-ignores]
+# E402 = 模块级 import 不在文件顶部。这两处都是**有意为之**，不是疏忽：
+"app/main.py" = ["E402"]           # 先 load_dotenv()，之后才 import 读环境变量的模块
+"scripts/eval_quick.py" = ["E402"]  # 先把自己加进 sys.path，才能 import src.*
+
+[lint.isort]
+# 让 isort 知道哪些是"本项目自己的包"，否则它会把 `from src.x import y`
+# 当成第三方、排到 `import pytest` 后面（那会产生一次纯噪音的重排）。
+known-first-party = ["app", "src", "scripts", "tests"]

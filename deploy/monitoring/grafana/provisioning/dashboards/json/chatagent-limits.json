@@ -184,7 +184,7 @@
       "id": 8,
       "type": "timeseries",
       "title": "安全与降级事件",
-      "description": "tenant_mismatch = 自报租户与 Key 绑定的租户不符（403）；session_owner_mismatch = 读别人的 thread_id（404，fail-closed）；shared_backend_errors = Redis 不可用退回进程内计数（此时多副本下的配额不再精确）。",
+      "description": "tenant_mismatch = 请求头 X-Tenant-Id 与 JWT 载荷里的租户不符（403，只由用户令牌路径产生）；session_owner_mismatch = 读别人的 thread_id（404，fail-closed）；shared_backend_errors = Redis 不可用退回进程内计数（此时多副本下的配额不再精确）。",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
       "targets": [

@@ -155,11 +155,25 @@ def _human(n):
 # ---------------------------------------------------------------------------
 # 备份
 # ---------------------------------------------------------------------------
+def _discard(path: str) -> None:
+    """尽力删掉中间产物 —— 删不掉也不该掩盖真正的失败原因。"""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def do_backup(cfg: Config, out_dir=None) -> str:
     """执行一次备份，返回文件路径。
 
     用 `-Fc`（custom format）：自带压缩、支持 pg_restore 选择性恢复与并行恢复。
     写完会校验文件确实非空且 pg_restore 能解析它 —— 空文件是"看起来成功了"的经典陷阱。
+
+    ⚠️ 先写 `.part`，校验通过后再 `os.replace` **原子改名**（2026-10-06 修）。
+    不能直接写最终文件名：被 SIGKILL / 断电 / 磁盘满打断时，最终文件名下会留下一个
+    **截断的 dump**，而它从名字上看和"一份新备份"完全一样 —— RUNBOOK 排查备份告警的
+    第一步就是 `ls -lt backups/ | head`，会把最上面那行当成最近的成功备份，
+    甚至可能有人拿它去恢复。用 `.part` 之后，半截文件不可能被误认成备份。
     """
     mode = cfg.choose("pg_dump")
     out_dir = out_dir or cfg.backup_dir
@@ -167,20 +181,19 @@ def do_backup(cfg: Config, out_dir=None) -> str:
     path = os.path.join(out_dir, f"chatagent_{_stamp()}.dump")
 
     cmd = cfg.base_cmd("pg_dump", mode) + ["-d", cfg.dbname, "-Fc"]
-    with open(path, "wb") as fh:
+    part = path + ".part"
+    with open(part, "wb") as fh:
         r = subprocess.run(cmd, stdout=fh, stderr=subprocess.PIPE, env=cfg._env())
     if r.returncode != 0:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        _discard(part)
         raise SystemExit(f"pg_dump 失败（exit {r.returncode}）：\n{r.stderr.decode(errors='replace')}")
 
-    size = os.path.getsize(path)
+    size = os.path.getsize(part)
     if size == 0:
-        os.remove(path)
+        _discard(part)
         raise SystemExit("pg_dump 成功退出但产出空文件：请检查库名/权限。")
 
+    os.replace(part, path)          # 同一目录内的改名是原子操作
     print(f"备份完成：{path}（{_human(size)}，通道={mode}）")
     return path
 
@@ -216,14 +229,26 @@ def do_list(cfg: Config):
     if not os.path.isdir(d):
         print(f"备份目录不存在：{d}")
         return
+
+    # 中断残留：`.part` 是"写到一半没成功改名"的中间产物（见 `do_backup`）。
+    # 单独报出来，是因为它**不该长期存在** —— 有它就说明上一次备份被打断过。
+    # 不报的话，这些文件会安静地堆在备份目录里占空间，而没人知道备份曾经中断。
+    leftovers = sorted(f for f in os.listdir(d) if f.endswith(".part"))
+
     files = sorted(f for f in os.listdir(d) if f.endswith(".dump"))
     if not files:
         print(f"备份目录为空：{d}")
-        return
-    print(f"备份目录：{d}")
-    for f in files:
-        p = os.path.join(d, f)
-        print(f"  {f}  {_human(os.path.getsize(p))}  {datetime.datetime.fromtimestamp(os.path.getmtime(p)):%Y-%m-%d %H:%M}")
+    else:
+        print(f"备份目录：{d}")
+        for f in files:
+            p = os.path.join(d, f)
+            print(f"  {f}  {_human(os.path.getsize(p))}  {datetime.datetime.fromtimestamp(os.path.getmtime(p)):%Y-%m-%d %H:%M}")
+
+    if leftovers:
+        print(f"⚠️ 有 {len(leftovers)} 个中断残留（上次备份没跑完就被打断了）：")
+        for f in leftovers:
+            print(f"  {f}")
+        print("   它们**不是**备份，可以删掉；但请先看那次备份为什么中断（磁盘满？容器被杀？）。")
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +334,7 @@ def do_drill(cfg: Config) -> bool:
         raise SystemExit(
             f"建临时库失败：{type(e).__name__}: {e}\n"
             "（需要 CREATE DATABASE 权限；容器镜像的 POSTGRES_USER 默认就是超级用户）"
-        )
+        ) from e
 
     try:
         print("=== 4/5 恢复到临时库 ===")

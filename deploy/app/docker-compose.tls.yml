@@ -1,0 +1,53 @@
+# TLS 覆盖文件：把明文入口换成 HTTPS（443 + HSTS + 80 跳转）。
+#
+# 用法
+# ----
+#   docker compose --env-file .env \
+#     -f deploy/app/docker-compose.yml -f deploy/app/docker-compose.tls.yml up -d
+#
+# 前置：证书。三种取得方式见 `nginx.tls.conf` 文件头（自签 / Let's Encrypt /
+# 由负载均衡卸载 TLS）。默认约定证书落在 `deploy/app/certs/server.crt` 与
+# `server.key`（该目录已在 `.gitignore` 里 —— **私钥绝不能进仓库**）。
+#
+# 为什么要做成"覆盖文件"而不是写进主文件
+# -------------------------------------
+# 主文件是**参考编排**，面向本机/内网联调：明文入口**只绑回环**。
+# 对公网提供服务必须是一个**显式动作** —— 于是"不小心把明文入口暴露到公网"
+# 在结构上不可能发生（主文件根本不绑全网卡）。
+# 一句话：默认安全；要暴露就得动手，动手就会读到这份文件。
+#
+# ⚠️ 为什么用 `!override`（依据 Compose 官方合并规则，不是猜的）
+# ----------------------------------------------------------
+#   https://docs.docker.com/reference/compose-file/merge/
+#   * `ports` 是 unique resource，唯一键 `{ip, target, published, protocol}`。
+#     主文件那条 `127.0.0.1:8080:80` 的 ip 与这里不同 ⇒ 会被**追加**而非替换，
+#     结果是"同时绑 8080 与 80"（staging 文件里踩过同一个坑：
+#     `docker-compose.staging.yml` 的注释记着那次 `address already in use`）。
+#     所以这里显式 `!override`，让发布的端口**恰好**是 80 与 443。
+#   * `volumes` 的唯一键是容器内 `target` 路径 —— 同 target 会自然覆盖，
+#     用 `!override` 只是把意图写明，避免读者去推合并规则。
+#   * 本项目已有多处使用 `!override`（见 staging 覆盖文件），口径一致。
+#
+# ⚠️ TRUST_PROXY_HEADERS
+# ---------------------
+# 若前面还有一层 LB / 云负载均衡（它建 TLS，nginx 只看得到 LB 的对端地址），
+# 必须在 `.env` 里设 `TRUST_PROXY_HEADERS=1`，否则按 IP 的限流
+# （含 `POST /v1/auth/login` 的防爆破闸门）会把**所有用户算成同一个桶** ——
+# 限流与防爆破一起失效，而且没有任何报错。
+# 直连客户端（本文件就是 TLS 终点）时保持 0。
+
+services:
+  nginx:
+    volumes: !override
+      - ./nginx.tls.conf:/etc/nginx/conf.d/default.conf:ro
+      # 证书只读。⚠️ 不要给 `:rw`
+      - ./certs:/etc/nginx/certs:ro
+      # ACME http-01 challenge 的 webroot（Let's Encrypt 续期用）。
+      # `nginx.tls.conf` 里 `location /.well-known/acme-challenge/` 指向这里。
+      - ./certs:/var/www/certbot:ro
+    ports: !override
+      # 80：ACME challenge + 301 跳 HTTPS。**不能省** —— 省了证书就无法用
+      #     http-01 方式续期，而"续期失败"通常要等到证书过期当天才发现。
+      - "80:80"
+      # 443：真正的服务入口
+      - "443:443"

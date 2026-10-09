@@ -1,0 +1,88 @@
+# 依赖自动更新（Dependabot）
+# ==========================
+# 解决什么
+# --------
+# "CI 某天突然变红"是**最晚**才知道依赖出问题的时刻。这份配置把发现提前到
+# "上游发了新版本"：每周检查一次，有更新就开 PR，而不是等某个包爆出 CVE。
+#
+# ⚠️ 合并 pip 的 PR 前**必须多做一步**
+# ------------------------------------
+# 仓库用 `requirements.lock` 钉精确版本（`scripts/lock_requirements.py` 生成，
+# CI 里有门禁），而 Dependabot **不认识**这个文件 —— 它只改 `requirements.txt`
+# 里的 `>=` 声明。于是会出现这种组合：
+#
+#   - 一致性门禁**不会**红：该门禁只校验"声明的包名在 lock 里有没有"，
+#     **不校验版本号**（见 `lock_requirements.py` 的 `check()`）；
+#   - 但 Dockerfile 用 `-c requirements.lock` 安装，lock 里钉的旧版本会与新的
+#     `>=` 约束冲突 ⇒ **镜像构建失败**。
+#
+# 所以合并前请跑一次 `python scripts/lock_requirements.py --write`，把 lock 一起提交。
+# 这是刻意保留的"显式失败"：宁可构建红一次，也不要静默锁着一个已知有漏洞的版本。
+#
+# 分组策略
+# --------
+# 补丁与次版本合并成一个 PR —— 它们的合并风险同量级，而二十多个包各开一个 PR
+# 的结果是**没人看**（等于没开）；**主版本刻意不合并**：它可能带破坏性变更，
+# 必须一个个看、一个个过测试，合在一起会让"是哪个包引入的问题"无法定位。
+# 安全更新单独成组、且不受 `open-pull-requests-limit` 限制（GitHub 的规则），
+# 免得它排在普通版本更新后面被搁置。
+
+version: 2
+
+updates:
+  # ------------------------------------------------------------------
+  # Python 依赖 —— 生产镜像实际安装的就是这一份
+  # ------------------------------------------------------------------
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:30"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "python"]
+    commit-message:
+      prefix: "deps"
+    groups:
+      patch-and-minor:
+        patterns: ["*"]
+        update-types: ["patch", "minor"]
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # ------------------------------------------------------------------
+  # CI 自身用的 action（checkout / setup-python / cosign / trivy / gitleaks 等）
+  # 全合并成一个 PR：它们不参与业务运行，且一次只有几个版本号变化。
+  # ------------------------------------------------------------------
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:30"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 3
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # ------------------------------------------------------------------
+  # 基础镜像：业务镜像与告警网关镜像的 `FROM`
+  # 逐月检查，比 Python 依赖慢 —— 换基础镜像会连带换掉整套系统库，
+  # 属于"必须重建并复验"的一类，节奏本来就不该和包更新一样快。
+  # ------------------------------------------------------------------
+  - package-ecosystem: "docker"
+    directories:
+      - "/deploy/app"
+      - "/deploy/monitoring"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 2
+    labels: ["dependencies", "docker"]
+    commit-message:
+      prefix: "docker"

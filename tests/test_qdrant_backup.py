@@ -54,7 +54,8 @@ def _make_snapshot_bytes(entries=("config.json", "collection/segments/0")) -> by
 
 
 def _args(**kw):
-    base = dict(url="", api_key="", collection="", backup_dir="", file="", keep=7, apply=False)
+    base = {"url": "", "api_key": "", "collection": "", "backup_dir": "",
+            "file": "", "keep": 7, "apply": False}
     base.update(kw)
     return type("A", (), base)()
 
