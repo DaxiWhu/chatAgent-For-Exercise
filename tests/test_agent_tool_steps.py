@@ -1,16 +1,19 @@
-"""第一阶段守卫：动作清单（工具名 / 参数指纹 / 成败 / 耗时）与**成败分辨**。
+"""动作清单的守卫：步骤记录 / 成败分辨（第一阶段）+ 重复计数（第二阶段）。
 
 守的是什么
 ----------
 一个 agent 节点 = 一次完整的运行。这次运行里模型可以来回最多 ``AGENT_MAX_TURNS``
 次，每次都可能在调工具 —— 这些全在节点内部，图不介入、不落检查点。于是从外面只
-看得到"工具调了几次"，看不到"调得对不对"。本组守的就是**让它看得见**的那一小段：
+看得到"工具调了几次"，看不到"调得对不对"、"是不是在原地打转"。本组守的就是
+**让它看得见**的那几小段：
 
 * ``calls_from_response``：从模型响应里取"它请求了哪些工具"；
 * ``StepLog``：按步展开的状态机（``begin`` / ``finish`` / ``fail``）；
 * ``tool_error_handler``：把"失败"在**官方默认错误文本之外**多记一份，且**逐字节**
   不改回给模型的文本（自愈能力不能受影响）；
-* 七处接线（三个 ``function_tool`` + 三个专家 ``as_tool`` + 一个评审 ``as_tool``）。
+* 七处接线（三个 ``function_tool`` + 三个专家 ``as_tool`` + 一个评审 ``as_tool``）；
+* ``StepLog.repeat_counts`` / ``max_repeat``：同一动作被做第二次起计入"重复"并播
+  ``agent_action_repeats_total`` —— **"原地打转"的唯一判据**（见第九组）。
 
 ⚠️ 最值得盯的一条：**失败路径会被两个来源碰到**。官方先把异常转成一句给模型看的
 话，之后 ``on_tool_end`` 照样触发 —— 所以"已经定格为 failed 的那一条"绝不能被
@@ -726,3 +729,178 @@ def test_a_failing_tool_leaves_exactly_one_failed_step(tmp_path, sink):
     assert len(sink.counters("agent_tool_result_total")) == 1, "播报次数不是 1"
     assert out.answer == "答复。"
     assert out.exit_reason != "error"
+
+
+# --------------------------------------------------------------------------- #
+# 九、重复计数（"原地打转"的唯一判据）
+# --------------------------------------------------------------------------- #
+# 为什么盯这一组：打转时**总工具次数不高、重量级动作也不多**（模型在两个动作之间
+# 来回试），所以"跑了多久""调了几个重家伙"都看不出异常。只有"同一个动作被做过
+# 第二次"能把它暴露出来 —— 这里守的就是这个信号既**不缺席**、也**不误报**。
+#
+# 一个动作 = **工具名 + 规范化参数**。按工具名数会把"换个关键词多查几轮"误报成
+# 打转；按参数数才对。所以下面既验"相同的认出来"，也验"不同的别认成一样"。
+def _do(log: StepLog, tool: str, arguments: str, idx: int, *, ok: bool = True) -> None:
+    """走一遍真实顺序做一次动作（成功或失败）。"""
+    _begin(log, tool, arguments, f"c{idx}")
+    if ok:
+        log.finish(tool, f"结果{idx}")
+    else:
+        log.fail(tool, ValueError(f"坏{idx}"))
+        log.finish(tool, "错误文本")
+
+
+def test_no_repeat_when_every_action_differs(sink):
+    """每个动作都不一样 ⇒ 没有重复：清单为空、``max_repeat`` 为 0、**一次都不播**。
+
+    这是"不误报"那一侧。播了不该播的，看板上的"打转"就全是噪声，真打转时反而
+    被淹掉 —— 而这两个状态（真打转 / 没打转）在指标上长得一模一样。
+    """
+    log = StepLog()
+    _do(log, "kb_search", '{"query": "a"}', 1)
+    _do(log, "kb_search", '{"query": "b"}', 2)
+    _do(log, "save_text_asset", '{"name": "n"}', 3)
+
+    assert log.repeat_counts() == {}
+    assert log.max_repeat == 0
+    assert sink.counters("agent_action_repeats_total") == []
+
+
+def test_a_second_identical_action_counts_and_broadcasts_once(sink):
+    """同一动作做第二次 ⇒ 计入重复（``max_repeat == 2``）并**恰好播一次**。"""
+    log = StepLog()
+    _do(log, "kb_search", '{"query": "同一个"}', 1)
+    _do(log, "kb_search", '{"query": "同一个"}', 2)
+
+    assert list(log.repeat_counts().values()) == [2]
+    assert log.max_repeat == 2
+    assert len(sink.counters("agent_action_repeats_total")) == 1
+
+
+def test_every_extra_call_broadcasts_again(sink):
+    """第三次、第四次接着播（口径：**出现第二次起，每多一次算一次重复**）。
+
+    为什么不"达到阈值才播一次"：指标是累计量，每次多出来的一份都要留下痕迹，
+    阈值判断留给读它的人（反思闸门要按 ``AGENT_REFLECT_ON_REPEAT`` 决定何时介入）。
+    若只在跨过阈值那一下播，重复数从 3 涨到 8 的过程就完全看不见了。
+    """
+    log = StepLog()
+    for i in range(1, 5):
+        _do(log, "kb_search", '{"query": "同一个"}', i)
+
+    assert log.max_repeat == 4
+    assert len(sink.counters("agent_action_repeats_total")) == 3
+
+
+def test_a_different_key_order_still_counts_as_the_same_action(sink):
+    """★ 参数相同、**键序不同** ⇒ 仍然是同一个动作，重复要被认出来。
+
+    这是"不缺席"那一侧最实际的失效方式：模型每轮把键序换一下，同一动作看起来
+    就是两个动作 —— 打转信号**恒为 0**，而且没有任何东西会报错。指纹里的规范化
+    （JSON 键排序）是唯一挡住它的地方。
+    """
+    log = StepLog()
+    _do(log, "kb_search", '{"query": "限流", "top_k": 3}', 1)
+    _do(log, "kb_search", '{"top_k": 3, "query": "限流"}', 2)
+
+    assert log.max_repeat == 2
+    assert len(sink.counters("agent_action_repeats_total")) == 1
+
+
+def test_different_arguments_are_not_a_repeat(sink):
+    """参数不同 ⇒ **不算**重复（"换个关键词再查一次"是正常的，不是打转）。"""
+    log = StepLog()
+    _do(log, "kb_search", '{"query": "限流"}', 1)
+    _do(log, "kb_search", '{"query": "配额"}', 2)
+
+    assert log.repeat_counts() == {}
+    assert sink.counters("agent_action_repeats_total") == []
+
+
+def test_the_same_arguments_on_a_different_tool_are_not_a_repeat(sink):
+    """参数一模一样、但工具不同 ⇒ **不算**重复（指纹里含工具名）。
+
+    反例很现实：``kb_search({"query": "x"})`` 与 ``save_text_asset({"query": "x"})``
+    是两件完全不同的事。指纹若不绑工具名，这两条会被算成"同一个动作做了两次"。
+    """
+    log = StepLog()
+    _do(log, "kb_search", '{"q": "same"}', 1)
+    _do(log, "save_text_asset", '{"q": "same"}', 2)
+
+    assert log.repeat_counts() == {}
+    assert sink.counters("agent_action_repeats_total") == []
+
+
+def test_a_failed_action_still_counts_as_a_repeat(sink):
+    """重复的判据是"**动作**又做了一次"，与它成没成**无关** —— 失败也要计入。
+
+    反而更该计入：同一次调用失败后原样重试，正是打转最常见的形态。若只数成功的，
+    最该报警的那种"一直在失败和重试之间撞墙"会恰好被排除在外。
+    """
+    log = StepLog()
+    _do(log, "generate_image", '{"prompt": "p"}', 1)
+    _do(log, "generate_image", '{"prompt": "p"}', 2, ok=False)
+
+    assert log.max_repeat == 2
+    assert len(sink.counters("agent_action_repeats_total")) == 1
+
+
+def test_blank_fingerprint_never_counts_as_a_repeat(sink):
+    """★ 没有指纹的步骤（没配到参数）**不参与**重复计数。
+
+    空指纹是"这一条没拿到参数"的记号，不是"同一动作"的证据。把它们按同一个值
+    归并，三条互不相干的孤立步骤会凭空变成"重复了三次" —— 而这正是最容易被当成
+    真信号去查的那种假警报。
+    """
+    log = StepLog()
+    for _ in range(3):
+        log.begin("orphan")            # 没有 note_calls ⇒ 指纹为空
+        log.finish("orphan", "ok")
+
+    assert [s.fingerprint for s in log.steps] == ["", "", ""]
+    assert log.repeat_counts() == {}
+    assert log.max_repeat == 0
+    assert sink.counters("agent_action_repeats_total") == []
+
+
+def test_repeat_counts_only_lists_actions_done_twice(sink):
+    """``repeat_counts`` 的键只有"做过两次以上"的动作 —— 只做一次的不列。"""
+    log = StepLog()
+    _do(log, "kb_search", '{"query": "重复的"}', 1)
+    _do(log, "kb_search", '{"query": "重复的"}', 2)
+    _do(log, "kb_search", '{"query": "只做一次的"}', 3)
+
+    assert list(log.repeat_counts().values()) == [2]
+    assert len(log.steps) == 3, "清单要留住全部步骤，只有统计口径筛掉一次的"
+
+
+def test_broadcasts_agree_with_the_readable_counts(sink):
+    """★ 播报的次数与"读出来的重复数"**同源**：播报次数 == Σ(每个动作次数 − 1)。
+
+    为什么不厌其烦对这条账：这两处一旦分家（一处按定格前的清单算、另一处按别的
+    口径算），看板上"播了几次"与闸门"读到的重复数"就会对不上 —— 而两边各自都
+    "看着正常"，没有任何东西会报错。这条把它们钉成一个数。
+    """
+    log = StepLog()
+    for i in range(1, 4):                       # x 做 3 次 ⇒ 播 2
+        _do(log, "kb_search", '{"query": "x"}', i)
+    for i in range(4, 6):                       # y 做 2 次 ⇒ 播 1
+        _do(log, "kb_search", '{"query": "y"}', i)
+    _do(log, "kb_search", '{"query": "z"}', 6)  # z 做 1 次 ⇒ 播 0
+
+    counts = log.repeat_counts()
+    assert sorted(counts.values()) == [2, 3]
+    assert sum(n - 1 for n in counts.values()) == 3
+    assert len(sink.counters("agent_action_repeats_total")) == 3
+
+
+def test_repeat_is_not_broadcast_when_disabled(monkeypatch, sink):
+    """关掉步骤记录 ⇒ 重复计数一起关（**跟随** ``AGENT_TOOL_STEPS``，没有独立开关）。"""
+    monkeypatch.setenv("AGENT_TOOL_STEPS", "0")
+    log = StepLog()
+    _do(log, "kb_search", '{"query": "同一个"}', 1)
+    _do(log, "kb_search", '{"query": "同一个"}', 2)
+
+    assert log.steps == []
+    assert log.repeat_counts() == {} and log.max_repeat == 0
+    assert sink.counters("agent_action_repeats_total") == []

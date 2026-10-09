@@ -25,6 +25,16 @@
    几次"（按工具名统计）没有影响，但"哪个参数导致了失败"暂时配不准 ——
    已知限制，不要在这个基础上做因果推断。
 3. **观测失败绝不影响业务**：这张清单的任何一步出问题，都只降级为"这一步没记上"。
+
+重复计数（第二步接在这张清单上）
+--------------------------------
+同一个动作（工具名 + 规范化参数）出现第二次时，播一次
+``agent_action_repeats_total{tool}`` —— 这是"原地打转"**唯一**能被看见的地方：
+打转时**总工具次数不高、重量级动作也不多**（模型在两个动作之间来回试），
+只有"同一动作反复做"能把这种情况暴露出来。
+
+清单侧对应 ``StepLog.repeat_counts()`` / ``StepLog.max_repeat``：下一次反思闸门
+直接读它判"该不该介入"，不必另建一份重复状态 —— 两处分别维护一定会漂。
 """
 
 from __future__ import annotations
@@ -147,7 +157,7 @@ class ToolStep:
     seq: int
     tool: str
     fingerprint: str = ""
-    """「工具名 + 规范化参数」的短哈希 —— 用于发现"同一动作被反复调用"。"""
+    """「工具名 + 规范化参数」的短哈希 —— 重复计数的判据（见 ``StepLog.repeat_counts``）。"""
     call_id: str = ""
     """定位编号。模型请求时给、工具结果带同一个回来 ⇒ 将来"退回第几步"的定位键。"""
     status: str = "running"
@@ -184,6 +194,29 @@ class StepLog:
     def failed(self) -> list[ToolStep]:
         """失败的步骤（兜底出口要用它列"未完成清单"，不要另写一份描述）。"""
         return [s for s in self.steps if s.status == "failed"]
+
+    @property
+    def max_repeat(self) -> int:
+        """同一个动作被做过的最多次数（``0`` / ``1`` 都表示**没有任何动作重复**）。
+
+        判"打转"的现成阈值就是它：反思闸门要的是"有没有一个动作被做过 N 次"。
+        """
+        return max(self.repeat_counts().values(), default=0)
+
+    def repeat_counts(self) -> dict[str, int]:
+        """按指纹统计"同一动作做过几次"，**只列做过两次以上的** ⇒ ``{指纹: 次数}``。
+
+        为什么非要按**指纹**数而不是按工具名：同一个 ``kb_search`` 用不同关键词查十次
+        是正常检索，用同一个关键词查十次才是打转。按工具名数只会把"查得多"误报成
+        "卡住了"，而看板上它俩长得一模一样。
+        ⚠️ 与播报同一口径：只数**已定格**的步骤（有结果才算"做过一次"），于是读出来的
+        数与 ``agent_action_repeats_total`` 播报过的次数同源 —— 两处分别维护一定会漂。
+        """
+        counts: dict[str, int] = {}
+        for step in self.steps:
+            if step.settled and step.fingerprint:
+                counts[step.fingerprint] = counts.get(step.fingerprint, 0) + 1
+        return {fp: n for fp, n in counts.items() if n >= 2}
 
     def as_list(self) -> list[dict]:
         return [s.as_dict() for s in self.steps]
@@ -263,15 +296,26 @@ class StepLog:
                 return _fingerprint(tool, arguments), call_id
         return "", ""
 
+    def _count_settled(self, fingerprint: str) -> int:
+        """**已经定格**的同指纹步骤有几条（调用它的那条自己还没定格）。"""
+        return sum(1 for s in self.steps if s.settled and s.fingerprint == fingerprint)
+
     def _settle(self, step: ToolStep, status: str, detail: Any) -> None:
         """定格一条步骤并**播报一次**（重复调用直接返回，不与业务交互）。"""
         if step.settled:
             return
+        # ⚠️ "这条是不是重复"必须在**设 settled 之前**判：此刻数到的同指纹步骤都是
+        #    **之前**那几次。放到后面就会把自己算进去 ⇒ 每一次调用都被判成重复，
+        #    "打转"指标直接等于总调用数，而症状是"指标看着有数、其实全是噪声"。
+        #    空指纹（没配到参数的步骤）不参与：把它们算作"同一动作"会凭空造出重复。
+        repeated = bool(step.fingerprint) and self._count_settled(step.fingerprint) > 0
         step.settled = True
         step.status = status
         step.detail = _clip(detail)
         step.duration = max(0.0, time.perf_counter() - step.started) if step.started else 0.0
         observability.counter("agent_tool_result_total", tool=step.tool, status=step.status)
+        if repeated:
+            observability.counter("agent_action_repeats_total", tool=step.tool)
         if step.duration:
             observability.histogram(
                 "agent_tool_duration_seconds", step.duration, tool=step.tool

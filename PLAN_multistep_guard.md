@@ -109,9 +109,24 @@
 
 ### 3.3 动作指纹
 
-`指纹 = 短哈希(工具名 + 规范化后的参数)`。规范化 = JSON 键排序、去掉空白。
-用途只有一个：**发现"同一动作重复"**（§2.4 的第 4 个计数）。
-不做跨请求持久化（只在本次运行内存活）。
+`指纹 = 短哈希(工具名 + 规范化后的参数)`。规范化 = JSON 键排序 + 压掉分隔符空白
+（`sort_keys=True` / `separators=(",", ":")`），确保 `{"a":1,"b":2}` 与
+`{"b":2,"a":1}` 落到同一个值。用途只有一个：**发现"同一动作重复"**
+（§3.4 四个计数里的 `repeat`）。不做跨请求持久化（只在本次运行内存活）。
+
+✅ **已落地（2026-10-09，第二步）**。落点与口径：
+
+- `steps.py::_fingerprint`；清单侧 `StepLog.repeat_counts()`（只列**做过两次以上**的
+  `{指纹: 次数}`）与 `StepLog.max_repeat`（最多次数，反思闸门直接读它）。
+- `_settle` 里**在设 `settled` 之前**判"这个指纹之前出现过没有"：设之后再判会把
+  **自己**算进去 ⇒ 每一条都被判成重复，"打转"指标直接等于总调用数。
+- 播报：同一动作**出现第二次起、每多一次播一次** `agent_action_repeats_total{tool}`。
+  口径是整次运行内累计（不设窗口），且与 `repeat_counts()` **同源**（都只数已定格的
+  步骤）⇒ 播报次数恒等于 `Σ(每个动作次数 − 1)`，两处不会各算各的。
+- **跟随 `AGENT_TOOL_STEPS`**，没有独立开关 —— 指纹本来就在步骤清单里，重复次数只是
+  它的派生量，两处分别维护一定会漂。
+- ⚠️ 空指纹（没配到参数的步骤）**不参与**：它是"这一条没拿到参数"的记号，
+  按同一个值归并会让几条互不相干的孤立步骤凭空变成"重复了三次"。
 
 ### 3.4 反思闸门
 
@@ -211,15 +226,19 @@
 
 | 指标 | 类型 | 标签 | 用途 |
 |---|---|---|---|
-| `agent_tool_result_total` | counter | `tool` / `status` | **工具正确率**（缺口一） |
-| `agent_tool_duration_seconds` | histogram | `tool` | 哪个工具慢 |
-| `agent_action_repeats_total` | counter | `tool` | 打转的直接信号 |
+| `agent_tool_result_total` | counter | `tool` / `status` | **工具正确率**（缺口一）✅ 第一步已落地 |
+| `agent_tool_duration_seconds` | histogram | `tool` | 哪个工具慢 ✅ 第一步已落地 |
+| `agent_action_repeats_total` | counter | `tool` | 打转的直接信号 ✅ 第二步已落地 |
 | `agent_reflections_total` | counter | `trigger` / `verdict` | `trigger` ∈ tools/heavy/hops/repeat；`verdict` ∈ ok/problem |
 | `agent_reflection_duration_seconds` | histogram | | 反思自己多慢 |
 | `agent_reflection_timeout_total` | counter | | 反思没跑完 |
 | `agent_reflection_late_total` | counter | | 结论没赶上（白跑） |
 | `agent_recovery_level_total` | counter | `level` | 1 / 2 / 3 各发生几次 |
 | `agent_task_outcome_total` | counter | `outcome` | **任务完成率**（缺口二）：delivered / partial / manual / failed |
+
+⚠️ **前三个已落地，但只看板不告警**：告警（`AgentToolFailureRateHigh` /
+`AgentLoopDetected` / `AgentRecoveryLevel3Frequent`）排在 §7 第 7 步，与其余指标、
+配置、文档一起收口 —— 在那之前它们只是"有数据、没人盯"。
 
 ⚠️ 沿用现有口径约束：`agent` 组序列**只在真走 agent 链路时才有**（没流量时序列不存在，
 而不是报 0）；按 `exit_reason` 聚合的看板**必须带 `agent` 标签**。
@@ -234,7 +253,7 @@
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `AGENT_TOOL_STEPS` | `1` | 第一步的开关：步骤记录 + 成败分辨。**默认开**，理由见下 |
+| `AGENT_TOOL_STEPS` | `1` | 第一 + 二步的开关：步骤记录 / 成败分辨 / **重复计数**。**默认开**，理由见下 |
 | `AGENT_MULTISTEP_GUARD` | `0` | 总开关 |
 | `AGENT_REFLECT_AFTER_TOOLS` | `8` | 工具调用数阈值 |
 | `AGENT_REFLECT_AFTER_HEAVY` | `3` | 重量级动作阈值 |
@@ -249,6 +268,9 @@
 它是**纯观察** —— 不改任何对外可见行为（回给模型的错误文本仍由官方实现产出、
 指标走旁路、记录失败只降级为日志），所以"关掉时与今天一致"它天然满足；
 而**默认关掉等于这个指标永远没有数据**，那正是要修的缺口一。
+第二步的**重复计数跟随它、没有独立开关**（理由见 §3.3 末）：同一个"纯观察"里再切一刀，
+只会多出一种"记录开着但重复数没开"的组合，而那种组合下看板会显示"没有打转"——
+比不显示更糟。
 
 `src/` 侧**直读 `os.getenv`**（与 `session.py` / `compaction.py` 一致，避免 `src/ → app/` 反向依赖）；
 数字用 `src/envutil.py` 的 `env_int/env_float`（带上下界夹取）。
@@ -268,13 +290,23 @@
    `on_llm_end` 的函数调用项，把它的原始形态打一行日志即可 —— **不必等到第 4 步**。
    若发现 `call_id` 在拼好的输入里丢了，第 4 步的形态要改，而那时前面三步已经能用。
    **实测结论见 §8 开头（第 1 条只验到一半，第 2 条已验证）。**
-2. **动作指纹 + 重复计数**（§3.3）—— 打转变得可见。
+2. **动作指纹 + 重复计数**（§3.3）—— ✅ **已完成**（2026-10-09）。
+   落点：`steps.py::StepLog.repeat_counts()` / `max_repeat`；`_settle` 里在设 `settled`
+   **之前**判重复并播 `agent_action_repeats_total{tool}`。**跟随 `AGENT_TOOL_STEPS`**，
+   不引入独立开关。口径：整次运行内累计、同一动作出现第二次起**每多一次播一次**、
+   空指纹不参与。
+   守卫：`tests/test_agent_tool_steps.py` 第九组（11 条）；变异验证 **8 组全部按预测抓到**
+   （每一条都判重复 / 判定放在 `settled` 之后 / 丢指纹判据 / 丢空指纹判据 / 阈值放宽 /
+   指纹不含工具名 / 指纹不排序 / `max_repeat` 数成"有几个动作重复"）。
+   下一步（反思闸门）直接读 `max_repeat` 与 `repeat_counts()` 判"该不该介入"。
 3. **反思闸门**（§3.4）—— 触发、异步、结构化输出、注入。
    先只做"注入"，不做退回。
 4. **三级升级**（§3.5）—— 第 2 级退回需要 `call_id` 定位，见下一条。
 5. **兜底出口**（§3.6）—— 接现有审核通道。
 6. **结构化摘要**（§4）—— 与压缩合并。
-7. 指标 / 告警 / 配置 / 文档 / 守卫。
+7. 指标 / 告警 / 配置 / 文档 / 守卫 —— **收口**。
+   ⚠️ 含 `CHANGELOG.md` 的 `[Unreleased]` 条目：前几步落地时**刻意都没单独补**，
+   避免同一个功能在变更日志里记成半截（"记了指标没记开关"那种）。
 
 ## 8. 风险与落地时必须先验证的点
 
