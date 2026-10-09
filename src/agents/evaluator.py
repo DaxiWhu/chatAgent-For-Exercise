@@ -36,6 +36,7 @@ from agents import Agent, RunResult, RunResultStreaming
 
 from .context import TaskContext
 from .hooks import AGENT_HOOKS
+from .steps import tool_error_handler
 from .types import EvaluationFeedback
 
 __all__ = ["evaluate_draft_tool", "evaluator_agent", "extract_evaluation"]
@@ -97,4 +98,7 @@ evaluate_draft_tool = evaluator_agent.as_tool(
     # ⚠️ hooks 三处都不能省：as_tool 的嵌套 run **不会**继承父 run 的 hooks。
     hooks=AGENT_HOOKS,
     custom_output_extractor=extract_evaluation,
+    # 评审失败（模型没给出可解析的结构化结论）要能看见 —— 否则它只会表现为
+    # "这次没评审"，而"没评审"与"评审没做成"是两件事（前者是模型的选择）。
+    failure_error_function=tool_error_handler("review_draft"),
 )

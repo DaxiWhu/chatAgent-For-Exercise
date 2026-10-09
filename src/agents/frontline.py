@@ -61,6 +61,7 @@ from .specialists import (
     slides_agent,
     visual_agent,
 )
+from .steps import tool_error_handler
 from .tools import save_text_asset
 from .types import FrontlineDecision
 
@@ -106,12 +107,16 @@ frontline_agent = Agent[TaskContext](
         # 继承父 run 的 hooks（SDK 里这是两个独立形参）。漏掉的表现是"专家的模型
         # 调用次数与参与 agent 静默少算"，而模型调用次数正是成本与能力指标的分母 ——
         # 数字看起来完全正常，只是偏小，没有任何告警会响。
+        # ⚠️ ``failure_error_function`` 四处（这里三个 + evaluator 那个）都要给：
+        # 专家整体失败（例如结构化产出解析不出来）时，成败同样要能看见 —— 只覆盖
+        # 专家**内部**的工具不够，那一层失败会静默消失在"专家被调了几次"里。
         researcher_agent.as_tool(
             "research",
             "多步检索取证。输入一个待查证的问题，返回带出处编号的结论列表。"
             "用于回答需要事实依据的问题；不要用它来做文学创作或版式设计。",
             hooks=AGENT_HOOKS,
             custom_output_extractor=extract_research,
+            failure_error_function=tool_error_handler("research"),
         ),
         slides_agent.as_tool(
             "build_slide_deck",
@@ -119,12 +124,14 @@ frontline_agent = Agent[TaskContext](
             "需要一份演示稿时用它；它不写字幕式正文。",
             hooks=AGENT_HOOKS,
             custom_output_extractor=extract_slide_deck,
+            failure_error_function=tool_error_handler("build_slide_deck"),
         ),
         visual_agent.as_tool(
             "make_illustration",
             "生成一张插图并返回资产路径。需要配图时用它；一次只出一张。",
             hooks=AGENT_HOOKS,
             custom_output_extractor=extract_illustration,
+            failure_error_function=tool_error_handler("make_illustration"),
         ),
         # -- 评审：要不要调由模型自己决定（见 evaluator.py 的口径说明）--
         evaluate_draft_tool,

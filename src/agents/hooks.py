@@ -1,4 +1,4 @@
-"""生命周期钩子 → 逐请求统计（官方 ``RunHooks``）。
+"""生命周期钩子 → 逐请求统计 + 动作清单（官方 ``RunHooks``）。
 
 为什么必须有它
 --------------
@@ -16,6 +16,17 @@ agent、发生了哪几次 handoff、工具被调了几次。这些量只有 SDK
 ⚠️ 一个容易漏的事实：``agent.as_tool()`` 的嵌套 run **不会**自动继承父 run 的
 hooks（SDK 源码里 ``as_tool`` 有独立的 ``hooks=`` 形参，默认 None）。所以必须显式
 ``as_tool(..., hooks=AGENT_HOOKS)``，否则 expert 的模型调用次数会**静默少算**。
+
+两条线：统计（按量）与动作清单（按步）
+------------------------------------
+* 统计（``AgentStats``）：**按量**聚合 —— 跑了几次模型、几次工具。
+* 动作清单（``steps.StepLog``）：**按步**展开 —— 每一步调了哪个工具、什么参数、
+  成没成、花了多久。前者回答"多不多"，后者回答"对不对"。
+
+后者为什么光有钩子不够：工具抛异常时官方**先把异常转成一句给模型看的话**，
+``on_tool_end`` 拿到的已经是那句话（实测：失败路径照样触发这个钩子）⇒ 从钩子侧
+分不出"真的成功了"与"收到一句错误文本"。所以成败由**工具自己的错误处理函数**
+先定格，见 ``steps.tool_error_handler``。
 """
 
 from __future__ import annotations
@@ -25,8 +36,9 @@ from typing import Any
 from agents import RunHooks
 
 from .context import AgentStats, TaskContext
+from .steps import StepLog, calls_from_response, steps_enabled
 
-__all__ = ["AgentRunHooks", "AGENT_HOOKS", "stats_of"]
+__all__ = ["AgentRunHooks", "AGENT_HOOKS", "stats_of", "steps_of"]
 
 
 def stats_of(context: Any) -> AgentStats | None:
@@ -42,14 +54,34 @@ def stats_of(context: Any) -> AgentStats | None:
     return None
 
 
+def steps_of(context: Any) -> StepLog | None:
+    """从钩子收到的 context 里取动作清单（与 ``stats_of`` 同一套兜底口径）。"""
+    inner = getattr(context, "context", None)
+    if isinstance(inner, TaskContext):
+        return inner.steps
+    return None
+
+
 class AgentRunHooks(RunHooks[TaskContext]):
-    """把 SDK 的生命周期事件累计进 ``TaskContext.stats``。"""
+    """把 SDK 的生命周期事件累计进 ``TaskContext``（统计 + 动作清单）。"""
 
     async def on_llm_start(self, context, agent, system_prompt, input_items) -> None:
         """每一次 LLM 调用前触发。**这就是 ``max_turns`` 计数的那个单位。**"""
         stats = stats_of(context)
         if stats is not None:
             stats.model_calls += 1
+
+    async def on_llm_end(self, context, agent, response) -> None:
+        """每一次 LLM 调用**之后**触发（拿到这一次的响应）。
+
+        这里取的是"模型请求了哪些工具" —— 工具的两个钩子都**不带参数、也不带定位
+        编号**，所以工具入参只能从响应这一侧取（从工具钩子那一侧取不到）。
+        """
+        if not steps_enabled():
+            return
+        log = steps_of(context)
+        if log is not None:
+            log.note_calls(calls_from_response(response))
 
     async def on_agent_start(self, context, agent) -> None:
         """当前 agent 变更时触发（含首次）。"""
@@ -82,6 +114,21 @@ class AgentRunHooks(RunHooks[TaskContext]):
         stats = stats_of(context)
         if stats is not None:
             stats.tool_calls += 1
+        log = steps_of(context)
+        if log is not None:
+            log.begin(getattr(tool, "name", "") or "")
+
+    async def on_tool_end(self, context, agent, tool, result) -> None:
+        """本地工具执行结束。
+
+        ⚠️ **失败路径也会走到这里** —— 官方把异常转成一句给模型看的话之后，照样
+        触发这个钩子（实现在 SDK 的 ``run_internal/tool_execution.py``）。所以
+        成败**不在这里判**：失败由工具自己的错误处理函数先定格（见
+        ``steps.tool_error_handler``），这里只做收尾；对已定格的条目不会重复播报。
+        """
+        log = steps_of(context)
+        if log is not None:
+            log.finish(getattr(tool, "name", "") or "", result)
 
 
 AGENT_HOOKS = AgentRunHooks()

@@ -34,6 +34,7 @@ from ..envutil import env_int
 from ..rag import guard
 from ..rag.retrieval import build_citations
 from .context import TaskContext
+from .steps import tool_error_handler
 
 __all__ = ["generate_image", "kb_search", "render_deck", "render_slide_deck", "save_text_asset"]
 
@@ -58,7 +59,7 @@ def _ensure_dir(path: Path) -> Path:
 # --------------------------------------------------------------------------- #
 # 检索：真实知识库（按租户分片的检索器由上下文注入）
 # --------------------------------------------------------------------------- #
-@function_tool
+@function_tool(failure_error_function=tool_error_handler("kb_search"))
 def kb_search(ctx: RunContextWrapper[TaskContext], query: str, top_k: int = DEFAULT_TOP_K) -> str:
     """在知识库里检索与 query 相关的原文片段，返回带出处编号（形如 [1]）的条目。
 
@@ -121,7 +122,7 @@ def kb_search(ctx: RunContextWrapper[TaskContext], query: str, top_k: int = DEFA
 # --------------------------------------------------------------------------- #
 # 落盘：确定性步骤
 # --------------------------------------------------------------------------- #
-@function_tool
+@function_tool(failure_error_function=tool_error_handler("save_text_asset"))
 def save_text_asset(ctx: RunContextWrapper[TaskContext], name: str, content: str) -> str:
     """把一段文本落盘成资产文件，返回资产路径。
 
@@ -141,7 +142,7 @@ def save_text_asset(ctx: RunContextWrapper[TaskContext], name: str, content: str
     return str(path)
 
 
-@function_tool
+@function_tool(failure_error_function=tool_error_handler("generate_image"))
 def generate_image(ctx: RunContextWrapper[TaskContext], prompt: str, style: str = "flat") -> str:
     """按画面描述生成一张插图，返回资产路径。
 

@@ -45,6 +45,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .steps import StepLog
+
 __all__ = ["AgentStats", "CARRY_ACROSS_NODES", "TaskContext", "RUN_LOCAL", "stats_from_dict"]
 
 
@@ -224,6 +226,14 @@ class TaskContext:
     """
 
     stats: AgentStats = field(default_factory=AgentStats)
+
+    steps: StepLog = field(default_factory=StepLog)
+    """本次运行的动作清单（工具名 / 参数指纹 / 成败 / 耗时）。
+
+    ⚠️ 与 ``stats`` 一样**不进 LangGraph state**（不是可序列化类型），且
+    **不跨 agent 节点** —— 一次请求里每个 agent 节点各建一份 ``TaskContext``。
+    理由与边界见 ``steps`` 模块的 docstring。
+    """
 
     def record(self, kind: str, value: Any) -> None:
         """登记一项产出。幂等：同种产出只保留最新一次。"""
