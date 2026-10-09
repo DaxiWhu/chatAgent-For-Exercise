@@ -31,7 +31,8 @@ import logging
 import os
 import re
 import time
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +287,7 @@ def _cache_path(image_bytes: bytes) -> str:
     return os.path.join(root, f"{sha}.json")
 
 
-def _read_cache(image_bytes: bytes) -> Optional[dict]:
+def _read_cache(image_bytes: bytes) -> dict | None:
     """读缓存的描述结果，未命中或解析失败返回 None。
 
     image_bytes: 图片字节（透传 _cache_path 算键）。
@@ -299,7 +300,7 @@ def _read_cache(image_bytes: bytes) -> Optional[dict]:
     if not os.path.isfile(p):
         return None
     try:
-        with io.open(p, "r", encoding="utf-8") as fh:
+        with open(p, encoding="utf-8") as fh:
             data = json.load(fh)
         data["cached"] = True
         return data
@@ -320,7 +321,7 @@ def _write_cache(image_bytes: bytes, result: dict) -> None:
     try:
         p = _cache_path(image_bytes)
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        with io.open(p, "w", encoding="utf-8") as fh:
+        with open(p, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(result, ensure_ascii=False, indent=2))
     except Exception as exc:  # noqa: BLE001
         logger.warning("VLM 缓存写入失败（不影响结果）：%s", exc)
@@ -443,8 +444,8 @@ def _call_api(messages: list) -> tuple[str, dict]:
     return text, usage
 
 
-def describe(path: str, context: Optional[dict] = None, *,
-             call: Optional[Callable] = None, use_cache: bool = True) -> dict:
+def describe(path: str, context: dict | None = None, *,
+             call: Callable | None = None, use_cache: bool = True) -> dict:
     """描述一张图。返回结构化结果（含 issues / usage / cached）。
 
     path: 图片文件路径。扩展名落在 VECTOR_EXTS 时直接返回 error（不读盘）。
@@ -475,7 +476,7 @@ def describe(path: str, context: Optional[dict] = None, *,
         if hit:
             return hit
         # 兼容早期用原始文件字节做键写下的缓存
-        with io.open(path, "rb") as fh:
+        with open(path, "rb") as fh:
             hit = _read_cache(fh.read())
         if hit:
             return hit
@@ -568,8 +569,8 @@ def context_for(chunks: list, index: int) -> dict:
             "predicted_class": pred}
 
 
-def enrich(chunks: list, *, describer: Optional[Callable] = None,
-           max_images: Optional[int] = None) -> dict:
+def enrich(chunks: list, *, describer: Callable | None = None,
+           max_images: int | None = None) -> dict:
     """就地为需要 VLM 的块补描述。返回统计（供日志与脚本使用）。
 
     chunks: 块列表（KnowledgeChunk 对象），**就地改写** —— 写 vlm_desc、

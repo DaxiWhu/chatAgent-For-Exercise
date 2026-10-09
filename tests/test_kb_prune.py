@@ -38,9 +38,8 @@ def _load(path: Path, name: str):
 
 
 import src.rag.kb_inventory as kb  # noqa: E402
-from src.rag.vector_store import PgVectorStore, SOURCE_KEY_SQL, chunk_fingerprint  # noqa: E402
 from src.rag.qdrant_store import QdrantStore  # noqa: E402
-
+from src.rag.vector_store import SOURCE_KEY_SQL, PgVectorStore, chunk_fingerprint  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 1. 源清单扫描
@@ -328,7 +327,11 @@ class FakeStore:
 
     def __init__(self, rows, tenants=None):
         self.rows = list(rows)
-        self.tenants = list(tenants if tenants is not None else ["", ])
+        # `list_tenants()` 的默认返回值 = "库里只有一个没有租户名的分区"。
+        # 它对应**真实库里那批老数据**（payload 里没写 `tenant`），而脚本拿到
+        # 这个清单后会再用一个 `tenant=None`（不过滤）的句柄去扫它 —— 所以
+        # 下面 `holder` 的默认键也是 `None`，两者必须对得上。
+        self.tenants = list(tenants if tenants is not None else [None])
         self.deleted = []
 
     def list_rows(self):
@@ -352,7 +355,12 @@ def prune(monkeypatch):
     mod = _load(PRUNE_SCRIPT, "kb_prune_under_test")
     holder = {}
 
-    def _fake(tenant=""):
+    def _fake(tenant=None):
+        """与真实 `_make_store` **同一个默认值**（`None` = 不过滤）。
+
+        ⚠️ 默认值写 `""` 会让"探测句柄"悄悄取到一个真实租户的句柄 —— 而探测与
+        遍历用同一个键时，`tenants=["t1","t2"]` 那种用例会静默退化成"只清了一个".
+        """
         store = holder.get(tenant)
         if store is not None:
             return store, ""
@@ -373,12 +381,12 @@ def _run(mod, argv, capsys):
 
 def test_script_refuses_when_corpus_is_empty(tmp_path, prune, capsys):
     """★ 语料目录扫不到文件时**拒绝执行**（退出码 2）—— 照常比对会清空全库。"""
-    prune.holder[""] = FakeStore([("", "a.md", "h")])
+    prune.holder[None] = FakeStore([("", "a.md", "h")])
     code, _out, err = _run(prune, ["--docs", str(tmp_path), "--apply"], capsys)
     assert code == 2
     assert "拒绝执行" in err
     assert "挂" in err, "提示必须指向「语料没挂进容器」这个最常见成因"
-    assert prune.holder[""].deleted == [], "拒绝执行时绝不允许发出任何删除"
+    assert prune.holder[None].deleted == [], "拒绝执行时绝不允许发出任何删除"
 
 
 def test_script_refuses_missing_corpus_dir(tmp_path, prune, capsys):
@@ -397,7 +405,7 @@ def test_script_dry_run_reports_without_deleting(tmp_path, prune, capsys):
     (tmp_path / "a.md").write_text("x", encoding="utf-8")
     store = FakeStore([("", "a.md", kb.file_digest(tmp_path / "a.md")),
                        ("", "gone.md", "h")])
-    prune.holder[""] = store
+    prune.holder[None] = store
     code, out, _err = _run(prune, ["--docs", str(tmp_path)], capsys)
     assert code == 0
     assert "源已消失 1 份" in out and "[dry-run]" in out
@@ -408,7 +416,7 @@ def test_script_apply_deletes_missing_but_keeps_stale(tmp_path, prune, capsys):
     """★ 默认只删「源已消失」；「内容已变」必须先灌新再删（避免知识库空窗）。"""
     (tmp_path / "a.md").write_text("x", encoding="utf-8")
     store = FakeStore([("", "a.md", "stale-hash"), ("", "gone.md", "h")])
-    prune.holder[""] = store
+    prune.holder[None] = store
     code, out, _err = _run(prune, ["--docs", str(tmp_path), "--apply"], capsys)
     assert code == 0
     assert store.deleted == [["gone.md"]]
@@ -419,7 +427,7 @@ def test_script_apply_deletes_missing_but_keeps_stale(tmp_path, prune, capsys):
 def test_script_include_stale_deletes_both(tmp_path, prune, capsys):
     (tmp_path / "a.md").write_text("x", encoding="utf-8")
     store = FakeStore([("", "a.md", "stale-hash"), ("", "gone.md", "h")])
-    prune.holder[""] = store
+    prune.holder[None] = store
     code, _out, _err = _run(prune, ["--docs", str(tmp_path), "--apply",
                                     "--include-stale"], capsys)
     assert code == 0
@@ -430,7 +438,7 @@ def test_script_never_deletes_rows_without_hash(tmp_path, prune, capsys):
     """老数据（无指纹）永远不进删除清单 —— 端到端再确认一次。"""
     (tmp_path / "a.md").write_text("x", encoding="utf-8")
     store = FakeStore([("", "a.md", "")])
-    prune.holder[""] = store
+    prune.holder[None] = store
     code, out, _err = _run(prune, ["--docs", str(tmp_path), "--apply",
                                    "--include-stale"], capsys)
     assert code == 0
@@ -442,7 +450,7 @@ def test_script_json_output_is_machine_readable(tmp_path, prune, capsys):
     import json as _json
 
     (tmp_path / "a.md").write_text("x", encoding="utf-8")
-    prune.holder[""] = FakeStore([("", "gone.md", "h")])
+    prune.holder[None] = FakeStore([("", "gone.md", "h")])
     code, out, _err = _run(prune, ["--docs", str(tmp_path), "--json"], capsys)
     assert code == 0
     data = _json.loads(out)
@@ -455,7 +463,7 @@ def test_script_json_output_is_machine_readable(tmp_path, prune, capsys):
 def test_script_all_tenants_walks_every_tenant(tmp_path, prune, capsys):
     """多租户必须逐个租户清理 —— 一条不限租户的删除会跨租户误删。"""
     (tmp_path / "a.md").write_text("x", encoding="utf-8")
-    prune.holder[""] = FakeStore([], tenants=["t1", "t2"])
+    prune.holder[None] = FakeStore([], tenants=["t1", "t2"])
     prune.holder["t1"] = FakeStore([("t1", "gone1.md", "h")])
     prune.holder["t2"] = FakeStore([("t2", "gone2.md", "h")])
     code, out, _err = _run(prune, ["--docs", str(tmp_path), "--apply",
@@ -469,7 +477,7 @@ def test_script_all_tenants_walks_every_tenant(tmp_path, prune, capsys):
 def test_script_all_tenants_with_no_data_still_succeeds(tmp_path, prune, capsys):
     """表存在但还没数据：走一遍、报「源已消失 0 份」，退出码仍是 0（不是错误）。"""
     (tmp_path / "a.md").write_text("x", encoding="utf-8")
-    prune.holder[""] = FakeStore([], tenants=[])
+    prune.holder[None] = FakeStore([], tenants=[])
     code, out, _err = _run(prune, ["--docs", str(tmp_path), "--all-tenants"], capsys)
     assert code == 0 and "源已消失 0 份" in out
 
@@ -486,7 +494,55 @@ def test_script_exit_1_when_store_explodes(tmp_path, prune, capsys):
         def list_rows(self):
             raise RuntimeError("connection refused")
 
-    prune.holder[""] = Boom([])
+    prune.holder[None] = Boom([])
     code, _out, err = _run(prune, ["--docs", str(tmp_path)], capsys)
     assert code == 1
     assert "清理失败" in err and "connection refused" in err
+
+
+def test_script_without_tenant_cleans_every_partition(tmp_path, prune, capsys):
+    """★ 不给 `--tenant` 时清理对象是**库里出现过的每个租户**，不是某一个分区。
+
+    为什么单钉一条：脚本的"默认范围"曾经是"整个库"（那时空串等于不过滤）。
+    口径反转后如果不显式处理，默认值会经身份归一化落到 `RAG_TENANT` —— 表现是
+    **只清公共分区、别的租户的孤儿一条都不碰**，而输出看起来完全正常。
+    """
+    (tmp_path / "a.md").write_text("x", encoding="utf-8")
+    prune.holder[None] = FakeStore([], tenants=["t1", "t2"])
+    prune.holder["t1"] = FakeStore([("t1", "gone1.md", "h")])
+    prune.holder["t2"] = FakeStore([("t2", "gone2.md", "h")])
+
+    code, _out, _err = _run(prune, ["--docs", str(tmp_path), "--apply"], capsys)
+
+    assert code == 0
+    assert prune.holder["t1"].deleted == [["gone1.md"]]
+    assert prune.holder["t2"].deleted == [["gone2.md"]], \
+        "不给 --tenant 时漏掉了别的分区（默认范围被收窄了）"
+
+
+def test_script_tenant_flag_is_a_literal_partition_name(tmp_path, prune, capsys):
+    """★ `--tenant` 是**字面**分区名，不做身份归一化。
+
+    `--tenant ""` 要清的正是"没有租户名"那批老数据所在的分区。若这里改走
+    `resolve_tenant`，空串会被归一成公共租户 / 哨兵值 ⇒ 脚本去清一个空分区，
+    打印"源已消失 0 份"、退出码 0 —— **在什么都没做的情况下报成功**。
+    """
+    (tmp_path / "a.md").write_text("x", encoding="utf-8")
+    prune.holder[""] = FakeStore([("", "gone.md", "h")])
+
+    code, _out, _err = _run(
+        prune, ["--docs", str(tmp_path), "--apply", "--tenant", ""], capsys)
+
+    assert code == 0
+    assert prune.holder[""].deleted == [["gone.md"]], \
+        "`--tenant \"\"` 没落到空串分区（说明被归一化成了别的分区名）"
+
+
+def test_script_refuses_conflicting_scope_flags(tmp_path, prune, capsys):
+    """`--tenant` 与 `--all-tenants` 同时给出时必须拒绝 —— 两者语义互斥。"""
+    (tmp_path / "a.md").write_text("x", encoding="utf-8")
+    code, _out, err = _run(
+        prune, ["--docs", str(tmp_path), "--tenant", "public", "--all-tenants"],
+        capsys)
+    assert code == 2
+    assert "不能同时给" in err

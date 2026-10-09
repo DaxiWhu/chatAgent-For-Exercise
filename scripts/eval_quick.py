@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """快速检索评测：一个进程内跑完「旧切分 vs 新切分」× 多后端 × 有无前缀。
 
 与 eval_retrieval.py 的区别：查询向量一次性批量算好，不再每条查询发一次 HTTP，
@@ -16,11 +15,13 @@ sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 
 import numpy as np
-import src.rag.retrieval as R
 from langchain_openai import OpenAIEmbeddings
 
+import src.rag.retrieval as R
+
 EN = "Represent this sentence for searching relevant passages: "
-SET = json.load(open(os.path.join("scripts", "eval_set.json"), encoding="utf-8"))
+with open(os.path.join("scripts", "eval_set.json"), encoding="utf-8") as _fh:
+    SET = json.load(_fh)
 QUERIES = SET["queries"]
 
 
@@ -38,7 +39,7 @@ def rrf(lists, k=60):
 
 def report(name, ranks, chunks):
     g = defaultdict(lambda: {"n": 0, "t1": 0, "t3": 0, "rr": 0.0})
-    for q, idxs in zip(QUERIES, ranks):
+    for q, idxs in zip(QUERIES, ranks, strict=False):
         expect = set(q["expect"])
         qtype = q.get("type", "literal")
         srcs = [chunks[i]["source"] for i in idxs[:3]]

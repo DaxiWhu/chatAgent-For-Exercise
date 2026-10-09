@@ -56,6 +56,7 @@ if ROOT not in sys.path:
 os.chdir(ROOT)
 
 import src.rag.retrieval as R  # noqa: E402
+from scripts.eval_backend import local_eval  # noqa: E402
 
 DEFAULT_SET = os.path.join("scripts", "eval_answer_set.json")
 
@@ -175,6 +176,15 @@ def main():
         print("评测集里没有 cases —— 空评测会给出满分，必须当成失败", file=sys.stderr)
         return 2
 
+    # ⚠️ 整段评测罩在**锁定的本地口径**下（见 `scripts/eval_backend.py`）。不锁的话
+    #    数字随开发机 `.env` 走 hybrid、CI 走 bm25 —— 同一份代码两个结论且两边都不报错，
+    #    而阈值只按 bm25 校准过。锁必须罩住**检索调用**（查询侧前缀是查询时读的模块常量），
+    #    所以开在装配之前、关在评测之后。
+    with local_eval():
+        return _evaluate_and_report(args, docs_dir, cases)
+
+
+def _evaluate_and_report(args, docs_dir, cases):
     chunks = R.load_chunks(docs_dir)
     if not chunks:
         # 语料为空是**静默失败**：检索恒无结果，但如果不显式拦住，
@@ -190,7 +200,8 @@ def main():
         print(json.dumps({"summary": summary, "details": details},
                          ensure_ascii=False, indent=2))
     else:
-        print(f"语料：{docs_dir}（{len(chunks)} 个片段）｜用例：{summary['cases']} 条")
+        print(f"语料：{docs_dir}（{len(chunks)} 个片段）｜用例：{summary['cases']} 条"
+              f"｜口径：{R.EMBEDDING_BACKEND}（钉死，与 CI 一致）")
         print(f"  来源覆盖   {summary['source_coverage']:.3f}")
         print(f"  关键点覆盖 {summary['keypoint_coverage']:.3f}")
         print(f"  引用可回溯 {summary['traceable_rate']:.3f}")

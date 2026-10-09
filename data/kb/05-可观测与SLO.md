@@ -23,7 +23,7 @@
 | `client_disconnected_total` | counter | 客户端提前断开次数 |
 | `rate_limited_total` | counter | 被限流拦截次数，按维度打标签 |
 | `quota_exceeded_total` | counter | 被配额拦截次数 |
-| `tenant_mismatch_total` | counter | 租户与 Key 不匹配（越权尝试） |
+| `tenant_mismatch_total` | counter | 请求头 `X-Tenant-Id` 与 JWT 载荷里的租户不符（越权尝试，403） |
 | `session_owner_mismatch_total` | counter | 会话归属不符（猜测会话 id） |
 | `request_timeout_total` | counter | 请求级总超时触发次数 |
 | `http_requests_in_flight` | gauge | 在途请求数，关闭时用于播报 |

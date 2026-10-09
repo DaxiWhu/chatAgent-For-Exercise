@@ -313,7 +313,7 @@ def test_pg_sync_verifies_identity_even_when_index_is_up_to_date(fake_emb):
     而且所有测试都是绿的（"没报警"与"没检查"长得一模一样）。
     """
     chunks = [_chunk("s", "t")]
-    store = _SyncStore(existing={chunk_fingerprint(chunks[0], "")}, dim=1024)
+    store = _SyncStore(existing={chunk_fingerprint(chunks[0], R.resolve_tenant(""))}, dim=1024)
 
     R.PgVectorRetriever(chunks, store=store, tenant="")
 
@@ -326,7 +326,7 @@ def test_pg_sync_verifies_identity_even_when_index_is_up_to_date(fake_emb):
 def test_qdrant_sync_verifies_identity_even_when_index_is_up_to_date(fake_emb):
     """同 pg：Qdrant 侧的早退路径也必须先校验。"""
     chunks = [_chunk("s", "t")]
-    store = _SyncStore(existing={point_id(chunk_fingerprint(chunks[0], ""))}, dim=1024)
+    store = _SyncStore(existing={point_id(chunk_fingerprint(chunks[0], R.resolve_tenant("")))}, dim=1024)
 
     R.QdrantRetriever(chunks, store=store, tenant="")
 
@@ -495,6 +495,14 @@ class _FakeQClient:
         self._points = list(points)
         self.structs = []
         self.stored = {}
+
+    def get_collections(self):
+        """`_scroll_rows` 现在先问"集合到底存不存在"（区分首灌与读失败）。
+
+        替身必须跟着提供这一问，否则假客户端会在**新的**第一步就 AttributeError ——
+        而那与"读失败"在测试里长得一样，会掩盖真正的回归。
+        """
+        return SimpleNamespace(collections=[SimpleNamespace(name="rag_chunks")])
 
     def scroll(self, collection_name, scroll_filter=None, limit=512, offset=None,
                with_payload=True, with_vectors=False):

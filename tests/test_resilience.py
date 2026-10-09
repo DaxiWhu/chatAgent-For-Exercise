@@ -6,8 +6,7 @@ import time
 
 import pytest
 
-from src.rag.resilience import (CLOSED, HALF_OPEN, OPEN, CircuitBreaker,
-                                CircuitOpenError, guarded_call, retry_call)
+from src.rag.resilience import CLOSED, HALF_OPEN, OPEN, CircuitBreaker, CircuitOpenError, guarded_call, retry_call
 
 
 def test_breaker_opens_after_threshold_and_fast_fails():
@@ -108,3 +107,29 @@ def test_retry_call_raises_last_error():
 
     with pytest.raises(ValueError):
         retry_call(boom, attempts=2, base_delay=0, jitter=0)
+
+
+def test_guarded_call_defaults_to_exactly_one_attempt():
+    """★ 默认（不传 `retries`）**只试一次**，且这一次失败就记一次熔断失败。
+
+    为什么要把"不重试"也钉住：模块标题写着"熔断器 + 带退避的重试"，容易让人
+    以为线上是"重试 N 次都失败才计一次"。实际不是 —— 全项目的调用点都没传
+    `retries`，所以 `CIRCUIT_FAIL_THRESHOLD=5` 的含义是"连续 5 次请求各失败一次"，
+    而不是"连续 5 轮重试都失败"，两者在抖动场景下能差一个数量级，
+    而调参的人会按后一种理解去调。
+
+    这条用例就是那个**口径的锚**：哪天有人把默认值改成 >1，它会立刻红，
+    逼着改动者同时去想 `CIRCUIT_FAIL_THRESHOLD` 的含义。
+    """
+    b = CircuitBreaker("demo", fail_threshold=5)
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        raise ValueError("一次抖动")
+
+    with pytest.raises(ValueError):
+        guarded_call(b, flaky)
+
+    assert calls["n"] == 1, "默认竟然重试了 —— 那 CIRCUIT_FAIL_THRESHOLD 的含义就变了"
+    assert b.failures == 1

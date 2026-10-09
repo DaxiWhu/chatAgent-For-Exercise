@@ -123,7 +123,7 @@ def test_auto_ocr_opens_when_any_single_page_lacks_a_text_layer(available, monke
     chunks 非空、status=ok，一条 warning 都不会有。
     """
     monkeypatch.setattr(docling_loader, "DOCLING_OCR", "auto")
-    chars = {p: 800 for p in range(1, 11)}     # 10 页电子版
+    chars = dict.fromkeys(range(1, 11), 800)     # 10 页电子版
     chars[11] = 0                              # 1 页扫描
     assert docling_loader._scanned_pages(chars) == {11}
     assert docling_loader._want_ocr(chars) is True
@@ -237,7 +237,7 @@ def test_docx_chart_values_are_exact(parsed_docx):
     assert "来自XML" in chart.tags
     assert CHART_TITLE in chart.retrieval_text
     assert SERIES_NAME in chart.retrieval_text
-    for cat, val in zip(CHART_CATS, CHART_VALS):
+    for cat, val in zip(CHART_CATS, CHART_VALS, strict=False):
         assert f"{cat}={val}" in chart.retrieval_text
         assert cat in chart.table_md and val in chart.table_md
 

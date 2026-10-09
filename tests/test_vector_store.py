@@ -190,7 +190,7 @@ def test_pg_retriever_first_sync_writes_all(fake_emb):
 def test_pg_retriever_second_sync_skips_all(fake_emb):
     """库里已全部存在时，必须零 embedding 调用（这是切 pgvector 的核心收益）。"""
     chunks = [_chunk("s1", "a"), _chunk("s2", "b")]
-    existing = {chunk_fingerprint(c) for c in chunks}
+    existing = {chunk_fingerprint(c, R.resolve_tenant(None)) for c in chunks}
     store = _FakeStore(existing=existing)
 
     R.PgVectorRetriever(chunks, store=store)
@@ -203,17 +203,17 @@ def test_pg_retriever_second_sync_skips_all(fake_emb):
 def test_pg_retriever_syncs_only_missing(fake_emb):
     have = _chunk("s1", "a")
     missing = _chunk("s2", "b")
-    store = _FakeStore(existing={chunk_fingerprint(have)})
+    store = _FakeStore(existing={chunk_fingerprint(have, R.resolve_tenant(None))})
 
     R.PgVectorRetriever([have, missing], store=store)
 
     assert len(store.upserted) == 1
-    assert store.upserted[0][0] == chunk_fingerprint(missing)
+    assert store.upserted[0][0] == chunk_fingerprint(missing, R.resolve_tenant(None))
 
 
 def test_pg_retriever_search_delegates_to_store(fake_emb):
     chunks = [_chunk("s1", "a")]
-    store = _FakeStore(existing={chunk_fingerprint(chunks[0])})
+    store = _FakeStore(existing={chunk_fingerprint(chunks[0], R.resolve_tenant(None))})
     r = R.PgVectorRetriever(chunks, store=store)
 
     hits = r.search("任意问题", top_k=1)

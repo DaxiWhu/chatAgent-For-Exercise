@@ -37,8 +37,8 @@ def test_bm25_sparse_encoder_orders_by_relevance():
 
     def dot(text):
         bi, bv = enc.encode_document(text)
-        bd = dict(zip(bi, bv))
-        return sum(v * bd.get(i, 0.0) for i, v in zip(qi, qv))
+        bd = dict(zip(bi, bv, strict=False))
+        return sum(v * bd.get(i, 0.0) for i, v in zip(qi, qv, strict=False))
 
     assert dot("六堡茶是梧州特产，历史悠久") > dot("高铁从广州到梧州大约两小时")
 
@@ -146,7 +146,7 @@ def test_qdrant_retriever_first_sync_writes_all(fake_emb):
     assert fake_emb.calls == 1
     assert len(r.by_id) == 2
     # 点的 id 必须是 point_id(fingerprint)，这样才能与 existing_ids 对齐
-    assert store.upserted[0][0] == point_id(chunk_fingerprint(chunks[0], ""))
+    assert store.upserted[0][0] == point_id(chunk_fingerprint(chunks[0], R.resolve_tenant("")))
 
 
 def test_qdrant_retriever_second_sync_skips_all(fake_emb):
@@ -157,7 +157,7 @@ def test_qdrant_retriever_second_sync_skips_all(fake_emb):
     但 upserted 为空、embedding 零调用。
     """
     chunks = [_chunk("s1", "a"), _chunk("s2", "b")]
-    existing = {point_id(chunk_fingerprint(c, "")) for c in chunks}
+    existing = {point_id(chunk_fingerprint(c, R.resolve_tenant(""))) for c in chunks}
     store = _FakeQStore(existing=existing)
 
     R.QdrantRetriever(chunks, store=store, tenant="")
@@ -170,12 +170,12 @@ def test_qdrant_retriever_second_sync_skips_all(fake_emb):
 def test_qdrant_retriever_syncs_only_missing(fake_emb):
     have = _chunk("s1", "a")
     missing = _chunk("s2", "b")
-    store = _FakeQStore(existing={point_id(chunk_fingerprint(have, ""))})
+    store = _FakeQStore(existing={point_id(chunk_fingerprint(have, R.resolve_tenant("")))})
 
     R.QdrantRetriever([have, missing], store=store, tenant="")
 
     assert len(store.upserted) == 1
-    assert store.upserted[0][0] == point_id(chunk_fingerprint(missing, ""))
+    assert store.upserted[0][0] == point_id(chunk_fingerprint(missing, R.resolve_tenant("")))
 
 
 def test_qdrant_retriever_dim_mismatch_rejected(fake_emb, monkeypatch):
@@ -190,7 +190,7 @@ def test_qdrant_retriever_dim_mismatch_rejected(fake_emb, monkeypatch):
 # ---------------- 两路适配器委派 ----------------
 def test_qdrant_adapters_delegate_to_store(fake_emb):
     chunks = [_chunk("s", "六堡茶是梧州特产")]
-    store = _FakeQStore(existing={point_id(chunk_fingerprint(chunks[0], ""))})
+    store = _FakeQStore(existing={point_id(chunk_fingerprint(chunks[0], R.resolve_tenant("")))})
     r = R.QdrantRetriever(chunks, store=store, tenant="")
 
     sp = r.sparse.search("六堡茶", top_k=1)
@@ -203,7 +203,7 @@ def test_qdrant_adapters_delegate_to_store(fake_emb):
 def test_qdrant_sparse_adapter_empty_query_returns_empty(fake_emb):
     """查询无有效 term（如纯空白）时稀疏路返回 []，不调用 store。"""
     chunks = [_chunk("s", "六堡茶是梧州特产")]
-    store = _FakeQStore(existing={point_id(chunk_fingerprint(chunks[0], ""))})
+    store = _FakeQStore(existing={point_id(chunk_fingerprint(chunks[0], R.resolve_tenant("")))})
     r = R.QdrantRetriever(chunks, store=store, tenant="")
     assert r.sparse.search("") == []
 
@@ -296,3 +296,148 @@ def test_build_retriever_hybrid_qdrant_falls_back(monkeypatch):
     assert isinstance(r, R.HybridRetriever)
     assert isinstance(r.sparse, R.BM25Retriever)   # 稀疏回退进程内 BM25
     assert isinstance(r.dense, _Emb)               # 稠密回退内存
+
+
+# ---------------- existing_ids / _scroll_rows：把"读失败"和"真的不存在"分开 ----------------
+#
+# ⚠️ 这一组守卫针对的是一种**花钱**的事故，不是崩溃：
+# `existing_ids` 曾把"Qdrant 抖了一下"和"集合还没建"**都**吞成空集，
+# 而调用方（增量同步）据此把**整个知识库**重算一遍 embedding。
+# 两种情况的返回值完全一样，只有"集合到底存不存在"这一问能把它们分开。
+#
+# 同理 `_scroll_rows`：它的出口是 `list_tenants` → 孤儿预演 → **删除决策**，
+# 读不到库却返回空集 = 在看不见数据的情况下报告"一切正常"。
+
+
+class _Point:
+    def __init__(self, pid, payload=None):
+        self.id = pid
+        self.payload = payload or {}
+
+
+class _Coll:
+    def __init__(self, name):
+        self.name = name
+
+
+class _CollList:
+    def __init__(self, names):
+        self.collections = [_Coll(n) for n in names]
+
+
+class _FakeClient:
+    """只实现 `existing_ids` / `_scroll_rows` 用到的方法。
+
+    names: `get_collections()` 报告的集合名（不含 = 集合还不存在）。
+    points: `scroll()` 返回的点（一次返回完，offset=None 结束）。
+    list_error: `get_collections()` 要抛的异常（模拟"根本连不上"）。
+    scroll_error: `scroll()` 要抛的异常（模拟"连得上但这次读失败"）。
+    """
+
+    def __init__(self, names=("rag_chunks",), points=(), list_error=None,
+                 scroll_error=None):
+        self._names = list(names)
+        self._points = list(points)
+        self._list_error = list_error
+        self._scroll_error = scroll_error
+        self.scroll_calls = 0
+
+    def get_collections(self):
+        if self._list_error:
+            raise self._list_error
+        return _CollList(self._names)
+
+    def scroll(self, **_kw):
+        self.scroll_calls += 1
+        if self._scroll_error:
+            raise self._scroll_error
+        return list(self._points), None
+
+
+def _qdrant_store_with(monkeypatch, client, **kw):
+    """造一个 QdrantStore，并把它的连接替换成替身（不真连服务）。"""
+    store = QdrantStore("http://qdrant:6333", **kw)
+    monkeypatch.setattr(store, "_connect", lambda: client)
+    return store
+
+
+def test_existing_ids_treats_a_missing_collection_as_empty(monkeypatch):
+    """集合还没建 ⇒ 空集是**对的**（首次灌库本就该走全量写入）。"""
+    c = _FakeClient(names=())          # 集合还不存在
+    store = _qdrant_store_with(monkeypatch, c)
+    assert store.existing_ids() == set()
+    assert c.scroll_calls == 0, "集合都不存在还去滚一遍（多余请求）"
+
+
+def test_existing_ids_never_swallows_a_read_failure(monkeypatch):
+    """集合在、但这次读失败 ⇒ **必须抛**，绝不能返回空集。
+
+    返回空集的后果不是报错，而是**账单**：增量同步会把每个块都判成缺失，
+    把整个知识库的 embedding 重算一遍并全量 upsert。
+    """
+    c = _FakeClient(names=("rag_chunks",), scroll_error=RuntimeError("timeout"))
+    store = _qdrant_store_with(monkeypatch, c)
+    with pytest.raises(RuntimeError):
+        store.existing_ids()
+
+
+def test_existing_ids_never_swallows_a_connectivity_failure(monkeypatch):
+    """连 Qdrant 都连不上（`get_collections` 就炸）⇒ 同样必须抛。
+
+    这条挡住的是最恶劣的形态：地址填错 / 容器没起 ⇒ 每次都被当成"首次灌库"
+    ⇒ 每次都全量重算 —— 而运维看到的是"灌库成功"。
+    """
+    c = _FakeClient(list_error=RuntimeError("connection refused"))
+    store = _qdrant_store_with(monkeypatch, c)
+    with pytest.raises(RuntimeError):
+        store.existing_ids()
+
+
+def test_existing_ids_returns_points_when_healthy(monkeypatch):
+    c = _FakeClient(points=[_Point("a"), _Point("b")])
+    store = _qdrant_store_with(monkeypatch, c)
+    assert store.existing_ids() == {"a", "b"}
+
+
+def test_scroll_rows_never_reports_clean_when_it_cannot_read(monkeypatch):
+    """`_scroll_rows` 的出口是删除决策 ⇒ 读不到时**不能**报"没有孤儿"。"""
+    c = _FakeClient(names=("rag_chunks",), scroll_error=RuntimeError("timeout"))
+    store = _qdrant_store_with(monkeypatch, c)
+    with pytest.raises(RuntimeError):
+        store.list_rows()
+    with pytest.raises(RuntimeError):
+        store.list_tenants()
+
+
+def test_scroll_rows_treats_a_missing_collection_as_empty(monkeypatch):
+    """集合还没建时维护脚本不该报错（确实没东西可维护）。"""
+    c = _FakeClient(names=())
+    store = _qdrant_store_with(monkeypatch, c)
+    assert store.list_rows() == set()
+    assert store.list_tenants() == []
+
+
+# 注："跳过索引身份元数据点"已有专门的用例
+# （`tests/test_index_identity.py::test_qdrant_list_rows_skips_index_metadata_point`），
+# 这里**刻意不重复** —— 同一件事有两份断言时，改一处漏一处是迟早的事。
+
+
+def test_retriever_keys_points_by_the_resolved_tenant(fake_emb, monkeypatch):
+    """写库用的 id 必须来自 `resolve_tenant()` 的**归一化结果**，不能直接用入参。
+
+    为什么值得单钉一条：`""` 与 `None` 都要落到公共租户（`RAG_TENANT`）。如果
+    "写进去的 id"用了空串、而"增量判定查的 id"用了归一化后的值（或反过来），
+    两者永远对不上 —— 表现是**每次启动都把整个库重算一遍 embedding**：
+    不报错、不告警，只是账单。
+    """
+    monkeypatch.setattr(R, "RAG_TENANT", "public")
+    chunk = _chunk("s1", "a")
+
+    store = _FakeQStore(existing=set())
+    R.QdrantRetriever([chunk], store=store, tenant="")
+
+    written = store.upserted[0][0]
+    assert written == point_id(chunk_fingerprint(chunk, "public")), \
+        "没走 resolve_tenant：写库用的还是空串（增量判定将永远对不上）"
+    assert written != point_id(chunk_fingerprint(chunk, "")), \
+        "空串与公共租户算出了同一个 id ⇒ 归一化没生效"

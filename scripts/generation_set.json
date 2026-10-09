@@ -1,0 +1,73 @@
+{
+  "_comment": "生成侧评测集：评的是**答案本身**（agent 产出），不是检索命中，也不是喂给模型的材料——那两项分别由 eval_retrieval.py / eval_answer.py 负责。用例分两类：answerable=true 的带 reference_answer（人工写的忠实答案，标识符必须逐字来自 data/kb），用来验证『忠实答案不会被指标误报成幻觉』；answerable=false 是**负样本**（资料里确实没有这个信息），用来验证『该拒答时会不会编』。改语料后必须重跑，reference_answer 里的标识符一旦在语料里消失，就会从『忠实』变成『编造』——这正是本评测要抓的。",
+  "docs_dir": "data",
+  "top_k": 3,
+  "cases": [
+    {
+      "q": "worker 数量从哪里读取",
+      "answerable": true,
+      "expect_sources": ["02-部署与配置.md"],
+      "reference_answer": "worker 数量由 `APP_WORKERS` 决定，未配置时回退 `WEB_CONCURRENCY`，最后才是 1。"
+    },
+    {
+      "q": "服务怎么启动，能不能直接用 uvicorn",
+      "answerable": true,
+      "expect_sources": ["01-服务概览与接口.md", "02-部署与配置.md"],
+      "reference_answer": "必须用 `python -m app.serve` 启动，不能裸用 uvicorn app.main:app，启动逻辑收在 `app/serve.py` 里。"
+    },
+    {
+      "q": "部署在反向代理后面要注意什么",
+      "answerable": true,
+      "expect_sources": ["02-部署与配置.md"],
+      "reference_answer": "反代之后要设 `TRUST_PROXY_HEADERS=1`，否则所有请求会共用一个限流桶。"
+    },
+    {
+      "q": "健康检查端点是什么",
+      "answerable": true,
+      "expect_sources": ["01-服务概览与接口.md"],
+      "reference_answer": "健康检查有 `/health/live` 与 `/health/ready` 两个端点。"
+    },
+    {
+      "q": "被限流之后客户端应该怎么重试",
+      "answerable": true,
+      "expect_sources": ["04-限流与配额.md"],
+      "reference_answer": "返回 `429` 并在响应头带 `Retry-After`，客户端按它退避重试。"
+    },
+    {
+      "q": "运行指标从哪里拉",
+      "answerable": true,
+      "expect_sources": ["05-可观测与SLO.md"],
+      "reference_answer": "从 `/metrics` 拉，例如 `http_requests_in_flight`、`rate_limited_total`、`quota_exceeded_total`。"
+    },
+    {
+      "q": "多租户的知识库是怎么隔离的",
+      "answerable": true,
+      "expect_sources": ["03-检索与引用链路.md"],
+      "reference_answer": "租户取自身份：用户令牌的租户来自已验签的 JWT 载荷（唯一不可伪造的来源），脚本通行证与匿名身份则取自请求头 `X-Tenant-Id` 自报；租户为空串时不加过滤，能召回全部租户的文档。"
+    },
+    {
+      "q": "容器被停止时怎么保证在途请求不被掐断",
+      "answerable": true,
+      "expect_sources": ["02-部署与配置.md"],
+      "reference_answer": "`stop_grace_period` 必须大于 `GRACEFUL_SHUTDOWN_TIMEOUT`，只改一处等于没改。"
+    },
+    {
+      "q": "数据库备份会保留多少天",
+      "answerable": false,
+      "note": "语料里有备份脚本与演练流程，但**没有**任何保留天数/轮转周期的说明（已核实 data/kb 里『天数』零命中）。这一条测的是『资料看了但没写』时会不会照常识编一个数。",
+      "reference_answer": "资料里没有提及备份的保留天数，只说明了备份、校验与演练的脚本用法。"
+    },
+    {
+      "q": "这个服务支持哪些大模型厂商",
+      "answerable": false,
+      "note": "语料只提到 AGNES_MODEL 这个配置项，从未列举厂商或模型清单。问『支持哪些』时模型很容易按先验补一份名单。⚠️ 参考答案**刻意不提任何标识符**：负样本走真实检索，凡是『资料里没有』就该以纯拒答作答，提具体项会让这条用例的成败取决于『那一项有没有恰好被召回』。",
+      "reference_answer": "资料里没有提及支持哪些模型厂商。"
+    },
+    {
+      "q": "每个用户每月的调用次数上限是多少",
+      "answerable": false,
+      "note": "语料里的配额是 `USER_DAILY_TOKEN_QUOTA`（按天、按 token），**不是**按月按次。这条最阴：主题高度相关，答案极易把日配额当成月配额来答。参考答案同样不提标识符，理由见上一条。",
+      "reference_answer": "资料里没有提及按月的调用次数上限。"
+    }
+  ]
+}

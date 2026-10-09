@@ -7,7 +7,6 @@
 真正的 API 调用由 scripts/check_vlm.py 单独做（那才是它的职责）。
 """
 import json
-import os
 
 import pytest
 

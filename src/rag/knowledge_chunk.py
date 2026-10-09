@@ -19,7 +19,7 @@ import hashlib
 import logging
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ class KnowledgeChunk:
                                     # ⚠️ 只能由 make_chunk_id 产出。改各 _build_* 里的 anchor 表达式
                                     #    = 全部既有 id 变化 = 全库重建 + 旧引用回溯失效。
     source: str = ""                # 文件名（不含目录）。id 的稳定性靠这个字面值，不靠文件路径
-    page: Optional[int] = None      # **起始页**（1 基），只是给人看的代表值。
+    page: int | None = None      # **起始页**（1 基），只是给人看的代表值。
                                     # 两个真实用途：① 裁原页截图时"去哪一页裁"；② 引用里显示"第 N 页"。
                                     # ⚠️ xlsx/pptx 下它不是页码而是工作表/幻灯片序号（见 retrieval._where）
     # 完整跨越页码（升序、去重）。`page` 只是它的首元素：给人看的代表值，
@@ -144,7 +144,7 @@ class KnowledgeChunk:
     # docx 是流式格式，没有页码与 bbox，位置只能这样表达：
     #   para_index  —— 文档流第几段（精确）
     #   anchor_text —— 该元素所在段落文字，为空则回退到上文最近的非空段落（给检索用的上下文）
-    para_index: Optional[int] = None
+    para_index: int | None = None
     anchor_text: str = ""
 
     # ── B. 内容双通道 ────────────────────────────────────────────────────
@@ -160,7 +160,7 @@ class KnowledgeChunk:
                                     # 处理状态标记（待VLM / 自身无内容 / 混排块正文）都往里放。
                                     # ⚠️ 读取侧必须用**正向白名单**（_V25_CLASSES），任何"排除已知
                                     #    非分类词"的黑名单写法都会在新增 tag 时静默失效
-    page_total: Optional[int] = None
+    page_total: int | None = None
                                     # 这份文档共几页。⚠️ src/ 里目前**只有写入侧、没有读取侧**
     parser: str = ""                # 实际生效的解析器：docling | pdfminer | docx_zip | python-docx |
                                     # xlsx/pptx/md/txt…（后一组直接取扩展名）。
@@ -177,7 +177,7 @@ class KnowledgeChunk:
     alt_text: str = ""              # 作者手写的替代文字（docx 图片/图表）。
                                     # 也是 VLM 的 caption 首选来源：image_describer.context_for 取它，
                                     # 空则回退到 content
-    vlm_desc: Optional[dict] = None # 批次6：VLM 描述**原文**（chart_type/title/key_data/issues/usage/
+    vlm_desc: dict | None = None # 批次6：VLM 描述**原文**（chart_type/title/key_data/issues/usage/
                                     # model/elapsed/cached 全留）。存全文是为了审计——核 token 账只能从这读
     source_image: str = ""          # 批次6：裁出的插图/媒体原件路径。既是 VLM 的输入，
                                     # 也是引用附件（cite.source_image）
@@ -190,7 +190,7 @@ class KnowledgeChunk:
     parent_id: str = ""             # 父子块预留。⚠️ 实际值由 retrieval.attach_parents 写在**dict 层**
                                     # （c["parent_id"] = "{source}#{lo}-{hi}" + 兄弟字段 parent_text），
                                     # 不写回 dataclass —— 所以这个字段在本对象上恒为空串
-    unprocessable_reason: Optional[str] = None
+    unprocessable_reason: str | None = None
                                     # 非空 = 这是一条"解析失败的显式记录"（kind == unprocessable）。
                                     # 拒绝要显式、不静默：chunk_writer.summarize 按它列出失败文件
 
@@ -291,7 +291,7 @@ def linearize_table(table_md: str, caption: str = "", max_rows: int = 200) -> st
 
     这是本项目自己的设计：Docling 只给结构化网格，检索能不能召回要靠这里改写。
     """
-    lines = [l for l in (table_md or "").splitlines() if l.strip()]
+    lines = [ln for ln in (table_md or "").splitlines() if ln.strip()]
     if not lines:
         return ""
 
@@ -420,7 +420,7 @@ def _predicted_class(item: Any) -> str:
     return ""
 
 
-def _image_path_of(item: Any, image_paths: Optional[dict]) -> str:
+def _image_path_of(item: Any, image_paths: dict | None) -> str:
     """取该图片元素落盘后的本地路径（见 docling_loader._save_pictures）。
 
     item: docling 的 PictureItem。用它的 self_ref 去查表；item 为 None 时返回 ""。
@@ -495,7 +495,7 @@ def _sibling_texts(items: list[Any], exclude=("picture", "table")) -> str:
     return "；".join(out)
 
 
-def picture_kind(item: Any, area_ratio: Optional[float] = None) -> tuple[str, bool]:
+def picture_kind(item: Any, area_ratio: float | None = None) -> tuple[str, bool]:
     """图片 → (kind, 是否值得送 VLM)。
 
     item: docling 的 PictureItem。为 None 时按"无分类的位图"处理
@@ -665,7 +665,7 @@ def _resolve_items(items: list[Any], doc: Any) -> list[Any]:
 # 转换入口
 # ---------------------------------------------------------------------------
 def from_pdfminer_pieces(pieces: list[str], source: str,
-                         page_total: Optional[int] = None) -> list[KnowledgeChunk]:
+                         page_total: int | None = None) -> list[KnowledgeChunk]:
     """降级路径：把 pdf_parser.pdf_to_chunks 的 str 列表包成 KnowledgeChunk。
 
     pieces: 纯文本块列表（pdf_parser.pdf_to_chunks 的产物）。None / 空列表返回 []；
@@ -694,7 +694,7 @@ def from_pdfminer_pieces(pieces: list[str], source: str,
 
 
 def unprocessable(source: str, reason: str, parser: str = "",
-                  page_total: Optional[int] = None) -> KnowledgeChunk:
+                  page_total: int | None = None) -> KnowledgeChunk:
     """显式失败：解析不出内容时不能静默丢弃，要留下可查询的记录。
 
     source: 文件名（basename），写进 source 与 retrieval_text。
@@ -765,7 +765,7 @@ def _mark_broad_fallback(kc: KnowledgeChunk, *, own: bool, text: str,
 
 
 def _build_table_chunk(item: Any, doc: Any, *, items: list, pages: list, boxes: list,
-                       section_path: str, source: str, page_total: Optional[int] = None,
+                       section_path: str, source: str, page_total: int | None = None,
                        parser: str = _DEFAULT_PARSER, origin: str = _DEFAULT_ORIGIN,
                        file_checksum: str = "", text: str = "",
                        id_prefix: str = "", with_sibling: bool = True,
@@ -861,8 +861,8 @@ def _build_table_chunk(item: Any, doc: Any, *, items: list, pages: list, boxes: 
 
 def _build_picture_chunk(item: Any, doc: Any, *, items: list, pages: list, boxes: list,
                          section_path: str, source: str,
-                         image_paths: Optional[dict] = None,
-                         page_total: Optional[int] = None, parser: str = _DEFAULT_PARSER,
+                         image_paths: dict | None = None,
+                         page_total: int | None = None, parser: str = _DEFAULT_PARSER,
                          origin: str = _DEFAULT_ORIGIN, file_checksum: str = "",
                          text: str = "", id_prefix: str = "",
                          with_sibling: bool = True,
@@ -930,7 +930,7 @@ def _build_picture_chunk(item: Any, doc: Any, *, items: list, pages: list, boxes
 
 def _build_formula_chunk(item: Any, doc: Any, *, items: list, pages: list, boxes: list,
                          section_path: str, source: str,
-                         page_total: Optional[int] = None, parser: str = _DEFAULT_PARSER,
+                         page_total: int | None = None, parser: str = _DEFAULT_PARSER,
                          origin: str = _DEFAULT_ORIGIN, file_checksum: str = "",
                          text: str = "", id_prefix: str = "",
                          allow_broad_fallback: bool = True) -> KnowledgeChunk:
@@ -990,7 +990,7 @@ def _build_formula_chunk(item: Any, doc: Any, *, items: list, pages: list, boxes
 
 def _build_text_chunk(chunk: Any, *, pages: list, boxes: list, section_path: str,
                       text: str, source: str = "", chunker: Any = None,
-                      page_total: Optional[int] = None,
+                      page_total: int | None = None,
                       parser: str = _DEFAULT_PARSER, origin: str = _DEFAULT_ORIGIN,
                       file_checksum: str = "") -> KnowledgeChunk:
     """纯文本块构造器 —— 块内没有表 / 图 / 公式时唯一产出的块（kind=KIND_TEXT）。
@@ -1124,13 +1124,13 @@ def from_docling_chunk_all(chunk: Any, doc: Any, **kwargs) -> list[KnowledgeChun
     # 触发全库重建 + 引用失效。
     # 纯文本出口不受这条约束 —— 那里块内没有别的元素，text 就是本块全部内容。
     text = (getattr(chunk, "text", "") or "").strip()
-    common = dict(
-        section_path=section_path, source=kwargs.get("source", ""),
-        page_total=kwargs.get("page_total"),
-        parser=kwargs.get("parser", _DEFAULT_PARSER),
-        origin=kwargs.get("origin", _DEFAULT_ORIGIN),
-        file_checksum=kwargs.get("file_checksum", ""),
-    )
+    common = {
+        "section_path": section_path, "source": kwargs.get("source", ""),
+        "page_total": kwargs.get("page_total"),
+        "parser": kwargs.get("parser", _DEFAULT_PARSER),
+        "origin": kwargs.get("origin", _DEFAULT_ORIGIN),
+        "file_checksum": kwargs.get("file_checksum", ""),
+    }
 
     if not (tables or pictures or formulas):
         # 纯文本快通道：本函数唯一的非元素出口。
@@ -1257,9 +1257,9 @@ class _ItemAsChunk:
 
 
 def from_blocks(blocks: list, source: str, *, parser: str = "loader",
-                origin: str = "file_loader", page_total: Optional[int] = None,
+                origin: str = "file_loader", page_total: int | None = None,
                 file_checksum: str = "",
-                splitter: Optional[Any] = None) -> list[KnowledgeChunk]:
+                splitter: Any | None = None) -> list[KnowledgeChunk]:
     """`loaders.Block` → list[KnowledgeChunk]（duck typing 读属性，本模块不依赖 loaders）。
 
     blocks: loaders.load_blocks 的产物（Block 对象列表）。空列表返回 []。
@@ -1346,9 +1346,9 @@ def _with_section(text: str, section: str) -> str:
 
 def from_docling_items(doc: Any, *, source: str, parser: str = "docling",
                        origin: str = "docling_pdf",
-                       page_total: Optional[int] = None,
+                       page_total: int | None = None,
                        file_checksum: str = "",
-                       image_paths: Optional[dict] = None) -> list[KnowledgeChunk]:
+                       image_paths: dict | None = None) -> list[KnowledgeChunk]:
     """按 item 逐条兜底切块。仅在两种 chunker 都产出 0 块时使用。
 
     doc: DoclingDocument。靠 `doc.iterate_items()` 遍历（按阅读顺序）。
@@ -1410,7 +1410,7 @@ def from_docling_items(doc: Any, *, source: str, parser: str = "docling",
 
 def from_docling_markdown(doc: Any, *, source: str, parser: str = "docling",
                           origin: str = "docling_pdf",
-                          page_total: Optional[int] = None,
+                          page_total: int | None = None,
                           file_checksum: str = "") -> list[KnowledgeChunk]:
     """最后兜底：整份文档的 Markdown 作为**单块**。
 
@@ -1503,7 +1503,7 @@ def _safe(obj: Any, name: str, default: Any = "") -> Any:
     return default if v is None else v
 
 
-def from_docx_media(assets: list, source: str, *, page_total: Optional[int] = None,
+def from_docx_media(assets: list, source: str, *, page_total: int | None = None,
                     file_checksum: str = "") -> list[KnowledgeChunk]:
     """docx 媒体资产（src/docx_media.py 产出）→ list[KnowledgeChunk]。
 
@@ -1546,7 +1546,7 @@ def from_docx_media(assets: list, source: str, *, page_total: Optional[int] = No
     return out
 
 
-def _docx_asset_to_chunk(asset: Any, source: str, page_total: Optional[int],
+def _docx_asset_to_chunk(asset: Any, source: str, page_total: int | None,
                          file_checksum: str) -> KnowledgeChunk:
     """单个 DocxAsset → KnowledgeChunk（按 kind 分派：chart / ole / image / 其它）。
 

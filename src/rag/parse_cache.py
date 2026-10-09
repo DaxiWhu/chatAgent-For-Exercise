@@ -35,15 +35,48 @@ from .retrieval import load_chunks
 CACHE_VERSION = 1
 
 # 影响解析结果的环境变量。任一变化都要重算（例如把 OCR 从 auto 改成 on）。
+#
+# ⚠️ 这份清单**必须覆盖解析链路上读到的每一个环境变量**（2026-10-06 补齐）。
+# 漏一个的后果不是"少一次重算"，而是：改了配置、缓存却命中 ⇒ 返回**旧配置产出的
+# chunks** ⇒ 功能静默不生效（不报错、不降级、日志还写着"缓存命中，跳过解析"）。
+# 补齐前实测漏了 23 个（`RAG_VLM_DESC` / `BGE_TOKENIZER` / `CONTEXTUAL_MODEL` /
+# 整个 `RAG_CTX_*` / `RAG_DOCX_OLE_TEXT_LIMIT` / `RAG_MAX_BLOCKS` …），
+# 也就是说"把图片描述打开""换 BGE 分词器"这类改动**一个都不会让缓存失效**。
+# 守卫：`tests/test_parse_cache.py::test_env_keys_cover_everything_the_parsers_read`
+# 会把"解析链路上读了却没列进这里"的键直接判红。
+#
+# 收录判据：**只要它可能改变产出的 chunks 就算**（解析器选择、切分口径、token 预算、
+# 模型与端点、各类上限、内容护栏）。刻意**不收**两类：
+#   ① 密钥（如 `AGNES_API_KEY`）—— 它决定"能不能调通"，不决定"产出什么"；
+#      把一个凭证哈希进缓存**文件名**是没有必要的暴露，且轮换一次密钥会让整份
+#      缓存（分钟级重算）白白作废。
+#   ② 缓存自身的行为开关（`RAG_PARSE_CACHE` / `RAG_PARSE_CACHE_DIR`）——
+#      它们改变的是"用不用缓存"，参与指纹会形成自指。
 _ENV_KEYS = (
+    # --- 切分口径 ---
     "RAG_CHUNK_STRATEGY", "RAG_CHUNK_SIZE", "RAG_CHUNK_OVERLAP",
     "RAG_PDF_CHUNK_SIZE", "RAG_PDF_CHUNK_OVERLAP", "RAG_DOC_CHUNK_TOKENS",
     "RAG_DOC_PARSER", "RAG_CONTEXTUAL", "RAG_PARENT_CHILD", "RAG_PARENT_MAX_CHARS",
-    "RAG_CTX_CACHE_DIR", "RAG_MEDIA_DIR", "RAG_VLM_CACHE_DIR",
+    # --- 目录（换个目录 = 换一批输入文件）---
+    "RAG_CTX_CACHE_DIR", "RAG_MEDIA_DIR", "RAG_VLM_CACHE_DIR", "DOCS_DIR",
+    # --- Docling / OCR ---
     "DOCLING_OCR", "DOCLING_OCR_MODE", "DOCLING_OCR_LANG", "DOCLING_OCR_BACKEND",
+    "DOCLING_OCR_SCALE", "DOCLING_PAGE_IMAGES",
     "DOCLING_ARTIFACTS_PATH", "DOCLING_DEVICE", "DOCLING_FORMULA",
-    "VLM_MODEL", "VLM_MAX_IMAGES", "VLM_MAX_SIDE", "RAG_DOCX_MAX_ASSETS",
-    "RAG_CITE_IMAGE_MARGIN", "DOCLING_IMAGES_SCALE", "DOCS_DIR",
+    "DOCLING_IMAGES_SCALE", "BGE_TOKENIZER", "EMBEDDING_MODEL",
+    # --- 图片描述（VLM）---
+    "VLM_MODEL", "VLM_MAX_IMAGES", "VLM_MAX_SIDE", "VLM_TIMEOUT",
+    "RAG_VLM_DESC", "AGNES_API_BASE",
+    # --- Contextual Retrieval 前缀 ---
+    "CONTEXTUAL_MODEL",
+    "RAG_CTX_MAX_CHUNKS", "RAG_CTX_DOC_CHARS", "RAG_CTX_PREFIX_MAX",
+    "RAG_CTX_MAX_TOKENS", "RAG_CTX_TIMEOUT", "RAG_CTX_WORKERS",
+    "RAG_CTX_LIMITED_SHOWN",
+    # --- 各类上限（超过即截断 ⇒ 直接影响产出）---
+    "RAG_MAX_BLOCKS", "RAG_XLSX_MAX_ROWS", "RAG_CSV_ROWS_PER_BLOCK",
+    "RAG_JSON_MAX_RECORDS", "RAG_DOCX_MAX_ASSETS", "RAG_DOCX_OLE_TEXT_LIMIT",
+    # --- 引用与内容护栏 ---
+    "RAG_CITE_IMAGE_MARGIN", "RAG_GUARD", "RAG_GUARD_ACTION",
 )
 
 
@@ -108,10 +141,10 @@ def cache_key(doc_folder, chunk_size=None, chunk_overlap=None,
         h.update(str(v).encode())
         h.update(b"\x00")
     for k in _ENV_KEYS:
-        h.update(f"{k}={os.getenv(k, '')}".encode("utf-8"))
+        h.update(f"{k}={os.getenv(k, '')}".encode())
         h.update(b"\x00")
     for rel, size, mtime in _iter_files(doc_folder):
-        h.update(f"{rel}|{size}|{mtime}".encode("utf-8"))
+        h.update(f"{rel}|{size}|{mtime}".encode())
         h.update(b"\x00")
     return h.hexdigest()
 
@@ -139,7 +172,7 @@ def load_chunks_cached(doc_folder, chunk_size=None, chunk_overlap=None,
                         pdf_chunk_size, pdf_overlap)
         path = os.path.join(cache_dir_for(doc_folder, cache_dir or ""), key + ".json")
         if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(path, encoding="utf-8") as fh:
                 payload = json.load(fh)
             if payload.get("version") == CACHE_VERSION and isinstance(payload.get("chunks"), list):
                 logging.info("语料解析缓存命中：%s（%d 块，跳过解析）",

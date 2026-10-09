@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from src.rag.loaders import load_blocks, load_text
+from src.rag.loaders import load_blocks
 from src.rag.retrieval import load_chunks
 
 
@@ -62,7 +62,7 @@ def test_xlsx_merged_cell_value_propagates_across_columns(tmp_path):
     wb.save(str(p))
 
     # 前提确认：合并区的非左上角确实是 None（否则这条用例测不到东西）
-    vals = [r for r in openpyxl.load_workbook(str(p)).active.iter_rows(values_only=True)]
+    vals = list(openpyxl.load_workbook(str(p)).active.iter_rows(values_only=True))
     assert vals[1][1] is None
 
     text = _texts(load_blocks(str(p)))

@@ -16,9 +16,9 @@ KnowledgeChunk 后同样过本函数，这样两条链路的出参结构完全�
 """
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
-from .knowledge_chunk import KnowledgeChunk, KIND_UNPROCESSABLE
+from .knowledge_chunk import KIND_UNPROCESSABLE, KnowledgeChunk
 
 # 旧消费者依赖的最小字段集，测试也断言这个
 LEGACY_REQUIRED = ("source", "text")

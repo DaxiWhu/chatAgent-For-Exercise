@@ -31,9 +31,9 @@ import json
 import logging
 import os
 import re
-import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ class Block:
 
     text: str
     section: str = ""
-    page: Optional[int] = None
+    page: int | None = None
     kind: str = KIND_TEXT
     tags: list = field(default_factory=list)
     source_image: str = ""      # 图片类块：落盘后的文件路径
@@ -169,7 +169,8 @@ def _read_text_file(path: str) -> str:
         不抛 UnicodeDecodeError 的编码胜出；全部失败时用 utf-8 + errors="ignore"
         兜底（宁可丢几个无法解码的字符，也不让整份文件读不出来）。
     """
-    raw = open(path, "rb").read()
+    with open(path, "rb") as _fh:
+        raw = _fh.read()
     for enc in _ENCODINGS:
         try:
             return raw.decode(enc)
@@ -219,7 +220,7 @@ def _row_to_kv(header: list[str], row: list) -> str:
     return " | ".join(pairs)
 
 
-def _looks_like_header(row: list[str], next_row: Optional[list[str]] = None) -> bool:
+def _looks_like_header(row: list[str], next_row: list[str] | None = None) -> bool:
     """判断某一行是不是表头。
 
     判据刻意保守：**不能**用"全是文本、下一行有数字"这种启发式 ——
@@ -301,7 +302,7 @@ def _blocks_markdown(path) -> list[Block]:
 
     headings: list[str] = []
     buf: list[str] = []
-    fence: Optional[str] = None
+    fence: str | None = None
 
     def flush(kind: str = KIND_TEXT, tags=None):
         """把当前缓冲区收口成一块并清空缓冲（区块切分的统一出口）。

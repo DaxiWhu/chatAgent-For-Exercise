@@ -4,7 +4,6 @@
 第几页、哪一节、原文长什么样、表格原网格是什么、配图在哪。
 所以测试的重点不是"有没有 citations 字段"，而是**保真数据有没有被加工品顶掉**。
 """
-from unittest.mock import MagicMock
 
 from langchain_core.messages import AIMessage
 

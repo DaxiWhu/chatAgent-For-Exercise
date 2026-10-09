@@ -32,12 +32,16 @@
 
 用法
 ----
-    python scripts/kb_prune.py                       # 预演（不删）
+    python scripts/kb_prune.py                       # 预演（不删），逐个租户
     python scripts/kb_prune.py --json                # 机器可读
     python scripts/kb_prune.py --include-stale       # 连"内容已变"的也列出来
     python scripts/kb_prune.py --apply               # 真删 missing
     python scripts/kb_prune.py --apply --include-stale
-    python scripts/kb_prune.py --all-tenants --apply  # 逐个租户清理
+    python scripts/kb_prune.py --tenant public --apply  # 只清这一个分区
+    python scripts/kb_prune.py --all-tenants --apply    # 与不给 --tenant 等价
+
+⚠️ `--tenant` 是**字面值**（不是"身份归一化"）：写 `--tenant ""` 清理的是
+"没有租户名"那批老数据所在的分区。不给 `--tenant` 才是"库里所有分区"。
 
 典型顺序（先灌新、再删旧，避免知识库出现空窗）：
     python -m src.rag.retrieval --docs data   # 或服务启动自带的增量灌库
@@ -76,17 +80,20 @@ def _anchor(path):
     return path if os.path.isabs(path) else os.path.join(ROOT, path)
 
 
-def _make_store(tenant=""):
+def _make_store(tenant=None):
     """按 `RAG_VECTOR_STORE` 造一个向量库句柄。
 
-    tenant: 租户 id（空串 = 不隔离；多租户部署下 `--all-tenants` 会逐个传）。
+    tenant: 租户 id。**None = 不过滤**（`--all-tenants` 的探测句柄用这个）；
+        任何字符串（含空串）都是一个真实租户，读写都锁在它上面。
+        ⚠️ 2026-10-06 之前空串也等于"不过滤" —— 与向量库同一处口径反转，
+        所以这里**不能再拿空串当"全库"的暗号**（见 `PgVectorStore.__init__`）。
 
     返回 `(store, error)`：成功时 error 为空串；失败时 store 为 None 且 error
     里写明**为什么**（这些原因都要原样打印给运维看，它们直接指向该改哪个变量）。
     """
     from src.rag import retrieval as R
-    from src.rag.vector_store import PgVectorStore
     from src.rag.qdrant_store import QdrantStore
+    from src.rag.vector_store import PgVectorStore
 
     vs = (R.VECTOR_STORE or "memory").strip().lower()
     if vs == "pg":
@@ -125,9 +132,11 @@ def main(argv=None):
     ap.add_argument("--include-stale", action="store_true",
                     help="连「源文件还在但内容已变」的旧块一起清理（默认只报告）")
     ap.add_argument("--tenant", default=None,
-                    help="限定租户（默认取 RAG_TENANT）")
+                    help="只清理这一个分区，**按字面值**（如 `--tenant public`；"
+                         "老数据在空串分区，写 `--tenant \"\"`）。"
+                         "不给则清理库里出现过的每个租户")
     ap.add_argument("--all-tenants", action="store_true",
-                    help="对库里出现过的每个租户分别执行（多租户部署）")
+                    help="对库里出现过的每个租户分别执行（与不给 --tenant 等价）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出（便于接监控）")
     args = ap.parse_args(argv)
 
@@ -148,17 +157,37 @@ def main(argv=None):
             "请先确认目录内容（`ls`），确认无误后再手工处理。"
         )
 
-    from src.rag import retrieval as R
+    if args.tenant is not None and args.all_tenants:
+        return _refuse("--tenant 与 --all-tenants 不能同时给："
+                       "前者只清一个分区，后者清每个分区。"
+                       "（不给 --tenant 就等于 --all-tenants）")
 
-    if args.all_tenants:
-        probe, err = _make_store("")
+    if args.tenant is not None:
+        # 显式指定 ⇒ **按字面值**用，不过 `resolve_tenant`。
+        #
+        # ⚠️ 这里刻意不归一化（2026-10-06 修）。`resolve_tenant` 的职责是
+        # "把**身份**归一成一个过滤值"（无租户 ⇒ 公共租户 ⇒ 哨兵），它服务的是
+        # 请求路径；而本脚本是**运维工具**，操作对象是"库里实际存在的分区名"。
+        # 两者混用出过一个很难发现的问题：不给 `--tenant` 时经 `resolve_tenant(None)`
+        # 会落到 `RAG_TENANT`（或它留空时的哨兵值），于是
+        #   · `RAG_TENANT=public`：只清公共分区，**别的租户的孤儿一条都不碰**；
+        #   · `RAG_TENANT` 留空：清理对象变成哨兵分区（库里根本不存在它）⇒
+        #     脚本打印"源已消失 0 份"、退出码 0 —— **在什么都没做的情况下报成功**。
+        # 一个用来决定删不删东西的工具，最不该有的就是这种假绿。
+        tenants = [args.tenant.strip()]
+    else:
+        # 不给 --tenant（或给了 --all-tenants）⇒ 库里出现过的**每个**租户分别清。
+        # 这与口径反转之前的"不过滤 = 整个库"在**数据范围**上等效，
+        # 但每次删除都被限定在单个分区内 —— 少一次跨租户误删的机会。
+        #
+        # ⚠️ 探测句柄必须显式 `tenant=None`（= 不过滤）：新口径下传空串只会去查
+        # "空租户那一份"，`list_tenants()` 于是恒为空 ⇒ 静默退化成"什么都没做"。
+        probe, err = _make_store(None)
         if probe is None:
             return _refuse(err)
         tenants = probe.list_tenants()
         if not tenants:
-            tenants = [""]     # 表/集合存在但还没数据 → 走一遍，得到"无孤儿"
-    else:
-        tenants = [R.RAG_TENANT if args.tenant is None else args.tenant]
+            tenants = [None]   # 表/集合存在但还没数据 → 走一遍，得到"无孤儿"
 
     report = {
         "mode": "apply" if args.apply else "dry-run",
@@ -183,7 +212,7 @@ def main(argv=None):
         total_stale += len(plan["stale"])
         total_unknown += len(plan["unknown"])
         total_deleted += deleted
-        report["tenants"][t or "<不隔离>"] = {
+        report["tenants"]["<不隔离>" if t is None else t] = {
             "ok": len(plan["ok"]),
             "missing": len(missing_keys),
             "stale": len(plan["stale"]),

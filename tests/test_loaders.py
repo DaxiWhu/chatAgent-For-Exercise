@@ -1,5 +1,4 @@
 """多格式解析测试：全部离线，各格式文件由测试现场生成。"""
-import os
 
 import pytest
 

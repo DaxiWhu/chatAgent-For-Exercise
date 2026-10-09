@@ -129,13 +129,18 @@ class _FakeDense:
 
 
 class _FakeReranker:
-    def __init__(self, out=None, boom=False):
+    def __init__(self, out=None, boom=False, exc=None):
         self.out = out
         self.boom = boom
+        #: 指定要抛的异常。用来区分"上游报错"与"被熔断挡下"——
+        #: 两者都回退，但**计数器标签不同**（处置方向也不同）。
+        self.exc = exc
         self.calls = 0
 
     def rerank(self, query, chunks, top_k):
         self.calls += 1
+        if self.exc is not None:
+            raise self.exc
         if self.boom:
             raise RuntimeError("rerank service down")
         return self.out
@@ -204,7 +209,11 @@ def test_rerank_client_propagates_error_for_caller_to_handle(monkeypatch):
 
     monkeypatch.setattr(httpx, "post", boom)
     c = RerankClient("https://x/v1", "k", "m")
-    with pytest.raises(Exception):
+    # 断言**具体**异常，不用 `Exception`：`RerankClient.rerank` 的 docstring
+    # 承诺"失败会抛异常（httpx 网络错误 / raise_for_status 的 4xx-5xx）"，
+    # 写 `Exception` 等于把这条承诺测没了 —— 将来它改成"吞掉并返回 None"，
+    # 这个用例照样绿（那正是降级路径与失败路径被混淆的经典形态）。
+    with pytest.raises(httpx.ConnectError):
         c.rerank("q", [_chunk("s", "t")], 1)
 
 
@@ -272,3 +281,118 @@ def test_build_retriever_skips_reranker_when_disabled(monkeypatch):
 
     r = build_retriever([_chunk("s", "梧州特产有六堡茶。")])
     assert r.reranker is None
+
+
+# ---------------- 精排降级必须被计数 ----------------
+class _CountingSink:
+    """收下观测出口的调用（`src/observability` 的注入点）。"""
+
+    def __init__(self):
+        self.counters = {}
+
+    def counter(self, name, amount=1, **labels):
+        key = (name, tuple(sorted(labels.items())))
+        self.counters[key] = self.counters.get(key, 0) + amount
+
+    def histogram(self, name, value, **labels):   # pragma: no cover - 本文件不用
+        pass
+
+    def gauge(self, name, value, **labels):       # pragma: no cover - 本文件不用
+        pass
+
+
+@pytest.fixture()
+def obs_sink():
+    """注入一个可断言的观测出口；退出时**还原原来那一个**。
+
+    ⚠️ 必须是"存下来再放回去"，**不能**用 `reset_sink()`（2026-10-06 踩过）：
+
+    `app.main` 在导入时（conftest 的 autouse fixture）已经装了 `_MetricsSink`，
+    `reset_sink()` 会把它清成 `None`，而**没有任何人**会重新装上 ⇒ 之后所有
+    依赖这个出口的用例都静默收不到指标。症状是"另一个文件的一批用例红"
+    （那次是 `tests/test_runtime_metrics.py` 里 11 个），与本文件毫无关系，
+    单跑本文件还全绿 —— 排查方向会被完全带偏。
+
+    `tests/test_agents_route.py` 里早就是这个写法（`saved` + 还原），这里跟它一致。
+    """
+    from src import observability
+
+    saved = observability.get_sink()
+    sink = _CountingSink()
+    observability.set_sink(sink)
+    yield sink
+    observability.set_sink(saved)
+
+
+def _fallback_count(sink, reason):
+    return sink.counters.get(("rerank_fallback_total", (("reason", reason),)), 0)
+
+
+def test_rerank_fallback_is_counted_for_every_cause(obs_sink):
+    """★ 每一条精排降级路径都必须留下计数。
+
+    ⚠️ 为什么这条不能省：此前这条路径**只有一条 WARNING 日志**，于是
+    `RERANK_TIMEOUT=0`（超时被写成 0 ⇒ 请求根本发不出去）、`RERANK_MODEL` 拼错、
+    上游 429 这三种**完全不同**的故障，在面板上长得一模一样 —— 都是"什么都没发生"。
+    检索静默退回"不精排"，答案质量下降，而没有任何可告警的信号。
+
+    三种成因的处置方向不同（改本机配置 / 查上游健康 / 查配额），所以标签也必须
+    分开：混成一个数只能看出"在降级"，看不出该动哪里。
+    """
+    from src.rag.resilience import CircuitOpenError
+
+    a, b = _chunk("s1", "a"), _chunk("s2", "b")
+    args = {"sparse": _FakeSparse([(a, 0.9), (b, 0.4)]),
+            "dense": _FakeDense([(a, 0.8)])}
+
+    # ① 上游抛异常
+    HybridRetriever([a, b], reranker=_FakeReranker(boom=True), **args).search("任意", top_k=2)
+    assert _fallback_count(obs_sink, "error") == 1
+
+    # ② 上游 200 但结果为空（模型名写错 / 配额耗尽 / 网关降级都会长这样）
+    HybridRetriever([a, b], reranker=_FakeReranker(out=None), **args).search("任意", top_k=2)
+    assert _fallback_count(obs_sink, "empty") == 1
+
+    # ③ 被熔断挡下（本机**没有发出请求**）—— 与①②分开计数
+    HybridRetriever([a, b],
+                    reranker=_FakeReranker(exc=CircuitOpenError("rerank 熔断中")),
+                    **args).search("任意", top_k=2)
+    assert _fallback_count(obs_sink, "circuit_open") == 1
+
+    # 精排成功时**不能**再增加降级计数（否则这个指标就失去意义）
+    # 注意必须是"快照前后不变"而不是"集合为空" —— 上面三种成因的计数还在里面。
+    before = {k: v for k, v in obs_sink.counters.items()
+              if k[0] == "rerank_fallback_total"}
+    r = HybridRetriever([a, b], reranker=_FakeReranker(out=[(b, 0.9)]), **args)
+    r.search("任意", top_k=2)
+    assert r.last_rerank_ok is True
+    after = {k: v for k, v in obs_sink.counters.items()
+             if k[0] == "rerank_fallback_total"}
+    assert after == before, "精排成功却也记了一笔降级"
+
+
+# ---------------- 切分参数：重叠 ≥ 块长 ----------------
+def test_overlap_larger_than_chunk_size_is_clamped_not_fatal(monkeypatch, caplog):
+    """★ 重叠 ≥ 块长时必须**夹取**，而不是让整个灌库失败。
+
+    LangChain 的 `RecursiveCharacterTextSplitter` 对 `overlap >= chunk_size`
+    直接抛 `ValueError: Got a larger chunk overlap ... than chunk size`，而灌库
+    链路的宽 `except` 会把它记成"这份文档解析失败" ⇒ 现象是**所有文档都灌不进去**，
+    日志里只有一句看不出因果的报错（报错指向切分器，真因在 `.env`）。
+
+    关键点：这两个值**各自**都是合法整数（`RAG_CHUNK_SIZE=300`、
+    `RAG_CHUNK_OVERLAP=500`），"重叠 ≥ 块长"是它们之间的**相对**约束 ——
+    单看任一变量永远判不出来，所以只能在造切分器的唯一漏斗 `_make_splitter` 里夹。
+    """
+    import logging
+
+    monkeypatch.setattr(R, "CHUNK_SIZE", 100)
+    monkeypatch.setattr(R, "CHUNK_OVERLAP", 500)
+
+    with caplog.at_level(logging.WARNING):
+        chunks = R.split_documents([("a.md", "字" * 500)])
+
+    assert chunks, "夹取之后必须仍然切得出块（而不是抛错中断灌库）"
+    assert all(len(c["text"]) <= 100 for c in chunks), "块长上限没有生效"
+    assert any("已夹到" in r.getMessage() for r in caplog.records), \
+        "夹取必须留一条 WARNING —— 静默把 500 改成 99 也是'行为变了没人知道'"

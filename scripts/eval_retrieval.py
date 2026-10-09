@@ -15,9 +15,19 @@
 指标：
     Top1 / Top3 / MRR。**按 type 分组统计**——literal 是照抄原文词的查询，
     paraphrase 是换了说法的查询，混在一起统计会得出「关键词就够用」的错误结论。
+
+    另有三项**集合指标**：Recall@k / Precision@k / nDCG@k。
+    Top1/Top3/MRR 回答的是「对不对」（第一条准不准），集合指标回答的是
+    「**找全了吗**」：一条查询期望多个来源时，Top1 只说得出"第一条对了"，
+    说不出"另外两条找回来没有"。两者互补，只看一类会漏掉一半的问题。
+
+    ⚠️ 集合指标按**来源去重**后计算：同一份文档的两个片段同时命中，不该把
+    Recall 抬过 100%，也不该在 nDCG 里被算成两次"相关"。期望来源是文件名级的，
+    所以指标也必须按文件名级算，否则口径不一致（评测集说 2 个来源，指标按 3 个片段算）。
 """
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -48,8 +58,22 @@ def prepare_corpus(eval_set, workdir):
 
 
 def evaluate(retriever, queries, top_k=3):
-    """返回 {"all": {...}, "literal": {...}, "paraphrase": {...}} 与未命中明细。"""
-    groups = defaultdict(lambda: {"n": 0, "top1": 0, "top3": 0, "rr": 0.0})
+    """返回 {"all": {...}, "literal": {...}, "paraphrase": {...}} 与未命中明细。
+
+    每组里同时含定位类（top1/top3/mrr）与集合类（recall/precision/ndcg）指标。
+    集合类的实现细节：
+
+      - **按来源去重**：期望与命中都收敛到"文件名"这一级。不去重的后果是
+        同一文档的两个片段同时命中会把 Precision 抬到虚高，而期望来源只有一个时
+        Precision 上限仍然只有 1/k —— 两个口径混着看会得出相反结论。
+      - **Precision 的分母是实际返回条数**（不是 top_k）：检索器只返回 2 条时
+        按 3 算等于凭空扣分，而"少返回"本身该由 Top-k 覆盖率反映。
+      - **nDCG 的 IDCG 按"理想前 min(|expect|, 返回数) 位全命中"算**，
+        不是按实际命中的个数算 —— 用后者的话"一条都没命中"时 IDCG=0，
+        会退化成 0/0；而按理想算才能让"命中位置更靠前"得分更高。
+    """
+    groups = defaultdict(lambda: {"n": 0, "top1": 0, "top3": 0, "rr": 0.0,
+                                  "recall": 0.0, "precision": 0.0, "ndcg": 0.0})
     misses = []
     for item in queries:
         q, expect = item["q"], set(item["expect"])
@@ -61,6 +85,22 @@ def evaluate(retriever, queries, top_k=3):
         rank = next((i for i, s in enumerate(sources, 1) if s in expect), 0)
         hit3 = rank > 0
 
+        got = {s for s in sources if s}
+        recall = (len(expect & got) / len(expect)) if expect else 1.0
+        precision = (len(expect & got) / len(got)) if got else 1.0
+
+        # 去重后按**首次出现**的顺序建 gain 序列：同一来源出现多次只算最靠前那次
+        seen, gains = set(), []
+        for s in sources:
+            if s in seen:
+                continue
+            seen.add(s)
+            gains.append(1.0 if s in expect else 0.0)
+        dcg = sum(g / math.log2(i + 1) for i, g in enumerate(gains, 1))
+        ideal_n = min(len(expect), len(gains))
+        idcg = sum(1.0 / math.log2(i + 1) for i in range(1, ideal_n + 1))
+        ndcg = (dcg / idcg) if idcg > 0 else 1.0
+
         for key in ("all", qtype):
             g = groups[key]
             g["n"] += 1
@@ -68,6 +108,9 @@ def evaluate(retriever, queries, top_k=3):
             g["top3"] += int(hit3)
             if rank:
                 g["rr"] += 1.0 / rank
+            g["recall"] += recall
+            g["precision"] += precision
+            g["ndcg"] += ndcg
         if not hit3:
             misses.append((q, qtype, sources[:3]))
 
@@ -75,7 +118,8 @@ def evaluate(retriever, queries, top_k=3):
     for key, g in groups.items():
         n = g["n"] or 1
         out[key] = {"n": g["n"], "top1": g["top1"] / n, "top3": g["top3"] / n,
-                    "mrr": g["rr"] / n}
+                    "mrr": g["rr"] / n, "recall": g["recall"] / n,
+                    "precision": g["precision"] / n, "ndcg": g["ndcg"] / n}
     return out, misses
 
 
@@ -153,9 +197,10 @@ def main():
 
         print()
         print(f"{'后端':9s} {'前缀':7s} {'rerank':7s} | "
-              f"{'整体Top1':>8s} {'整体Top3':>8s} {'整体MRR':>8s} | "
+              f"{'Top1':>7s} {'Top3':>7s} {'MRR':>7s} "
+              f"{'Recall@k':>9s} {'nDCG@k':>7s} {'Prec@k':>7s} | "
               f"{'照抄Top1':>8s} | {'改写Top1':>8s} {'改写Top3':>8s}")
-        print("-" * 92)
+        print("-" * 118)
 
         results = []
         cache = {}
@@ -174,13 +219,18 @@ def main():
             lit = res.get("literal", {})
             par = res.get("paraphrase", {})
             print(f"{backend:9s} {'英文指令' if prefix else '(无)':7s} {str(use_rerank):7s} | "
-                  f"{res['all']['top1']:7.0%} {res['all']['top3']:8.0%} {res['all']['mrr']:8.3f} | "
-                  f"{lit.get('top1', 0):7.0%} | "
-                  f"{par.get('top1', 0):7.0%} {par.get('top3', 0):8.0%}")
+                  f"{res['all']['top1']:7.0%} {res['all']['top3']:7.0%} {res['all']['mrr']:7.3f} "
+                  f"{res['all']['recall']:9.0%} {res['all']['ndcg']:7.3f} "
+                  f"{res['all']['precision']:7.0%} | "
+                  f"{lit.get('top1', 0):8.0%} | "
+                  f"{par.get('top1', 0):8.0%} {par.get('top3', 0):8.0%}")
 
-        print("-" * 92)
+        print("-" * 118)
         print("说明：『照抄Top1』= 查询直接复用原文词；『改写Top1』= 换种说法提问。")
         print("      只看整体会低估语义检索的价值，改写列才是它真正解决的问题。")
+        print("      Recall@k / nDCG@k / Prec@k 是**集合指标**：Top1 只说明『第一条对不对』，")
+        print("      多来源查询『有没有找全』要看 Recall@k，『排序好不好』要看 nDCG@k，")
+        print("      『有没有混进无关文档』要看 Prec@k（Top3 是 Hit@3，不含这些信息）。")
 
         if results:
             best_all = max(results, key=lambda r: (r[3]["all"]["top1"], r[3]["all"]["mrr"]))
@@ -194,7 +244,7 @@ def main():
                   f" → Top1 {best_par[3].get('paraphrase', {}).get('top1', 0):.0%}")
 
         if args.show_miss:
-            for backend, prefix, use_rerank, res, misses in results:
+            for backend, prefix, use_rerank, _res, misses in results:
                 if not misses:
                     continue
                 print(f"\n[{backend}{' + 前缀' if prefix else ''}"

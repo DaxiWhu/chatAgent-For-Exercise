@@ -24,8 +24,8 @@ from tests.docx_fixtures import (
     ALT_CHART,
     ALT_IMAGE,
     ALT_OLE,
-    CHART_CATS,
     CHART_CAT_FORMULA,
+    CHART_CATS,
     CHART_TITLE,
     CHART_VALS,
     OLE_CELL_TEXT,
@@ -125,7 +125,7 @@ def test_chart_to_table_is_markdown_with_header(assets):
 
 
 def test_parse_chart_xml_on_garbage_reports_error_instead_of_raising():
-    info = parse_chart_xml("<c:chartSpace 这不是 xml".encode("utf-8"))
+    info = parse_chart_xml("<c:chartSpace 这不是 xml".encode())
     assert info["series"] == []
     assert info["error"]
 

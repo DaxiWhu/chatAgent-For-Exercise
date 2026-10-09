@@ -5,8 +5,8 @@ import src.rag.retrieval as R
 from src.rag.retrieval import (
     BM25Retriever,
     NullRetriever,
-    build_retriever,
     build_prompt,
+    build_retriever,
     embedding_configured,
     load_documents,
     split_documents,

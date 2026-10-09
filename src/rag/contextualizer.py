@@ -17,17 +17,16 @@ Anthropic 的实测结论（`contextual-retrieval`）：仅加**上下文前缀*
   RAG_CTX_MAX_CHUNKS  单次运行上限（默认 500）
   RAG_CTX_DOC_CHARS   给模型的文档全文上限（默认 20000，超出只取头部+命中块附近）
   RAG_CTX_CACHE_DIR   缓存目录（默认 data/.ctx_cache）
+  RAG_CTX_TIMEOUT     单次出站调用超时秒数（默认 60）
 """
 from __future__ import annotations
 
 import hashlib
-import io
-import json
 import logging
 import os
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +63,16 @@ CTX_API_KEY = os.getenv("AGNES_API_KEY", "").strip()
 CTX_MAX_CHUNKS = max(1, _env_int("RAG_CTX_MAX_CHUNKS", 500))
 CTX_DOC_CHARS = max(2000, _env_int("RAG_CTX_DOC_CHARS", 20000))
 CTX_CACHE_DIR = os.getenv("RAG_CTX_CACHE_DIR", "data/.ctx_cache").strip() or "data/.ctx_cache"
+#: 单次出站调用超时（秒）。**2026-10-05 从硬编码 60 改为可配**。
+#:
+#: 为什么统一到环境变量：本目录其余每一个出站点（embedding 的 EMBEDDING_TIMEOUT、
+#: 向量库的 QDRANT_TIMEOUT、重排的 RERANK_TIMEOUT、图片描述的 VLM_TIMEOUT）都
+#: 已可配，只有这一处写死在 `OpenAI(..., timeout=60)`。硬编码的后果不是"超时不对"，
+#: 而是**换模型/换网关时无法按需收紧**（推理型模型的前缀生成本来就慢，60 秒可能
+#: 宽裕；换成一个排队严重的网关时又可能想调大），只能改代码重新发版。
+#: 这里还**不设 `max_retries`**（SDK 默认为 2）：切分是离线批量任务，
+#: 失败重试比"立刻放弃"更划算，且它不在请求热路径上，重试不会拖慢任何用户请求。
+CTX_TIMEOUT = max(5, _env_int("RAG_CTX_TIMEOUT", 60))
 # 输出上限。**实测教训（两次）**：agnes-2.5-pro 是推理型模型，先花推理 token 再出正文。
 #   一次简单请求：46 推理 + 16 正文；
 #   一次带"文档全文"的真实请求：**404 推理 + 0 正文**（finish_reason=length）→ 只得到空串且不报错。
@@ -151,14 +160,14 @@ def _cache_path(source: str, text: str) -> str:
     这类静默错配比多花一次调用贵得多。
     """
     key = hashlib.sha1((f"{CONTEXTUAL_MODEL}\x00{CTX_PREFIX_MAX}\x00{source}\x00{text}")
-                       .encode("utf-8")).hexdigest()
+                       .encode()).hexdigest()
     root = CTX_CACHE_DIR
     if not os.path.isabs(root):
         root = os.path.join(_ROOT, root)
     return os.path.join(root, f"{key}.txt")
 
 
-def _read_cache(source: str, text: str) -> Optional[str]:
+def _read_cache(source: str, text: str) -> str | None:
     """读缓存的前缀，未命中或读取失败返回 None。
 
     source: 来源文件名，透传 _cache_path 参与算键。
@@ -171,7 +180,7 @@ def _read_cache(source: str, text: str) -> Optional[str]:
     if not os.path.isfile(p):
         return None
     try:
-        with io.open(p, "r", encoding="utf-8") as fh:
+        with open(p, encoding="utf-8") as fh:
             v = fh.read().strip()
         return v or None
     except Exception as exc:  # noqa: BLE001
@@ -191,7 +200,7 @@ def _write_cache(source: str, text: str, value: str) -> None:
     try:
         p = _cache_path(source, text)
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        with io.open(p, "w", encoding="utf-8") as fh:
+        with open(p, "w", encoding="utf-8") as fh:
             fh.write(value)
     except Exception as exc:  # noqa: BLE001
         logger.warning("上下文缓存写入失败（不影响结果）：%s", exc)
@@ -209,7 +218,7 @@ def _call_api(prompt: str) -> str:
     """
     from openai import OpenAI
 
-    client = OpenAI(api_key=CTX_API_KEY, base_url=CTX_API_BASE, timeout=60)
+    client = OpenAI(api_key=CTX_API_KEY, base_url=CTX_API_BASE, timeout=CTX_TIMEOUT)
     resp = client.chat.completions.create(
         model=CONTEXTUAL_MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -227,7 +236,7 @@ def _call_api(prompt: str) -> str:
     return text.strip()
 
 
-def _clean(text: str, limit: Optional[int] = None) -> str:
+def _clean(text: str, limit: int | None = None) -> str:
     """把模型输出收拾成"一行前缀"。
 
     text: 模型原始输出。None / 空串都会走到空串返回。
@@ -246,8 +255,8 @@ def _clean(text: str, limit: Optional[int] = None) -> str:
     return t[:limit].strip()
 
 
-def apply(chunks: list, *, call: Optional[Callable[[str], str]] = None,
-          max_chunks: Optional[int] = None, workers: Optional[int] = None) -> dict:
+def apply(chunks: list, *, call: Callable[[str], str] | None = None,
+          max_chunks: int | None = None, workers: int | None = None) -> dict:
     """就地为每块加 `ctx_prefix`，并把前缀拼到 `text` 前面（嵌入输入即带上下文）。
 
     chunks: 待处理的块列表（list[dict]，**就地改写**，不是返回值）。实现读

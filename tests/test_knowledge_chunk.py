@@ -10,13 +10,13 @@ from src.rag.docx_media import DocxAsset, chart_to_table, chart_to_text
 from src.rag.knowledge_chunk import (
     _CHART_CLASSES,
     _V25_CLASSES,
-    _struct_items,
     KIND_CHART,
     KIND_DIAGRAM,
     KIND_FORMULA,
     KIND_TABLE,
     KIND_TEXT,
     KIND_UNPROCESSABLE,
+    _struct_items,
     from_docling_chunk_all,
     from_docling_items,
     from_docling_markdown,
@@ -30,6 +30,7 @@ from src.rag.knowledge_chunk import (
     unprocessable,
 )
 
+
 # ---------------------------------------------------------------------------
 # 假 Docling 对象（只模仿被用到的属性）
 # ---------------------------------------------------------------------------
@@ -39,8 +40,11 @@ class _Label:
 
 
 class _Box:
-    def __init__(self, l, t, r, b):
-        self.l, self.t, self.r, self.b = l, t, r, b
+    def __init__(self, left, top, right, bottom):
+        # ⚠️ **属性名必须保持 l/t/r/b**：这个假对象是在模仿 Docling 的
+        #    BoundingBox，被测代码读的就是 `.l/.t/.r/.b`。E741 只管参数名，
+        #    把属性一起改名会让它不再像真对象，测试会变成假绿。
+        self.l, self.t, self.r, self.b = left, top, right, bottom
 
 
 class _Prov:

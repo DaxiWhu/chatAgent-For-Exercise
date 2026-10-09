@@ -30,11 +30,12 @@ RAG 检索层（检索增强生成）
 - 本文件原名 rag.py，为消除与教程目录 rag/ 的同名冲突而迁入 src/ 并改名。
 """
 
-import os
-import re
+import argparse
 import glob
 import logging
-import argparse
+import os
+import re
+import time
 
 # 让 .env 自动生效。
 # 注意必须显式给 dotenv_path：load_dotenv() 无参时是按「调用方脚本所在目录」找 .env，
@@ -52,11 +53,13 @@ except Exception:  # noqa: BLE001  （dotenv 是可选依赖）
 from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from .vector_store import PgVectorStore, chunk_fingerprint
-from .qdrant_store import QdrantStore, Bm25SparseEncoder, point_id
-from .kb_inventory import stamp_source
+from .. import observability
+from ..envutil import env_int
 from . import index_identity
-from .resilience import CircuitBreaker, guarded_call
+from .kb_inventory import stamp_source
+from .qdrant_store import Bm25SparseEncoder, QdrantStore, point_id
+from .resilience import CircuitBreaker, CircuitOpenError, guarded_call
+from .vector_store import PgVectorStore, chunk_fingerprint
 
 
 def _env_int(name, default):
@@ -64,11 +67,14 @@ def _env_int(name, default):
 
     name: 环境变量名。
     default: 未设置或值非法（跑不出 int）时的回退值。
+
+    ⚠️ 实现委托给 `src/envutil.py`（2026-10-06）：本模块原先自带一份，
+    而 `src/agent*` / `src/graph.py` / `docling_loader` 各自又有一份或干脆没有 ——
+    同一个口径散在 5 处，其中 8 处是**没有兜底**的裸 `int(os.getenv(...))`
+    （在 import 期就崩，服务起不来）。现在只剩一份实现，这里保留函数名是为了
+    不惊动本模块里 40 多个调用点。
     """
-    try:
-        return int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        return default
+    return env_int(name, default)
 
 
 def _env_float(name, default, lo, hi):
@@ -102,6 +108,16 @@ MODEL_NAME = os.getenv("AGNES_MODEL", "agnes-2.0-flash")
 API_KEY = os.getenv("AGNES_API_KEY", "")
 BASE_URL = os.getenv("AGNES_API_BASE", "https://apihub.agnes-ai.com/v1")
 
+#: 生成调用的单次超时（秒）。**2026-10-05 补** —— 此前本文件的 demo 分支
+#: `ChatOpenAI(model=..., api_key=..., base_url=...)` **没传 timeout**，SDK 默认
+#: 600 秒 ⇒ 一个"连得上但迟迟不回包"的网关能让这个示例挂住十几分钟，而且
+#: **一个字都不打印**，现象是"看起来在正常思考"。它虽然只是 `__main__` 里的
+#: 演示路径，但那一行正是"怎么调这个 API"的说明书，照抄它的人会一起漏掉超时。
+#: 默认 30 与主链路 `app/main.py` 的 `ChatOpenAI(timeout=30)` 对齐 ——
+#: 两处取值不一致会导致"换了链路但没人知道超时变了"（见 `src/agents/model.py`
+#: 里同样的对齐说明）。
+GEN_TIMEOUT = max(1, _env_int("AGNES_TIMEOUT", 30))
+
 
 # ---------- Embedding 配置（检索用，与 LLM 解耦）----------
 def _normalize_api_base(url: str) -> str:
@@ -127,6 +143,21 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "").strip()
 # 单次请求送多少条文本。各家上限差别很大（百炼约 10 条，硅基流动可更多），
 # 这里保守默认 10，语料大时可调大：EMBEDDING_BATCH=64
 EMBEDDING_BATCH = max(1, _env_int("EMBEDDING_BATCH", 10))
+
+#: 单次 embedding 出站请求的超时（秒）。⚠️ 2026-10-05 补 —— 此前**没有超时**。
+#:
+#: 为什么必须有：`langchain_openai.OpenAIEmbeddings` 不传 `timeout` 时，底层
+#: openai SDK 用的是它的默认值 **600 秒**，而这里又设了 `max_retries=3`
+#: ⇒ 一次"能连上但迟迟不回包"的 embedding 网关（限流排队、半开连接、LB 黑洞）
+#: 能让单次查询向量化卡住**约 40 分钟**。它发生在**请求热路径**上（每次检索都要
+#: embed_query），后果不是"这个请求慢"，而是工作线程被占死、并发闸门名额耗尽，
+#: 而 `REQUEST_TIMEOUT_SECONDS` 默认是 0（不设总时限）⇒ 请求可以永久挂住，
+#: 优雅关闭的排空上界被击穿，最后被容器 SIGKILL —— 现场表现是
+#: "上线后实例陆续卡死、重启即恢复"，很难往"少了一个 timeout"上想。
+#:
+#: 取 20 秒与 `RERANK_TIMEOUT` 同量级：两者都是同一条链路上的同步出站调用，
+#: 一个"正常"的 embedding 请求是几百毫秒级，20 秒已足够宽容（含冷启动与批量）。
+EMBEDDING_TIMEOUT = max(1, _env_int("EMBEDDING_TIMEOUT", 20))
 
 # 查询侧指令前缀：BGE 系模型的检索效果对前缀敏感（文档侧不加，只加在 query 上）。
 # 实测（bge-m3，8 条中文查询 / 6 篇语料）Top1 准确率：
@@ -165,8 +196,10 @@ VECTOR_STORE = os.getenv("RAG_VECTOR_STORE", "memory").strip().lower()
 PGVECTOR_TABLE = os.getenv("PGVECTOR_TABLE", "rag_chunks").strip() or "rag_chunks"
 # hnsw（默认，召回好）| ivfflat（省内存）| none（不建向量索引，仅小数据量/测试用）
 PGVECTOR_INDEX = os.getenv("PGVECTOR_INDEX", "hnsw").strip().lower()
-# 多租户：非空时 pgvector 的读写都被锁进该租户（详见 vector_store.PgVectorStore）。
-# 空串 = 不隔离，与既有数据/行为完全一致。
+# 多租户：**公共租户**（无租户的身份唯一能读到的分区）。
+# ⚠️ 留空 ≠ "不隔离"（2026-10-06 起）—— 留空会经 `resolve_tenant()` 落到
+# `NO_TENANT_SENTINEL`，也就是**什么都检索不到**（与 app 层一致，见那里的说明）。
+# 想去掉租户过滤只有一个显式写法：`tenant=None`（离线工具/迁移用）。
 RAG_TENANT = os.getenv("RAG_TENANT", "").strip()
 
 # ---------- Qdrant 后端（RAG_VECTOR_STORE=qdrant）----------
@@ -200,41 +233,124 @@ def resolve_tenant(tenant=None) -> str:
     这个函数把两条来源收敛到一处，供 `PgVectorRetriever` / `build_retriever`
     调用 —— 免得"哪一层该用哪个值"在每个调用点各判一次（那种写法迟早分叉）。
 
-    tenant: 请求期租户。None 表示"调用方不关心"（CLI、脚本、原有调用点），
-        此时退回模块级 RAG_TENANT，**保证改造前后行为一致**。
-        传空串表示"显式要求不隔离"。
+    tenant: 请求期租户。**`None` 与空串同义**（都表示"这个调用方没有租户信息"），
+        此时落到模块级 `RAG_TENANT`；`RAG_TENANT` 也留空 ⇒ `NO_TENANT_SENTINEL`。
 
-    返回：最终租户字符串（已 strip）；可能是空串（=不隔离）。
+    ⚠️ **绝不返回空串**（2026-10-06 修）
+    --------------------------------
+    此前这里会返回 `""`（传空串 = "显式要求不隔离"），而向量库把空租户读成
+    **"不拼过滤条件"** ⇒ 一次 `RAG_TENANT` 留空就把**整个库**暴露出来。
+
+    这与上一轮已经反转的公开口径**正好相反**：
+      · app 层（`_retrieval_tenant`）：无租户 ⇒ 落到 `RAG_TENANT`，`RAG_TENANT`
+        再留空 ⇒ `NO_TENANT_SENTINEL` ⇒ **什么都读不到**（fail-closed）；
+      · src 层（本函数，修前）：`RAG_TENANT` 留空 ⇒ `""` ⇒ **不过滤** ⇒ 读全部租户。
+    同一份配置、两层结论相反，而 src 层这一侧是**静默放行** —— 文档写着
+    "留空 = 什么都读不到"，实际留空等于"谁都能看见全部租户的内容"。
+    `PRODUCTION_CONFIG.md` / `README.md` / `data/kb/03-检索与引用链路.md`
+    都已经把那条反转写成了已完成的事实，所以这是**实现没跟上文档**。
+
+    ⚠️ 为什么 `""` 要跟 `None` **同义**，而不是各走一条
+    --------------------------------------------------
+    上一版把 `""` 判成"显式要求不隔离"，于是同一个"没有租户"的输入在本项目里
+    有两个结论（app 层给公共租户、src 层给全库）—— 这正是上面那场事故的成因。
+    现在只留**一条**规则，且与 `_retrieval_tenant` 逐字一致：
+
+        ident.tenant  →  RAG_TENANT  →  NO_TENANT_SENTINEL
+        （identity 侧）   （公共租户）     （什么都读不到）
+
+    传 `tenant=None` 与传 `tenant=""` 走的是同一条路，结果必然相同 ——
+    "空串到底等不等于不隔离"这个必须在每个调用点各判一次的陷阱就此消失。
+
+    ⚠️ 需要"真的不过滤"时怎么办：**不要把空串塞进这里**，那是本函数明确禁止的
+    输入语义。离线的维护/迁移工具（`kb_prune` 等）是**直接构造** store
+    （`PgVectorStore(..., tenant="")` / `QdrantStore(..., tenant=None)`），
+    不经过本函数 —— store 的 `tenant` 是"取原值、按值过滤"的，与这里
+    "把身份归一成过滤值"是两件事。
+
+    ⚠️ **必须先 strip 再兜底**，不能写成 `(tenant or RAG_TENANT).strip()`
+    ---------------------------------------------------------------
+    `"   "`（纯空格）在 `or` 判据下是**真值**，于是它会短路掉公共租户兜底、
+    直接走到最后那一步 `.strip()` 变成空串 ⇒ 哨兵值。也就是说"身份里带了几个
+    空格"和"身份里没有租户"会得到**不同**的结果 —— 而请求头/令牌里多一个空格
+    是完全可能的，且症状（搜不到东西）看起来与"这个账号没被分配租户"一模一样。
+    所以这里逐字对齐 `app/main.py::_retrieval_tenant` 的形状：
+    先各自 strip，再依次兜底。
+
+    返回：最终租户字符串（已 strip），**永不为空**；无租户时为哨兵值
+    `NO_TENANT_SENTINEL`（库里不可能有该分区的数据 ⇒ 天然什么都召回不到）。
     """
-    if tenant is None:
-        return RAG_TENANT
-    return (tenant or "").strip()
+    return (tenant or "").strip() or (RAG_TENANT or "").strip() or NO_TENANT_SENTINEL
+
+
+#: "没有租户"的哨兵值。**权威定义在 `app/config.py`**（`config.NO_TENANT_SENTINEL`），
+#: 这里重复一份字面量是刻意的：`src/` 绝不能反向 import `app/`（那会形成
+#: `src → app` 的反向依赖，而 `app/config.py` 又是全项目的配置入口）。
+#: 两份字面量由 `tests/test_tenant_isolation.py` 的等值守卫钉住 —— 只改一边会红。
+#:
+#: 为什么必须与 app 层同值：它同时是"app 层无租户时交给检索层的过滤值"。
+#: 两侧不同值的话，app 层会传 A、src 层兜底用 B ⇒ "无租户"在同一个进程里有两个
+#: 分区名 —— 谁都不会报错，只是各自查到不同的空集合。
+NO_TENANT_SENTINEL = "%__no_tenant__%"
+
+
+def tenant_label(tenant=None) -> str:
+    """日志/自检文案用：把"无租户"渲染成人看得懂的 `<无租户>`。
+
+    为什么需要它：`resolve_tenant()` 现在**永不为空**，无租户时给出的是哨兵值
+    `%__no_tenant__%`。直接把哨兵打进日志，"绑定了哪个分区"这件事就成了一串
+    符号噪音；而旧写法 `resolve_tenant(x) or "<不隔离>"` 现在恒为假（永不触发），
+    留在那里会误导读者以为"空租户 = 不隔离"仍然是可能存在的情形。
+    """
+    t = resolve_tenant(tenant)
+    return "<无租户>" if t == NO_TENANT_SENTINEL else t
 
 # ---------- 出站调用熔断（rerank / embedding）----------
 # 连续失败达阈值即"快速失败"，隔 reset 秒放一个试探请求。默认开；
 # 关掉后行为与加这层之前一致（每次都真的发请求）。
 CIRCUIT_ENABLED = os.getenv("RAG_BREAKER", "1").strip().lower() not in ("0", "off", "false", "no")
-CIRCUIT_FAIL_THRESHOLD = _env_int("CIRCUIT_FAIL_THRESHOLD", 5)
-CIRCUIT_RESET_SECONDS = _env_int("CIRCUIT_RESET_SECONDS", 30)
+# ⚠️ 下界 1（2026-10-06 修）：`CIRCUIT_FAIL_THRESHOLD=0` 是"合法"整数，
+# 而判据是 `failures >= threshold` ⇒ **一次失败就打开**（熔断退化成"一碰就断"，
+# 上游偶发抖动被放大成整条检索降级）；`CIRCUIT_RESET_SECONDS=0` 则是
+# "刚打开就允许试探" ⇒ 熔断事实上不存在，故障期间照样每个请求都打上游。
+# 两者都不会报错，只会让 `circuit_opened_total` 的曲线变形。
+CIRCUIT_FAIL_THRESHOLD = env_int("CIRCUIT_FAIL_THRESHOLD", 5, lo=1)
+CIRCUIT_RESET_SECONDS = env_int("CIRCUIT_RESET_SECONDS", 30, lo=1)
 
 # 混合检索：每一路各取多少条候选送进融合
 HYBRID_POOL = max(1, _env_int("RAG_HYBRID_POOL", 10))
-# RRF 的平滑常数（原论文推荐 60），越大越弱化头部排名差异
-RRF_K = _env_int("RAG_RRF_K", 60)
+# RRF 的平滑常数（原论文推荐 60），越大越弱化头部排名差异。
+# ⚠️ 下界 1（2026-10-06 修）：融合分是 `1/(k + rank)`，`rank` 从 1 起，
+# 所以 `k = 0` 不会除零 —— 但 **负数** 会：`k = -3` 时第 1 名得 1/(-2)，
+# 第 5 名得 1/2 ⇒ **排名被整体倒过来**。这是最隐蔽的一种"配置写错"：
+# 检索仍返回结果、不报任何错，只是排在前面的全是最不相关的。
+RRF_K = env_int("RAG_RRF_K", 60, lo=1)
 
 # ---------- rerank（可选，失败自动回退）----------
 RERANK_API_BASE = _normalize_api_base(os.getenv("RERANK_API_BASE", ""))
 RERANK_API_KEY = os.getenv("RERANK_API_KEY", "").strip()
 RERANK_MODEL = os.getenv("RERANK_MODEL", "").strip()
 RERANK_ENABLED = os.getenv("RAG_RERANK", "1").strip().lower() not in ("0", "false", "off", "no")
-RERANK_TIMEOUT = _env_int("RERANK_TIMEOUT", 20)
+# ⚠️ 必须夹到 [1, 600]（2026-10-06 修）：此前是裸 `_env_int("RERANK_TIMEOUT", 20)`，
+# 于是 `0` / 负数都是"合法"输入。本机对 `httpx`（精排用的就是它）实测：
+#   · `timeout=0`   → `ConnectError`（连接侧直接失败，请求**发不出去**）
+#   · `timeout=-1`  → `ValueError: Timeout value out of range`（调用点抛）
+# 两种都让精排每一次都失败 ⇒ 检索静默退回"不精排"：`circuit_open` 会亮、
+# `rerank_fallback_total` 会涨，但没人会把"这些指标起来了"联想到
+# "有人把超时写成了 0"。上界同理：`RERANK_TIMEOUT=20000`（毫秒，抄错单位）
+# 会让一次精排挂 5.5 小时 —— 而请求级总时限只约束"消费上游流"，管不到这里。
+RERANK_TIMEOUT = env_int("RERANK_TIMEOUT", 20, lo=1, hi=600)
 
 # ---------- 切分 ----------
 # headings：按 Markdown 标题切，并把标题路径写进块（结构化文件收益明显）
 # recursive：纯递归字符切分
 CHUNK_STRATEGY = os.getenv("RAG_CHUNK_STRATEGY", "headings").strip().lower()
-CHUNK_SIZE = _env_int("RAG_CHUNK_SIZE", 300)
-CHUNK_OVERLAP = _env_int("RAG_CHUNK_OVERLAP", 50)
+CHUNK_SIZE = env_int("RAG_CHUNK_SIZE", 300, lo=1)
+# ⚠️ `RAG_CHUNK_OVERLAP >= RAG_CHUNK_SIZE` 不会被这里拦住 —— 那是个**相对**约束，
+# 只能在真正造切分器时判（见 `_make_splitter`）。LangChain 对这种输入抛
+# `ValueError: Got a larger chunk overlap ... than chunk size`，而灌库链路
+# 会把它当成"这份文档解析失败"处理 ⇒ 表现成"所有文档都灌不进去"。
+CHUNK_OVERLAP = env_int("RAG_CHUNK_OVERLAP", 50, lo=0)
 
 # 递归切分的分隔符优先级。
 # LangChain 默认只有 ["\n\n", "\n", " ", ""] —— 中文没有空格，无换行的长段落会从 " "
@@ -297,7 +413,7 @@ def load_documents(doc_folder: str):
     files = glob.glob(os.path.join(doc_folder, "**", "*"), recursive=True)
     for f in files:
         if f.lower().endswith((".txt", ".md")):
-            with open(f, "r", encoding="utf-8") as fh:
+            with open(f, encoding="utf-8") as fh:
                 texts.append((os.path.basename(f), fh.read()))
     return texts
 
@@ -305,12 +421,36 @@ def load_documents(doc_folder: str):
 def _make_splitter(chunk_size, chunk_overlap):
     """造一个递归字符切分器（分隔符固定用 SPLIT_SEPARATORS）。
 
-    chunk_size: 块长度上限（字符）。
-    chunk_overlap: 相邻块的重叠长度（字符）。
+    chunk_size: 块长度上限（字符）。至少 1。
+    chunk_overlap: 相邻块的重叠长度（字符）。**会被夹到 `[0, chunk_size - 1]`**。
+
+    ⚠️ 为什么在这里夹而不是在各调用点（2026-10-06 修）
+    -------------------------------------------------
+    `chunk_size` / `chunk_overlap` 分别来自 `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP`
+    （PDF 另有 `RAG_PDF_CHUNK_*` / `RAG_DOC_CHUNK_TOKENS`），**各自都是合法整数**，
+    但"重叠 ≥ 块长"是它们之间的**相对**约束 —— 单看任一变量永远判不出来。
+    LangChain 的 `RecursiveCharacterTextSplitter.__init__` 对此抛
+    `ValueError: Got a larger chunk overlap (500) than chunk size (300)`，
+    而灌库链路的宽 `except` 会把它记成"这份文档解析失败" ⇒ 现象是
+    **所有文档都灌不进去**，日志里却只有一句看不出因果的报错。
+
+    本函数是**全部**切分路径的唯一漏斗（`split_documents` / `split_by_headings` /
+    结构化合并切分都走它），所以夹一次就够，且不会漏掉以后新增的调用点。
+    被夹时留 WARNING：静默把 500 改成 299 也是一种"行为变了没人知道"。
     """
+    size = max(1, int(chunk_size or 1))
+    overlap = max(0, int(chunk_overlap or 0))
+    if overlap >= size:
+        clamped = size - 1
+        logging.warning(
+            "块间重叠 %d ≥ 块长 %d（LangChain 会直接报错、灌库整体失败）"
+            "，已夹到 %d。请检查 RAG_CHUNK_OVERLAP / RAG_CHUNK_SIZE"
+            "（PDF 看 RAG_PDF_CHUNK_OVERLAP / RAG_PDF_CHUNK_SIZE）。",
+            overlap, size, clamped)
+        overlap = clamped
     return RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
+        chunk_size=size,
+        chunk_overlap=overlap,
         separators=SPLIT_SEPARATORS,
     )
 
@@ -795,8 +935,8 @@ class BM25Retriever:
         与查询无关的量（idf / avgdl / norm）全部在构造期算好，查询时只剩一次 O(nnz) 累加。
         改 k1 / b 需要**重建实例** —— 长度归一化分母已按当时的值烘进 self.norm。
         """
-        from sklearn.feature_extraction.text import CountVectorizer
         import numpy as np
+        from sklearn.feature_extraction.text import CountVectorizer
 
         self.chunks = chunks
         self.np = np
@@ -839,7 +979,14 @@ class BM25Retriever:
 
         得分为 0 的块被过滤掉（与查询零词重叠 = 无关），所以实际返回可能少于 top_k，
         极端情况下返回 [] —— 与换掉的 TF-IDF 行为一致，上游据此走"没找到资料"的降级路径。
+
+        计时包一层、不改 `_search` 的缩进：稀疏路本该是微秒级，它一旦变慢就说明
+        走的是 Qdrant 稀疏后端（网络）。把测量与算法分开也保住了 `_search` 的
+        可读性 —— 那里是逐行注释过的热点代码。
         """
+        return _timed("sparse", lambda: self._search(query, top_k))
+
+    def _search(self, query, top_k=TOP_K):
         np = self.np
         q = self.vectorizer.transform([query])
         if q.nnz == 0:
@@ -878,8 +1025,8 @@ class EmbeddingRetriever:
         chunks: 块列表（dict），读 "text" 键作为文档。每条一次嵌入调用，
             大语料下这里是启动耗时的主要来源（无持久化，每次启动全量重算）。
         """
-        from langchain_openai import OpenAIEmbeddings
         import numpy as np
+        from langchain_openai import OpenAIEmbeddings
 
         self.chunks = chunks
         self.np = np
@@ -888,6 +1035,9 @@ class EmbeddingRetriever:
             api_key=EMBEDDING_API_KEY,
             base_url=EMBEDDING_API_BASE or None,
             chunk_size=EMBEDDING_BATCH,   # 按各家单次输入上限分批，避免 400
+            # ⚠️ 显式传 timeout：不传时 SDK 默认 600 秒 × 3 次重试 ≈ 最坏 40 分钟
+            # 挂在请求热路径上（见 EMBEDDING_TIMEOUT 的说明）。
+            timeout=EMBEDDING_TIMEOUT,
             max_retries=3,
         )
         # 实例级熔断器（不跨用例共享状态）：embedding 网关整体挂了时快速失败，
@@ -908,14 +1058,19 @@ class EmbeddingRetriever:
             所以恒返回 min(top_k, 块数) 条。
         """
         # 查询侧加指令前缀（文档侧不加），BGE 系模型靠这个拉开区分度
-        q = guarded_call(
+        q = _timed("embed", lambda: guarded_call(
             self.breaker,
             lambda: self.embedder.embed_query(
                 apply_query_prefix(EMBEDDING_QUERY_PREFIX, query)),
-        )
-        sims = [self._cos(q, v) for v in self.vectors]
-        order = self.np.argsort(sims)[::-1][:top_k]
-        return [(self.chunks[i], float(sims[i])) for i in order]
+        ))
+
+        def _rank():
+            # 本地暴力余弦 + 排序。与 embed 分开计时，才能区分"上游慢"与"本地慢"。
+            sims = [self._cos(q, v) for v in self.vectors]
+            order = self.np.argsort(sims)[::-1][:top_k]
+            return [(self.chunks[i], float(sims[i])) for i in order]
+
+        return _timed("vector", _rank)
 
     @staticmethod
     def _cos(a, b):
@@ -950,8 +1105,9 @@ class PgVectorRetriever:
 
         chunks: 块列表（dict），取 text 作检索文本、**整块**落 jsonb 供检后回读。
         store: PgVectorStore 或同接口的假实现；None 时自建。
-        tenant: 租户 id。None（默认）时退回模块级 RAG_TENANT，**行为与改造前完全一致**；
-            显式传入时才覆盖。空串 = 不隔离（单租户/兼容既有数据）。
+        tenant: 租户 id。None（默认）时退回模块级 RAG_TENANT；两者都空则落到
+            哨兵值（什么都检索不到，见 `resolve_tenant`）。
+            ⚠️ 空串**不再**等于"不隔离"：要显式去掉过滤得走 `tenant=None`。
 
         构造会连库、首次灌库时还会调 embedding API；表已存在且块都在库里时，
         零 embedding 调用（只发一次 `SELECT id`）。
@@ -968,6 +1124,7 @@ class PgVectorRetriever:
             api_key=EMBEDDING_API_KEY,
             base_url=EMBEDDING_API_BASE or None,
             chunk_size=EMBEDDING_BATCH,
+            timeout=EMBEDDING_TIMEOUT,   # 见 EMBEDDING_TIMEOUT 的说明
             max_retries=3,
         )
         self.breaker = CircuitBreaker("embedding", CIRCUIT_FAIL_THRESHOLD,
@@ -996,7 +1153,7 @@ class PgVectorRetriever:
         self.store.ensure_schema(len(vectors[0]))
         rows = [
             (cid, c, (c.get("text") or ""), vec)
-            for (cid, c), vec in zip(missing, vectors)
+            for (cid, c), vec in zip(missing, vectors, strict=False)
         ]
         n = self.store.upsert(rows)
         logging.info("pgvector 增量写入 %d 块（库内原有 %d 块）", n, len(existing))
@@ -1042,7 +1199,8 @@ class QdrantRetriever:
 
         chunks: 块列表（dict），取 text 作检索文本、**整块**落 payload 供检后回读。
         store: QdrantStore 或同接口的假实现；None 时按 QDRANT_* 自建。
-        tenant: 租户 id。None（默认）时退回模块级 RAG_TENANT；空串 = 不隔离。
+        tenant: 租户 id。None（默认）时退回模块级 RAG_TENANT；两者都空则落到
+            哨兵值（什么都检索不到）。⚠️ 空串**不再**等于"不隔离"。
         """
         from langchain_openai import OpenAIEmbeddings
 
@@ -1056,6 +1214,7 @@ class QdrantRetriever:
             api_key=EMBEDDING_API_KEY,
             base_url=EMBEDDING_API_BASE or None,
             chunk_size=EMBEDDING_BATCH,
+            timeout=EMBEDDING_TIMEOUT,   # 见 EMBEDDING_TIMEOUT 的说明
             max_retries=3,
         )
         self.breaker = CircuitBreaker("embedding", CIRCUIT_FAIL_THRESHOLD,
@@ -1099,7 +1258,7 @@ class QdrantRetriever:
                 f"{QDRANT_COLLECTION}_d{got}）重新灌库，并把 QDRANT_DIM 设为 {got}。"
             )
         rows = []
-        for (fp, c), vec in zip(missing, vectors):
+        for (fp, c), vec in zip(missing, vectors, strict=False):
             s_idx, s_val = self.encoder.encode_document(c.get("text") or "")
             rows.append((point_id(fp), c, (c.get("text") or ""), vec, s_idx, s_val))
         n = self.store.upsert(rows)
@@ -1129,10 +1288,13 @@ class QdrantSparseRetriever:
 
     def search(self, query, top_k=TOP_K):
         """返回 [(chunk, score), ...]。查询无有效 term 时返回 []（同 BM25Retriever）。"""
-        idx, val = self._o.encoder.encode_query(query)
-        if not idx:
-            return []
-        return self._o.store.search_sparse(idx, val, top_k)
+        def _run():
+            idx, val = self._o.encoder.encode_query(query)
+            if not idx:
+                return []
+            return self._o.store.search_sparse(idx, val, top_k)
+
+        return _timed("sparse", _run)
 
 
 class QdrantDenseRetriever:
@@ -1144,12 +1306,15 @@ class QdrantDenseRetriever:
 
     def search(self, query, top_k=TOP_K):
         """返回 [(chunk, score), ...]，score = 余弦相似度（与 EmbeddingRetriever 同口径）。"""
-        q = guarded_call(
+        q = _timed("embed", lambda: guarded_call(
             self._o.breaker,
             lambda: self._o.embedder.embed_query(
                 apply_query_prefix(EMBEDDING_QUERY_PREFIX, query)),
-        )
-        return self._o.store.search_dense(q, top_k)
+        ))
+        # 与 EmbeddingRetriever 的差别：这里的 "vector" 是**真的网络查询**（ANN），
+        # 不是本地暴力余弦 —— 同一 stage 标签下两个后端的量级本就不同，
+        # 这也正是"按后端看检索延迟"必须能分开的原因。
+        return _timed("vector", lambda: self._o.store.search_dense(q, top_k))
 
 
 class NullRetriever:
@@ -1171,6 +1336,31 @@ class NullRetriever:
 # ---------------------------------------------------------------------------
 # 3. 混合检索（RRF 融合 + 可选 rerank）
 # ---------------------------------------------------------------------------
+def _timed(stage, fn):
+    """给检索链路的**一段**计时并返回其结果（异常照常抛出）。
+
+    为什么需要分段而不是只看整体
+    -------------------------
+    检索层此前只有一个整体耗时（`graph.py` 的 `rag_retrieval_duration_seconds`）。
+    它能告诉你"检索变慢了"，但**不能告诉你慢在哪一段** —— 而四段的处置完全不同：
+      embed  —— 查询向量化 ⇒ 上游 embedding 网关 / 配额 / 网络；
+      vector —— 向量库查询 ⇒ 索引、连接池、数据量；
+      rerank —— 精排 ⇒ 上游 rerank 网关（三家出站调用里最容易超时的一家）；
+      sparse —— 关键词路 ⇒ 本地 BM25（应当恒为微秒级），慢就说明走了
+                 Qdrant 稀疏路（网络）。
+    没有这个拆分，"检索从 200ms 变成 3s"只能靠逐个注释代码去试。
+
+    异常也记耗时：超时型故障的耗时（正好压着 timeout 上限）是判断"卡在哪一段"
+    最直接的证据 —— 失败时把它丢掉，等于丢掉最有用的那个样本。
+    """
+    t0 = time.perf_counter()
+    try:
+        return fn()
+    finally:
+        observability.histogram("rag_stage_duration_seconds",
+                                time.perf_counter() - t0, stage=stage)
+
+
 def _chunk_key(chunk):
     """块的去重键：source + section + text 三元组。
 
@@ -1261,7 +1451,9 @@ class RerankClient:
 
         # 经熔断器发请求：熔断打开时抛 CircuitOpenError（上游 HybridRetriever 会
         # 捕获并回退融合顺序），避免持续故障期间每个请求都白等一个超时。
-        resp = guarded_call(self.breaker, _post)
+        # 计时**含**被熔断挡下的那一次（耗时≈0）：那同样是个可观测事实 ——
+        # `circuit_rejected_total` 给出次数，这里给出它省下了多少等待。
+        resp = _timed("rerank", lambda: guarded_call(self.breaker, _post))
         results = resp.json().get("results") or []
         out = []
         for item in results:
@@ -1325,8 +1517,24 @@ class HybridRetriever:
                 self.last_rerank_ok = bool(reranked)
                 if reranked:
                     return reranked
+                # 精排"成功但返回空" —— 也是一种降级，只是没有异常可抓：
+                # 上游 200 但 results 为空（模型名写错、配额耗尽返回空列表、
+                # 网关降级），检索会**静默**退回融合顺序。
+                observability.counter("rerank_fallback_total", reason="empty")
+                logging.warning("rerank 返回空结果，回退融合顺序")
             except Exception as e:  # noqa: BLE001
                 self.last_rerank_ok = False
+                # ⚠️ 必须有 counter（2026-10-06 修）：此前这条降级路径**只有一条
+                # WARNING 日志** —— 而 `rerank_fallback_total` 是"检索质量悄悄
+                # 下降"的唯一可告警信号。缺了它，`RERANK_TIMEOUT=0`、
+                # `RERANK_MODEL` 拼错、上游 429 这三种完全不同的故障在面板上
+                # 长得一模一样：什么都看不出来。熔断挡住的那次单独标
+                # `reason="circuit_open"`，避免与真实的网络/上游错误混在一起
+                # （处置方式不同：前者查上游健康，后者查本机配置）。
+                observability.counter(
+                    "rerank_fallback_total",
+                    reason=("circuit_open"
+                            if isinstance(e, CircuitOpenError) else "error"))
                 logging.warning("rerank 失败，回退融合顺序：%s", e)
 
         return fused[:top_k]
@@ -1425,7 +1633,8 @@ def _make_dense_retriever(chunks, tenant=None):
     """按 RAG_VECTOR_STORE 选稠密检索后端：qdrant / pg（pgvector）/ memory（numpy）。
 
     chunks: 块列表。
-    tenant: 租户 id（None = 用模块级 RAG_TENANT）。**只有 qdrant / pg 后端会真正
+    tenant: 租户 id（None = 用模块级 RAG_TENANT；两者都空 ⇒ 哨兵值 ⇒ 读不到东西）。
+        **只有 qdrant / pg 后端会真正
         用到它** —— 内存后端（EmbeddingRetriever）的语料就是传进来的这批 chunks，
         本身不含跨租户数据，因此没有可过滤的维度。
 
@@ -1439,7 +1648,7 @@ def _make_dense_retriever(chunks, tenant=None):
         try:
             r = QdrantRetriever(chunks, tenant=tenant)
             logging.info("稠密检索后端：Qdrant（集合=%s，租户=%s）",
-                         QDRANT_COLLECTION, resolve_tenant(tenant) or "<不隔离>")
+                         QDRANT_COLLECTION, tenant_label(tenant))
             return r.dense
         except Exception as e:  # noqa: BLE001  （任何失败都回退，不让服务崩）
             logging.warning("Qdrant 后端不可用（%s），回退内存向量检索。", e)
@@ -1447,7 +1656,7 @@ def _make_dense_retriever(chunks, tenant=None):
         try:
             r = PgVectorRetriever(chunks, tenant=tenant)
             logging.info("稠密检索后端：pgvector（表=%s，租户=%s）",
-                         PGVECTOR_TABLE, resolve_tenant(tenant) or "<不隔离>")
+                         PGVECTOR_TABLE, tenant_label(tenant))
             return r
         except Exception as e:  # noqa: BLE001  （任何失败都回退，不让服务崩）
             logging.warning("pgvector 后端不可用（%s），回退内存向量检索。", e)
@@ -1512,7 +1721,7 @@ def build_retriever(chunks, tenant=None):
             try:
                 qr = QdrantRetriever(chunks, tenant=tenant)
                 logging.info("hybrid 双路后端：Qdrant（集合=%s，租户=%s）",
-                             QDRANT_COLLECTION, resolve_tenant(tenant) or "<不隔离>")
+                             QDRANT_COLLECTION, tenant_label(tenant))
                 return HybridRetriever(chunks, sparse=qr.sparse, dense=qr.dense,
                                        reranker=reranker)
             except Exception as e:  # noqa: BLE001
@@ -1673,7 +1882,6 @@ def _where(chunk) -> str:
     span = _page_span(chunk)
     if span:
         # PDF 说"第 N 页"；xlsx/pptx 的 page 是工作表序号/幻灯片序号，含义不同
-        kind = chunk.get("kind") or ""
         parser = (chunk.get("parser") or "").lower()
         if parser in ("xlsx", "xlsm"):
             parts.append(f"第 {span} 个工作表")
@@ -1758,7 +1966,8 @@ def main():
     print(f"已加载语料，共 {len(chunks)} 个片段"
           f"（切分策略={CHUNK_STRATEGY}，块大小={CHUNK_SIZE}）。")
 
-    model = ChatOpenAI(model=MODEL_NAME, api_key=API_KEY, base_url=BASE_URL)
+    model = ChatOpenAI(model=MODEL_NAME, api_key=API_KEY, base_url=BASE_URL,
+                       timeout=GEN_TIMEOUT)
     retriever = build_retriever(chunks)
     print(f"检索后端：{type(retriever).__name__}"
           f"（RAG_EMBEDDING={EMBEDDING_BACKEND}，"

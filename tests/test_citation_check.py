@@ -265,7 +265,7 @@ def test_low_overlap_is_a_warning_not_a_block():
 
 def test_verify_is_ok_when_everything_lines_up():
     body = "梧州特产有六堡茶，历史悠久，是广西梧州的传统名茶之一。"
-    got = cc.verify(f"梧州特产有六堡茶 [1]。", [_cite(1, body)])
+    got = cc.verify("梧州特产有六堡茶 [1]。", [_cite(1, body)])
     assert got["status"] == "ok"
     assert got["ok"] is True
     assert got["detail"]

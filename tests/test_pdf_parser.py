@@ -6,19 +6,18 @@
 - nltk punkt 数据缺失时自动回退，不再崩
 """
 import os
-import io
 
 import pytest
 
 from src.rag.pdf_parser import (
-    extract_pdf_text,
     extract_pdf_paragraphs,
-    rebuild_paragraphs,
-    sent_tokenize_zh,
-    sent_tokenize,
-    split_text_sentence_aware,
-    pdf_to_chunks,
+    extract_pdf_text,
     guess_lang,
+    pdf_to_chunks,
+    rebuild_paragraphs,
+    sent_tokenize,
+    sent_tokenize_zh,
+    split_text_sentence_aware,
 )
 from src.rag.retrieval import load_chunks
 
@@ -143,6 +142,7 @@ def test_pdf_page_text_chars_sees_no_text_on_a_rasterized_page(tmp_path):
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "scripts"))
     from check_ocr import build_scanned_pdf
+
     from src.rag.pdf_parser import pdf_page_text_chars
 
     chars = pdf_page_text_chars(build_scanned_pdf(str(tmp_path / "scanned.pdf")))

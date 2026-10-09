@@ -22,7 +22,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -45,18 +45,20 @@ try:
 except Exception:  # noqa: BLE001  （dotenv 是可选依赖）
     pass
 
+from ..envutil import env_float, env_int  # noqa: E402  （必须在 load_dotenv 之后）
+
 # ---------------------------------------------------------------------------
 # 配置（与 retrieval.py 的 RAG_* 风格保持一致）
 # ---------------------------------------------------------------------------
 DOC_PARSER = os.getenv("RAG_DOC_PARSER", "docling").strip().lower()
-DOC_CHUNK_TOKENS = int(os.getenv("RAG_DOC_CHUNK_TOKENS", "512") or 512)
+DOC_CHUNK_TOKENS = env_int("RAG_DOC_CHUNK_TOKENS", 512, lo=1)
 DOCLING_OCR = os.getenv("DOCLING_OCR", "auto").strip().lower()      # auto | on | off
 DOCLING_DEVICE = os.getenv("DOCLING_DEVICE", "cpu").strip()
 DOCLING_ARTIFACTS = os.getenv("DOCLING_ARTIFACTS_PATH", "").strip()
 TOKENIZER_MODE = os.getenv("BGE_TOKENIZER", "hf").strip().lower()    # hf | tiktoken | char
 # 与 embedding 用同一个模型，保证 chunk 的 token 预算和向量模型的上限对齐
 TOKENIZER_MODEL = os.getenv("EMBEDDING_MODEL", "").strip() or "BAAI/bge-m3"
-IMAGES_SCALE = float(os.getenv("DOCLING_IMAGES_SCALE", "2.0") or 2.0)
+IMAGES_SCALE = env_float("DOCLING_IMAGES_SCALE", 2.0, lo=0.1)
 
 # ---- 原页截图（供用户回溯核对）----
 # auto（默认，PDF 开）| on | off
@@ -67,7 +69,7 @@ IMAGES_SCALE = float(os.getenv("DOCLING_IMAGES_SCALE", "2.0") or 2.0)
 DOCLING_PAGE_IMAGES = os.getenv("DOCLING_PAGE_IMAGES", "auto").strip().lower()
 # 裁剪时向外扩的边距（PDF 点）。太小会把贴着 bbox 的表格边框切掉，
 # 让人对不上"这到底是原文里的哪一块"。
-CITE_IMAGE_MARGIN = float(os.getenv("RAG_CITE_IMAGE_MARGIN", "8") or 8)
+CITE_IMAGE_MARGIN = env_float("RAG_CITE_IMAGE_MARGIN", 8.0, lo=0.0)
 # 值得返回原图的块类型；纯文字块不返回。
 CITE_IMAGE_KINDS = {"table", "chart", "diagram", "formula"}
 # 原始 bbox 的最小可信面积（pt²）：低于它认为这个元素的位置不可信，宁可不给图
@@ -131,7 +133,7 @@ class ParseOutcome:
     chunks: list = field(default_factory=list)
     status: str = "ok"       # ok | partial | unprocessable | unavailable | failed
     reason: str = ""
-    page_total: Optional[int] = None
+    page_total: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +231,7 @@ class _CharTokenizer:
 
 
 def _unprocessable_with_page(doc: Any, source: str, why: str,
-                             page_total: Optional[int], path: str):
+                             page_total: int | None, path: str):
     """解析不出内容的**显式失败记录**，并且尽量带上原页图。
 
     为什么这类记录也要给图：解析不出内容最常见的原因就是**扫描件 OCR 读不出来**
@@ -391,15 +393,17 @@ def _crop_region(pil: Any, kc: Any, page: Any) -> Any:
     scale = pil.height / page_h if page_h else IMAGES_SCALE
 
     xs0, ys0, xs1, ys1 = [], [], [], []
-    for l, t, r, b in boxes:
+    for left, t, r, b in boxes:
         if t >= b:
             # docling/PDF 惯例：左下原点，y 越大越靠上 → 换算成左上原点
             top_y, bot_y = page_h - t, page_h - b
         else:
             # 已经是左上原点（t 是上边、b 是下边），不换算
             top_y, bot_y = t, b
-        xs0.append(min(l, r)); xs1.append(max(l, r))
-        ys0.append(top_y); ys1.append(bot_y)
+        xs0.append(min(left, r))
+        xs1.append(max(left, r))
+        ys0.append(top_y)
+        ys1.append(bot_y)
 
     m = CITE_IMAGE_MARGIN
     # 可信度判据看**原始 bbox 的面积**，不看加完边距的结果：
@@ -521,10 +525,10 @@ def build_tokenizer() -> Any:
 
     if TOKENIZER_MODE in ("hf", "auto"):
         try:
-            from transformers import AutoTokenizer
             from docling_core.transforms.chunker.tokenizer.huggingface import (
                 HuggingFaceTokenizer,
             )
+            from transformers import AutoTokenizer
             tok = AutoTokenizer.from_pretrained(TOKENIZER_MODEL)
             logger.info("切分 tokenizer：HuggingFace %s（与 embedding 模型对齐）", TOKENIZER_MODEL)
             return HuggingFaceTokenizer(tokenizer=tok, max_tokens=max_tokens)
@@ -792,9 +796,9 @@ def _chunk_once(doc: Any, chunker: Any, kwarg: str) -> list:
 
 
 def to_knowledge_chunks(doc: Any, source: str, *, kind: str = "pdf",
-                        page_total: Optional[int] = None,
+                        page_total: int | None = None,
                         checksum: str = "",
-                        image_paths: Optional[dict] = None) -> list:
+                        image_paths: dict | None = None) -> list:
     """DoclingDocument → list[KnowledgeChunk]，四级阶梯，确保抽到的内容不被丢掉。
 
     阶梯设计的原因
@@ -817,7 +821,9 @@ def to_knowledge_chunks(doc: Any, source: str, *, kind: str = "pdf",
     但是docx不行，有些地方docling解析出来的字段是没有的，所以会走一些兜底策略
     """
     from .knowledge_chunk import (
-        from_docling_chunk_all, from_docling_items, from_docling_markdown,
+        from_docling_chunk_all,
+        from_docling_items,
+        from_docling_markdown,
     )
 
     origin = "docling_pdf" if kind == "pdf" else "docling_docx"
@@ -1006,7 +1012,6 @@ def parse_pdf(path: str, source: str) -> ParseOutcome:
                        source, type(exc).__name__, exc)
 
     if not chunks:
-        from .knowledge_chunk import unprocessable
         # 区分"文档真的没抽到东西"与"抽到了但切块没产出"——后者是我们自己的问题，
         # 原因写成"疑似扫描件"会把排查方向带偏（实测就被这样误导过一次）。
         if _doc_has_content(doc):
@@ -1042,7 +1047,7 @@ def _anchor_key(chunk: Any) -> str:
     return f"{getattr(chunk, 'retrieval_text', '') or ''}\n{getattr(chunk, 'content', '') or ''}"
 
 
-def _find_anchor_index(texts: list, anchor: str, start: int) -> Optional[int]:
+def _find_anchor_index(texts: list, anchor: str, start: int) -> int | None:
     """在 texts[start:] 里找第一个包含 anchor 的块，找不到返回 None。
 
     先用整段、再退到前 32/16 字：锚点段落可能被切分器切开，或两端空白不同，

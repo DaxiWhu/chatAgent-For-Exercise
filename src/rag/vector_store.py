@@ -167,21 +167,32 @@ class PgVectorStore:
     """
 
     def __init__(self, dsn, table=DEFAULT_TABLE, index="hnsw", connect_timeout=10,
-                 tenant=""):
+                 tenant=None):
         """记住连接与表配置，构造时**不连库**。
 
         dsn: 连接串（DB_URL）。
         table: 表名（会做标识符白名单校验）。
         index: 向量索引类型：hnsw（默认，召回好）/ ivfflat（省内存）/ none（不建）。
         connect_timeout: 单次连接超时（秒）。
-        tenant: 租户 id。非空时**读写都锁定在该租户内**（多租户隔离）；
-            空串 = 不隔离（单租户/兼容既有数据）。
+        tenant: 租户 id。**语义于 2026-10-06 反转**：
+            - `None` = 显式声明"**不过滤**"（离线工具、迁移、单租户兼容）；
+            - **任何字符串（含空串）= 一个真实的租户值**，读写都锁定在它上面。
+
+            ⚠️ 此前是 `if self.tenant:` 判断 ⇒ 空串同样等于"不过滤"。修它的理由
+            不是洁癖：`resolve_tenant()` 当时会返回空串（"显式要求不隔离"），
+            于是 `RAG_TENANT` 留空这一个配置就把**整个库**暴露出去 —— 而文档
+            写的恰好相反（"留空 = 什么都读不到"）。**空串不再是一个"关闭隔离"
+            的暗号**：想去掉过滤，只有一个显式得多的写法 `tenant=None`。
         """
         self.dsn = (dsn or "").strip()
         self.table = _safe_ident(table)
         self.index = (index or "hnsw").strip().lower()
         self.connect_timeout = connect_timeout
-        self.tenant = (tenant or "").strip()
+        # ⚠️ 保留 None 与 "" 的区别（过滤判定靠 `is not None`）；但**写入**一律落
+        # 字符串（`self.tenant or ""`）—— 那既避免了 NULL 与 '' 两种"空"并存
+        # （过滤时 `tenant = ''` 匹配不到 NULL，是个静默的空集合），也让
+        # `tenant=None` 建的表与历史数据完全一致（历史写入的就是 ''）。
+        self.tenant = None if tenant is None else str(tenant).strip()
 
     # ---------- 连接 ----------
     def _connect(self):
@@ -275,8 +286,9 @@ class PgVectorStore:
     def existing_ids(self):
         """返回库里已有的全部块指纹。
 
-        无参数。返回 set[str]。设了 tenant 时**只返回该租户的** —— 否则会把
-        别的租户的块判成"已存在"从而漏灌。
+        无参数。返回 set[str]。`tenant` 不为 None 时**只返回该租户的** —— 否则会把
+        别的租户的块判成"已存在"从而漏灌（反向也一样：别的租户的块被算进来，
+        本租户该灌的反而漏掉）。
 
         表不存在时返回空集（而不是抛错）—— 这是"首次灌库"的正常路径：
         空集 ⇒ 所有块都被判为缺失 ⇒ 全量写入并顺带建表。
@@ -286,7 +298,7 @@ class PgVectorStore:
                 cur.execute("SELECT to_regclass(%s)", (self.table,))
                 if cur.fetchone()[0] is None:
                     return set()
-                if self.tenant:
+                if self.tenant is not None:
                     cur.execute(f"SELECT id FROM {self.table} WHERE tenant = %s",
                                 (self.tenant,))
                 else:
@@ -326,7 +338,7 @@ class PgVectorStore:
         params = [
             (
                 cid,
-                self.tenant,
+                self.tenant or "",
                 str(meta.get("source", "") or ""),
                 str(meta.get("section", "") or ""),
                 _int_or_none(meta.get("page")),
@@ -357,13 +369,17 @@ class PgVectorStore:
         score 是余弦相似度（1 - 距离），越大越相关，与 EmbeddingRetriever.search
         返回的分数口径一致，因此上游 RRF / rerank 无需任何改动。
 
-        设了 tenant 时**只在该租户的数据里检索**（多租户隔离的最后一道闸）。
+        `tenant` 不为 None 时**只在该租户的数据里检索**（多租户隔离的最后一道闸）。
+
+        ⚠️ 这里的判据是 `is not None`，不是"非空"（2026-10-06 修）：空串曾等于
+        "拼不出条件 ⇒ 不过滤"，而 `resolve_tenant()` 当时正会给空串 ——
+        `RAG_TENANT` 留空即把整个库暴露给任何一个请求。
         """
         from pgvector import Vector
 
         params = [Vector(vector)]
         conds = []
-        if self.tenant:
+        if self.tenant is not None:
             conds.append("tenant = %s")
             params.append(self.tenant)
         if sources:
@@ -382,13 +398,13 @@ class PgVectorStore:
 
     # ---------- 维护 ----------
     def count(self):
-        """返回表内行数（设了 tenant 则只数该租户）；表不存在返回 0。"""
+        """返回表内行数（`tenant` 不为 None 则只数该租户）；表不存在返回 0。"""
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT to_regclass(%s)", (self.table,))
                 if cur.fetchone()[0] is None:
                     return 0
-                if self.tenant:
+                if self.tenant is not None:
                     cur.execute(f"SELECT count(*) FROM {self.table} WHERE tenant = %s",
                                 (self.tenant,))
                 else:
@@ -488,7 +504,7 @@ class PgVectorStore:
                     f"FROM {self.table}"
                 )
                 params = []
-                if self.tenant:
+                if self.tenant is not None:
                     sql += " WHERE tenant = %s"
                     params.append(self.tenant)
                 cur.execute(sql, params)
@@ -525,7 +541,7 @@ class PgVectorStore:
             return 0
         conds = [f"{SOURCE_KEY_SQL} = ANY(%s)"]
         params = [keys]
-        if self.tenant:
+        if self.tenant is not None:
             conds.append("tenant = %s")
             params.append(self.tenant)
         with self._connect() as conn:

@@ -26,8 +26,8 @@ import logging
 import os
 import re
 import zipfile
-from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from dataclasses import asdict, dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +44,14 @@ try:
 except Exception:  # noqa: BLE001  （dotenv 是可选依赖）
     pass
 
+from ..envutil import env_int  # noqa: E402  （必须在 load_dotenv 之后）
+
 # 媒体导出根目录。默认 data/.media（已在 .gitignore 里）。
 MEDIA_DIR = os.getenv("RAG_MEDIA_DIR", "data/.media").strip() or "data/.media"
 # 单个 docx 最多导出多少个媒体文件，防止异常文件把磁盘写满
-MAX_ASSETS = int(os.getenv("RAG_DOCX_MAX_ASSETS", "300") or 300)
+MAX_ASSETS = env_int("RAG_DOCX_MAX_ASSETS", 300, lo=0)
 # OLE 内层正文摘要的截断长度（内层可能是几十页的表格，全灌进索引会污染召回）
-OLE_TEXT_LIMIT = int(os.getenv("RAG_DOCX_OLE_TEXT_LIMIT", "4000") or 4000)
+OLE_TEXT_LIMIT = env_int("RAG_DOCX_OLE_TEXT_LIMIT", 4000, lo=0)
 
 # ---- 命名空间集合（Transitional + Strict 两种都要认） ----
 _W = {
@@ -132,7 +134,7 @@ class DocxAsset:
     alt_text: str = ""            # 作者填的替代文字（docPr@descr，确定性，不用 VLM）
     prog_id: str = ""
     size: int = 0
-    chart: Optional[dict] = None  # kind == chart 时的确定性数据（见 parse_chart_xml）
+    chart: dict | None = None  # kind == chart 时的确定性数据（见 parse_chart_xml）
     inner_ext: str = ""           # OLE 解包后内层文件的扩展名（如 .xlsx）
     ole_text: str = ""            # OLE 内层是可解析格式时抽出的正文摘要
     is_ole_preview: bool = False  # 本"图片"其实是同段落 OLE 对象的预览位图（见 _mark_ole_previews）
@@ -659,7 +661,7 @@ def _write(blob: bytes, dest_dir: str, filename: str) -> str:
         return ""
 
 
-def media_dir_for(path: str, media_dir: Optional[str] = None) -> str:
+def media_dir_for(path: str, media_dir: str | None = None) -> str:
     """某份文档的媒体导出目录：`<根目录>/<文件名词干>_<源路径指纹>/`。
 
     同时服务两条链路：docx 解 zip 导出的图片/OLE，以及 PDF 裁剪出的插图
@@ -688,7 +690,7 @@ def media_dir_for(path: str, media_dir: Optional[str] = None) -> str:
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
-def extract(path: str, *, media_dir: Optional[str] = None) -> list[DocxAsset]:
+def extract(path: str, *, media_dir: str | None = None) -> list[DocxAsset]:
     """解 docx 包 → [DocxAsset]，顺序即文档流顺序。
 
     失败（不是 zip、文件损坏）返回空列表并告警：docx 支路整体不因媒体提取失败而中断，
@@ -1043,7 +1045,7 @@ def _read_part_rels(zf: zipfile.ZipFile, part: str) -> dict[str, dict]:
     return out
 
 
-def extract_pptx_media(path: str, media_dir: Optional[str] = None) -> list[dict]:
+def extract_pptx_media(path: str, media_dir: str | None = None) -> list[dict]:
     """PPT 的图片与图表 → [{page, part, saved_path, alt_text, chart, filename}]。
 
     位置靠页序表达（PPT 没有页码，页序是它唯一确定的位置信息），

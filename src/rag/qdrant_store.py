@@ -226,14 +226,18 @@ class QdrantStore:
     只负责"和 Qdrant 打交道"，不负责算 embedding（那是 `retrieval.QdrantRetriever` 的事）。
     """
 
-    def __init__(self, url, api_key="", collection=DEFAULT_COLLECTION, tenant="",
+    def __init__(self, url, api_key="", collection=DEFAULT_COLLECTION, tenant=None,
                  timeout=10, hnsw_m=16, hnsw_ef_construct=100, on_disk=False):
         """记住连接与集合配置，构造时**不连服务**（与 PgVectorStore 同一约定）。
 
         url: Qdrant 地址（QDRANT_URL）。
         api_key: 可选密钥（QDRANT_API_KEY）。空 = 无鉴权（本地/内网）。
         collection: 集合名（会做字符白名单校验）。
-        tenant: 租户 id。非空时**读写都锁定在该租户内**（payload 过滤）；空串 = 不隔离。
+        tenant: 租户 id。**语义于 2026-10-06 反转**（与 `PgVectorStore` 保持一致）：
+            - `None` = 显式声明"**不过滤**"（离线工具、迁移、单租户兼容）；
+            - **任何字符串（含空串）= 一个真实的租户值**，读写都锁定在它上面。
+            此前空串也等于"不过滤"，于是 `RAG_TENANT` 留空即为"全库可见" ——
+            与文档写明的相反（留空 = 什么都读不到）。
         timeout: 单次请求超时（秒）。
         hnsw_m / hnsw_ef_construct: 稠密 HNSW 建索引参数（只影响首次建集合）。
         on_disk: 向量是否落盘（大数据量省内存，代价是检索变慢）。
@@ -241,7 +245,10 @@ class QdrantStore:
         self.url = (url or "").strip()
         self.api_key = (api_key or "").strip() or None
         self.collection = _safe_collection(collection)
-        self.tenant = (tenant or "").strip()
+        # 保留 None 与 "" 的区别（过滤判定靠 `is not None`）；**写入**一律落字符串
+        # （payload 里的 `self.tenant or ""`）—— 历史点写的就是 ""，不能变成 null，
+        # 否则按 `tenant == ""` 过滤时匹配不到它们（静默空集合）。
+        self.tenant = None if tenant is None else str(tenant).strip()
         self.timeout = timeout
         self.hnsw_m = hnsw_m
         self.hnsw_ef_construct = hnsw_ef_construct
@@ -339,33 +346,67 @@ class QdrantStore:
             return 0
 
     # ---------- 增量判定 ----------
+    def _collection_absent(self, client) -> bool:
+        """集合是否**确实**不存在（用于把"首次灌库"与"读失败"分开）。
+
+        判据与 `ensure_schema` 完全一致（同一组 `get_collections()`）——
+        这样"集合在不在"全类只有一个口径，不会出现"建集合时认为不存在、
+        增量判定时认为存在"这种自相矛盾。
+
+        ⚠️ 只回答"不存在"，**回答不了"读不到"**：`get_collections()` 自身
+        抛异常时原样向上抛（调用方据此区分）。Qdrant 连不上时绝不返回 True ——
+        那正是本方法要防的那个错误结论。
+        """
+        existing = {c.name for c in client.get_collections().collections}
+        return self.collection not in existing
+
     def existing_ids(self):
         """返回集合里**该租户**已有的全部 point id（set[str]）。
 
         设了 tenant 时只返回该租户的 —— 否则会把别的租户的块判成"已存在"从而漏灌。
         集合不存在（首次灌库）时返回空集 —— 让所有块都被判为缺失、走全量写入。
+
+        ⚠️ **"读失败"绝不能再当成"空集"**（2026-10-06 修）
+        -------------------------------------------------
+        原实现是 `try: … scroll … except: return set()`，注释写的是
+        "集合不存在等 → 视为空，走首灌路径"。问题在于**它分不清两种情况**：
+
+        - 集合真的还没建 ⇒ 返回空集是**对的**（首灌）；
+        - Qdrant 抖了一下 / 网络瞬断 / 超时 ⇒ 返回空集 ⇒ 调用方
+          （`retrieval.py` 的增量同步）算出 `missing = 全部块` ⇒
+          **把整个知识库重新算一遍 embedding 并全量 upsert**。
+
+        后者是最贵的一种事故：它不是"报错"，而是**账单**（每次抖一下就把
+        全量向量重算一次，token 与时长都按全量计），而且日志只有一行 DEBUG，
+        面板上完全看不出来（`rag_hits_total` 等指标只反映检索，不反映灌库）。
+        同一条"失败与真实空值不可区分"的毛病在本文件里还有 `_scroll_rows`。
+
+        所以现在先问一句"集合在不在"（`_collection_absent`），
+        **只有确实不存在才返回空集**；其余异常一律向上抛 —— 让灌库整体
+        失败，而不是静默地把全量重算当成"增量"跑完。
         """
         client = self._connect()
+        if self._collection_absent(client):
+            logging.info("Qdrant 集合 %s 尚不存在（首次灌库），按空集处理",
+                         self.collection)
+            return set()
+
         flt = self._tenant_filter()
         ids: set[str] = set()
         offset = None
-        try:
-            while True:
-                points, offset = client.scroll(
-                    collection_name=self.collection,
-                    scroll_filter=flt,
-                    limit=512,
-                    offset=offset,
-                    with_payload=False,
-                    with_vectors=False,
-                )
-                for p in points:
-                    ids.add(str(p.id))
-                if offset is None:
-                    break
-        except Exception as e:  # noqa: BLE001  （集合不存在等 → 视为空，走首灌路径）
-            logging.debug("Qdrant 读取已有 id 失败（按空集处理）：%s", e)
-            return set()
+        while True:
+            points, offset = client.scroll(
+                collection_name=self.collection,
+                scroll_filter=flt,
+                limit=512,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            for p in points:
+                ids.add(str(p.id))
+            if offset is None:
+                break
         return ids
 
     # ---------- 写入 ----------
@@ -392,7 +433,9 @@ class QdrantStore:
                 vectors[SPARSE_VECTOR] = qm.SparseVector(indices=list(s_idx),
                                                          values=list(s_val))
             payload = {
-                "tenant": self.tenant,
+                # 写入一律落字符串（None ⇒ ""）：历史点写的就是 ""，而按
+                # `tenant == ""` 过滤匹配不到 null（静默空集合）。
+                "tenant": self.tenant or "",
                 "source": str(meta.get("source", "") or ""),
                 # source_key / content_hash 是**级联删除的判定依据**（见 kb_inventory）。
                 # 顶层单列一份（而不是只藏在 chunk 里）：Qdrant 的过滤只能打到
@@ -454,21 +497,33 @@ class QdrantStore:
 
     # ---------- 过滤器 ----------
     def _tenant_filter(self):
-        """仅租户过滤（给 existing_ids 用）。无 tenant 时返回 None。"""
+        """仅租户过滤（给 existing_ids / count 用）。`tenant` 为 None 时返回 None。
+
+        ⚠️ 延迟导入必须在"确实要造过滤器"之后（2026-10-06 修）
+        ----------------------------------------------------
+        `qdrant_client` 是**可选依赖**（`requirements.txt` 里那句"不装/不配则完全
+        不影响其它后端"，也正是本文件所有 import 都写在方法内的原因）。
+        但 import 写在早退判断**之前**时，"不过滤"这条根本不需要该库的路径
+        也会因为库没装而抛 `ModuleNotFoundError` —— 于是
+        `existing_ids()` / 离线维护工具在没装 qdrant 的环境里直接不可用，
+        而它们本该是最不需要那个库的一批调用。
+        """
+        if self.tenant is None:
+            return None
         from qdrant_client import models as qm
 
-        if not self.tenant:
-            return None
         return qm.Filter(must=[
             qm.FieldCondition(key="tenant", match=qm.MatchValue(value=self.tenant))
         ])
 
     def _source_filter(self, sources=None):
-        """租户 + 可选来源过滤（给检索用）。都为空的组合返回 None。"""
+        """租户 + 可选来源过滤（给检索用）。都为空的组合返回 None（同上：此时不导入）。"""
+        must = []
+        if self.tenant is None and not sources:
+            return None
         from qdrant_client import models as qm
 
-        must = []
-        if self.tenant:
+        if self.tenant is not None:
             must.append(qm.FieldCondition(key="tenant",
                                           match=qm.MatchValue(value=self.tenant)))
         if sources:
@@ -489,7 +544,7 @@ class QdrantStore:
         client = self._connect()
         try:
             info = client.get_collection(self.collection)
-            if self.tenant:
+            if self.tenant is not None:
                 res = client.count(collection_name=self.collection,
                                    count_filter=self._tenant_filter(), exact=True)
                 return int(res.count)
@@ -561,41 +616,47 @@ class QdrantStore:
         """滚一遍集合，产出 `(tenant, source_key, content_hash)` 的原始三元组。
 
         flt: 额外的过滤条件（None = 全集合）。
-        集合不存在等异常按"空集合"处理（与 `existing_ids` 同口径），
-        并且**只 debug 记录** —— 维护脚本不该因为集合还没建就报错。
+        集合不存在时按"空集合"处理（维护脚本不该因为集合还没建就报错）。
+
+        ⚠️ **只有"确实不存在"才算空**（2026-10-06 修）：原实现把**所有**异常
+        都吞成空集。这条链路的出口是 `list_tenants()` → `kb_prune --all-tenants`
+        → `plan_orphans` → **删除决策**。Qdrant 连不上时返回空集，会让孤儿
+        预演打印"无孤儿"，即**在根本读不到库的情况下报告一切正常** ——
+        一个用来决定删不删东西的工具，最不该有的就是这种假绿。
+        （"删多了"比"没删"危险得多，所以宁可整体失败。）
+        与 `existing_ids` 同口径：不存在 → 空；读失败 → 抛。
         """
         client = self._connect()
+        if self._collection_absent(client):
+            logging.info("Qdrant 集合 %s 尚不存在，源清单按空处理", self.collection)
+            return set()
         out = set()
         offset = None
-        try:
-            while True:
-                points, offset = client.scroll(
-                    collection_name=self.collection,
-                    scroll_filter=flt,
-                    limit=512,
-                    offset=offset,
-                    with_payload=True,
-                    with_vectors=False,
-                )
-                for p in points:
-                    pl = p.payload or {}
-                    if pl.get(META_FLAG):
-                        # 索引身份的元数据点：不是块，**必须**跳过。留着它会被
-                        # `plan_orphans` 看成一条 source 为空的脏行，级联删除据此
-                        # 报出的孤儿清单就不可信了（这条链路只用来做删除决策，
-                        # 一个假输入就足以让人误删）。
-                        continue
-                    # ⚠️ 回落顺序必须与 `kb_inventory.source_key` 一致：
-                    # 老点没有顶层 source_key（本次改造前灌的），此时用 source。
-                    key = str(pl.get("source_key") or pl.get("source") or "")
-                    out.add((str(pl.get("tenant") or ""),
-                             key.replace("\\", "/"),
-                             str(pl.get("content_hash") or "")))
-                if offset is None:
-                    break
-        except Exception as e:  # noqa: BLE001  （集合不存在 → 视为空）
-            logging.debug("Qdrant 读取源清单失败（按空处理）：%s", e)
-            return set()
+        while True:
+            points, offset = client.scroll(
+                collection_name=self.collection,
+                scroll_filter=flt,
+                limit=512,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for p in points:
+                pl = p.payload or {}
+                if pl.get(META_FLAG):
+                    # 索引身份的元数据点：不是块，**必须**跳过。留着它会被
+                    # `plan_orphans` 看成一条 source 为空的脏行，级联删除据此
+                    # 报出的孤儿清单就不可信了（这条链路只用来做删除决策，
+                    # 一个假输入就足以让人误删）。
+                    continue
+                # ⚠️ 回落顺序必须与 `kb_inventory.source_key` 一致：
+                # 老点没有顶层 source_key（本次改造前灌的），此时用 source。
+                key = str(pl.get("source_key") or pl.get("source") or "")
+                out.add((str(pl.get("tenant") or ""),
+                         key.replace("\\", "/"),
+                         str(pl.get("content_hash") or "")))
+            if offset is None:
+                break
         return out
 
     def list_rows(self):
@@ -625,7 +686,7 @@ class QdrantStore:
         from qdrant_client import models as qm
 
         must = []
-        if self.tenant:
+        if self.tenant is not None:
             must.append(qm.FieldCondition(key="tenant",
                                           match=qm.MatchValue(value=self.tenant)))
         should = [

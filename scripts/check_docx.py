@@ -41,9 +41,17 @@ def main() -> int:
         print("[失败] docling 未安装")
         return 1
 
-    from tests.docx_fixtures import (ALT_CHART, ALT_IMAGE, ALT_OLE, CHART_CATS,
-                                     CHART_TITLE, CHART_VALS, OLE_CELL_TEXT,
-                                     PARA_BEFORE_CHART, PARA_BEFORE_OLE, SERIES_NAME)
+    from tests.docx_fixtures import (
+        ALT_IMAGE,
+        ALT_OLE,
+        CHART_CATS,
+        CHART_TITLE,
+        CHART_VALS,
+        OLE_CELL_TEXT,
+        PARA_BEFORE_CHART,
+        PARA_BEFORE_OLE,
+        SERIES_NAME,
+    )
 
     tmpdir = tempfile.mkdtemp(prefix="check_docx_")
     docx = _build_sample(os.path.join(tmpdir, "report.docx"))
@@ -72,7 +80,7 @@ def main() -> int:
         ("图表标题", CHART_TITLE in text),
         ("图表系列名", SERIES_NAME in text),
         ("图表数值（类目=数值）",
-         all(f"{k}={v}" in text for k, v in zip(CHART_CATS, CHART_VALS))),
+         all(f"{k}={v}" in text for k, v in zip(CHART_CATS, CHART_VALS, strict=False))),
         ("图片替代文字", ALT_IMAGE in text),
         ("OLE 内层正文", OLE_CELL_TEXT in text),
         ("位置锚点（图表前文）", PARA_BEFORE_CHART in text),
