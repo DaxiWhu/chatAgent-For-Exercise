@@ -42,16 +42,79 @@ def test_resolve_tenant_explicit_value_wins(monkeypatch):
     assert R.resolve_tenant("acme") == "acme"
 
 
-def test_resolve_tenant_empty_string_means_no_isolation(monkeypatch):
-    """空串是**显式**要求不隔离，与 None（未指定）语义不同。"""
-    monkeypatch.setattr(R, "RAG_TENANT", "process-default")
-    assert R.resolve_tenant("") == ""
-
-
 def test_resolve_tenant_strips_whitespace(monkeypatch):
     """请求头可能带空格，'acme ' 与 'acme' 必须是同一个租户（否则各建一个分片）。"""
     monkeypatch.setattr(R, "RAG_TENANT", "")
     assert R.resolve_tenant("  acme  ") == "acme"
+
+
+def test_resolve_tenant_never_returns_an_empty_string(monkeypatch):
+    """⚠️ **口径反转**（2026-10-06）：空串不再是一个"关掉隔离"的暗号。
+
+    修前这里断言的是 `resolve_tenant("") == ""`，而向量库把空租户读成
+    **"不拼过滤条件"** ⇒ `RAG_TENANT` 留空这一个配置就把整个库暴露出去。
+    更糟的是它与公开口径**相反**：`PRODUCTION_CONFIG.md` / `README.md` 都写着
+    "RAG_TENANT 留空 = 落到 `NO_TENANT_SENTINEL` = 什么都读不到"，而 app 层
+    (`_retrieval_tenant`) 确实那么做了 —— 只有 src 层这一侧静默放行。
+
+    三种输入都必须落到"读不到东西"，任何一种返回空串都会把隔离关掉。
+    """
+    monkeypatch.setattr(R, "RAG_TENANT", "")
+    assert R.resolve_tenant(None) == R.NO_TENANT_SENTINEL, \
+        "RAG_TENANT 留空时没有 fail-closed"
+    assert R.resolve_tenant("") == R.NO_TENANT_SENTINEL, \
+        "空串把隔离关掉了（空串在过滤条件里 = 不加过滤）"
+    assert R.resolve_tenant("   ") == R.NO_TENANT_SENTINEL, \
+        "纯空格同样必须 fail-closed"
+
+
+def test_resolve_tenant_treats_blank_and_none_alike(monkeypatch):
+    """★ 空串与 `None` **同义**：都表示"这个调用方没有租户信息"。
+
+    为什么必须同义：app 层的口径是 `ident.tenant or RAG_TENANT or 哨兵`，而
+    `_retrieval_tenant` 里空租户**先落公共租户**。src 层若把空串另判一条
+    （旧实现："空串 = 显式要求不隔离"），同一个"没有租户"在两层会得到**相反**
+    结论 —— 那正是 2026-10-05 那场"RAG_TENANT 留空 = 全库可见"事故的成因。
+
+    额外收益：`chunk_fingerprint(c, t)` 里 `t` 的取值由此唯一，不会出现
+    "写库用空串、增量判定用公共租户"这种**每次启动都全量重算 embedding** 的错配。
+    """
+    monkeypatch.setattr(R, "RAG_TENANT", "public")
+    assert R.resolve_tenant(None) == "public"
+    assert R.resolve_tenant("") == "public"
+    assert R.resolve_tenant("   ") == "public"
+    assert R.resolve_tenant("") == R.resolve_tenant(None)
+
+
+def test_resolve_tenant_falls_back_when_process_default_is_blank(monkeypatch):
+    """`RAG_TENANT` 留空 + 调用方不传租户 ⇒ 哨兵值，而不是空串。"""
+    monkeypatch.setattr(R, "RAG_TENANT", "   ")
+    assert R.resolve_tenant(None) == R.NO_TENANT_SENTINEL
+    # 但配置非空时**原样保留** —— 生产上 RAG_TENANT 是有具名值（本项目 public）的。
+    monkeypatch.setattr(R, "RAG_TENANT", "public")
+    assert R.resolve_tenant(None) == "public"
+
+
+def test_the_src_layer_sentinel_equals_the_app_layer_one():
+    """哨兵值的**两份字面量**必须相等（否则"无租户"会有两个分区名）。
+
+    `src/` 不能反向 import `app/`，所以 `src/rag/retrieval.py` 里有一份重复的
+    字面量。这条守卫把"只改一边"变成红灯 —— 否则 app 层传 A、src 层兜底用 B，
+    谁都不报错，只是各自查到不同的空集合。
+    """
+    from app import config as app_config
+
+    assert R.NO_TENANT_SENTINEL == app_config.NO_TENANT_SENTINEL
+
+
+def test_tenant_label_renders_the_sentinel_readably():
+    """日志文案：无租户要渲染成 `<无租户>`，而不是把 `%__no_tenant__%` 打出来。
+
+    旧的 `resolve_tenant(x) or "<不隔离>"` 在反转后**恒为假**（永不触发），
+    留在日志里会让人以为"空租户 = 不隔离"仍存在。
+    """
+    assert R.tenant_label("") == "<无租户>"
+    assert R.tenant_label("acme") == "acme"
 
 
 # ---------------------------------------------------------------------------
@@ -315,32 +378,205 @@ def test_cross_tenant_rows_do_not_leak_through_fingerprints():
     assert fa == R.chunk_fingerprint(chunk, "acme")
 
 
+# ---------------------------------------------------------------------------
+# 存储层：空租户**不再**等于"不过滤"（2026-10-06）
+# ---------------------------------------------------------------------------
+# 这一节是"第二层防护"：即便某条路径把空串递到了存储层（绕过 `resolve_tenant`），
+# 它也必须**照样过滤**，而不是把过滤条件整个丢掉。修前 `if self.tenant:` 的判据
+# 让空串落进 `else` 分支 = 不加条件 = 全库可见，且没有任何日志。
+class _RecordingCursor:
+    """只记录 SQL 的假游标（不连库）。"""
+
+    def __init__(self, log):
+        self._log = log
+        self.rowcount = 3
+
+    def execute(self, sql, params=None):
+        self._log.append((" ".join(str(sql).split()), params))
+        return self
+
+    def fetchone(self):
+        return (1,)          # to_regclass 非 None ⇒ "表存在"，别提前 return
+
+    def fetchall(self):
+        return []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _RecordingConn:
+    def __init__(self, log):
+        self._log = log
+
+    def cursor(self):
+        return _RecordingCursor(self._log)
+
+    def commit(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _sql_log(store, call):
+    """跑一次 store 的某个方法，返回它实际执行过的 (SQL, 参数) 列表。"""
+    log = []
+    store._connect = lambda: _RecordingConn(log)
+    call(store)
+    return log
+
+
+def _pg_store(tenant):
+    from src.rag.vector_store import PgVectorStore
+    return PgVectorStore("postgresql://u:p@h/db", "rag_chunks", tenant=tenant)
+
+
+def test_pg_search_with_an_empty_tenant_still_filters():
+    """空租户必须照样拼 `tenant = %s`（修前它等于"不过滤"，即全库可见）。"""
+    log = _sql_log(_pg_store(""), lambda s: s.search([0.1, 0.2, 0.3], top_k=3))
+    sql = log[-1][0]
+    assert "tenant = %s" in sql, f"空租户把过滤条件丢了（= 读全部租户）：{sql}"
+    assert log[-1][1][1] == "", "过滤值的绑定参数不对"
+
+
+def test_pg_search_without_a_tenant_skips_the_filter():
+    """显式的 `tenant=None` 才是"不过滤" —— 离线工具/迁移的唯一入口。"""
+    log = _sql_log(_pg_store(None), lambda s: s.search([0.1, 0.2, 0.3], top_k=3))
+    assert "tenant = %s" not in log[-1][0], "tenant=None 时不该拼租户条件"
+
+
+def test_pg_existing_ids_and_delete_keys_respect_the_empty_tenant():
+    """读路径与**删除**路径都要锁住：`delete_keys` 写错就是跨租户删数据。"""
+    log = _sql_log(_pg_store(""), lambda s: s.existing_ids())
+    assert any("WHERE tenant = %s" in sql for sql, _ in log), \
+        f"existing_ids 在空租户下不过滤（会把别人的块当成已知）：{log}"
+
+    log = _sql_log(_pg_store(""), lambda s: s.delete_keys(["a.md"]))
+    sql, params = log[-1]
+    assert "tenant = %s" in sql, f"DELETE 少了租户条件（跨租户删数据）：{sql}"
+    assert params[-1] == ""
+
+
+def test_qdrant_filters_treat_an_empty_tenant_as_a_real_value(monkeypatch):
+    """Qdrant 侧同款：空租户 ⇒ 真的过滤 `tenant == ""`，不是"不过滤"。
+
+    `qdrant_client` 是可选依赖（本机 CI 环境未必装），所以这里塞一个最小的
+    `qdrant_client.models` 替身进 `sys.modules` —— 过滤条件是纯数据构造，
+    不需要真客户端，而"空串是否落进 must 里"这个判据必须被真的执行到。
+    """
+    import sys
+    import types
+
+    if "qdrant_client" not in sys.modules:
+        pkg = types.ModuleType("qdrant_client")
+        models = types.ModuleType("qdrant_client.models")
+
+        class MatchValue:
+            def __init__(self, value):
+                self.value = value
+
+        class MatchAny:
+            def __init__(self, any):
+                self.any = any
+
+        class FieldCondition:
+            def __init__(self, key, match):
+                self.key, self.match = key, match
+
+        class Filter:
+            def __init__(self, must=None, should=None):
+                self.must, self.should = list(must or []), list(should or [])
+
+        models.MatchValue, models.MatchAny = MatchValue, MatchAny
+        models.FieldCondition, models.Filter = FieldCondition, Filter
+        pkg.models = models
+        monkeypatch.setitem(sys.modules, "qdrant_client", pkg)
+        monkeypatch.setitem(sys.modules, "qdrant_client.models", models)
+
+    from src.rag.qdrant_store import QdrantStore
+
+    flt = QdrantStore("http://q:6333", tenant="")._tenant_filter()
+    assert flt is not None, "空租户返回 None ⇒ 完全不拼过滤条件 ⇒ 全库可见"
+    assert flt.must[0].match.value == ""
+
+    assert QdrantStore("http://q:6333", tenant=None)._tenant_filter() is None, \
+        "tenant=None 才是显式的'不过滤'"
+
+    flt = QdrantStore("http://q:6333", tenant="")._source_filter()
+    assert any(c.key == "tenant" for c in flt.must), "检索用的过滤器同样漏了租户"
+
+    assert QdrantStore("http://q:6333", tenant=None)._source_filter() is None
+
+
 
 # ---------------------------------------------------------------------------
-# app 层：只信"Key 反查"出来的租户
+# app 层：租户的来源与可信度（2026-10-04 口径）
 # ---------------------------------------------------------------------------
-def _identity(tenant: str, via: str):
+def _identity(tenant: str):
     from app.main import Identity
-    return Identity(tenant, via)
+    return Identity(tenant)
 
 
-def test_retrieval_tenant_trusts_key_bound_tenant(monkeypatch):
-    """Key 反查得到的租户不可伪造 ⇒ 可以用于隔离。"""
+def test_retrieval_tenant_trusts_jwt_tenant(monkeypatch):
+    """令牌载荷里的租户是**唯一可信来源** ⇒ 用于隔离（外部身份源已删除）。"""
     from app import main as M
     monkeypatch.setattr(M.config, "DEFAULT_TENANT", "default")
-    assert M._retrieval_tenant(_identity("acme", "tenant-key")) == "acme"
+    assert M._retrieval_tenant(_identity("acme")) == "acme"
 
 
-@pytest.mark.parametrize("via", ["global-key", "anonymous"])
-def test_retrieval_tenant_ignores_self_reported(monkeypatch, via):
-    """**安全断言**：自报租户不得用于检索隔离。
+# 「无租户时怎么检索」的口径在 2026-10-05 反转了，本节随之重写
+# ---------------------------------------------------------------------------
+# 旧口径：`RAG_TENANT` 空串 ⇒ `_retrieval_tenant` **原样返回空串** ⇒ 检索层
+#   "不加租户过滤" ⇒ 能召回**全部租户**的文档。
+# 新口径（用户拍板）：「无租户可以查我们提供的公共租户文档，别的租户的不允许」。
+#   ⇒ 无租户的主体落到**公共租户**；**没配**公共租户则落到哨兵值，什么都检不到。
+#
+# 为什么必须重写而不是"调个期望值"：旧口径与新口径的安全后果是相反的
+# （全库可见 vs 什么都看不到）。留着旧用例等于把反转后的口径又钉回去。
+def test_retrieval_tenant_falls_back_to_the_public_tenant(monkeypatch):
+    """无租户的主体 ⇒ 落到**公共租户**：能读公共文档，读不到别人的。"""
+    from app import main as M
+    monkeypatch.setattr(M.config, "DEFAULT_TENANT", "public")
+    assert M._retrieval_tenant(_identity("")) == "public"
 
-    改用 ident.tenant 的实现会返回 "globex"（攻击者声明的值）⇒ 本用例红。
-    这条防的是"假隔离"：客户端把 X-Tenant-Id 改成别人的就能读到别人的资料。
+
+def test_retrieval_tenant_is_fail_closed_without_a_public_tenant(monkeypatch):
+    """没配公共租户 ⇒ 落到哨兵值，**检不到任何内容**；空串绝不能传出去。
+
+    真正要防的是这一个：空串在检索层的语义是"**不加租户过滤**"。若把"看不见
+    任何东西"的意图用空串表达，会恰好得到最坏的结果 —— 全都能看到。
+    所以断言分两半：① 必须是哨兵；② 必须**非空**。
+    哨兵之所以不可能与真实租户名碰撞：`%` 被 `AccountStore._check_name` 禁止。
     """
     from app import main as M
-    monkeypatch.setattr(M.config, "DEFAULT_TENANT", "default")
-    assert M._retrieval_tenant(_identity("globex", via)) == "default"
+    monkeypatch.setattr(M.config, "DEFAULT_TENANT", "")
+    got = M._retrieval_tenant(_identity(""))
+    assert got == M.config.NO_TENANT_SENTINEL
+    assert got != "", "空串会被检索层理解成「不加过滤」⇒ 反而能读全库"
+
+
+def test_retrieval_tenant_ignores_any_self_reported_value(monkeypatch):
+    """自报的租户**不再被采信**：租户只来自已验签的载荷。
+
+    这里删除的是一条被拍板的例外 —— 脚本通行证（`X-API-Key`）的租户取自
+    `X-Tenant-Id` 并被采信，理由是"压测要能针对某个租户"。**路径已删除**，
+    例外随之消失。
+
+    钉住它是因为"自报被采信"这件事**没有症状**：压测脚本照常跑、指标照常好看，
+    只是所有数据悄悄落到了别人的桶里（或读到了别人的桶）。
+    """
+    from app import main as M
+    monkeypatch.setattr(M.config, "DEFAULT_TENANT", "public")
+    # 空租户不会"顺手采信"任何外部值，只会落到公共租户。
+    assert M._retrieval_tenant(_identity("")) == "public"
+    assert M._retrieval_tenant(_identity("acme")) == "acme"
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,16 @@
-"""身份与出口收紧的测试：租户绑定、会话归属、启动策略、文档开关、断连止损。
+"""身份与出口收紧的测试：鉴权口径、会话归属、启动策略、文档开关、断连止损。
 
 这一组测试针对的是 2026-09-28 审计出的真实越权/漏钱路径，所以每条都
 **刻意断言到"删掉实现就会红"的粒度**：
-  - 租户自报 → 必须 403（不是"忽略了就算"）
+  - 缺凭证 → 必须 401（不是"忽略了就算"）
   - 断连 → 必须不再下发 done、不再查状态、上游必须被 aclose
-  - 无 Key + REQUIRE_AUTH → 必须拒绝启动
+  - 环境里残留已删除的鉴权开关 → 必须拒绝启动
+
+⚠️ 口径收敛（2026-10-04 → 2026-10-05）：租户绑定到 API Key（`TENANT_KEYS`）的
+整条路径先被移除，随后**共享密钥脚本通行证（`SERVE_API_KEY` / `X-API-Key`）与
+"匿名放行"开关（`REQUIRE_AUTH`）也一并删除**。现在服务端只有一种身份来源：
+账号密码 / 外部 IdP → JWT。下面 `test_legacy_auth_knobs_refuse_startup` 与
+"`app.main` 不许再出现 `SERVE_API_KEY`"那两条，钉的就是"删除"本身。
 
 全部离线，不打真实模型/数据库。
 """
@@ -25,9 +31,10 @@ from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import app.main as M  # noqa: E402
-from app.sessions import SessionRegistry  # noqa: E402
+from app.sessions import SessionError, SessionRegistry  # noqa: E402
+from tests.auth_util import auth_headers  # noqa: E402
 
-client = TestClient(M.app)
+client = TestClient(M.app, headers=auth_headers())
 
 
 # ---------------------------------------------------------------------------
@@ -192,87 +199,197 @@ def _collect_with_disconnect(make_gen, trip_after, timeout=20):
 
 
 # ---------------------------------------------------------------------------
-# 租户绑定：租户只能由 Key 推导
+# 鉴权入口：**只有一条路**（已验签的 JWT），没有任何兜底档
 # ---------------------------------------------------------------------------
-def test_tenant_keys_resolves_tenant_from_key(monkeypatch):
-    monkeypatch.setattr(M.config, "TENANT_KEYS", {"k-a": "acme", "k-b": "globex"})
-    assert M._authenticate("k-a", "").tenant == "acme"
-    assert M._authenticate("k-b", "").tenant == "globex"
+# 2026-10-05 删除了两档兜底：
+#   · 共享密钥 `SERVE_API_KEY` / `X-API-Key`（分不出身份、撤不掉、租户可自报）
+#   · `REQUIRE_AUTH=0` 时的匿名放行（完全不带凭证也能调所有业务接口）
+# 下面这组用例钉住"它们真的没了"，而不是"改成了别的写法"：
+# 用**签名断言**与**行为断言**两种方式，因为前者能拦住"参数位又被人加回去"这种
+# 静默复活。
+def test_no_credential_is_rejected_with_401(monkeypatch):
+    """没有任何凭证 ⇒ 401（不是 503，也不是匿名放行）。
 
-
-def test_tenant_keys_rejects_unknown_key(monkeypatch):
-    monkeypatch.setattr(M.config, "TENANT_KEYS", {"k-a": "acme"})
+    为什么不是 503：这是**客户端**没登录，不是服务端故障。503 会被计入服务端错误、
+    污染 SLO 错误预算 —— "用户忘了登录"在监控上看起来像"服务挂了"。
+    """
     with pytest.raises(HTTPException) as ei:
-        M._authenticate("not-a-key", "")
+        M._authenticate("")
     assert ei.value.status_code == 401
+    assert "缺少凭证" in ei.value.detail
 
 
-def test_tenant_keys_rejects_self_declared_other_tenant(monkeypatch):
-    """**核心用例**：拿着 acme 的 Key 自称 globex —— 这就是越权尝试，必须 403。
+def test_authenticate_has_no_shared_key_parameter():
+    """`_authenticate` 的第一个参数是 `X-Tenant-Id`，**不是** `X-API-Key`。
 
-    改回旧实现（信任请求头）时这条会变成 200/通过 ⇒ 红。
+    为什么用签名断言而不是行为断言：行为上"删掉共享密钥档"与"把比较改成恒 False"
+    无法区分，而后者等于代码里还留着一条能被人重新打开的路。签名一旦变了，
+    本用例立刻红 —— 这是绊线，不是形式。
     """
-    monkeypatch.setattr(M.config, "TENANT_KEYS", {"k-a": "acme"})
+    import inspect
+
+    params = list(inspect.signature(M._authenticate).parameters)
+    assert params == ["x_tenant_id", "authorization"], (
+        f"_authenticate 的签名变成了 {params} —— 若第一个参数又是 x_api_key，"
+        "说明共享密钥档被加回来了"
+    )
+    assert not hasattr(M, "SERVE_API_KEY"), "共享密钥常量又回到了 app.main"
+
+
+def test_tenant_header_can_only_confirm_not_declare(monkeypatch):
+    """`X-Tenant-Id` **只能"确认"**：与令牌里的租户不符 ⇒ 403。
+
+    它不再是"声明" —— 租户的唯一来源是已验签的载荷。这条把"自报被采信"这个
+    曾经的例外彻底钉死（那个例外的代价是：持共享密钥者换一个请求头就能切检索分区）。
+    """
+    monkeypatch.setattr(M.config, "AUTH_ENABLED", True)
+
+    def fake_user(bearer):
+        assert bearer == "TOK"                  # 凭证确实被传了进来
+        return M.Identity(tenant="token-tenant", user="alice")
+
+    monkeypatch.setattr(M, "_authenticate_user", fake_user)
     with pytest.raises(HTTPException) as ei:
-        M._authenticate("k-a", "globex")
+        M._authenticate("claimed-tenant", authorization="Bearer TOK")
     assert ei.value.status_code == 403
+    assert "不匹配" in ei.value.detail
 
 
-def test_tenant_keys_accepts_matching_claim(monkeypatch):
-    """自报值与自己一致时不该被拒（避免把正常客户端误伤）。"""
-    monkeypatch.setattr(M.config, "TENANT_KEYS", {"k-a": "acme"})
-    ident = M._authenticate("k-a", "acme")
-    assert ident.tenant == "acme" and ident.via == "tenant-key"
+def test_tenant_header_absent_is_fine(monkeypatch):
+    """不带 `X-Tenant-Id` 也能正常调用（它只是可选的一致性核对）。"""
+    monkeypatch.setattr(M.config, "AUTH_ENABLED", True)
+    monkeypatch.setattr(
+        M, "_authenticate_user",
+        lambda bearer: M.Identity(tenant="", user="alice"))
+    ident = M._authenticate("", authorization="Bearer TOK")
+    assert ident.tenant == ""
 
 
-def test_compat_mode_still_honors_header(monkeypatch):
-    """未配 TENANT_KEYS 时保持旧行为（单租户/本地开发）。
+def test_bearer_rejected_when_user_auth_disabled(monkeypatch):
+    """带了 Bearer 但服务没启用用户鉴权 ⇒ 明确 401。
 
-    这是**已知且已告警**的降级路径，不是遗漏 —— 单租户下所有请求本就是同一租户。
+    不能"忽略它、放行请求"：那会让客户端以为认证生效了，而实际没有任何身份。
     """
-    monkeypatch.setattr(M.config, "TENANT_KEYS", {})
-    monkeypatch.setattr(M, "SERVE_API_KEY", "global-key")
-    ident = M._authenticate("global-key", "any-tenant")
-    assert ident.tenant == "any-tenant" and ident.via == "global-key"
+    monkeypatch.setattr(M.config, "AUTH_ENABLED", False)
+    with pytest.raises(HTTPException) as ei:
+        M._authenticate("", authorization="Bearer TOK")
+    assert ei.value.status_code == 401
+    assert "未启用用户鉴权" in ei.value.detail
 
 
-def test_chat_endpoint_returns_403_on_tenant_mismatch(monkeypatch):
-    """走完整 HTTP 栈确认端点真的接上了新鉴权（而不是只测了函数）。"""
-    monkeypatch.setattr(M.config, "TENANT_KEYS", {"k-a": "acme"})
-    r = client.post("/v1/chat", json={"thread_id": "t-mismatch", "message": "hi"},
-                    headers={"X-API-Key": "k-a", "X-Tenant-Id": "globex"})
-    assert r.status_code == 403
+def test_chat_endpoint_requires_credentials():
+    """走完整 HTTP 栈确认端点真的接上了鉴权（而不是只测了函数）。"""
+    from fastapi.testclient import TestClient as _TC
+
+    r = _TC(M.app).post("/v1/chat", json={"thread_id": "t-noauth", "message": "hi"})
+    assert r.status_code == 401
 
 
 # ---------------------------------------------------------------------------
-# 启动期策略：无 Key 时拒绝启动
+# 启动期策略：生产必须有用户鉴权；残留的旧开关必须拦住
 # ---------------------------------------------------------------------------
-def test_require_auth_rejects_startup_without_any_key(monkeypatch):
-    """REQUIRE_AUTH=1 且没有任何 Key ⇒ 必须 raise（起不来好过裸奔接流量）。"""
-    monkeypatch.setattr(M.config, "REQUIRE_AUTH", True)
-    monkeypatch.setattr(M.config, "TENANT_KEYS", {})
-    monkeypatch.setattr(M, "SERVE_API_KEY", "")
-    with pytest.raises(RuntimeError):
+def test_production_without_user_auth_refuses_to_start(monkeypatch):
+    """生产环境没配用户鉴权 ⇒ **拒绝启动**。
+
+    现象会是"服务活着、日志祥和、但没有任何人能用" —— 比起不来更糟，
+    因为起不来至少会有人去查。
+    """
+    monkeypatch.setattr(M.config, "IS_PRODUCTION", True)
+    monkeypatch.setattr(M.config, "AUTH_ENABLED", False)
+    with pytest.raises(RuntimeError) as ei:
         M._assert_auth_policy()
+    assert "用户鉴权" in str(ei.value)
 
 
-def test_auth_policy_warns_when_only_global_key(monkeypatch, caplog):
-    """只配全局 Key 时必须点名"租户可被冒充"，不能静默。"""
-    monkeypatch.setattr(M.config, "REQUIRE_AUTH", False)
-    monkeypatch.setattr(M.config, "TENANT_KEYS", {})
-    monkeypatch.setattr(M, "SERVE_API_KEY", "global")
-    with caplog.at_level("WARNING"):
+def test_non_production_without_user_auth_starts_but_says_it_is_unusable(monkeypatch, caplog):
+    """非生产、没配鉴权 ⇒ 允许启动（否则连导入 app 的工具脚本都跑不了），
+    但必须用 ERROR 说明"所有业务请求都会 401"。
+
+    这是删掉匿名兜底之后新增的一条"说清楚"：本地不配账号的服务**谁也服务不了**，
+    沉默地起一个这样的进程是最容易浪费半小时的情形。
+    """
+    monkeypatch.setattr(M.config, "IS_PRODUCTION", False)
+    monkeypatch.setattr(M.config, "AUTH_ENABLED", False)
+    with caplog.at_level("ERROR"):
         M._assert_auth_policy()
-    assert any("冒充" in r.message for r in caplog.records)
+    assert any("401" in r.message for r in caplog.records), (
+        "未配鉴权时必须明确说'所有业务请求都会 401'，不能沉默"
+    )
 
 
-def test_auth_policy_silent_when_tenant_keys_configured(monkeypatch, caplog):
-    """配了 TENANT_KEYS 就该安静（没有需要警告的自报路径）。"""
-    monkeypatch.setattr(M.config, "REQUIRE_AUTH", True)
-    monkeypatch.setattr(M.config, "TENANT_KEYS", {"k-a": "acme"})
-    with caplog.at_level("WARNING"):
+def test_auth_policy_is_quiet_when_user_auth_enabled(monkeypatch, caplog):
+    """启用了用户鉴权 ⇒ 不该出现"服务不可用"那类 ERROR。"""
+    monkeypatch.setattr(M.config, "AUTH_ENABLED", True)
+    with caplog.at_level("ERROR"):
         M._assert_auth_policy()
-    assert not [r for r in caplog.records if "冒充" in r.message or "对任何人开放" in r.message]
+    assert not [r for r in caplog.records if "401" in r.message]
+
+
+def test_legacy_auth_knobs_refuse_startup(monkeypatch):
+    """`.env` / 环境里残留 `SERVE_API_KEY` 或 `REQUIRE_AUTH` ⇒ **拒绝启动**。
+
+    为什么不静默忽略（这是本组用例存在的理由）：这两个开关**曾经真的能改变鉴权
+    结果**。运维看到变量还在、服务又照常起来，会合理地认为"这道门还开着"
+    —— 而代码已经不读它了。这类"以为有、其实没有"的安全配置是最危险的形态：
+    它不会以任何方式表现出来，直到有人从那个不存在的门走进来。
+    """
+    monkeypatch.setenv("SERVE_API_KEY", "leftover-from-old-env")
+    monkeypatch.delenv("REQUIRE_AUTH", raising=False)
+    with pytest.raises(RuntimeError) as ei:
+        M._assert_no_legacy_auth_knobs()
+    assert "SERVE_API_KEY" in str(ei.value)
+
+    monkeypatch.delenv("SERVE_API_KEY")
+    monkeypatch.setenv("REQUIRE_AUTH", "0")
+    with pytest.raises(RuntimeError) as ei2:
+        M._assert_no_legacy_auth_knobs()
+    assert "REQUIRE_AUTH" in str(ei2.value)
+
+
+def test_legacy_auth_knobs_guard_is_quiet_when_absent(monkeypatch):
+    """两个开关都不在时，守卫必须**静默通过**（否则正常的服务起不来）。"""
+    monkeypatch.delenv("SERVE_API_KEY", raising=False)
+    monkeypatch.delenv("REQUIRE_AUTH", raising=False)
+    M._assert_no_legacy_auth_knobs()
+
+
+def test_oidc_knobs_refuse_startup_even_when_blank(monkeypatch):
+    """环境里残留**任何** `AUTH_OIDC_` 开头的键（**留空也算**）⇒ **拒绝启动**。
+
+    为什么留空也算：`AUTH_OIDC_JWKS_URI=` 与填了地址一样坏 —— 看到它的人同样会
+    以为"这个外部身份源是配过的、这道门还开着"。这类"以为有、其实没有"的安全
+    配置不会以任何方式表现出来，所以判据取"**键存在**"而不是"值非空"。
+
+    为什么用**前缀族**而不是逐条列举：这一族有 10 个键（地址 / 受众 / 算法 /
+    缓存 TTL / 时钟偏移 …）。逐条列举的守卫有个隐蔽失效模式 —— 漏掉的那一条
+    没人会去数，于是"漏一个键"等价于"留一个口子"，而且没有任何症状。
+    """
+    monkeypatch.delenv("SERVE_API_KEY", raising=False)
+    monkeypatch.delenv("REQUIRE_AUTH", raising=False)
+    monkeypatch.setenv("AUTH_OIDC_JWKS_URI", "")
+    with pytest.raises(RuntimeError) as ei:
+        M._assert_no_legacy_auth_knobs()
+    msg = str(ei.value)
+    assert "AUTH_OIDC_JWKS_URI" in msg, "报错必须点名是哪个键残留了"
+    # 文案必须点出"这一族"，否则运维删掉这一个键就以为完事了，而族里还有九个。
+    assert "AUTH_OIDC_" in msg
+
+
+@pytest.mark.parametrize("name", [
+    "AUTH_OIDC_ISSUER",
+    "AUTH_OIDC_AUDIENCE",
+    "AUTH_OIDC_ALGORITHMS",
+    "AUTH_OIDC_JWKS_CACHE_TTL",
+    "AUTH_OIDC_LEEWAY",
+])
+def test_oidc_knob_guard_covers_the_whole_family(monkeypatch, name):
+    """族里**任意**一个键都要被拦住，不能只认最眼熟的那个（`parametrize` 逐个试）。"""
+    monkeypatch.delenv("SERVE_API_KEY", raising=False)
+    monkeypatch.delenv("REQUIRE_AUTH", raising=False)
+    monkeypatch.setenv(name, "leftover-from-old-env")
+    with pytest.raises(RuntimeError) as ei:
+        M._assert_no_legacy_auth_knobs()
+    assert name in str(ei.value)
 
 
 # ---------------------------------------------------------------------------
@@ -280,31 +397,116 @@ def test_auth_policy_silent_when_tenant_keys_configured(monkeypatch, caplog):
 # ---------------------------------------------------------------------------
 def test_session_registry_blocks_cross_tenant_reuse():
     reg = SessionRegistry(dsn="", enabled=True)
-    assert reg.claim("s1", "acme") == (True, "acme")
+    assert reg.claim("s1", "acme") == (True, ("acme", ""))
     ok, owner = reg.claim("s1", "globex")
-    assert ok is False and owner == "acme"
+    assert ok is False and owner == ("acme", "")
 
 
 def test_session_registry_same_tenant_reuse_is_fine():
     reg = SessionRegistry(dsn="", enabled=True)
     reg.claim("s1", "acme")
-    assert reg.claim("s1", "acme") == (True, "acme")
+    assert reg.claim("s1", "acme") == (True, ("acme", ""))
+
+
+def test_session_registry_blocks_cross_user_reuse_within_same_tenant():
+    """**同租户内的两个用户之间也必须隔离。**
+
+    归属只比到 tenant 时，A 只要知道 B 的 thread_id 就能读到完整对话、
+    删掉它、甚至替 B 接受待审草稿 —— 隔离边界只画在"组织之间"，
+    而多用户场景下最需要隔离的恰恰是"同一个组织里的两个人"。
+    """
+    reg = SessionRegistry(dsn="", enabled=True)
+    assert reg.claim("s1", "acme", "alice") == (True, ("acme", "alice"))
+    ok, owner = reg.claim("s1", "acme", "bob")
+    assert ok is False and owner == ("acme", "alice")
+    # 同租户 + 同用户仍可复用（不能矫枉过正）
+    assert reg.claim("s1", "acme", "alice")[0] is True
+
+
+def test_session_registry_key_and_user_sessions_do_not_cross():
+    """Key 会话（user 为空）与用户会话**互不继承** —— 它们是两类主体。
+
+    刻意如此的严格语义：让它们互通等于给"机器凭证"开一条访问用户数据的后门。
+    """
+    reg = SessionRegistry(dsn="", enabled=True)
+    reg.claim("k1", "acme")                       # API Key 建的
+    assert reg.claim("k1", "acme", "alice")[0] is False
+    reg.claim("u1", "acme", "alice")              # 用户凭证建的
+    assert reg.claim("u1", "acme")[0] is False
 
 
 def test_session_registry_disabled_passes_everything():
-    """单租户模式（未配 TENANT_KEYS）不做区分 —— 否则会平白误伤。"""
+    """未启用用户鉴权时不做区分 —— 否则会平白误伤（那时所有请求同属主）。"""
     reg = SessionRegistry(dsn="", enabled=False)
     assert reg.claim("s1", "acme")[0] is True
     assert reg.claim("s1", "globex")[0] is True
 
 
-def test_session_registry_memory_is_bounded():
-    """内存模式必须有界：超限后停止登记但仍放行（安全降级，不阻断服务）。"""
+def test_session_registry_memory_is_bounded_and_fails_closed():
+    """内存模式必须有界；**超限后拒绝登记新会话**（而不是放行）。
+
+    ⚠️ 2026-10-05 改。此前超限时 `return True, me`（放行且不登记），docstring 写的
+    理由是"安全降级而非可用性降级"。**那个理由是错的**：放行意味着归属校验被
+    整个跳过 —— 表满之后任何人都能拿别人的 thread_id 直接开跑，而且**零症状**。
+    判不了就必须拒绝；代价（新会话起不来）用 503 + 可重试 来表达，
+    而不是用"静默放行"来掩盖。
+
+    ⚠️ 同时钉住"不能矫枉过正"：拒绝的是**新**会话，已登记的仍要照常校验
+    （本主通过、他人被拒）。少了后半条，一个把入口焊死的实现也能让本用例变绿。
+    """
     reg = SessionRegistry(enabled=True)
     reg.MAX_ENTRIES = 3
-    for i in range(6):
+    for i in range(3):
         assert reg.claim(f"s{i}", "acme")[0] is True
+
+    with pytest.raises(SessionError) as ei:
+        reg.claim("s3", "acme")
+    assert ei.value.status_code == 503, "判不了必须是 503（可重试），不是 403（结论明确）"
+    assert ei.value.code == "session_registry_full"
+
+    assert reg.claim("s0", "acme")[0] is True      # 已登记 + 本主 ⇒ 仍然放行
+    assert reg.claim("s0", "globex")[0] is False   # 已登记 + 他人 ⇒ 仍然被拒
     assert reg.count() == 3
+
+
+def test_session_registry_storage_error_denies_instead_of_allowing(monkeypatch):
+    """存储异常时必须**拒绝**，且是 503 而不是 403。
+
+    这是本次修的核心：此前抛异常后 `return True, me`，也就是"数据库抖动 ⇒
+    归属校验整体失效"。而抖动恰恰是这类旁路保护最该生效的时刻。
+    """
+    from app import pg
+
+    def _boom(*a, **kw):
+        raise RuntimeError("connection refused")
+
+    # 打桩点在**连接池**这一层（`app.pg.connect`）而不是 `psycopg.connect`：
+    # 三个同步存储类已改为从共享池借连接，不再自己调 psycopg。
+    monkeypatch.setattr(pg, "connect", _boom)
+    reg = SessionRegistry(dsn="postgresql://fake", enabled=True)
+
+    with pytest.raises(SessionError) as ei:
+        reg.claim("t-1", "acme")
+    assert ei.value.status_code == 503
+    assert ei.value.code == "session_store_unavailable"
+
+    # 读路径同样不能把"读不出来"降级成"不存在"（那会把排障引向"会话被删了"）
+    with pytest.raises(SessionError) as ei2:
+        reg.owner_of("t-1")
+    assert ei2.value.status_code == 503
+
+
+def test_session_registry_rejects_empty_thread_id():
+    """空 thread_id 必须拒绝：所有客户端会共用同一个空 key 的会话空间。
+
+    请求层已有非空校验（`ChatReq._v_thread_id`），这里是**纵深防御** ——
+    存储层不该对"空 id"这种明显无法定位的记录做任何放行决定。
+    """
+    reg = SessionRegistry(enabled=True)
+    with pytest.raises(SessionError) as ei:
+        reg.claim("   ", "acme")
+    assert ei.value.status_code == 400
+    assert ei.value.code == "empty_thread_id"
 
 
 def test_preflight_rejects_cross_tenant_session(monkeypatch):
@@ -316,20 +518,45 @@ def test_preflight_rejects_cross_tenant_session(monkeypatch):
     assert ei.value.status_code == 403
 
 
+def test_preflight_rejects_cross_user_session_in_same_tenant(monkeypatch):
+    """同租户、不同用户 → 403。这是"隔离下沉到用户"的直接断言。
+
+    只测"跨租户被拒"是不够的：那个用例在归属只比到 tenant 时**照样能过**，
+    所以它钉不住用户维度。
+    """
+    reg = SessionRegistry(enabled=True)
+    reg.claim("shared-thread", "acme", "alice")
+    monkeypatch.setattr(M, "_SESSIONS", reg)
+    with pytest.raises(HTTPException) as ei:
+        M._preflight(_FakeHTTPRequest(), session="shared-thread",
+                     tenant="acme", user="bob")
+    assert ei.value.status_code == 403
+    # 属主本人必须仍然能过（否则就是"拒绝得对"掩盖了"所有人都被拒"）
+    M._preflight(_FakeHTTPRequest(), session="shared-thread",
+                 tenant="acme", user="alice")
+
+
 # ---------------------------------------------------------------------------
 # 出口收紧：恒定时间比较 + 异常文案脱敏
 # ---------------------------------------------------------------------------
-def test_global_key_compare_is_constant_time(monkeypatch):
-    """全局 Key 的比较必须走 `hmac.compare_digest`。
+def test_password_verify_is_constant_time(monkeypatch):
+    """密码校验必须走 `hmac.compare_digest`，不能用 `==`。
 
-    为什么不写"行为断言"：`!=` 与 `compare_digest` 的**返回值完全一致**，
-    任何黑盒用例都无法区分它们 —— 所以这里退而求其次，断言"确实调用了它"。
-    这是一条**绊线**：把它改回 `!=` 时本用例会红。
+    为什么不写"行为断言"：`==` 与 `compare_digest` 的**返回值完全一致**，
+    任何黑盒用例都分不出它们 —— 所以这里退而求其次，断言"确实调用了它"。
+    这是一条**绊线**：把它改回 `==` 时本用例会红。
 
-    为什么值得钉：`!=` 在第一个不同的字节就返回，攻击者逐字节试错能靠响应时间
-    反推密钥前缀（timing oracle）。网络抖动让它很难利用，但修它只要一行。
+    为什么值得钉：`==` 在第一个不同的字节就返回，攻击者可逐字节试错、靠响应时间
+    反推正确前缀（timing oracle）。网络抖动让它很难利用，但修它只要一行。
+
+    ⚠️ 这条此前钉的是**共享密钥**的比较（`app/main.py` 里那句
+    `hmac.compare_digest(x_api_key, SERVE_API_KEY)`，随共享密钥路径一起删除）。
+    服务里还剩**这一处**需要恒定时间比较的地方 —— 密码哈希比对，所以覆盖面没有
+    变窄，只是换了对象。
     """
     import hmac as _hmac
+
+    from app import auth as A
 
     calls = []
     real = _hmac.compare_digest
@@ -338,17 +565,15 @@ def test_global_key_compare_is_constant_time(monkeypatch):
         calls.append((a, b))
         return real(a, b)
 
-    monkeypatch.setattr(M.hmac, "compare_digest", spy)
-    monkeypatch.setattr(M, "SERVE_API_KEY", "sekret")
-    monkeypatch.setattr(M.config, "TENANT_KEYS", {})
+    monkeypatch.setattr(A.hmac, "compare_digest", spy)
+    digest = A.hash_password("pw-correct", iterations=100_000)
 
-    assert M._authenticate("sekret", "").via == "global-key"
-    assert len(calls) == 1 and calls[0] == ("sekret", "sekret")
+    assert A.verify_password("pw-correct", digest) is True
+    assert calls, "密码校验没走 compare_digest —— 又退回了 `==` 比较"
 
-    with pytest.raises(HTTPException) as ei:
-        M._authenticate("wrong", "")
-    assert ei.value.status_code == 401
-    assert len(calls) == 2         # 错误分支也必须走同一条比较路径
+    calls.clear()
+    assert A.verify_password("pw-wrong", digest) is False
+    assert calls, "错误分支必须走同一条比较路径（短路径会泄漏信息）"
 
 
 def test_client_error_hides_internals_in_production(monkeypatch):
@@ -370,7 +595,7 @@ def test_client_error_keeps_detail_in_development(monkeypatch):
 
 def test_client_error_includes_request_id_in_production(monkeypatch):
     """带上 request_id：信息没丢（运维可凭它查到完整堆栈），只是没泄露给外面。"""
-    from app.logging_setup import set_request_id, reset_request_id
+    from app.logging_setup import reset_request_id, set_request_id
 
     monkeypatch.setattr(M.config, "IS_PRODUCTION", True)
     token = set_request_id("rid-abc123")
@@ -426,7 +651,17 @@ def test_client_ip_ignores_forwarded_for_by_default(monkeypatch):
 
 
 def test_client_ip_uses_forwarded_for_when_trusted(monkeypatch):
-    """TRUST_PROXY_HEADERS=1 时必须取 XFF **第一段**（代理链里最左才是真实来源）。"""
+    """TRUST_PROXY_HEADERS=1 时取 XFF **第一段**（最左段）。
+
+    ⚠️ 2026-10-04 订正 docstring：原文写的是"代理链里最左才是真实来源"—— 那句话是
+    **错的**。最左段只有在代理**覆盖式**写入该头时才是真实客户端地址；若代理用
+    nginx 的 `$proxy_add_x_forwarded_for`（追加式：客户端那段留在左），最左段恰是
+    **客户端可控**的那一段，限流可被伪造绕过。
+
+    所以本条只钉"实现取的是哪一段"（这是事实，不变）；
+    "代理必须以覆盖式写入"由 `tests/test_deploy_topology.py` 的守卫负责。
+    两条一起才构成完整防护。
+    """
     monkeypatch.setattr(M.config, "TRUST_PROXY_HEADERS", True)
     req = _FakeHTTPRequest(headers={"x-forwarded-for": "1.2.3.4, 10.0.0.9"},
                            peer="10.0.0.9")
@@ -489,7 +724,11 @@ def test_docs_endpoints_404_when_disabled():
 
 def test_production_env_turns_docs_off_by_default():
     """子进程验证"APP_ENV=production 时默认关文档"这条推导真的成立。"""
-    env = {**os.environ, "APP_ENV": "production", "SERVE_API_KEY": "x", "DB_URL": ""}
+    # ⚠️ 必须给一个**用户鉴权**来源：生产环境"只配脚本通行证"会**拒绝启动**
+    # （见 `test_auth_policy_blocks_production_without_user_auth`），
+    # 那样这条用例根本测不到文档开关。
+    env = {**os.environ, "APP_ENV": "production", "AUTH_SESSION_SECRET": "s",
+           "DB_URL": ""}
     code = "import app.main as M; print(M.app.docs_url, M.app.openapi_url, M.config.ENABLE_DOCS)"
     out = subprocess.run([sys.executable, "-c", code], cwd=os.getcwd(), env=env,
                          capture_output=True, text=True, timeout=180)
@@ -567,10 +806,16 @@ def test_disconnect_detected_even_when_upstream_stalls(monkeypatch):
 
 
 def test_disconnect_still_settles_quota(monkeypatch):
-    """断连不等于免费：已经产出的部分仍要计入租户用量。"""
+    """断连不等于免费：已经产出的部分仍要计入租户用量。
+
+    ⚠️ 必须给一个**开着额度**的层（`daily_limit > 0`）：日额度改成租户+每人两级之后，
+    两级都为 0 表示"不限" —— 此时根本不会建桶，`settle` 是空转的，
+    断言会失败在一个与"断连记账"完全无关的原因上（历史版本无条件记账，
+    所以那时 `daily_limit=0` 也能攒出数）。
+    """
     from app import quota as Q
 
-    q = Q.QuotaManager(daily_limit=0, request_limit=0)
+    q = Q.QuotaManager(daily_limit=10 ** 6, request_limit=1000)
     monkeypatch.setattr(M, "_QUOTA", q)
 
     g = _FakeGraph([SimpleNamespace(content="已经产出的内容")] * 20, delay=0.02)
@@ -579,7 +824,7 @@ def test_disconnect_still_settles_quota(monkeypatch):
     _collect_with_disconnect(
         lambda sig: M._stream_graph({}, {}, "chat", tenant="tenant-x", disconnect=sig),
         trip_after=0.1)                         # 已产出若干 chunk 后才断
-    assert q.store.get("tenant-x", Q._today()) > 0
+    assert q.store.get(Q._tenant_bucket("tenant-x", Q._today()), Q._today()) > 0
 
 
 def test_normal_run_without_disconnect_is_unchanged(monkeypatch):
@@ -607,11 +852,11 @@ def test_close_error_does_not_break_accounting(monkeypatch):
             super().__init__(chunks)
             self.stream = _BadClose(chunks)
 
-    q = Q.QuotaManager(daily_limit=0, request_limit=0)
+    q = Q.QuotaManager(daily_limit=10 ** 6, request_limit=1000)
     monkeypatch.setattr(M, "_QUOTA", q)
     g = _BadGraph([SimpleNamespace(content="内容")])
     monkeypatch.setattr(M, "graph", g)
 
     events = _collect(M._stream_graph({}, {}, "chat", tenant="t-bad"))
     assert [e["event"] for e in events] == ["token", "done"]
-    assert q.store.get("t-bad", Q._today()) > 0
+    assert q.store.get(Q._tenant_bucket("t-bad", Q._today()), Q._today()) > 0
