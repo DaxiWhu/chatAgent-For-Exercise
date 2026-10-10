@@ -88,7 +88,7 @@ from agents import (
 
 from .. import observability
 from ..envutil import env_int
-from . import reflection, runtime
+from . import fallback, reflection, runtime
 from .context import TaskContext
 from .frontline import frontline_agent
 from .guards import (
@@ -161,6 +161,21 @@ class TaskOutcome:
     含用户数据）。它的去处是**日志**与调用方的一次性判断。
     """
 
+    fallback: fallback.FallbackVerdict | None = None
+    """兜底判定（第 5 步）。``None`` = 没判（**转交**那一步没有交付物，不进判定表）。
+
+    ⚠️ 它是**收尾口径的唯一来源**：图那两处收尾（``frontline`` / ``literary``）不再各自
+    判"该交还是该停"，只读这个结论。两处各判一次的结果必然是两套规则，改一处漏一处。
+    """
+
+    fallback_draft: str = ""
+    """兜底转人工时**带给审核人**的那段内容（入口护栏 = 用户那句请求；出口护栏 = 被拒的产出）。
+
+    ⚠️ 它**不是交付物**。官方语义是"被拒的候选输出不落库"，这里有意偏离，
+    只为让审核人判断"这是不是误拦" —— 那种判断没有原文根本做不了
+    （``PLAN_step5_fallback.md`` §11）。
+    """
+
     decision: dict[str, Any] = field(default_factory=dict)
     """结构化判定（``{"action": ..., "content": ...}``）。
 
@@ -192,6 +207,17 @@ class TaskOutcome:
             return 30          # 确定性拦截：确凿的坏产出，交人
         # review_failed / max_turns / error：链路没跑完或没过审 → 交人
         return 40
+
+
+def _rejected_output(exc: BaseException) -> str:
+    """从出口护栏的 tripwire 里取回**被拒的那段产出**（官方 ``agent_output``）。
+
+    ⚠️ 这是"救回来存档"、不是"拿来交付"：官方语义是"被拒的候选输出不落库"，本服务只把它
+    作为**转人工时的草稿**带给审核人（``PLAN_step5_fallback.md`` §11 的决策）。
+    取不到就退化成空串 —— 宁可为一条诊断信息少带一点，也不要让收尾崩掉。
+    """
+    result = getattr(exc, "guardrail_result", None)
+    return str(getattr(result, "agent_output", "") or "")
 
 
 def _guardrail_name(exc: BaseException) -> str | None:
@@ -460,6 +486,7 @@ async def run_agent(
     exit_reason = "error"
     guardrail: str | None = None
     error_kind = ""
+    fallback_draft = ""
     result = None
     #: 本次运行结束时停在哪个 agent。空 = run 没跑到底 ⇒ 调用方保持 state 原值不变。
     ended_on = ""
@@ -480,11 +507,22 @@ async def run_agent(
         )
     except OutputGuardrailTripwireTriggered as exc:
         # 出口护栏拦下的输出**不会**成为交付物 —— 官方语义：被拒的候选输出不落库。
+        # ⚠️ 但那段产出要"救回来存档"：转人工时它作为草稿带给审核人（见 fallback_draft）。
         exit_reason, guardrail = "output_guardrail", _guardrail_name(exc)
+        fallback_draft = _rejected_output(exc)
     except InputGuardrailTripwireTriggered as exc:
         exit_reason, guardrail = "input_guardrail", _guardrail_name(exc)
+        # 入口护栏拦下的是**用户那句话本身** —— 转人工时要带给审核人的就是它。
+        fallback_draft = prompt or ""
     except MaxTurnsExceeded:
         exit_reason = "max_turns"
+    except reflection.AgentStoppedByGuard:
+        # 第 3 级踩刹车（从注入口抛出来的）。⚠️ **必须排在上面那个 `except Exception` 之前**：
+        # 否则会被它吞成 `exit_reason="error"`，表现是"停是停了、理由却变成崩溃"，
+        # 而运维看到"崩溃率上升"会去查一个根本不存在的故障。
+        # ⚠️ 这里**不冒泡**（与 `error` 那条不同）：主线的收尾要照常走完 ——
+        # 判定表会把它收成 `failed`（运行被打断 ⇒ 没有产出物）。
+        exit_reason = "guard_stop"
     except Exception as e:  # noqa: BLE001  上游抖动 / 协议错误
         logging.exception("agent 链路执行异常")
         exit_reason = "error"
@@ -535,11 +573,22 @@ async def run_agent(
         agent=getattr(agent, "name", ""),
     )
 
+    # 交付物：没过审时**仍返回产出**：与 max_turns 同一考虑 —— 有疑点但不确凿，
+    # 交给人工复核比丢给用户一句空话好。被护栏拦下的则不给（那是确凿的坏产出）；
+    # 转交的也不给（那一段内容压根不是给用户看的）。
+    deliverable = answer if passed or exit_reason in ("review_failed", "max_turns") else ""
+
+    # 兜底判定（第 5 步）：**转交**那一步不进表 —— 它没有交付物，拿它进表会让每一次
+    # 正常转交都落进"没有可交付的答复"那一行（转交是常态，不是出问题）。
+    verdict = None
+    if exit_reason != "transfer":
+        verdict = fallback.decide(context, exit_reason=exit_reason, answer=deliverable)
+        fallback.report(
+            verdict, exit_reason=exit_reason, agent=getattr(agent, "name", "")
+        )
+
     return TaskOutcome(
-        # 没过审时**仍返回产出**：与 max_turns 同一考虑 —— 有疑点但不确凿，
-        # 交给人工复核比丢给用户一句空话好。被护栏拦下的则不给（那是确凿的坏产出）；
-        # 转交的也不给（那一段内容压根不是给用户看的）。
-        answer=answer if passed or exit_reason in ("review_failed", "max_turns") else "",
+        answer=deliverable,
         attempts=1,
         final_agent=ended_on,
         passed=passed,
@@ -548,5 +597,7 @@ async def run_agent(
         delivered=dict(context.delivered),
         guardrail=guardrail,
         error=error_kind,
+        fallback=verdict,
+        fallback_draft=fallback_draft,
         decision=decision,
     )

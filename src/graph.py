@@ -133,7 +133,8 @@ HIGH = 80
 LLM_TRY_TIME = 5
 MAX_ITERATION = 10
 ERROR_REPORT = "服务出现问题请稍后重试"
-GUARDRAIL_REFUSAL = "抱歉，这个请求包含试图覆盖系统指令的内容，我无法处理。"
+# 注：旧的 ``GUARDRAIL_REFUSAL``（入口护栏当场回一句拒绝）已随第 5 步删除 —— 入口护栏
+# 拦下的一律转人工（业务类），被拦下的那句请求本身会作为草稿带给审核人，见 ``_verdict_state``。
 
 # RAG：语料目录（可用 DOCS_DIR 覆盖）与召回条数
 DOCS_DIR = os.getenv("DOCS_DIR", "data")
@@ -212,6 +213,12 @@ class OverAllState(MessagesState):
     assets: list = []          # 本轮落盘的资产路径
     agent_stats: dict = {}     # src/agents 的运行统计（普通 dict，可序列化）
     agent_guardrail: str = ""  # 被哪条出口护栏拦下
+    # ---- 兜底出口（第 5 步；`src/agents/fallback.py` 判、本文件写）----
+    # ``delivered`` / ``partial`` / ``manual`` / ``failed``，与指标
+    # `agent_task_outcome_total{outcome}` 同名（看板上"完成率掉了"要能直接对到代码）。
+    task_outcome: str = ""
+    fallback_reason: str = ""      # 为什么落到那一档（有限枚举，可做标签）
+    unfinished_steps: list = []    # 未完成清单（**有上限**；只给前端与审核人，不进对话）
     # 前台节点那一步的**判定**（2026-10-03 拆成多节点后新增）：
     # ``{"action": "reply"|"transfer", "content": ...}``，由 ``route_frontline`` 消费。
     # ⚠️ 它与 ``current_agent`` 分工不同：那个是"本轮结束在哪个 agent"（观测），
@@ -406,6 +413,11 @@ def init(state: OverAllState) -> OverAllState:
         "feedback_source": "",
         "human_action": "",
         "agent_guardrail": "",
+        # 兜底的三个字段同样要清：上一轮是"部分结果"时留下的清单，会让本轮的
+        # 接口返回凭空多出一份不属于这次的未完成清单（与 feedback 那次是同一类污染）。
+        "task_outcome": "",
+        "fallback_reason": "",
+        "unfinished_steps": [],
         "agent_stats": {},
         "assets": [],
         "agent_decision": {},
@@ -567,8 +579,10 @@ class AgentRunFailed(RuntimeError):
     **失败**（SSE 下是一个脱敏的 ``error`` 事件，见 ``app/main.py`` 的收流分支）。
     这是刻意换的 —— 把"没跑成"伪装成"跑成了"，会让观测面与重试逻辑一起失真。
 
-    ⚠️ **只包异常**。"超轮数"与"护栏拦截"仍然是正常的收尾路径（见 ``_agent_stop``）：
+    ⚠️ **只包异常**。"超轮数"与"护栏拦截"仍然是正常的收尾路径（见 ``_verdict_state``）：
     它们有明确的结论要告诉用户，不是"什么都没发生"。
+    ⚠️ 第 3 级的刹车（``exit_reason="guard_stop"``）**不走这里** —— 它已经是一次"停"，
+    再冒泡只会让"停"变成"崩"，见 ``runner`` 里那条专用捕获。
     """
 
 
@@ -663,30 +677,126 @@ def _agent_base(state: OverAllState, outcome, ctx) -> dict:
     }
 
 
-def _agent_stop(outcome, base) -> OverAllState | None:
-    """处理"这次运行没有可交付答案"的三种收尾；没命中时返回 ``None``。
+#: 转人工时给的分（低于 ``HIGH`` ⇒ ``route_agent_review`` 自然判 ``human``）。
+#: 与 ``TaskOutcome.score_hint()`` 里 ``review_failed`` 那一档**同值** —— 同一个"该人看"的
+#: 结论不该有两种分数，否则"分数为什么不一样"永远解释不清。
+MANUAL_SCORE = 40
 
-    三种都是**确定的结论**，各自要给用户不同的东西：
+#: 兜底原因 → 给审核人看的一句话（写进 ``feedback`` 的前缀）。
+#:
+#: 为什么不直接把 ``reason`` 这个枚举值塞进去：审核人不是工程师，看到 ``not_fixed``
+#: 不知道发生了什么；而"引擎里那个值"与"给人看的话"本来也是两件事，混用的后果是
+#: 改文案会顺手改掉指标标签。
+_REASON_TEXT = {
+    "off_track": "内容偏离了用户的要求",
+    "review_failed": "评审未通过",
+    "guardrail": "请求或产出被护栏拦下",
+    "error": "运行崩溃",
+    "no_output": "没有任何产出，也没有异常信号",
+    "loop": "在原地反复做同一个动作",
+    "stuck": "反复失败、推进不下去",
+    "max_turns": "轮次烧完仍未收敛",
+    "guard_stop": "多步防护第 3 级停止重试",
+}
 
-    * 入口护栏 ⇒ 一句明确的拒绝（而不是空答复）；
-    * 出口护栏 ⇒ 空答复 + 由接口层下一个明确的 error 事件（**被拒的候选输出不成为
-      交付物**，官方语义 —— 不能拿一句被判定为编造的答复交付）；
-    * 超轮数 ⇒ 通用错误提示（模型绕圈没收敛，按错误收尾）。
 
-    ⚠️ 三处都顺手把 ``agent_decision`` 清空：这几条路径**没有**产生判定，
-    留着旧值会让条件边读到一个不属于本次的结论。
+def _verdict_state(outcome, base, ctx) -> OverAllState | None:
+    """按**兜底结论**决定这次怎么收尾；返回 ``None`` = 照常交付（``delivered`` / ``partial``）。
+
+    判定本身在 ``src/agents/fallback.py``（那张优先级表的唯一实现）—— 这里只负责
+    "翻译成 state 能表达的东西"。为什么这么分：那两个节点（前台 / 文学）写法不同、
+    将来还可能加第三个，把判定写进节点等于每加一个节点就复制一份规则。
+
+    两档的翻译方式，以及为什么这么翻译：
+
+    * ``manual``（转人工）⇒ 写一个**低于阈值**的分数，让 ``route_agent_review`` 自然走
+      ``human``。⚠️ 刻意**不**给那个条件边加一个"兜底"分支：同一个"该不该人看"的判定
+      散在两条规则里，改一处必漏另一处；而分数是既有的杠杆，复用它意味着判据仍然只有一处。
+      ⚠️ ``feedback_source`` 必须写 ``"ai"``：写成 ``"human"`` 会让下一轮把这句系统原因
+      当成"人工打回的意见"送进模型（见 ``_agent_context``）。
+    * ``failed``（停止 + 不交本次产出）⇒ ``output`` 换成一句通用错误说明 + ``force_exit``。
+      ⚠️ 说明里**没有**这次产出的内容（半成品一律不交），但必须给用户一个明确结局：
+      只留空答复的话客户端收到的是"零 token + done"，与"模型什么都没说"分不开。
     """
-    if outcome.exit_reason == "input_guardrail":
-        return {**base, "agent_decision": {}, "output": GUARDRAIL_REFUSAL,
-                "force_exit": True, "is_need_evaluate": False}
-    if outcome.exit_reason == "output_guardrail":
-        return {**base, "agent_decision": {}, "output": "", "force_exit": True,
-                "is_need_evaluate": False}
-    if outcome.exit_reason == "max_turns":
-        logging.warning("agent 链路未正常收尾（max_turns），按通用错误收尾")
-        return {**base, "agent_decision": {}, "output": ERROR_REPORT,
-                "force_exit": True, "is_need_evaluate": False}
+    verdict = outcome.fallback
+    if verdict is None:
+        return None
+    fields = _verdict_fields(verdict)
+    if verdict.outcome == "manual":
+        return {
+            **base,
+            **fields,
+            # 这几条路径**没有**产生判定，留着旧值会让条件边读到一个不属于本次的结论。
+            "agent_decision": {},
+            # 草稿：正常产出时就是它自己；护栏拦下的那两条**没有交付物**，
+            # 用被拦下的那段内容（入口 = 用户那句请求；出口 = 被拒的产出）——
+            # 让审核人能判断"是不是误拦"（`PLAN_step5_fallback.md` §11）。
+            "output": outcome.fallback_draft or outcome.answer,
+            "score": MANUAL_SCORE,
+            "is_need_evaluate": True,
+            "feedback": _manual_feedback(verdict, ctx),
+            "feedback_source": "ai",
+        }
+    if verdict.outcome == "failed":
+        logging.warning(
+            "agent 兜底：不交付本次产出（原因=%s，exit_reason=%s）",
+            verdict.reason, outcome.exit_reason,
+        )
+        return {
+            **base,
+            **fields,
+            "agent_decision": {},
+            "output": ERROR_REPORT,
+            "force_exit": True,
+            "is_need_evaluate": False,
+        }
     return None
+
+
+def _verdict_fields(verdict) -> dict:
+    """兜底结论里"记进 state 供前端与排查看"的那几个字段。
+
+    ``delivered`` 时返回**空 dict**（不是三个空值）：正常交付不该在 state 上留下
+    "有过兜底"的痕迹 —— 否则查询接口会为每一轮正常对话都回一个 `task_outcome`，
+    前端就得多一套"这个字段到底有没有意义"的判断。
+    """
+    if verdict is None or verdict.outcome == "delivered":
+        return {}
+    return {
+        "task_outcome": verdict.outcome,
+        "fallback_reason": verdict.reason,
+        "unfinished_steps": list(verdict.unfinished),
+    }
+
+
+def _with_partial_notice(answer: str) -> str:
+    """轻档的**交付正文** = 答复 + 一句提醒。"""
+    return f"{answer}\n\n{_partial_notice()}"
+
+
+def _manual_feedback(verdict, ctx) -> str:
+    """转人工时写进 ``feedback`` 的那一段（第 5 步决策 13：原因 + 未完成清单）。
+
+    做成**前缀**、并且与原先的评审建议拼在一起，是因为 ``feedback`` 这个字段本来就是
+    "对这段内容的建议"，人工打回时它会被覆盖成人的意见 —— 两者不冲突的前提是
+    ``feedback_source`` 保持 ``"ai"``（只有 ``"human"`` 才被当成打回意见送给模型）。
+    """
+    parts = [f"[系统] 兜底转人工：{_REASON_TEXT.get(verdict.reason, verdict.reason)}。"]
+    if verdict.unfinished:
+        parts.append(f"未完成：{verdict.unfinished_text()}。")
+    advice = getattr(ctx.recall("evaluation"), "feedback", "") or ""
+    if advice:
+        parts.append(advice)
+    return " ".join(parts)
+
+
+def _partial_notice() -> str:
+    """轻档在**正文**里加的那一句（决策 12：正文只给一句，完整清单走结构化返回）。
+
+    ⚠️ 它只进 ``output``（交付正文），**不进 ``messages``** —— 写进消息会跟着落库、
+    并进入后续对话上下文，等于让模型在下一轮看到"我上次没做完"，而那段话是给**用户**看的。
+    """
+    return "（本次为部分结果：运行未完全收敛，可能有动作没有完成。）"
 
 
 async def frontline(state: OverAllState, config: RunnableConfig | None = None) -> OverAllState:
@@ -734,9 +844,9 @@ async def frontline(state: OverAllState, config: RunnableConfig | None = None) -
         # ★ 冒泡（不是"写句错误提示正常收尾"）：只有冒出去，检查点才会留下
         # 待执行节点、续跑才真的可用。见 AgentRunFailed 的说明。
         raise AgentRunFailed(outcome.error or "agent 运行失败")
-    stop = _agent_stop(outcome, base)
-    if stop is not None:
-        return stop
+    verdict_state = _verdict_state(outcome, base, ctx)
+    if verdict_state is not None:
+        return verdict_state
 
     decision = dict(outcome.decision)
     if decision.get("action") == "transfer":
@@ -744,16 +854,23 @@ async def frontline(state: OverAllState, config: RunnableConfig | None = None) -
 
     check = citation_check.verify(outcome.answer, ctx.citations, docs_dir=DOCS_DIR)
     evaluation = ctx.recall("evaluation")
+    partial = outcome.fallback is not None and outcome.fallback.outcome == "partial"
     return {
         **base,
+        **_verdict_fields(outcome.fallback),
         "agent_decision": decision,
-        "output": outcome.answer,
+        # 轻档：正文多一句提醒（清单走结构化返回，见 `_partial_notice`）。
+        "output": _with_partial_notice(outcome.answer) if partial else outcome.answer,
+        # ⚠️ 写回消息的是**原答复**、不是带提醒的那份：提醒是给用户看的，
+        # 落进消息会跟着进下一轮的对话上下文。
         "messages": [AIMessage(content=outcome.answer)],
         "citation_check": check,
         # 评审结论接到主链路沿用的一套状态字段上：这样 route_agent_review 与
         # route_review 用的是同一套阈值口径，运维不需要记两套规则。
         "is_need_evaluate": True,
-        "score": outcome.score_hint(),
+        # 轻档要**照常交付**（不进人审），而分数是 `route_agent_review` 唯一的判据 ⇒
+        # 显式给高分；其余情形沿用映射（`score_hint`）。
+        "score": 90 if partial else outcome.score_hint(),
         "feedback": getattr(evaluation, "feedback", "") or "",
         "feedback_source": "ai",
     }
@@ -788,19 +905,23 @@ async def literary(state: OverAllState, config: RunnableConfig | None = None) ->
     base = _agent_base(state, outcome, ctx)
     if outcome.exit_reason == "error":
         raise AgentRunFailed(outcome.error or "agent 运行失败")
-    stop = _agent_stop(outcome, base)
-    if stop is not None:
-        return stop
+    verdict_state = _verdict_state(outcome, base, ctx)
+    if verdict_state is not None:
+        return verdict_state
 
     check = citation_check.verify(outcome.answer, ctx.citations, docs_dir=DOCS_DIR)
     evaluation = ctx.recall("evaluation")
+    partial = outcome.fallback is not None and outcome.fallback.outcome == "partial"
     return {
         **base,
-        "output": outcome.answer,
+        **_verdict_fields(outcome.fallback),
+        # 轻档：正文多一句提醒；清单走结构化返回，写回消息的仍是原答复
+        # （理由与前台节点逐字相同，见那边的注释）。
+        "output": _with_partial_notice(outcome.answer) if partial else outcome.answer,
         "messages": [AIMessage(content=outcome.answer)],
         "citation_check": check,
         "is_need_evaluate": True,
-        "score": outcome.score_hint(),
+        "score": 90 if partial else outcome.score_hint(),
         "feedback": getattr(evaluation, "feedback", "") or "",
         "feedback_source": "ai",
     }

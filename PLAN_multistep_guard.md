@@ -279,6 +279,15 @@
 
 ### 3.6 兜底出口（两级，按严重程度）
 
+> ⚠️ **本节口径已被 `PLAN_step5_fallback.md` §4 取代（2026-10-10）。** 原文留在这里只为
+> 对照"为什么改"，**实现请照 §4 那张表**。最要紧的一处修正是：这里的"轻 / 重"把
+> **问题性质**与**处置**揉成了一根轴 —— 实际上它们是两条互相垂直的轴：
+> **问题性质**（要人来审 = 业务类 / 要改代码 = 系统类）决定"该让谁来看"，
+> **处置**（停止 / 转人工 / 交什么）是另一条，**可以叠加**。
+> ⇒ 所以 **"停止" ≠ "不交东西"**：系统类的问题要停，但那次运行**已经产出的内容照交**，
+> 只标明"这是部分结果"；确实什么都没产出才是 `failed`。
+> 最终是**四档**：`delivered` / `partial` / `manual` / `failed`（与指标标签同名同值）。
+
 | 程度 | `outcome` | 交付什么 |
 |---|---|---|
 | 轻（有产出、只是没全做完） | `partial` | **已完成部分 + 未完成步骤清单**，并标明这是部分结果 |
@@ -318,13 +327,19 @@
 | `agent_reflection_duration_seconds` | histogram | | 反思自己多慢 ✅ 第三步已落地 |
 | `agent_reflection_timeout_total` | counter | | 反思没跑完 ✅ 第三步已落地（超时单独计数：它指向**配置**，与"网关抖动"处置不同） |
 | `agent_reflection_late_total` | counter | | 结论没赶上（白跑）✅ 第三步已落地（它在涨 ⇒ `AGENT_REFLECT_TIMEOUT` 或阈值配得不合适） |
-| `agent_recovery_level_total` | counter | `level` | 1 / 2 / 3 各发生几次 ✅ 第 3、4 步已落地（`1` = 注入提醒、`2` = 撤回那一步；`3` 属第 5 步） |
-| `agent_recovery_skipped_total` | counter | `reason` | **到线了却没撤成**：`not_found`（那一步已被裁剪/压缩吃掉）/ `side_effect`（动作有副作用、白名单外）/ `capped`（额度用完）。⚠️ 它在涨说明"问题还在、但已经没得退了" ⇒ 该调额度，或该上第 3 级 ✅ 第 4 步已落地 |
-| `agent_task_outcome_total` | counter | `outcome` | **任务完成率**（缺口二）：delivered / partial / manual / failed |
+| `agent_recovery_level_total` | counter | `level` | 1 / 2 / 3 各发生几次 ✅ 第 3、4、5 步已全部落地（`1` = 注入提醒、`2` = 撤回那一步、`3` = 踩刹车中断本次运行）。⚠️ `3` 是在**抛出那一下**计的、不是在"判定出来"那一下 —— 判定 ≠ 真的停成了（判定发生时运行可能已经没有下一次模型调用了） |
+| `agent_recovery_skipped_total` | counter | `reason` | **到线了却没撤成**：`not_found`（那一步已被裁剪/压缩吃掉）/ `side_effect`（动作有副作用、白名单外）/ `capped`（额度用完）。⚠️ 它在涨说明"问题还在、但已经没得退了" ⇒ 该调额度，或该上第 3 级 ✅ 第 4 步已落地（这三个值现在**各对应一个第 3 级停因**，见 `PLAN_step5_fallback.md` §5） |
+| `agent_task_outcome_total` | counter | `outcome` / `agent` | **任务完成率**（缺口二）：delivered / partial / manual / failed ✅ 第 5 步已落地。⚠️ 标签值就是代码里那四个常量（同名同值 ⇒ 看板上"完成率掉了"能直接对到判定，中间不过一次翻译） |
+| `agent_fallback_total` | counter | `reason` / `agent` | 兜底各类原因各几次（`reason` 是**有限枚举**：none / error / off_track / review_failed / guardrail / no_output / loop / stuck / max_turns / guard_stop）✅ 第 5 步已落地 |
 
-⚠️ **前三个 + 第三步那四个已落地，但只看板不告警**：告警（`AgentToolFailureRateHigh` /
-`AgentLoopDetected` / `AgentRecoveryLevel3Frequent`）排在 §7 第 7 步，与其余指标、
-配置、文档一起收口 —— 在那之前它们只是"有数据、没人盯"。
+⚠️ **两个 `agent` 标签是硬约定、不是风格**：一次请求 = N 次运行（转交那一轮是
+前台 + 文学 2 次），少了它按 `outcome` 聚合的看板会把"运行数"当"请求数"，阈值随之失真
+—— 而没有任何东西会变红。`error_kind` **绝不进标签**（异常原文带 request id、上游返回体、
+可能含用户数据），它只进日志。
+
+⚠️ **除 `agent_task_outcome_total` / `agent_fallback_total` 外，其余只看板不告警**：告警
+（`AgentToolFailureRateHigh` / `AgentLoopDetected` / `AgentRecoveryLevel3Frequent`）排在
+§7 第 7 步，与其余指标、配置、文档一起收口 —— 在那之前它们只是"有数据、没人盯"。
 
 ⚠️ 沿用现有口径约束：`agent` 组序列**只在真走 agent 链路时才有**（没流量时序列不存在，
 而不是报 0）；按 `exit_reason` 聚合的看板**必须带 `agent` 标签**。
@@ -368,6 +383,10 @@
 `AGENT_REFLECT_ON_REPEAT` / `AGENT_REFLECT_MAX_LEVEL1` / `AGENT_REFLECT_TIMEOUT` /
 `AGENT_REFLECT_WAIT_SECONDS`（第 3 步）+ `AGENT_REFLECT_MAX_FIRES` /
 `AGENT_REFLECT_MAX_LEVEL2`（第 4 步）—— 共 10 个键已进 `.env.example` 与运维文档。
+⚠️ **第 5 步没有新增任何键**（有意如此）：判定阈值、"未完成清单"条数上限都是代码里的常量。
+⭐ 可调的是**两个既有键**：`AGENT_REFLECT_MAX_LEVEL2=0` 会让每一个到线的同类问题都落进
+`capped` ⇒ 第 3 级**每次都会停**（组合错了就是"一发现问题就中断"，而它看起来只是"额度配小了"）；
+反过来把 `AGENT_REFLECT_MAX_FIRES` 配到 ≥ 两级额度之和，才看得到 `not_fixed` 这个停因。
 ⏳ 未落地：无（本表已全部落地）。
 
 ## 7. 落地顺序
@@ -410,13 +429,24 @@
    以及注入口里"滤掉已撤回的 → 执行撤回 → 追加说明"三段。两处口径见 §3.5 的表。
    守卫：`tests/test_agent_reflection.py` 第八组（20 条，全文件 64 条）；
    变异验证 9 组全部按预测抓到。
-   ⏳ **第 3 级**（停止重试）属第 5 步的兜底出口 —— 到线却没撤成时需要的正是它。
-   反过来也成立：`agent_recovery_skipped_total` 在涨 = 该上第 3 级了。
+   ✅ **第 3 级随第 5 步落地**（2026-10-10，见下条）：到线却没撤成时不再"降级成提醒"，
+   而是**停止本次运行**；`agent_recovery_skipped_total` 在涨 = 该上第 3 级了。
 5. **兜底出口**（§3.6）—— 接现有审核通道。
+   ✅ **已完成**（2026-10-10）。落点：新建 `src/agents/fallback.py`（`decide` 七行判定表 /
+   `report` 唯一上报点 / `_unfinished` 未完成清单）、`reflection.py` 的第 3 级
+   （`AgentStoppedByGuard` / `_level3_reason` / `_raise_stopped`）、`runner.py` 的
+   **专有捕获**（必须排在 `except Exception` 之前）与判定调用、`graph.py` 的两处收尾
+   （`_verdict_state` / `_verdict_fields` / `_with_partial_notice`）、`app/main.py`
+   的转人工判定**提前**（否则待审草稿会先流给用户）与 `task_outcome` 事件。
+   方案与全部口径：`PLAN_step5_fallback.md`（§1 两条垂直的轴 / §4 判定表 / §5 第 3 级）。
+   守卫：`tests/test_agent_fallback.py`（33 条）；`tests/test_agent_reflection.py` 补 3 条
+   第 3 级判定；变异验证 46 组（新增 19 组）。
+   ⚠️ 这一步**推翻了 §3.6 的"轻 / 重两级"**（那是把两条轴揉成了一根），最终是**四档**。
 6. **结构化摘要**（§4）—— 与压缩合并。
 7. 指标 / 告警 / 配置 / 文档 / 守卫 —— **收口**。
    ⚠️ 含 `CHANGELOG.md` 的 `[Unreleased]` 条目：前几步落地时**刻意都没单独补**，
    避免同一个功能在变更日志里记成半截（"记了指标没记开关"那种）。
+   第 5 步落地时同样**刻意没补** `CHANGELOG.md` —— 与前面一致，留到这一步一起写。
 
 ## 8. 风险与落地时必须先验证的点
 
@@ -436,7 +466,8 @@
    ⇒ 按 `call_id` 过滤就够，不会留下"一段没有来由的助手话"。
    ⚠️ **仍未验证**的是**真实网关那一层**（对话补全接口自己的转换函数）——
    探针用的是按官方 item 类型构造的假模型。所以实现里不假设"输入侧一定有 `call_id`"：
-   定位不到时**当次不退回**、降级成提醒并计数（`agent_recovery_skipped_total`）。
+   定位不到 ⇒ 计 `agent_recovery_skipped_total{reason="not_found"}` + **第 3 级停止**
+   （口径见 §8 第 6 条，2026-10-10 已从"降级成提醒"改成"停止"）。
 2. **`on_llm_end` 的 `response.output` 里，函数调用项的形态。**
    已确认类型存在（`ResponseFunctionToolCall`，带 `name` / `arguments` / `call_id`），
    但**在当前网关（对话补全接口）下是否原样保留**需要实测。
@@ -456,12 +487,16 @@
 5. **迟到的结论白跑**（§3.4）—— 属可接受损失，但要可计数（`agent_reflection_late_total`）。
 6. **与历史压缩的相互作用** —— 压缩会把老历史换成摘要，而退回要删的是**具体条目**；
    若那一步已被压缩吃掉，退回就**无从定位**。
-   ✅ **2026-10-09 定口径**（第 4 步）：定位不到 ⇒ **当次不退回**，降级成一条提醒，
-   并计 `agent_recovery_skipped_total{reason="not_found"}`。
+   ✅ **2026-10-09 定口径**（第 4 步）：定位不到 ⇒ 计
+   `agent_recovery_skipped_total{reason="not_found"}`。
    刻意没选方案里建议的"直接放弃、不计数"：那样"退回老是不生效"只能靠翻日志，
    与"一直没出问题"在看板上完全一样；而选"删到最近一条还在的为止"会让撤掉的
    不是真正出问题那一步，语义变模糊。同理，token 裁剪（`history_budget`）也会吃掉那一步，
    两条路径都落在同一个判据上。
+   ⚠️ **2026-10-10 改口径**（第 5 步）：定位不到**不再"当次不退回、降级成一条提醒"**，
+   而是**第 3 级：停止本次运行**。理由是分类 ——「该退却退不了」（找不到 / 那一步不可撤 /
+   额度用完）归**系统类**，系统类的处置就是"停止 + 给开发信号"；降级成提醒等于**让它
+   悄悄过去**（模型照样在同一个地方打转，只是我们不再管它了）。
 7. **跨副本**：步骤记录在进程内，多副本下各算各的（与现有指标同一局限，`SLO.md` 已写明）。
 
 ## 9. 第一步实测得到的两条形态事实（原方案没写到，但决定了实现形状）

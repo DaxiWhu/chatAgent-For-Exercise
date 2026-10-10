@@ -1522,6 +1522,11 @@ def _session_view(state, thread_id: str) -> dict:
         "score": values.get("score"),
         "feedback": values.get("feedback") or "",
         "draft": values.get("output") or "",
+        # 兜底结局（第 5 步）：与最新一轮 state 同源，**不落进对话历史**。
+        # 没有兜底时是空串/空表（`init` 每轮都会清，见 `src/graph.py`）。
+        "task_outcome": values.get("task_outcome") or "",
+        "fallback_reason": values.get("fallback_reason") or "",
+        "unfinished_steps": values.get("unfinished_steps") or [],
         "citations": values.get("citations") or [],
         # 引用校验结论（`citations` 非空 ≠ 有依据，两者必须分开报）
         "citation_check": values.get("citation_check") or {},
@@ -2509,12 +2514,18 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
             return
         values = state_snap.values
 
+        # ---- 本轮是不是停在人工审核？----
+        # ⚠️ 必须在**补齐产出之前**判（第 5 步）。转人工的内容**不是给用户的** ——
+        # 顺序反了的话，待审草稿会先以 token 事件发给用户、然后才收到"待审核"，
+        # 于是"不交半成品"只写在文档里、实际照样漏出去。
+        awaiting_review = bool(state_snap.next and "human_review" in state_snap.next)
+
         # ---- 非流式链路的产出补齐 ----
         # agent 链路用 `Runner.run` 整段返回，**不产生 token 事件**。
         # 不补这一步，客户端会收到"零 token + done" —— 表现得像服务没回答，
         # 而服务日志里一切正常（最容易误判成前端 bug 的一种）。
         # 放在这里而不是各链路各写一遍：判据统一是"本轮一个 token 都没流过"。
-        if not produced and (values.get("output") or ""):
+        if not produced and not awaiting_review and (values.get("output") or ""):
             text = values["output"]
             # 非流式链路（agent 链路）整段返回：它的"首字节"就是**整段
             # 生成耗时**，与流式差一个数量级。两者混进同一个分布会让 P95 变成
@@ -2579,7 +2590,18 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
                 "message": "本次产出未通过交付前校验（引用无法溯源或超出长度上限），已拦下。",
             }))
 
-        if state_snap.next and "human_review" in state_snap.next:
+        # ---- 兜底结局（第 5 步）：结构化字段，**不进答复正文、也不进对话历史** ----
+        # 轻档的正文里只有一句提醒，完整清单在这里给前端；failed / manual 也报一次 ——
+        # 否则"这一轮为什么没有正文"只能靠翻日志回答。
+        outcome_kind = values.get("task_outcome") or ""
+        if outcome_kind and outcome_kind != "delivered":
+            yield _record(_sse_json("task_outcome", {
+                "outcome": outcome_kind,
+                "reason": values.get("fallback_reason") or "",
+                "unfinished": values.get("unfinished_steps") or [],
+            }))
+
+        if awaiting_review:
             item = {
                 "thread_id": thread_id or (run_config.get("configurable", {}) or {}).get("thread_id", ""),
                 "draft": values.get("output") or "",

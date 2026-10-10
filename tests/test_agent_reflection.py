@@ -979,6 +979,9 @@ def test_reverting_something_with_side_effects_is_skipped_and_counted(monkeypatc
     assert [e[3] for e in sink.counters("agent_recovery_skipped_total")] == [
         {"reason": "side_effect"}
     ], "只有第 3 次（真到升级线那一次）该计 —— 前两次属正常"
+    # ★ 第 3 级：「该退却退不了」归**系统类** ⇒ 停（`PLAN_step5_fallback.md` §2）。
+    # 停因就是那个 refusal —— 报 `side_effect` 才知道"要撤回的动作不可撤"，而不是"没额度"。
+    assert ctx.reflection.stopped == "side_effect"
 
 
 def test_reverting_when_the_budget_is_gone_is_counted(monkeypatch, sink):
@@ -993,6 +996,94 @@ def test_reverting_when_the_budget_is_gone_is_counted(monkeypatch, sink):
     assert ctx.reflection.reverted == 0
     assert [e[3] for e in sink.counters("agent_recovery_skipped_total")] == [
         {"reason": "capped"}
+    ]
+    assert ctx.reflection.stopped == "capped", "额度用完也是「该退却退不了」⇒ 该停"
+
+
+# --------------------------------------------------------------------------- #
+# 第 3 级：该不该停（停因**逐行**钉住）
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("kinds", "reverted", "refusal", "want"),
+    [
+        ({"loop": 2}, 0, "", ""),                        # 还没到线：那正是"先提醒 N 次"
+        ({"loop": 3}, 0, "", ""),                        # 到线且撤得动 ⇒ 走第 2 级，不停
+        ({"loop": 3}, 0, "capped", "capped"),            # 该退却退不了：没额度了
+        ({"loop": 3}, 0, "side_effect", "side_effect"),  # 该退却退不了：那一步不可撤
+        ({"loop": 3}, 1, "", ""),                        # 撤过、同类问题**刚**复发 ⇒ 还不能断言"没用"
+        ({"loop": 4}, 1, "", "not_fixed"),               # 撤过、同类问题又来 ⇒ 撤了也没用
+        ({"loop": 4}, 1, "capped", "capped"),            # 两个都成立时报"没额度"（更具体）
+    ],
+)
+def test_the_level_three_reasons(kinds, reverted, refusal, want):
+    """★★ 判定表的**逐行**：哪一行都不许挪。
+
+    与 `fallback.decide` 那张表同一种理由 —— 这张表本身也是规格，而它的每一行都对应一个
+    **具体的调参动作**：`capped` ⇒ 调 `AGENT_REFLECT_MAX_LEVEL2`；`side_effect` ⇒ 那个动作
+    本来就不该撤；`not_fixed` ⇒ 撤回这个手段已经证伪；`not_found` ⇒ 输入被裁/压缩吃掉。
+
+    报错一个笼统的"停了"，上面四件事就只能靠人翻日志才分得清。顺序也有意：
+    `refusal` 排在 `not_fixed` **之前**（默认额度只有 1 次，同一个现象会先报"没额度"）。
+    """
+    state = R.ReflectionState()
+    state.kinds.update(kinds)
+    state.reverted = reverted
+
+    got = R._level3_reason(state, R.ReflectiveFinding(problem="loop"), refusal)
+
+    assert got == want
+
+
+def test_a_revert_that_did_not_help_stops_the_run(monkeypatch):
+    """★ 「撤了也没用」在**真实顺序**里确实会置上停因（不只是纯函数算得对）。
+
+    ⚠️ 要走到这条得把撤回额度配到 2：默认只有 1 次，同一个现象会先落到 `capped`
+    （"没额度了"比"撤了没用"更具体，见 `_level3_reason` 的顺序）。它顺带说明这两条
+    停因在默认配置下是**互斥**的 —— 想看到 `not_fixed` 就必须先把额度调大。
+    """
+    monkeypatch.setattr(R, "_reflect_sync", _loop())
+    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=1,
+            AGENT_REFLECT_MAX_FIRES=4, AGENT_REFLECT_MAX_LEVEL2=2)
+    ctx = TaskContext()
+    for i in range(1, 5):
+        _do(ctx, "kb_search", json.dumps({"q": "same"}), i)
+        _fire(ctx)
+
+    assert ctx.reflection.kinds == {"loop": 4}
+    assert ctx.reflection.reverted == 2, "第 3、4 次该各撤一次"
+    assert ctx.reflection.stopped == "not_fixed"
+
+
+def test_an_already_stopped_run_raises_without_waiting(monkeypatch, sink):
+    """★ 进门前已经该停 ⇒ **立刻抛**，连"等在飞的反思"都不做。
+
+    那几秒买不到任何东西：运行马上就被中断（模块 docstring "第 3 级"）。写成"先等完再判"
+    的代价是**每一次停止多付一个 `AGENT_REFLECT_WAIT_SECONDS`**，而默认 2 秒、上限 30 秒，
+    这段时间用户那边看起来就是"卡住了"。
+    """
+    waited = {"n": 0}
+
+    async def _never(state):  # noqa: ANN001
+        waited["n"] += 1
+
+    monkeypatch.setattr(R, "_wait_for_pending", _never)
+    ctx = TaskContext()
+    ctx.reflection.stopped = "capped"
+    ctx.reflection.pending.append(
+        R.ReflectiveFinding(problem="loop", summary="在打转", step=1,
+                            call_id="c1", tool="kb_search", level=1)
+    )
+    md = _inputs({"role": "user", "content": "问"})
+
+    with pytest.raises(R.AgentStoppedByGuard) as caught:
+        asyncio.run(R.inject_reflections(md, context=ctx))
+
+    assert caught.value.reason == "capped"
+    assert waited["n"] == 0, "已经该停时还在等反思跑完"
+    assert [f.level for f in ctx.reflection.pending] == [1], "停之前还在处理队列"
+    assert ctx.reflection.stopped == "capped"
+    assert [e[3] for e in sink.counters("agent_recovery_level_total")] == [
+        {"level": "3"}
     ]
 
 
@@ -1084,12 +1175,16 @@ def test_revoked_items_never_reach_the_model_in_a_real_run(tmp_path):
     assert "写一段文字" in seen
 
 
-def test_unlocatable_step_falls_back_to_a_note_and_is_counted(monkeypatch, sink):
-    """★ 那一步已经不在输入里（被裁剪 / 压缩吃掉）⇒ **当次不退回**，降级成提醒并计数。
+def test_unlocatable_step_stops_the_run_and_is_counted(monkeypatch, sink):
+    """★ 那一步已经不在输入里（被裁剪 / 压缩吃掉）⇒ **第 3 级：停止重试**。
 
-    方案 §8 的风险清单第 6 条就是这条：压缩会把老历史换成摘要，而退回要删的是**具体条目**。
-    选择"降级 + 计数"而不是"直接放弃"：能力退化本身必须是看得见的 —— 否则
-    "退回老是不生效"与"一直没出问题"在看板上一模一样。
+    ⚠️ 这条**取代**了早先"当次不退回、降级成一条提醒"的口径。改的理由是分类：
+    「该退却退不了」（找不到 / 落盘类不可撤 / 额度用完）归**系统类**，而系统类的处置是
+    "停止 + 给开发信号"（`PLAN_step5_fallback.md` §2）。降级成提醒等于**让它悄悄过去**——
+    模型照样在同一个地方打转，只是我们不再管它了。
+
+    它仍然是"能力退化必须看得见"的同一条：`agent_recovery_skipped_total{reason=not_found}`
+    照旧计数，另外多一个 `agent_recovery_level_total{level=3}`（真的踩了刹车）。
     """
     ctx = TaskContext()
     ctx.reflection.pending.append(
@@ -1098,21 +1193,27 @@ def test_unlocatable_step_falls_back_to_a_note_and_is_counted(monkeypatch, sink)
     )
     md = _inputs({"role": "user", "content": "问"})
 
-    out = asyncio.run(R.inject_reflections(md, context=ctx))
+    with pytest.raises(R.AgentStoppedByGuard) as caught:
+        asyncio.run(R.inject_reflections(md, context=ctx))
 
-    assert out.input[0]["content"] == "问"
-    assert out.input[-1]["role"] == "system"
-    assert "在打转" in out.input[-1]["content"], "降级后应给出一条提醒"
-    assert "已把第 7 步" not in out.input[-1]["content"], "没撤成却告诉模型撤了"
-    assert ctx.reflection.revoked == set()
-    assert ctx.reflection.injected == 1
+    assert caught.value.reason == "not_found", "抛出去的异常要带上停因"
+    assert ctx.reflection.stopped == "not_found"
+    assert ctx.reflection.revoked == set(), "没撤成却记了撤回"
+    assert ctx.reflection.pending == [], "队列要清掉，否则下一轮又读一次同一份结论"
     assert [e[3] for e in sink.counters("agent_recovery_skipped_total")] == [
         {"reason": "not_found"}
     ]
+    assert [e[3] for e in sink.counters("agent_recovery_level_total")] == [
+        {"level": "3"}
+    ]
 
 
-def test_unlocatable_step_with_no_budget_left_changes_nothing(sink):
-    """定位不到、而且第 1 级额度也用光了 ⇒ **原样返回**（连拷贝都不做）。"""
+def test_unlocatable_step_stops_even_when_the_note_budget_is_gone(sink):
+    """定位不到 + 第 1 级提醒额度也用光了 ⇒ **照样停**。
+
+    为什么值得单列：容易写成"没有额度了 ⇒ 原样返回"（第 4 步那版就是那样）。
+    停只取决于"该撤却撤不成"，与提醒额度**无关** —— 两件事共用一个计数器就会写成这样。
+    """
     ctx = TaskContext()
     ctx.reflection.injected = R.max_level1()      # 额度已用光
     ctx.reflection.pending.append(
@@ -1121,9 +1222,11 @@ def test_unlocatable_step_with_no_budget_left_changes_nothing(sink):
     )
     md = _inputs({"role": "user", "content": "问"})
 
-    out = asyncio.run(R.inject_reflections(md, context=ctx))
+    with pytest.raises(R.AgentStoppedByGuard):
+        asyncio.run(R.inject_reflections(md, context=ctx))
 
-    assert out is md, "什么都没做却重建了输入"
+    assert ctx.reflection.stopped == "not_found"
+    assert ctx.reflection.injected == R.max_level1(), "停止不该动提醒额度"
     assert [e[3] for e in sink.counters("agent_recovery_skipped_total")] == [
         {"reason": "not_found"}
     ]

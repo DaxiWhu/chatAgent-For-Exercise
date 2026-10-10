@@ -62,6 +62,33 @@ to the model"）。所以"提醒模型"只能表现为"在下一次模型调用�
 ⚠️ 它必须 ≥ ``第 1 级上限 + 第 2 级上限``，否则第 2 级永远轮不到（额度被第 1 级用光）
 —— 而这个组合**不报错**，所以有一条配置自检把它打成 warning（``_warn_once_if_...``）。
 
+第 3 级 · 停止重试（2026-10-10 追加）
+--------------------------------
+撤也不成、或撤了也没用时，模型已经被提醒过、也被退回过，再让它跑只是烧轮次 ⇒
+**系统自己踩刹车**（`PLAN_step5_fallback.md` §5）。
+
+**什么时候踩**（两个条件任一命中；两者都只发生在"同类问题已经重复到升级线"**之后**，
+所以踩刹车从不抢跑 —— 那正是"先提醒 N 次、还不行才撤"的语义）：
+
+* **到线却没撤成**：``capped``（额度用完）/ ``side_effect``（那一步是落盘类、白名单外）
+  —— 这两个在 ``_run`` 里就能判出来；``not_found``（那一步已被 token 裁剪或历史压缩
+  吃掉）⚠️ **只有注入口看得到模型输入**，所以只能在 ``inject_reflections`` 里判。
+* **撤了也没用**：``not_fixed`` —— 已经成功撤回过，同类问题**又**出现。
+
+**怎么踩**：置 ``ReflectionState.stopped``（带停因），然后在**下一次模型调用之前**
+（``inject_reflections``）抛 ``AgentStoppedByGuard`` ⇒ 冒到 ``Runner.run`` 外面 ⇒
+``runner`` 把它翻成 ``exit_reason="guard_stop"``。
+
+⚠️ **为什么必须在注入口抛**：保护线里唯一握有控制权的时刻就是它 —— 钩子（``on_tool_end``）
+没有返回值，后台任务（``_run``）抛异常没人接。实测（``tmp_probe/probe_guard_stop.py``）：
+异常**原样**冒到 ``Runner.run`` 外面（类型没被 SDK 改写），而且**只发生了 1 次模型调用**
+⇒ "抛出"确实打断了运行、没有多烧一轮。
+
+⚠️ **一条必须记住的后果**：踩了刹车 ⇒ 这次运行**没有最终产出**（agent 链路的交付物只在
+运行末尾成形，而运行是被打断的）⇒ 兜底判定必然落到"没有可交付的答复"那一行。
+所以"系统类停止之后、已产出的内容照交"这条适用于**没踩刹车**的情形（反思报过打转/卡住、
+但运行自己跑完了 ⇒ 交 + 标明部分结果），踩了刹车就只剩一句通用错误说明。
+
 旁路模型
 --------
 配置**复用** ``compaction.py`` 那一套（同 ``AGNES_MODEL`` / ``AGNES_API_KEY`` /
@@ -85,6 +112,7 @@ from .. import observability
 from ..envutil import env_float, env_int
 
 __all__ = [
+    "AgentStoppedByGuard",
     "ReflectionState",
     "ReflectiveFinding",
     "counts_of",
@@ -423,8 +451,31 @@ class ReflectionState:
     docstring 第 2 条），模型看到那条动作又回来了、很可能再调一次。
     """
 
+    stopped: str = ""
+    """第 3 级（停止重试）的**停因**；空串 = 没停。
+
+    取值 = ``capped`` / ``side_effect`` / ``not_found`` / ``not_fixed``（见模块 docstring
+    "第 3 级"）。它同时是两个地方的判据：**注入口**（要不要抛）与**兜底判定**
+    （"为什么没有产出"）。⚠️ 只置一次 —— 第一个停因就是原因，后面的都是它的后果。
+    """
+
     tasks: set[Any] = field(default_factory=set, repr=False)
     """在飞的后台任务的**强引用** —— 不持有会被 GC 掉（回收时任务可能停在半个动作上）。"""
+
+
+class AgentStoppedByGuard(Exception):
+    """第 3 级踩刹车时从**注入口**抛出去，用来中断本次运行。
+
+    为什么必须是**专有类型**、不能拿 ``RuntimeError`` 顶：``runner.run_agent`` 里有一个
+    ``except Exception`` 的兜底（上游抖动、协议错都落进它）。拿普通异常去中断会被它吞成
+    ``exit_reason="error"`` —— 表现是"停是停了，但理由变成了'崩溃'"，而运维看到
+    "崩溃率上升"会去查一个根本不存在的故障。专有类型让 ``runner`` 能在兜底**之前**
+    认出它、翻成 ``exit_reason="guard_stop"``。
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"多步防护第 3 级：停止重试（{reason}）")
+        self.reason = reason
 
 
 def _state_of(context: Any) -> ReflectionState | None:
@@ -562,6 +613,9 @@ async def _run(context: Any, evidence: str, trigger: str) -> None:
         finding.level = 2
     elif refusal:
         observability.counter("agent_recovery_skipped_total", reason=refusal)
+    # 第 3 级：该退却退不了 / 撤了也没用 ⇒ 置停因。⚠️ 这里**只置标记、不抛** —— 这是
+    # 后台任务，抛出去没人接。真正的"停"在下一次注入口（那里才握有控制权）。
+    state.stopped = state.stopped or _level3_reason(state, finding, refusal)
     state.pending.append(finding)
 
 
@@ -600,6 +654,36 @@ def _revert_decision(state: ReflectionState, finding: ReflectiveFinding) -> tupl
         # （`finding.tool` 为空）也走这一支 —— fail-safe，宁可少撤一次。
         return False, "side_effect"
     return True, ""
+
+
+def _level3_reason(state: ReflectionState, finding: ReflectiveFinding, refusal: str) -> str:
+    """该不该上第 3 级（停止重试）；返回停因，空串 = 不停。
+
+    顺序与 ``_revert_decision`` 对齐：**先判升级线** —— 没到线的时候既不该撤、也不该停，
+    那正是"先提醒 N 次"里的前几次。
+    """
+    if state.kinds.get(finding.problem, 0) < _level2_line():
+        return ""
+    if refusal:
+        # 「该退却退不了」：额度用完（``capped``）/ 那一步是落盘类不可撤（``side_effect``）。
+        return refusal
+    if state.reverted > 0 and state.kinds.get(finding.problem, 0) > _level2_line():
+        # 「撤了也没用」：已经成功撤过，同类问题**又**出现。
+        # ⚠️ 它排在 refusal 之后是有意的：默认配置下（撤回额度只有 1 次）同一个现象会先报
+        # ``capped``，而"额度没了"是**更具体**的原因 —— 报它才知道该调哪个配置。
+        return "not_fixed"
+    return ""
+
+
+def _raise_stopped(state: ReflectionState) -> None:
+    """抛 ``AgentStoppedByGuard``（**唯一**计 ``level=3`` 的地方）。
+
+    为什么在"抛"这一处计数、而不是在判定那一处：判定出来 ≠ 真的停成了 —— 若判定发生时
+    运行已经跑完（不再有模型调用），刹车就踩不下去。这个指标要回答的是"**真的中断过几次**"。
+    """
+    observability.counter("agent_recovery_level_total", level="3")
+    logging.warning("多步防护第 3 级：停止重试（原因=%s）", state.stopped)
+    raise AgentStoppedByGuard(state.stopped)
 
 
 def _finding_of(raw: dict | None, trigger: str) -> ReflectiveFinding:
@@ -764,9 +848,11 @@ def _parse_finding(text: str) -> dict | None:
 # 注入（``call_model_input_filter`` 的最后一步）
 # --------------------------------------------------------------------------- #
 async def inject_reflections(model_data: Any, *, context: Any = None) -> Any:
-    """本口的**全部**动作：持久撤回 + 注入提醒 + 执行第 2 级退回。
+    """本口的**全部**动作：持久撤回 + 注入提醒 + 执行第 2 级退回 + 第 3 级刹车。
 
     四步：等一下 → 滤掉已撤回的 → 处理待注入队列 → 装回输入。
+    ⚠️ 其中两个位置会**抛 ``AgentStoppedByGuard``**（第 3 级踩刹车）：进门前发现已经该停，
+    以及处理队列时新判出停因（``not_found``）。抛出即"本次运行到此为止"。
     ⚠️ 调用方必须保证它跑在**裁剪之后**（``runner.model_input_filter``）：排在前面的会被
     裁掉，而"刚提醒过模型、下一轮又被裁掉"等于这段提醒从来没生效，且完全不报错。
 
@@ -786,6 +872,10 @@ async def inject_reflections(model_data: Any, *, context: Any = None) -> Any:
     state = _state_of(context) if context is not None else None
     if state is None:
         return model_data
+    if state.stopped:
+        # 已经该停了 ⇒ **立刻抛**，连"等在飞的反思"都不做：那几秒买不到任何东西，
+        # 运行马上就被中断（理由见模块 docstring "第 3 级"）。
+        _raise_stopped(state)
     if state.pending or state.tasks:
         await _wait_for_pending(state)
 
@@ -798,9 +888,13 @@ async def inject_reflections(model_data: Any, *, context: Any = None) -> Any:
         if finding.level == 2:
             items, dropped = _apply_revert(items, state, finding)
             if not dropped:
+                # 「该退却退不了」里**只有这里能判**的一种：那一步已经被 token 裁剪或历史压缩
+                # 吃掉，模型输入里根本没有它 ⇒ 定位不到就没法撤。
+                # ⇒ 第 3 级：停止重试（该退却退不了 = 系统类，见 `PLAN_step5_fallback.md` §2）。
+                # ⚠️ 这一条**取代**了早先"当次不退回、降级成一条提醒"的口径：那时还没有
+                # "该退却退不了归系统类"这条分类，而"降级成提醒"等于让它悄悄过去。
                 observability.counter("agent_recovery_skipped_total", reason="not_found")
-                if _take_level1_slot(state):
-                    notes.append(finding.as_note())
+                state.stopped = state.stopped or "not_found"
                 continue
             changed = True
             notes.append(finding.as_revert_note())
@@ -813,6 +907,11 @@ async def inject_reflections(model_data: Any, *, context: Any = None) -> Any:
         if _take_level1_slot(state):
             notes.append(finding.as_note())
     state.pending.clear()
+
+    if state.stopped:
+        # 队列里刚判出来的停因 ⇒ 就地抛。⚠️ 排在"装回输入"**之前**：这一次模型调用本来也
+        # 不会发生了，把输入装好再抛只是白干。
+        _raise_stopped(state)
 
     if not notes and not changed:
         return model_data
