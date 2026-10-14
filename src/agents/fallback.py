@@ -28,6 +28,7 @@ from typing import Any
 from .. import observability
 
 __all__ = [
+    "AWAITING",
     "BUSINESS",
     "DELIVERED",
     "FAILED",
@@ -50,9 +51,14 @@ DELIVERED = "delivered"
 PARTIAL = "partial"
 MANUAL = "manual"
 FAILED = "failed"
-"""四档结局，与指标 ``agent_task_outcome_total{outcome}`` 的标签**同名同值**。
+AWAITING = "awaiting"
+"""五档结局，与指标 ``agent_task_outcome_total{outcome}`` 的标签**同名同值**。
 
 同名是有意的：看板上"任务完成率掉了"要能直接对到代码里的哪一个判定，中间不再过一次翻译。
+
+``awaiting`` 是唯一**不是终态**的一档：这次运行停在"等用户授权某个高危动作"，
+用户点头或拒绝之后还会**接着跑**（加固阶段三）。因此它**不算兜底**（见 ``is_fallback``）——
+兜底是"机制没兜住"，而待授权是**正常运行被有意暂停**。
 """
 
 BUSINESS = "business"
@@ -67,13 +73,13 @@ class FallbackVerdict:
     """一次 agent 运行的兜底结论。"""
 
     outcome: str
-    """``delivered`` / ``partial`` / ``manual`` / ``failed``。"""
+    """``delivered`` / ``partial`` / ``manual`` / ``failed`` / ``awaiting``。"""
 
     reason: str
     """为什么落到这一档（**有限枚举，做指标标签用**）。
 
     取值：``none`` / ``error`` / ``off_track`` / ``review_failed`` / ``guardrail`` /
-    ``no_output`` / ``loop`` / ``stuck`` / ``max_turns`` / ``guard_stop``。
+    ``no_output`` / ``loop`` / ``stuck`` / ``max_turns`` / ``guard_stop`` / ``tool_approval``。
 
     ⚠️ 必须保持有界。把它做成"把异常原文塞进去"会让指标基数爆炸
     （异常原文带 request id、上游返回体、可能含用户数据）—— 那是 ``TaskOutcome.error``
@@ -91,8 +97,13 @@ class FallbackVerdict:
 
     @property
     def is_fallback(self) -> bool:
-        """有没有发生兜底（正常交付不算）。"""
-        return self.outcome != DELIVERED
+        """有没有发生兜底（**正常交付**与**待授权**都不算）。
+
+        ``awaiting`` 刻意排除在外：兜底意味着"机制没兜住、要人来收拾"，而待授权是
+        正常运行被**有意**暂停。把它算进兜底，看板上的"兜底率"会随着用户点得慢而升高 ——
+        那个数字就不再指示任何东西了。
+        """
+        return self.outcome not in (DELIVERED, AWAITING)
 
     def unfinished_text(self) -> str:
         """清单的一行文本（转人工与日志共用；空清单返回空串）。"""
@@ -109,6 +120,9 @@ def decide(context: Any, *, exit_reason: str, answer: str) -> FallbackVerdict:
 
     ⚠️ 调用方必须先排掉"转交"那条路（``exit_reason == "transfer"``）：那一步**没有交付物**，
     它压根不是一次"产出"，拿它进表只会让每一次正常转交都落进兜底。
+
+    ``awaiting_approval``（第 ⓪ 行）**进表**、且排在最前：待授权不是问题、也不是终态，
+    但"这次运行是什么结局"必须只有一处回答 —— 表外再单判一次就是两套规则，改一处漏一处。
     """
     steps = _steps_of(context)
     state = getattr(context, "reflection", None)
@@ -116,6 +130,16 @@ def decide(context: Any, *, exit_reason: str, answer: str) -> FallbackVerdict:
     stopped = getattr(state, "stopped", None)
     produced = bool((answer or "").strip())
     unfinished = _unfinished(steps)
+
+    # ⓪ 待用户授权（加固阶段三）：**不是问题、也不是终态**。模型请求了一个高危动作
+    # （落盘 / 生成图片），这一轮就地停下来等人点头；用户点头或拒绝之后还会接着跑。
+    #
+    # ⚠️ 排在最前是有意的：其他各行都在回答"这次结果**怎么交**"，只有它在回答
+    # "这次**停在哪**、接下来还要接着跑"。若让它落到第⑤行（没有可交付的答复）——
+    # 那正是"不接这一档"会走到的位置 —— 用户看到的是一条**错误报告**而不是"等你授权"。
+    # 这不是推断：探针 P4 实测过（``tmp_probe/probe_tool_approval.py``）。
+    if exit_reason == "awaiting_approval":
+        return FallbackVerdict(AWAITING, "tool_approval", BUSINESS, unfinished)
 
     # ① 崩溃 / 限流 / 协议错：运行**根本没跑成**，谈不上"内容对错"。
     # 排在最前是有意的：这条路径没有草稿可审（产出为空），送进审核队列只会多出一条

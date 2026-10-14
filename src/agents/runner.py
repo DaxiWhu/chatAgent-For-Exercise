@@ -88,7 +88,7 @@ from agents import (
 
 from .. import observability
 from ..envutil import env_int
-from . import fallback, reflection, runtime
+from . import approval, fallback, reflection, runtime
 from .context import TaskContext
 from .frontline import frontline_agent
 from .guards import (
@@ -187,6 +187,21 @@ class TaskOutcome:
     （跑文学节点 / 没跑到底），后者是"给出了判定：直接答复"。
     """
 
+    approvals: list[approval.ApprovalRequest] = field(default_factory=list)
+    """等着用户点头的动作（``exit_reason == "awaiting_approval"`` 时有值）。
+
+    ⚠️ 它**不是**"这次运行产出了什么"，而是"这次运行**停在哪**"：那些动作**还没执行**。
+    别把它并进 ``delivered`` / ``assets`` —— 那两样是"已经做成了的事"。
+    """
+
+    run_snapshot: str = ""
+    """被打断那次运行的现场（JSON 串）。批准或拒绝之后从它接着跑。
+
+    ⚠️ 可能很大（含整段历史），所以只在 ``awaiting_approval`` 时非空。
+    ⚠️ 它**只能用一次**：官方那个运行状态消费掉批准结果之后就作废了。所以"同一个待批项
+    只恢复一次"这条必须由调用方保证（服务层用待审记录的"已办理"来挡）。
+    """
+
     def score_hint(self) -> int:
         """把"是否可交付"映射成主链路沿用的 0-100 分。
 
@@ -206,6 +221,8 @@ class TaskOutcome:
         if self.exit_reason in ("input_guardrail", "output_guardrail"):
             return 30          # 确定性拦截：确凿的坏产出，交人
         # review_failed / max_turns / error：链路没跑完或没过审 → 交人
+        # awaiting_approval 也落在这里 —— 它不是"内容有问题"，但确实**不能当成交付**
+        # （那个动作还没做）。落 40 让图把它交给人工通道，与"等一个人来处理"同一个落点。
         return 40
 
 
@@ -442,6 +459,7 @@ async def run_agent(
     session_id: str = "",
     max_turns: int = MAX_TURNS,
     append_prompt: bool = True,
+    resume: approval.ResumeRequest | None = None,
 ) -> TaskOutcome:
     """跑**一个** agent 一次，返回这次运行的结果。
 
@@ -457,6 +475,12 @@ async def run_agent(
     append_prompt: 本轮的这句用户输入**是否要追加进会话**。
         每轮第一个节点用默认的 True；后续节点传 False（会话里已经有了）。
         没有会话时这个参数不起作用 —— 见 ``_build_input_items``。
+    resume: **接着跑**一次被打断的运行所需的输入（``approval.ResumeRequest``）。
+        给了它，本次就是"从被打断的地方继续"，而不是"跑一轮新的"：``prompt`` /
+        ``session_id`` / ``append_prompt`` 三者都不起作用（历史已经在现场里）。
+
+        "接着跑"为什么成立（而不是"重跑一轮"）、两条路各自的代价，
+        见 ``approval`` 模块的模块 docstring —— 那里有实测证据，不是推断。
 
     ⚠️ 只跑**一次** ``Runner.run``：评审已改成模型可调用的 ``as_tool``，
     这里没有"评审不通过就回灌重来"的循环（见模块 docstring）。
@@ -474,13 +498,26 @@ async def run_agent(
 
     run_config = build_run_config(bound)
     started = time.perf_counter()
-    session = session_for(session_id)
     stats = context.stats
     #: 本次运行开始前的累计读数 —— 用来切出"这一次运行"的增量（见 _report_run_metrics）。
     before = (stats.model_calls, stats.tool_calls, stats.review_rounds)
 
     context.delivered.clear()
-    input_items = _build_input_items(prompt, context, session, append_prompt)
+    if resume is not None:
+        # 接着跑：输入是"那次被打断的运行现场"，不是新一轮的用户输入。
+        # ⚠️ **不接会话** —— 历史已经在现场里了；再接一次会把同一段历史喂两遍，
+        # 而症状是"模型看到的内容莫名翻倍"，从代码上完全看不出来。
+        session = None
+        run_input: Any = await approval.restore(
+            resume.snapshot,
+            agent=agent,
+            context=context,
+            approved=resume.approved,
+            reason=resume.reason,
+        )
+    else:
+        session = session_for(session_id)
+        run_input = _build_input_items(prompt, context, session, append_prompt)
 
     answer = ""
     exit_reason = "error"
@@ -495,7 +532,7 @@ async def run_agent(
     try:
         result = await Runner.run(
             agent,
-            input_items,
+            run_input,
             context=context,
             run_config=run_config,
             max_turns=max_turns,
@@ -528,7 +565,27 @@ async def run_agent(
         exit_reason = "error"
         error_kind = f"{type(e).__name__}: {e}"
 
+    # 工具审批（加固阶段三）：模型请求了一个**高危动作**，这一轮就地停下来等人点头。
+    #
+    # ⚠️ 三处刻意的顺序，每一处都有具体后果：
+    #   · 排在下面所有处理**之前** —— 中断那一刻 `final_output` 是 None，照常规路径走
+    #     会被当成"没产出"（判定表第⑤行）⇒ 用户看到的是一条**错误报告**，而不是
+    #     "等你授权"。探针 P4 实测过这个后果，所以这一步不能省。
+    #   · **不跑** `_flush_deterministic_steps` —— 用户可能拒绝，那时不该已经把大纲
+    #     渲染出来、资产收好了（落盘的东西撤不回）。
+    #   · `exit_reason` 单独一档 —— 判定表给它一行（**不是** failed、也**不算**兜底）。
+    approvals: list[approval.ApprovalRequest] = []
+    run_snapshot = ""
     if result is not None:
+        approvals = approval.requests_from(result)
+        if approvals:
+            exit_reason = "awaiting_approval"
+            run_snapshot = approval.snapshot(result)
+            logging.info(
+                "高危动作待用户授权：%s", "；".join(a.summary for a in approvals)
+            )
+
+    if result is not None and not approvals:
         final = result.final_output
         if isinstance(final, FrontlineDecision):
             # 带结构化判定的 agent（前台）：**产出就是判定**，正文在 content 字段里。
@@ -600,4 +657,6 @@ async def run_agent(
         fallback=verdict,
         fallback_draft=fallback_draft,
         decision=decision,
+        approvals=list(approvals),
+        run_snapshot=run_snapshot,
     )

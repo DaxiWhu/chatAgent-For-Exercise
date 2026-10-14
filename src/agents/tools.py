@@ -33,6 +33,7 @@ from .. import observability
 from ..envutil import env_int
 from ..rag import guard
 from ..rag.retrieval import build_citations
+from . import approval
 from .context import TaskContext
 from .steps import tool_error_handler
 
@@ -121,10 +122,23 @@ def kb_search(ctx: RunContextWrapper[TaskContext], query: str, top_k: int = DEFA
 
 # --------------------------------------------------------------------------- #
 # 落盘：确定性步骤
+#
+# ⚠️ 两个落盘工具都挂了 ``needs_approval``（加固阶段三）—— 它们**撤销不了**
+# （退回白名单里没有它们：删掉对话里那一步，磁盘上的文件不会消失），而且现有的人工
+# 审核审的是**最终草稿**，等审到时文件早落盘了。所以事前必须有人点头。
+#
+# 回调读的是总开关 ``AGENT_TOOL_APPROVAL``（**默认关**）：关着时这两个工具的行为与
+# 改造前逐字节一致。开与关的差别、以及"停下来"之后要配套什么，见 ``approval`` 模块。
 # --------------------------------------------------------------------------- #
-@function_tool(failure_error_function=tool_error_handler("save_text_asset"))
+@function_tool(
+    failure_error_function=tool_error_handler("save_text_asset"),
+    needs_approval=approval.needs_approval_callback,
+)
 def save_text_asset(ctx: RunContextWrapper[TaskContext], name: str, content: str) -> str:
     """把一段文本落盘成资产文件，返回资产路径。
+
+    ⚠️ 这是**会留下东西**的动作：文件一旦写出就撤不回（它不在退回白名单里）。
+    所以开启审批时，调用本工具前会先停下来请示用户。
 
     Args:
         name: 文件名主干（不含扩展名）。
@@ -142,13 +156,20 @@ def save_text_asset(ctx: RunContextWrapper[TaskContext], name: str, content: str
     return str(path)
 
 
-@function_tool(failure_error_function=tool_error_handler("generate_image"))
+@function_tool(
+    failure_error_function=tool_error_handler("generate_image"),
+    needs_approval=approval.needs_approval_callback,
+)
 def generate_image(ctx: RunContextWrapper[TaskContext], prompt: str, style: str = "flat") -> str:
     """按画面描述生成一张插图，返回资产路径。
+
+    ⚠️ 这也是**会留下东西**的动作（同 ``save_text_asset``）：生成物落盘就撤不回，
+    开启审批时会先停下来请示用户。
 
     ⚠️ 当前是**占位实现**：只把生成参数写成一份 sidecar 文件（``*.prompt.txt``），
     不调用任何外部图像服务。接入真实图像生成能力时，替换本函数体即可 ——
     契约（入参 prompt/style，出参资产路径，并登记到 ``TaskContext.assets``）不变。
+    真实服务一旦接入，"停下来等人点头"会更有价值（生成要花钱、且可能不合规）。
 
     Args:
         prompt: 画面描述（主体 / 构图 / 光线）。
