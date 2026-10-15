@@ -61,7 +61,7 @@ from src.graph import build_graph
 from src.prompts import PROMPT_VERSION
 
 from . import auth as userauth
-from . import config, health, metrics, middleware, tracing
+from . import config, health, loopwatch, metrics, middleware, tracing
 from .accounts import REQ_APPROVED, STATUS_DISABLED, AccountError, build_account_store
 from .auth import AuthError
 from .idempotency import DONE as IDEM_DONE
@@ -409,6 +409,15 @@ async def lifespan(_app):
                     "而 uvicorn 默认就用它。请用 `python -m app.serve` 启动（会先切到 "
                     "SelectorEventLoop），或改用 Linux/Docker 部署（那边默认就是 Selector）。"
                 )
+    # 事件循环阻塞探针。**压进 stack**：关闭时由 `stack.aclose()` 一并取消，
+    # 不在关闭路径上再写一遍取消逻辑（漏写的代价是每次滚动发布留一个悬挂任务）。
+    # 放在这里而不是更早，是因为上面那个 except 分支会 `aclose()` 并**重建** stack ——
+    # 压早了会被关掉，而重建后的那个 stack 里没有它（探针静默消失，指标永远为零）。
+    # ⚠️ `enter_async_context` 是 **async 方法**，必须 `await` —— 漏掉 `await` 只是
+    # RuntimeWarning（"coroutine was never awaited"），服务照样启动、探针**却从未运行**，
+    # 指标永远为空而没有任何别的症状。守卫见
+    # `tests/test_event_loop_lag.py::test_probe_registration_is_awaited`（AST 判据）。
+    await stack.enter_async_context(loopwatch.watching())
     try:
         yield
     finally:

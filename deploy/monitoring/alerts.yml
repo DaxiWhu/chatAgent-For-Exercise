@@ -118,6 +118,31 @@ groups:
           description: "在途 {{ $value | humanizePercentage }} 于 MaxConcurrency 上限，余量已不足。上限未配置时本指标不存在，这条规则不会触发（那是刻意的：没有闸门就没有饱和可言）。"
           runbook: "同 ConcurrencyShedding，但现在是『还有时间从容处理』的窗口：先看是常态增长还是突发，再决定加副本（推荐）还是调上限。"
 
+      - alert: EventLoopBlocked
+        # 事件循环被**同步调用**占住 —— 这段时间里**所有**并发请求都停着。
+        #
+        # 为什么需要一条专属信号：它**不产生任何错误**（错误率保持 0），唯一的表现是
+        # 延迟上升；而延迟上升的原因有几十个，只看 P95 分不出是哪一种。没有这个指标，
+        # "卡住了"与"慢"在面板上长得一模一样。
+        #
+        # 口径：`_sum` 是"被阻塞的总秒数"，对它 rate 出来就是**阻塞时间占比**（秒/秒）。
+        # `_count` 只统计超过 50ms 的事件（阈值依据见 `app/loopwatch.py` 的实测：
+        # Windows 上空载 P99 约 15ms，取 50ms 是它的 3 倍余量），因此这个比值
+        # **不含调度抖动** —— 不然 Windows 上每一次心跳都会被算成阻塞。
+        #
+        # ⚠️ 5% 是**起点，不是标定值**：探针是新增的，生产基线还没测过
+        # （见 `deploy/CAPACITY.md` 待补清单）。若长期误报，先看 `event_loop_lag_seconds`
+        # 的分位再调阈值，别直接把它关掉。
+        expr: sum(rate(event_loop_lag_seconds_sum[10m])) > 0.05
+        for: 10m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "事件循环至少有 5% 的时间被阻塞（当前 {{ $value | humanizePercentage }}）"
+          description: "有同步调用跑在事件循环上 ⇒ 所有并发请求一起卡住，而错误率保持 0。这类变慢在延迟面板上只表现为『变慢了』。"
+          runbook: "1) 看 `event_loop_lag_seconds` 的 P99 与 max：单次数百毫秒的尖峰 ⇒ 某个同步调用；持续的小值 ⇒ 高频小阻塞（日志、序列化）。2) 对照部署时间 —— 本告警从零变成持续 >0 的时刻，通常就是引入同步调用的那次发布。3) 找法：`tests/test_event_loop_offload.py` 守的是**已知**调用点，新增路径要自己查，优先看最近新增的工具、压缩路径、以及任何在 `async def` 里直接读写文件或调同步客户端的地方。4) 修法是把阻塞调用移到线程里（`asyncio.to_thread`），**不是**调大并发上限 —— 那只会让更多请求一起等。"
+
       - alert: StreamErrorsHigh
         expr: rate(chat_stream_errors_total[5m]) > 0.2
         for: 5m

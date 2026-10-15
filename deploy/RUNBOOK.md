@@ -272,6 +272,46 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 
 > 让 Prometheus 在最该看数据的时候没有数据。
 
 
+#### `EventLoopBlocked`（warning，10m）
+
+事件循环被**同步调用**占住 —— 这段时间里**所有**并发请求一起停着。它**不产生任何错误**
+（错误率、超时率都正常），唯一表现是延迟上升；而延迟上升的原因有几十个，所以需要这条
+专属信号把「卡住了」与「慢」分开。
+
+```bash
+# 1) 阻塞时间占比（秒/秒）—— 就是告警在判的那个量
+curl -s 'localhost:9090/api/v1/query?query=sum(rate(event_loop_lag_seconds_sum[10m]))' | python -m json.tool
+# 2) 单次阻塞有多长（P50）
+curl -s 'localhost:9090/api/v1/query?query=histogram_quantile(0.5,sum(rate(event_loop_lag_seconds_bucket[10m]))by(le))' | python -m json.tool
+```
+
+判读：**形状不同，要去的地方完全不同。**
+
+| `event_loop_lag_seconds` 的形状 | 含义 | 先去哪找 |
+| --- | --- | --- |
+| 偶发的数百毫秒尖峰 | 某个**一次性同步调用**（读大文件、同步 HTTP、`time.sleep`） | 最近新增的工具 / 压缩路径 |
+| 持续的小值（几十毫秒）不断出现 | **高频小阻塞**（日志、JSON 序列化、正则回溯） | 请求路径上的每个同步操作 |
+
+处置顺序：
+
+1. **先对照部署时间**：本告警从「零」变成「持续 >0」的时刻，通常就是引入同步调用的那次
+   发布 —— 用 `CHANGELOG.md` 与 `release` 标签定位到具体提交，比逐个函数读代码快得多。
+2. **找法**：`tests/test_event_loop_offload.py` 守的是**已知**的那些调用点（已经被移到线程里的），
+   它保证不了「新加的路径也不阻塞」。所以新路径要自己查：搜 `async def` 里有没有
+   `open()` / `requests.` / `time.sleep` / 大 `json.dumps` / 同步 DB 客户端。
+3. **修法**：把阻塞调用移到线程里（`await asyncio.to_thread(...)`）。
+   ⚠️ **不是**调大 `MAX_CONCURRENT_REQUESTS` —— 那只会让更多请求一起排队等同一个阻塞，
+   把等待时间摊给更多人。
+4. 若确认是**长期误报**（占比在阈值附近晃而延迟正常）⇒ 先看 `event_loop_lag_seconds`
+   的分位再定阈值，**不要直接删掉这条规则**：它是这类问题唯一的直接证据。
+
+> ⚠️ 改探针之前必读的两条实测约束（依据在 `app/loopwatch.py` 的模块说明）：
+> ① 心跳间隔 **0.1s 必须小于要检测的阻塞时长** —— 阻塞若完全落在两次心跳之间，
+> 心跳定时器仍会按时到期、`lag ≈ 0`，**什么都看不到**（实测：间隔 1s 时一次 200ms 的
+> 同步阻塞**完全没被记录**）；
+> ② 阈值 50ms 是 **Windows 定时器量化（约 15ms）**的 3 倍余量，Linux 上基线更低、更安全。
+
+
 #### `StreamErrorsHigh`（critical，5m）
 SSE 流中途抛异常。典型成因：检查点后端故障、模型超时、配额被拒。
 

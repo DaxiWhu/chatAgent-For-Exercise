@@ -699,6 +699,9 @@ def test_online_quality_sampling_skips_empty_answer(monkeypatch):
 # 一个谁都不知道去看的量，和没埋这个点没有区别。
 ALERTED = (
     "checkpoint_errors_total",
+    # 事件循环被同步调用占住 ⇒ 所有并发请求一起停住，而错误率为 0。
+    # 这条指标是"卡住了"与"慢"之间唯一的区分手段（见 app/loopwatch.py）。
+    "event_loop_lag_seconds",
     "llm_call_duration_seconds",
     "llm_call_errors_total",
     "llm_first_token_seconds",
