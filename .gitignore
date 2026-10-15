@@ -140,6 +140,12 @@ tmp_probe/
 # 改成前缀匹配，把 `.pytest_tmp_*` 与 `.pytest_basetemp` 这类变体一并吃掉。
 .pytest_tmp*/
 .pytest_basetemp/
+# ⚠️ 2026-10-15 补：上面那条前缀匹配兜住了 `.pytest_tmp*`，却漏了**另一种拼写** ——
+# 排障时写 `--basetemp=.pt_bench_$PPID` 这类短名（省键盘），一律以 `.pt_` 开头。
+# 症状直到一次 `git add -A` 把 `.pt_verify_605/` 暂存进索引才暴露 ——
+# 而平时 `git status` 里那串 `?? .pt_*` 混在一堆正常未跟踪文件里，没人会多看。
+# 只用一种拼写的人不会知道另一种没被忽略，所以前缀匹配也要按**拼写**兜全。
+.pt_*/
 
 # ---- 告警邮件的 SMTP 密码（**绝不能入库**）----
 # Alertmanager 的配置不支持环境变量插值，邮件密码只能以 `_file` 形式提供；
