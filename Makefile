@@ -19,6 +19,7 @@
 #     make            # = make help
 #     make check      # 提交前门禁（与 CI 的 test job 等价）
 #     make lint       # 静态检查（ruff；需先 pip install -r requirements-dev.txt）
+#     make bench      # 热路径微基准（make bench ARGS="-- --check" 走 CI 门禁口径）
 #     make test ARGS="-- -k version"
 #     make up
 #     make drill
@@ -31,7 +32,7 @@ ARGS ?=
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup test test-fast check lint eval version sync-version openapi lock \
+.PHONY: help setup test test-fast check lint bench eval version sync-version openapi lock \
         backup-pg backup-qdrant drill canary kb-prune e2e up up-observability down ps logs \
         release rollback secrets-encrypt secrets-decrypt clean
 
@@ -52,6 +53,9 @@ check:
 
 lint:
 	@$(PYTHON) $(TASKS) lint $(ARGS)
+
+bench:
+	@$(PYTHON) $(TASKS) bench $(ARGS)
 
 eval:
 	@$(PYTHON) $(TASKS) eval $(ARGS)

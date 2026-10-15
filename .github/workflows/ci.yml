@@ -254,6 +254,75 @@ jobs:
         run: python scripts/eval_generation.py
 
   # ------------------------------------------------------------------
+  # 2.5) 热路径性能门禁：只断言**机器无关的不变量**
+  # ------------------------------------------------------------------
+  # 为什么必须有这个 job
+  # -------------------
+  # 上面几个 job 守的是"功能对不对"，而下面这三件事**功能全对、错误率为 0、
+  # 延迟也还看不出来**，只有把样本量加大才显形：
+  #
+  #   a) 限流器退回"每次请求扫全表" ⇒ 高基数 IP 下吞吐随客户端数下降。
+  #   b) 配额结算每次重新遍历活跃租户 ⇒ 同上。
+  #   c) 指标直方图退回"存原始观测值" ⇒ 内存随 QPS **线性增长**，一个被刷的
+  #      接口即可 OOM，而 `_count` 的增长看起来完全正常。
+  #
+  # 为什么是独立 job 而不是并进 test
+  # ------------------------------
+  # 与 lint 同理：本地 `make check` 必须与 CI 的 test job **逐条对应**
+  # （守卫在 tests/test_tasks_entrypoint.py）。性能门禁需要"把样本翻 4 倍再比"
+  # 这种只有它才做的动作，塞进 test job 会让本地 `check` 变成几分钟的全量遍历。
+  #
+  # ⚠️ 只断言不变量，不比对绝对耗时
+  # ----------------------------
+  # CI runner 与开发机的绝对微秒数差 2~3 倍很常见，拿本机基线判 CI 会天天红 ——
+  # 而"随机红"的终点是有人把门禁 `continue-on-error` 掉或直接删掉，那比不设门禁
+  # 更糟（它给了"有防护"的错觉）。所以这里只用两类跨机器成立的判据：
+  #   1. 规模不变量：翻 4 倍样本，单次耗时 ≤ 2 倍（每个规模量 3 次取最小，吸收
+  #      runner 上的 GC/抢占噪声 —— 噪声是单向的，只有 min 不被它污染）；
+  #   2. 内存有界：直方图格数恒为 `len(bucket_bounds()) + 1`。
+  # 绝对耗时对比是**显式动作**（`--baseline`，本地/发版前人工跑），不在这里。
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # 依赖清单与 test job 保持一致：`bench_local` 会 import `app.ratelimit` /
+      # `app.quota` / `app.metrics`（都是标准库）以及 `src.rag.retrieval`
+      # （要 langchain-openai + langchain-text-splitters；`qdrant_client` 是**惰性**
+      # 导入的，不需要）。与 agent-session-pg 一样照抄 test job 的清单，
+      # 而不是另立一份 —— 少装一个包的报错是收集期的 ImportError，
+      # 看起来像"基准坏了"而不是"依赖没装"。
+      - name: 安装最小依赖（与 test job 同清单）
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "langgraph>=0.3" "langgraph-checkpoint-postgres>=2" \
+            "langchain-openai>=0.3" "langchain-community>=0.3" \
+            "langchain-text-splitters>=0.3" "psycopg[binary]>=3.2" \
+            "pydantic>=2.7" python-dotenv \
+            "fastapi>=0.110" "uvicorn>=0.30" sse-starlette \
+            "scikit-learn>=1.4" "numpy>=1.26" "pgvector>=0.3" \
+            pdfminer.six python-docx openpyxl python-pptx beautifulsoup4 lxml \
+            "pytest>=8.0" "httpx>=0.27" tiktoken \
+            "openai-agents>=0.20" "sqlalchemy>=2.0"
+
+      # 清空外部依赖配置（与 test / eval-gate 同口径）：这里量的是**本机**开销，
+      # 一旦有 EMBEDDING_API_KEY，检索基准量的就是外部网络往返而不是热路径。
+      # 注：`bench_retrieval` 内部还有一道 `local_eval()` 的**代码级**锁
+      # （见 scripts/eval_backend.py），env 清空只是第二道防线。
+      - name: 热路径不变量门禁（规模 + 内存）
+        env:
+          DB_URL: ""
+          AGNES_API_KEY: ""
+          EMBEDDING_API_KEY: ""
+        run: python scripts/bench_local.py --check --n 10000
+
+  # ------------------------------------------------------------------
   # 3) 全量依赖（每日定时 / 手动）：补上主流程刻意跳过的那批用例
   # ------------------------------------------------------------------
   # 为什么必须有这个 job
@@ -656,6 +725,9 @@ jobs:
   #      · lint      —— ruff 抓到未定义名字 / 导入顺序错，镜像照样发出（那类错在运行期才炸）；
   #      · eval-gate —— 改提示词 / 换模型 / 调切分导致召回或答案质量退化，质量门禁红着
   #                     而镜像照样发出 ⇒ 线上质量静默下降，且事后无法归因到哪次发布；
+  #      · bench     —— 热路径退化成 O(n)（限流器改成每请求扫全表 / 直方图退回存原始
+  #                     观测值）：高基数下吞吐随客户端数下降、内存随 QPS 增长，而
+  #                     错误率与 `_count` 看起来**完全正常** ⇒ 只能在线上先炸再查；
   #      · agent-session-pg —— 真库上的跨轮历史（落库 / 恢复）坏了，离线样例测试看不出来；
   #      · image / test —— 构建与冒烟本身。
   #    2026-10-06 修：原值是 `[image, test, security]`，上面三条全在门外 ——
@@ -679,7 +751,7 @@ jobs:
       github.event_name == 'push'
       && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
       && vars.PUBLISH_IMAGE != 'false'
-    needs: [lint, test, agent-session-pg, eval-gate, image, security]
+    needs: [lint, test, agent-session-pg, eval-gate, bench, image, security]
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:

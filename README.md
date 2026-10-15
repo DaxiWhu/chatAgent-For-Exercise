@@ -107,6 +107,7 @@ pytest tests/ -q
 | 看全部任务 | `tasks help` |
 | 跑测试 / 只重跑上次失败的 | `tasks test` / `tasks test-fast` |
 | **提交前门禁** | `tasks check` |
+| **热路径微基准** | `tasks bench`（`tasks bench -- --check` 走 CI 门禁口径；`-- --baseline <文件>` 与本机留档对比） |
 | 起本地栈 / 含监控 / 停 | `tasks up` / `tasks up-observability` / `tasks down` |
 | **端到端自检**（真起栈） | `tasks e2e`（SSE 分帧 / 灰度权重 / 持久化检查点；`--keep` 保留现场） |
 | 看服务状态 / 跟日志 | `tasks ps` / `tasks logs`（`tasks logs -- app-stable` 只看一个） |
@@ -746,6 +747,7 @@ python scripts/eval_generation.py --show-miss  # 看是哪条判据没过
 |-----|------|---------|
 | `test` | 每次 push / PR | 全量**离线**用例（刻意不装 docling/transformers）+ 依赖锁定静态一致性 |
 | `eval-gate` | 每次 push / PR | **三层质量门禁**：检索基线（bm25 Top1 ≥ 0.55）→ 材料覆盖（引用与关键点）→ **生成侧编造与拒答** |
+| `bench` | 每次 push / PR | **热路径性能门禁**：只断言**机器无关**的不变量 —— 翻 4 倍样本后单次耗时 ≤ 2 倍（抓"退化成 O(n)"）+ 直方图格数恒定（抓"内存随 QPS 线性增长"）。绝对耗时对比是显式动作（`--baseline`），不在 CI 里 |
 | `full-deps` | 每日定时 / 手动 | 装齐 docling/transformers 跑全量：**补上 `test` 刻意跳过的那批解析用例**（否则"本地绿 ≠ CI 绿"） |
 | `image` | 每次 push / PR | **部署产物**：镜像能构建 → 容器能起来并通过 `/health/live` → 漏洞扫描无 HIGH/CRITICAL |
 

@@ -211,6 +211,24 @@ def task_lint(args: list[str]) -> int:
     return run("ruff check ." + (" " + " ".join(args) if args else ""))
 
 
+def task_bench(args: list[str]) -> int:
+    """热路径微基准（默认只打印；`--check` 是 CI 用的门禁）。
+
+    为什么是独立目标、不并进 `check`：它量的是**时长**，而同一份代码在
+    "我的机器"和"CI runner"上的绝对耗时可差 2~3 倍 —— 所以 `--check` 只断言
+    **机器无关的不变量**（翻 4 倍样本后单次耗时 ≤ 2 倍；直方图格数恒定），
+    与"提交前门禁"要的那种确定性不是一回事；它也比单元测试慢。
+    与 CI 的关系：`bench` 是**独立 job**，而 `check` 与 CI 的 test job 逐条对应
+    （那条守卫见 tests/test_tasks_entrypoint.py），所以不并进来不会造成
+    "本地比 CI 松"。
+
+    绝对耗时的对比是**显式的**：`bench -- --baseline scripts/bench_baseline.json`
+    （基线不自动生成、不自动对比 —— 自动对比会变成"退化→顺手覆写基线→下次绿"
+    的自愈门禁，那等于没有门禁）。
+    """
+    return run("python scripts/bench_local.py" + (" " + " ".join(args) if args else ""))
+
+
 def task_eval(args: list[str]) -> int:
     """跑三层质量评测（检索召回 / 材料充足 / 生成忠实）并汇总 scorecard。"""
     return _steps(EVAL_STEPS, args)
@@ -566,6 +584,7 @@ TASKS: dict[str, tuple[str, Callable[[list[str]], int]]] = {
     "test-fast": ("只重跑上次失败的用例", task_test_fast),
     "check": ("提交前门禁（与 CI 的 test job 等价）", task_check),
     "lint": ("静态检查（ruff，需先装 requirements-dev.txt）", task_lint),
+    "bench": ("热路径微基准（--check 为 CI 的性能门禁）", task_bench),
     "eval": ("三层质量评测：检索召回 / 材料充足 / 生成忠实", task_eval),
     "version": ("打印当前版本", task_version),
     "sync-version": ("把 VERSION 同步到各副本", task_sync_version),

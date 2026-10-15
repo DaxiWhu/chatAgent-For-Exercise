@@ -338,6 +338,56 @@ def test_eval_gate_backend_exists_in_the_eval_script(ci):
 
 
 # ---------------------------------------------------------------------------
+# 热路径性能门禁
+# ---------------------------------------------------------------------------
+def _bench_job(ci):
+    """跑 `scripts/bench_local.py` 的那个 job。
+
+    按"哪一步真的跑了它"**推导**，不写死 job 名 —— 写死的话，改个 job 名
+    就会让下面两条断言指向一个已经不存在的对象（然后它们会以"找不到"的方式
+    红，或者更糟：被顺手删掉）。
+    """
+    for job_name, job in (ci.get("jobs") or {}).items():
+        runs = "\n".join(str(s.get("run", "")) for s in (job.get("steps") or []))
+        if "bench_local.py" in runs:
+            return job_name, job
+    return None, None
+
+
+def test_ci_runs_the_bench_gate_in_a_way_that_can_actually_fail(ci):
+    """性能门禁必须真的在跑，且**真的会卡**。
+
+    两种写法都会让它变成一个"永远绿"的空壳，而两者都没有任何症状：
+
+      - **少写 `--check`**：`bench_local.py` 默认只是打印一屏数字然后 **退出 0**
+        （`--check` 才是唯一会返回非 0 的模式）⇒ 这个 job 从此与性能无关，
+        但它看起来每天都在"跑性能测试"；
+      - **`continue-on-error: true`**：脚本返回 1 也只是日志里多一行，job 依旧绿。
+
+    与漏洞扫描那条守卫同一个道理（没设 `exit-code` 的扫描 = 只往日志里打 CVE）。
+    这个更隐蔽，因为"跑过了"和"卡住了"在 CI 的绿色对勾上长得一模一样。
+    """
+    job_name, job = _bench_job(ci)
+    assert job_name, "CI 里没有任何 job 跑 scripts/bench_local.py —— 性能门禁不存在"
+
+    gate_steps = [s for s in (job.get("steps") or [])
+                  if "bench_local.py" in str(s.get("run", ""))]
+    assert gate_steps, f"{job_name} job 里找不到跑 bench_local.py 的步骤"
+
+    missing = [s.get("name") for s in gate_steps
+               if "--check" not in str(s.get("run", ""))]
+    assert not missing, (
+        f"这些步骤跑了 bench_local.py 却没带 `--check`：{missing} —— "
+        "不带 `--check` 时脚本只打印一屏数字并退出 0，这个 job 会永远绿"
+    )
+    non_gating = [s.get("name") for s in gate_steps if s.get("continue-on-error")]
+    assert not non_gating, (
+        f"这些步骤设了 continue-on-error：{non_gating} —— "
+        "门禁失败不会让 CI 变红，等于没有这道门禁"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 发布链路：CI 验证过的镜像 = 唯一发布制品
 # ---------------------------------------------------------------------------
 def _publish_job(ci):
