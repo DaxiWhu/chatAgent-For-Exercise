@@ -94,10 +94,10 @@
       "id": 4,
       "type": "stat",
       "title": "待人工审核队列",
-      "description": "human-in-the-loop 的积压深度。持续 > 0 意味着有人在等，且没有通知渠道时不会有任何提醒（REVIEW_NOTIFY_WEBHOOK 未配时只有 ReviewBacklog 告警兜底）。",
+      "description": "human-in-the-loop 的积压深度。持续 > 0 意味着有人在等，且没有通知渠道时不会有任何提醒（REVIEW_NOTIFY_WEBHOOK 未配时只有 ReviewBacklog 告警兜底）。⚠️ 表达式用 max() 而非裸用、更不能求和：这个量是**全局唯一**的（PG 里一行待审就是一行），而每个副本都会报一份相同的真值 —— 裸用会画出 N 条重合线，sum 会把积压放大 N 倍。",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
-      "targets": [{ "refId": "A", "expr": "review_pending", "legendFormat": "待审" }],
+      "targets": [{ "refId": "A", "expr": "max(review_pending)", "legendFormat": "待审" }],
       "fieldConfig": {
         "defaults": {
           "unit": "short",

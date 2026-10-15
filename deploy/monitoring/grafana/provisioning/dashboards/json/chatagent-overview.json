@@ -177,7 +177,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "http_requests_in_flight",
+          "expr": "sum(http_requests_in_flight)",
           "legendFormat": "in flight"
         }
       ],
@@ -405,7 +405,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "100 * http_concurrency_in_flight / clamp_min(http_concurrency_limit, 1)",
+          "expr": "max(100 * http_concurrency_in_flight / clamp_min(http_concurrency_limit, 1))",
           "legendFormat": "saturation %"
         }
       ],
@@ -455,12 +455,12 @@
         {
           "refId": "B",
           "expr": "http_concurrency_in_flight",
-          "legendFormat": "在途"
+          "legendFormat": "在途 {{instance}}"
         },
         {
           "refId": "C",
           "expr": "http_concurrency_limit",
-          "legendFormat": "上限"
+          "legendFormat": "上限 {{instance}}"
         }
       ],
       "fieldConfig": {
@@ -503,7 +503,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "rag_index_identity_ok",
+          "expr": "min(rag_index_identity_ok)",
           "legendFormat": "identity ok"
         }
       ],

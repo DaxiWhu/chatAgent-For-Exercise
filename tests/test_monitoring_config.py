@@ -1396,3 +1396,117 @@ def test_smtp_password_can_never_be_committed():
     )
 
 
+# ---------------------------------------------------------------------------
+# Gauge 的跨副本聚合口径（2026-10-15）
+#
+# 为什么需要：`max` / `sum` / 裸用**在单副本下结果完全相同**，所以这类错误在本地
+# 测试与单副本环境里**永远不可见**。它只在扩到多副本时显形，表现是"面板出现 N 条
+# 重合线、同一条告警重复 N 次"—— 而那看起来像"服务真的出问题了"，会把排查带偏。
+# 能守住的部分只有"写法是否符合已声明的口径"，判据见 deploy/monitoring/SLO.md §8。
+# ---------------------------------------------------------------------------
+#: 应用进程导出的 Gauge → 它在**告警/录音表达式**里必须使用的聚合写法。
+#:
+#: * 字符串（如 `"max"`）：expr 里**每一处**出现都必须被该函数包住；
+#: * `None`：必须**逐副本读**，不得被 `sum/max/min/avg/count` 包住。
+#:
+#: 为什么是登记表而不是自动推断：一个量的身份（"全局唯一" 还是 "每副本各一份"）
+#: **推不出来** —— `metrics.set_gauge(...)` 看不出这个量在别的副本上是不是同一个值。
+#: 必须由人声明一次，机器负责 ① 声明的必须被遵守、② 新出现的 Gauge 必须声明。
+#:
+#: ⚠️ 面板（Grafana JSON）**不在**本检查范围内：同一个 Gauge 在不同位置可以有不同的
+#: 正确写法（`rag_index_identity_ok` 的告警要逐副本、面板要 `min`），面板形态按展示
+#: 意图定，由人工在面板 `description` 里写明理由。
+GAUGE_AGGREGATION: dict[str, str | None] = {
+    # 全局唯一：PG 里一行待审就是一行，N 个副本各报一份**相同**的真值
+    "review_pending": "max",
+    # 每副本一份，但判据与展示都是"总量"
+    "http_requests_in_flight": "sum",
+    # 每副本一份，且判据本身逐副本 —— 求和在多副本下会均值化、掩盖"单副本打满"
+    "http_concurrency_in_flight": None,
+    "http_concurrency_limit": None,
+    # 逐副本自检结论：告警要指名"哪个副本不一致"，必须逐副本读
+    "rag_index_identity_ok": None,
+    # 每个副本（且每个 breaker）各自的熔断状态
+    "circuit_open": None,
+}
+
+#: "包住"一个 Gauge 即改变其跨副本语义的聚合函数。
+#: ⚠️ `clamp_min(...)` 这类**不算** —— 它不改语义；也正因如此下面的正则用
+#: `(?<![\w])func` 而不是 `\bfunc`：`\b` 在 `clamp_min` 的 `_` 与 `m` 之间**不成立**
+#: （`_` 是 word 字符），所以两者其实都不会误判 —— 但写死"不是聚合函数"更清楚。
+_GAUGE_AGG_FUNCS = ("sum", "max", "min", "avg", "count")
+
+
+def _gauges_written_by_source() -> set[str]:
+    """从源码**发现**所有被写入的 Gauge 名。
+
+    ⚠️ 只认字符串字面量。`set_gauge(name, value, ...)` 这种转发（`app/metrics.py`
+    与 `src/observability.py` 的定义处）**不算** —— 否则会把形参名当成指标名。
+    """
+    names: set[str] = set()
+    for base in ("app", "src"):
+        for path in (ROOT / base).rglob("*.py"):
+            names |= set(re.findall(
+                r'\.(?:set_gauge|gauge)\(\s*"([A-Za-z_][A-Za-z0-9_]*)"',
+                path.read_text(encoding="utf-8")))
+    return names
+
+
+def _exprs_referencing(name: str, alerts_cfg, recording_cfg) -> list[str]:
+    """所有提到 `name` 的告警 / 录音表达式（`expr` 字段）。"""
+    out: list[str] = []
+    for cfg in (alerts_cfg, recording_cfg):
+        for group in cfg.get("groups", []):
+            for rule in group.get("rules", []):
+                expr = rule.get("expr") or ""
+                if re.search(rf"(?<![\w]){name}(?![\w])", expr):
+                    out.append(expr)
+    return out
+
+
+def test_gauge_aggregation_matches_its_identity(alerts_cfg, recording_cfg):
+    """每个 Gauge 在告警/录音表达式里必须按"它的身份"聚合（判据见 SLO.md §8）。
+
+    ⚠️ 本测试断言**不是**"数字对不对"（那要起多副本才测得出来，本地测不了），
+    而是"写法是否符合已声明的口径" —— 这是唯一能在 CI 里守住的那一半。
+    """
+    declared = set(GAUGE_AGGREGATION)
+    found = _gauges_written_by_source()
+
+    assert found, (
+        "没有从源码里发现任何 Gauge —— 扫描方式失效了（守卫空转）。"
+        '请检查 `_gauges_written_by_source` 的正则是否还匹配 `metrics.set_gauge("x", ...)`'
+    )
+    assert found == declared, (
+        "源码写入的 Gauge 与 `GAUGE_AGGREGATION` 登记表不一致：\n"
+        f"  只在源码里（新增了却没声明身份）: {sorted(found - declared)}\n"
+        f"  只在登记表里（已删除的死条目）: {sorted(declared - found)}\n"
+        "新增 Gauge 必须登记：声明它属于「全局唯一」还是「每副本各一份」，"
+        "以及告警里该用哪个聚合函数（判据：deploy/monitoring/SLO.md §8）"
+    )
+
+    problems: list[str] = []
+    for name, required in sorted(GAUGE_AGGREGATION.items()):
+        for expr in _exprs_referencing(name, alerts_cfg, recording_cfg):
+            flat = " ".join(expr.split())
+            total = len(re.findall(rf"(?<![\w]){name}(?![\w])", flat))
+            if required is None:
+                wrapped = [f for f in _GAUGE_AGG_FUNCS
+                           if re.search(rf"(?<![\w]){f}\s*\(\s*{name}(?![\w])", flat)]
+                if wrapped:
+                    problems.append(
+                        f"  {name}: 声明为「逐副本读」，却被 {wrapped} 包住"
+                        f" ⇒ 多副本下语义被改变\n      {flat}")
+            else:
+                n = len(re.findall(
+                    rf"(?<![\w]){required}\s*\(\s*{name}(?![\w])", flat))
+                if n != total:
+                    problems.append(
+                        f"  {name}: 声明必须 `{required}(...)`，"
+                        f"但 {total} 处出现里只有 {n} 处被包住\n      {flat}")
+
+    assert not problems, (
+        "以下表达式里的 Gauge 聚合与 SLO.md §8 声明的身份不符：\n" + "\n".join(problems)
+    )
+
+
