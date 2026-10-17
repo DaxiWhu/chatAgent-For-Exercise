@@ -100,6 +100,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 from .. import observability
@@ -395,6 +396,10 @@ def summarize_items(segment: list[Any]) -> str:
     if not body.strip():
         return ""
     model, _, _ = _model_config()
+    # 计时段**只包住模型调用**，不包 `_segment_body` 的拼装与 `_replace_items` 的
+    # 会话替换 —— 后者走检查点，耗时已经在 `checkpoint_duration_seconds{op}` 里。
+    # 只有"摘要这一次出站调用"是新增在首 token 延迟上、却完全没有归因出口的那一段。
+    started = time.perf_counter()
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -405,8 +410,14 @@ def summarize_items(segment: list[Any]) -> str:
         )
         text = resp.choices[0].message.content or ""
     except Exception as e:  # noqa: BLE001  上游抖动 / 网关不认 / 超时
+        # 失败也记耗时：超时型故障的耗时正是"这次为什么慢"的直接证据，
+        # 只记成功样本会让分布里恰好缺掉最长的那一截。
+        observability.histogram("agent_history_compaction_seconds",
+                                time.perf_counter() - started, result="error")
         _note_failure(e, stage="summarize")
         return ""
+    observability.histogram("agent_history_compaction_seconds",
+                            time.perf_counter() - started, result="ok")
     text = text.strip()
     if not text:
         logging.warning("摘要模型返回了空内容 ⇒ 这一轮不压（不拿空摘要替换历史）")

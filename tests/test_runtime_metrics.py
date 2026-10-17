@@ -723,6 +723,16 @@ DRILL_ONLY = (
     "circuit_opened_total",          # 状态由 circuit_open 兜住，这里是次数
     "circuit_rejected_total",        # 同上：省下了多少次白等
     "agent_tool_calls",              # 异常收尾由 agent_runs_total{exit_reason} 兜住
+    # 跨轮压缩那一次摘要调用的耗时：它压在首 token 之前，但**不是每一次请求**都会
+    # 触发（只有历史超过预算时才压），所以不适合单独设阈值告警 —— 它是
+    # `FirstTokenTooSlow` 的分诊入口（runbook 指路）。
+    "agent_history_compaction_seconds",
+    # 进程级资源三条：故障已由 OOM / 容器重启 / EventLoopBlocked 兜住，
+    # 这三条用来回答"是内存涨了还是 GC 在抖还是 CPU 打满"。
+    "process_resident_memory_bytes",
+    "process_cpu_seconds_total",
+    "python_gc_collections_total",
+    "python_gc_collected_objects_total",
     # 幂等键的另外四个分档都只在 `IdempotencyConflictsHigh` 的 runbook 里被指路：
     # 它们回答的是"冲突是哪种冲突"，属于**下钻**而不是独立的故障信号。
     "idempotency_replay_total",      # 被正确吸收的重试次数（机制的价值体现）
@@ -805,7 +815,8 @@ import inspect  # noqa: E402
 from src import observability  # noqa: E402
 
 _METRIC_CALL_OWNERS = {"observability", "metrics"}
-_METRIC_CALL_FUNCS = {"counter", "histogram", "gauge", "inc", "observe", "set_gauge"}
+_METRIC_CALL_FUNCS = {"counter", "histogram", "gauge", "inc", "observe",
+                      "set_gauge", "set_counter"}
 
 # 每个调用点最终把标签 dict **splat 进**哪个函数。
 # `src/observability.py` 只是转发，`app/main.py` 的 `_MetricsSink` 也只是转发 ——
@@ -818,6 +829,7 @@ _TERMINAL = {
     ("metrics", "inc"): metrics.inc,
     ("metrics", "observe"): metrics.observe,
     ("metrics", "set_gauge"): metrics.set_gauge,
+    ("metrics", "set_counter"): metrics.set_counter,
     ("metrics", "gauge"): metrics.gauge,
 }
 

@@ -1428,6 +1428,10 @@ GAUGE_AGGREGATION: dict[str, str | None] = {
     "rag_index_identity_ok": None,
     # 每个副本（且每个 breaker）各自的熔断状态
     "circuit_open": None,
+    # 进程 RSS：**每个副本一份自己的**，求和在多副本下毫无物理意义
+    # （把 3 个副本的内存加起来既不是"服务占用"也不能和容器 limit 比）。
+    # 判据只能逐副本读 —— 要看的是"哪个副本在涨"。
+    "process_resident_memory_bytes": None,
 }
 
 #: "包住"一个 Gauge 即改变其跨副本语义的聚合函数。
@@ -1442,12 +1446,20 @@ def _gauges_written_by_source() -> set[str]:
 
     ⚠️ 只认字符串字面量。`set_gauge(name, value, ...)` 这种转发（`app/metrics.py`
     与 `src/observability.py` 的定义处）**不算** —— 否则会把形参名当成指标名。
+
+    ⚠️ 前面用 `\\b` 而不是 `\\.`（2026-10-17 修）：原来只认 `metrics.set_gauge(...)`
+    这种**带模块前缀**的写法，于是 `app/metrics.py` **自己的模块内裸调用**
+    （`set_gauge("process_resident_memory_bytes", rss)`）完全扫不到 ——
+    表现是"登记表里有、源码里说没有"（被当成死条目）。这类盲区比漏一项更隐蔽：
+    守卫是绿的逻辑反了，它报的是"死条目"，而人看到"死条目"第一反应是删登记。
+    `\\b` 在 `.set_gauge` 与裸 `set_gauge` 两种写法下都成立，且不会误收
+    `my_gauge(...)`（`_` 是 word 字符，前面没有词边界）。
     """
     names: set[str] = set()
     for base in ("app", "src"):
         for path in (ROOT / base).rglob("*.py"):
             names |= set(re.findall(
-                r'\.(?:set_gauge|gauge)\(\s*"([A-Za-z_][A-Za-z0-9_]*)"',
+                r'\b(?:set_gauge|gauge)\(\s*"([A-Za-z_][A-Za-z0-9_]*)"',
                 path.read_text(encoding="utf-8")))
     return names
 

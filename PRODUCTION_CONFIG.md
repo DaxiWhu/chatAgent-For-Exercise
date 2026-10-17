@@ -477,6 +477,11 @@ curl -s localhost:8000/health/ready | python -m json.tool
        只在真的发生 >50ms 阻塞时才产生第一个样本。所以"序列不存在"是**正常**的
        （含义是"这段时间没被阻塞过"），别去找它；反过来说，它一旦出现就说明
        确实有过同步调用堵住事件循环（处置见 `RUNBOOK.md` 的 `EventLoopBlocked`）。
+       ✅ **与它相反，进程级四条从第一次抓取起就一直在**：`process_resident_memory_bytes`、
+       `process_cpu_seconds_total`、`python_gc_collections_total`、
+       `python_gc_collected_objects_total`。它们**缺席才是问题** ——
+       说明该平台的 RSS 读取分支没命中（只在 Windows / Linux 上实现），
+       而不是"暂时没有数据"。
 16. [ ] `deploy/monitoring/alerts.yml` 已加载（**6 组 60 条**），且 `review_pending` 有"长时间 > 0"的告警
 17. [ ] `chatagent-slo` 组已加载（面板上能看到 5 条燃尽率规则 + 2 条预算余量规则），
        且 `SLO.md` 的两张表与表达式一致（`pytest tests/test_monitoring_config.py` 会钉住）。

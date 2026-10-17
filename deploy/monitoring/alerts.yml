@@ -141,7 +141,7 @@ groups:
         annotations:
           summary: "事件循环至少有 5% 的时间被阻塞（当前 {{ $value | humanizePercentage }}）"
           description: "有同步调用跑在事件循环上 ⇒ 所有并发请求一起卡住，而错误率保持 0。这类变慢在延迟面板上只表现为『变慢了』。"
-          runbook: "1) 看 `event_loop_lag_seconds` 的 P99 与 max：单次数百毫秒的尖峰 ⇒ 某个同步调用；持续的小值 ⇒ 高频小阻塞（日志、序列化）。2) 对照部署时间 —— 本告警从零变成持续 >0 的时刻，通常就是引入同步调用的那次发布。3) 找法：`tests/test_event_loop_offload.py` 守的是**已知**调用点，新增路径要自己查，优先看最近新增的工具、压缩路径、以及任何在 `async def` 里直接读写文件或调同步客户端的地方。4) 修法是把阻塞调用移到线程里（`asyncio.to_thread`），**不是**调大并发上限 —— 那只会让更多请求一起等。"
+          runbook: "1) 看 `event_loop_lag_seconds` 的 P99 与 max：单次数百毫秒的尖峰 ⇒ 某个同步调用；持续的小值 ⇒ 高频小阻塞（日志、序列化、**GC**）—— 后者对照 `python_gc_collections_total` 的增速与 `process_resident_memory_bytes` 是否同步上涨（堆在变大 ⇒ 每次 GC 越来越重；第 2 代计数也在涨说明有对象活过了两轮回收，那通常就是泄漏），再看 `python_gc_collected_objects_total`：回收次数在涨而回收对象数不涨 ⇒ GC 在**空转**，该找引用链而不是调 GC 阈值。2) 用 `process_cpu_seconds_total` 与 `process_uptime_seconds` 的比值判断『在算还是在等』：接近核数 ⇒ 真在算；远低于核数 ⇒ 主要在等 I/O 或等上游，那就不是本告警的范畴。3) 对照部署时间 —— 本告警从零变成持续 >0 的时刻，通常就是引入同步调用的那次发布。4) 找法：`tests/test_event_loop_offload.py` 守的是**已知**调用点，新增路径要自己查，优先看最近新增的工具、压缩路径、以及任何在 `async def` 里直接读写文件或调同步客户端的地方。5) 修法是把阻塞调用移到线程里（`asyncio.to_thread`），**不是**调大并发上限 —— 那只会让更多请求一起等。"
 
       - alert: StreamErrorsHigh
         expr: rate(chat_stream_errors_total[5m]) > 0.2
@@ -312,7 +312,7 @@ groups:
         annotations:
           summary: "首字节延迟 P95 超过 8 秒（{{ $labels.kind }}）"
           description: "近 10 分钟流式请求的首字节 P95 = {{ $value }}s。用户在这段时间里看到的是一个空白的回答区。只看 `mode` 为 stream 的那一档：非流式链路（agent 链路整段返回）的「首字节」其实是整段生成耗时，混进同一个分位数会让这个数失去含义。"
-          runbook: "1) 先分诊：看 `rag_stage_duration_seconds`（检索是不是慢了）与 `llm_call_duration_seconds`（模型调用是不是慢了）；2) 两者都正常 ⇒ 问题在**排队/并发**：看 `http_concurrency_in_flight / http_concurrency_limit` 与 `rate_limited_total`；3) 若同时 `client_disconnected_total` 在涨，说明用户已经在关页面了，优先处理；4) 对照 `llm_tokens_total` 排除「上游整体过载」。"
+          runbook: "1) 先分诊：看 `rag_stage_duration_seconds`（检索是不是慢了）、`llm_call_duration_seconds`（模型调用是不是慢了）、以及 `agent_history_compaction_seconds`（跨轮历史压缩的那次摘要调用）。最后这条容易被漏掉：它压在首 token 之前，但**只在历史超过预算时才发生**，所以整体 P95 里几乎看不见它 —— 要单独看它的分布，并用 `result=error` 那一档区分『压得慢』与『压失败后白等一次超时』；2) 三者都正常 ⇒ 问题在**排队/并发**：看 `http_concurrency_in_flight / http_concurrency_limit` 与 `rate_limited_total`；3) 若同时 `client_disconnected_total` 在涨，说明用户已经在关页面了，优先处理；4) 对照 `llm_tokens_total` 排除「上游整体过载」。"
 
       - alert: LlmCallErrorsHigh
         # 模型调用**独立**的失败率。没有它时，上游抖动只能透过

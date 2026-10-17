@@ -291,6 +291,23 @@ curl -s 'localhost:9090/api/v1/query?query=histogram_quantile(0.5,sum(rate(event
 | --- | --- | --- |
 | 偶发的数百毫秒尖峰 | 某个**一次性同步调用**（读大文件、同步 HTTP、`time.sleep`） | 最近新增的工具 / 压缩路径 |
 | 持续的小值（几十毫秒）不断出现 | **高频小阻塞**（日志、JSON 序列化、正则回溯） | 请求路径上的每个同步操作 |
+| 持续小值 **＋ RSS 同步上涨** | **GC 越来越重**（堆变大 ⇒ 每次回收更久），或真在泄漏 | `python_gc_collections_total` 的增速 + `process_resident_memory_bytes` |
+
+第三步（区分「在算」还是「在等」）：拿 `process_cpu_seconds_total` 除以
+`process_uptime_seconds` —— 接近核数说明真在烧 CPU；远低于核数说明时间主要花在
+等 I/O 或等上游模型上，`EventLoopBlocked` 就不是主因。
+
+```bash
+# 内存是否在稳定上涨（泄漏的第一个信号）
+curl -s 'localhost:9090/api/v1/query?query=process_resident_memory_bytes' | python -m json.tool
+# 各代 GC 次数（第 2 代也在涨 ⇒ 有对象活过了两轮回收）
+curl -s 'localhost:9090/api/v1/query?query=rate(python_gc_collections_total[30m])' | python -m json.tool
+```
+
+⚠️ 这三条是**下钻**用的，没有独立告警：内存问题的最终故障形态是 OOM / 容器重启
+（由 k8s 侧兜住），GC 抖动由 `EventLoopBlocked` 兜住。它们负责回答「是内存涨了、
+GC 在抖、还是 CPU 打满」，不负责发通知。RSS 的绝对值**跨部署不可比**
+（取决于语料规模与并发），要设阈值必须先在目标环境回填基线（见 `CAPACITY.md` §五）。
 
 处置顺序：
 

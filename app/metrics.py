@@ -27,7 +27,10 @@
 """
 
 import bisect
+import gc
 import logging
+import os
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -127,6 +130,22 @@ def set_gauge(name, value, **labels):
         _GAUGES[_key(name, labels)] = float(value)
 
 
+def set_counter(name, value, **labels):
+    """把计数器**覆盖**成外部给的绝对值（用于操作系统已经累好的量）。
+
+    与 `inc` 的分工
+    --------------
+    * `inc` 记的是**我们自己发生的事件**（一次请求、一个 token）⇒ 加增量；
+    * `set_counter` 记的是**别人替我们累好的数**（进程 CPU 秒数、GC 次数）——
+      这些量只能读到"到目前为止一共多少"，拿不到增量。
+
+    ⚠️ 只能用于**单调不减**的量。拿它写"当前值"会让 `rate()` 失去意义
+    （Prometheus 会把下降当成计数器重置，从而算出一个假的尖峰）。
+    """
+    with _LOCK:
+        _COUNTERS[_key(name, labels)] = float(value)
+
+
 def gauge(name, **labels):
     """读 Gauge 当前值（测试用；生产从 /metrics 拉）。"""
     with _LOCK:
@@ -220,11 +239,114 @@ def _histogram_lines(name, labels, cum, total_sum, total_count):
     return out
 
 
+# ---------------------------------------------------------------------------
+# 进程级资源指标（RSS / CPU / GC）
+# ---------------------------------------------------------------------------
+# 为什么在 `render()` 里现算，而不是起一个后台采样协程
+# --------------------------------------------------
+# 这三类量本身就是"抓取那一刻"的值：RSS 是瞬时值，CPU 秒数与 GC 次数是累计值。
+# 后台采样只会让它们在两次抓取之间**陈旧**，还多出一个失效面 —— 采样任务一旦
+# 静默死掉，指标就永久冻结在一组旧数字上，而"采样任务死了"这件事本身没有指标
+# 能反映。`process_uptime_seconds` 一直是这么做的，这里只是把同一套做法扩到
+# 三类资源上。代价是 /metrics 多几次系统调用：与抓取间隔（通常 15~60s）相比可忽略。
+#
+# ⚠️ 全部**不引第三方依赖**：`psutil` 不在 `requirements.txt` 里。本地能 import
+# 只是别的包带进来的传递依赖，依赖它等于"开发机有、生产没有"——而这三条指标
+# 恰恰是用来观察生产的。
+
+_WIN_MEMORY_API = None
+
+
+def _build_win_memory_api(ctypes, wintypes):
+    """Windows 上 `GetProcessMemoryInfo` 的绑定（只做一次）。"""
+
+    class _Counters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(_Counters), wintypes.DWORD]
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+    return _Counters, psapi, kernel32
+
+
+def _resident_memory_bytes():
+    """当前进程的常驻内存（RSS，字节）；读不到返回 None（该指标就不出现）。
+
+    * Windows：`WorkingSetSize` —— 与任务管理器"内存"列同源；
+    * Linux：`/proc/self/statm` 的第二个字段（常驻页数）× 页大小。
+
+    探针实测（`tmp_probe/probe_rss.py`）：分配 200MB 后读数从 21.5MB 涨到
+    221.5MB，增量正好 200MB ⇒ 读的是真值，不是某个常量。
+    """
+    global _WIN_MEMORY_API
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        if _WIN_MEMORY_API is None:
+            _WIN_MEMORY_API = _build_win_memory_api(ctypes, wintypes)
+        counters_cls, psapi, kernel32 = _WIN_MEMORY_API
+        counters = counters_cls()
+        counters.cb = ctypes.sizeof(counters)
+        ok = psapi.GetProcessMemoryInfo(
+            kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb)
+        return int(counters.WorkingSetSize) if ok else None
+    with open("/proc/self/statm", encoding="ascii") as fh:
+        return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+
+
+def _refresh_runtime_metrics():
+    """把进程级指标写进注册表（每次抓取调用一次）。
+
+    ⚠️ **每一项各自 try**：指标是观察故障的组件，让它因为读不到某一项而把整个
+    `/metrics` 带崩，是最讽刺的一种失效。读不到就少一条序列，其余照常。
+    """
+    try:
+        rss = _resident_memory_bytes()
+        if rss is not None:
+            set_gauge("process_resident_memory_bytes", rss)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("读取进程 RSS 失败（该指标本轮不出现）：%s", e)
+
+    try:
+        # `process_time` 是 CPU 时间（不含等 I/O / 等上游模型的墙钟时间）。
+        # 与 `process_uptime_seconds` 一比就能区分"在算"还是"在等"。
+        set_counter("process_cpu_seconds_total", time.process_time())
+    except Exception as e:  # noqa: BLE001
+        logging.debug("读取进程 CPU 时间失败：%s", e)
+
+    try:
+        for generation, stats in enumerate(gc.get_stats()):
+            set_counter("python_gc_collections_total",
+                        stats.get("collections", 0), generation=str(generation))
+            set_counter("python_gc_collected_objects_total",
+                        stats.get("collected", 0), generation=str(generation))
+    except Exception as e:  # noqa: BLE001
+        logging.debug("读取 Python GC 统计失败：%s", e)
+
+
 def render():
     """输出 Prometheus 文本格式（text/plain; version=0.0.4）。
 
     计数器输出 `# TYPE x counter` + 样本行；直方图输出 `_bucket/_sum/_count` 三件套。
     末尾附带 `process_uptime_seconds`，便于看实例存活时长。
+
+    开头会先刷新**进程级资源指标**（RSS / CPU / GC）—— 它们不在后台采样，
+    而是抓取时现算，理由见 `_refresh_runtime_metrics` 上方的说明。
 
     ⚠️ **TYPE 行必须按"指标名"去重，且排在该名字的所有样本之前**
     ----------------------------------------------------------
@@ -252,6 +374,7 @@ def render():
     类型，而不是让整个 /metrics 变成非法文本。
     """
     lines = []
+    _refresh_runtime_metrics()
     with _LOCK:
         counters = dict(_COUNTERS)
         # 快照成不可变结构后再出锁渲染：渲染期间不该占着锁（它要拼很多字符串）
