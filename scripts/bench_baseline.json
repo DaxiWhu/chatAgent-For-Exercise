@@ -1,0 +1,37 @@
+{
+  "host": {
+    "python": "3.13.12",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "cpu": "Intel64 Family 6 Model 198 Stepping 2, GenuineIntel",
+    "cores": 24
+  },
+  "n": 20000,
+  "bench": {
+    "ratelimit": {
+      "n": 20000,
+      "total_s": 0.057434900001680944,
+      "us_per_op": 2.871745000084047,
+      "ops_per_s": 348220.33292326896
+    },
+    "quota": {
+      "n": 20000,
+      "total_s": 0.1234623999989708,
+      "us_per_op": 6.17311999994854,
+      "ops_per_s": 161992.63905583177
+    },
+    "metrics": {
+      "n": 20000,
+      "total_s": 0.030845199995383155,
+      "us_per_op": 1.5422599997691577,
+      "ops_per_s": 648399.102712693,
+      "histogram_slots": 14
+    },
+    "retrieval": {
+      "n": 1000,
+      "total_s": 0.6293014000038966,
+      "us_per_op": 629.3014000038966,
+      "ops_per_s": 1589.0636823528569,
+      "corpus_chunks": 141
+    }
+  }
+}
