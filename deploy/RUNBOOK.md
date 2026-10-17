@@ -655,8 +655,10 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 
 | `SLOAvailabilityBurnFast`（critical） | 按 P1 处理。**25% 的 30 天预算在 1 小时内烧掉** —— 这是最紧急的一类 |
 | `SLOAvailabilityBurnMedium`（critical） | 通常是长期错误源。看 6 小时错误按 `path` 是否集中在单一路由 |
 | `SLOAvailabilityBurnSlow`（warning） | 排期。若确认是常态，**正式**下调 SLO（改 `SLO.md` + 表达式两处），别让它长期挂着 |
-| `SLOLatencyBurnFast`（warning） | 按 `path` 定位：`/v1/reviews` 慢 ⇒ 审核队列表与 PG；`/health/*` 慢 ⇒ 探针在等外部依赖 |
+| `SLOLatencyBurnFast`（warning） | 按 `path` 定位：`/v1/reviews` 慢 ⇒ 审核队列表与 PG；`/health/*` 慢 ⇒ 探针在等外部依赖。⚠️ 这条**不含**流式接口（它们单独有一条） |
 | `SLOLatencyBurnSlow`（warning） | 排期优化（典型是 PG 查询缺索引） |
+| `SLOStreamLatencyBurnFast`（warning） | **首 token** 慢（不是整段生成慢）。按顺序分诊首 token 之前的每一段：`rag_stage_duration_seconds`（检索）→ `agent_history_compaction_seconds{result="error"}`（压缩白等一次超时）→ `llm_call_duration_seconds`（模型调用本身）→ 排队（`http_concurrency_in_flight / http_concurrency_limit`）。通常紧跟 `FirstTokenTooSlow`（P95 > 8s），是同一根因的两个粒度 |
+| `SLOStreamLatencyBurnSlow`（warning） | 排期。先看是不是集中在长历史会话（压缩与检索都随历史增长）；确认是上游模型整体变慢的话，要么换模型/加缓存，要么按 `SLO.md` §7 正式调整阈值 |
 | `SLOBudgetLow`（warning） | 该 SLI 的**功能变更冻结**（按 `ERROR_BUDGET_POLICY.md`），解冻条件是预算回到 50% |
 | `SLOBudgetExhausted`（critical） | **全面冻结**功能变更 + 48 小时内复盘。⚠️ 按 **P2** 处理，不是 P1（见 §1.3 的说明） |
 
@@ -665,7 +667,7 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 
 > **`SLOBudget*` 触发则按预算余量的两档动作执行**（20% ⇒ 冻结该 SLI 的变更，
 > 耗尽 ⇒ 全面冻结 + 复盘）。
 
-#### 预算余量的两条（与上面 4 条不是同一族）
+#### 预算余量的两条（与上面 7 条不是同一族）
 
 上面那几条问的是"**按这个速度还要多久烧光**"（燃尽率），它们对
 "**现在还剩多少**"完全无感；`SLOBudgetLow` / `SLOBudgetExhausted` 问的是后者。
@@ -673,7 +675,7 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 
 `deploy/monitoring/SLO.md` §4b）。
 
 ```bash
-# 两个 SLI 各自还剩多少（与告警读的是同一个数）
+# 每个 SLI 各自还剩多少（availability / latency / stream_latency，与告警读的是同一个数）
 curl -s --noproxy '*' 'localhost:9090/api/v1/query?query=slo:budget_remaining_ratio' \
   | python -m json.tool
 # 先确认录音规则本身在跑（它哑掉时告警只会"永远不触发"，看起来像预算很健康）

@@ -466,6 +466,31 @@ def _budget_rows() -> list[dict]:
     return _doc_table(SLO_DOC.read_text(encoding="utf-8"), BUDGET_COLS)
 
 
+def _slo_targets() -> dict[str, float]:
+    """从 SLO.md §3 的目标表读出 `{SLI: 目标值}`。
+
+    为什么从**文档**推导而不是在断言里写死清单：写死的断言对"**新增**一个 SLI"
+    完全无感 —— 而"新 SLI 没有配预算录音"正是最该被抓住的那类缺口
+    （它静默：那个 SLI 的错误预算永远不会被检查，余量告警永远不会响）。
+    SLO.md 是三者（本文 / `alerts.yml` / `recording.yml`）的唯一事实源，
+    所以以它为原点做**双向**发现：文档有 ⇒ 录音必须有；录音有 ⇒ 文档必须有。
+    """
+    rows = _doc_table(SLO_DOC.read_text(encoding="utf-8"),
+                      ["sli", "target", "budget", "meaning"])
+    assert rows, "SLO.md 里没有解析到 §3 的目标表（4 列表格）"
+    targets: dict[str, float] = {}
+    for row in rows:
+        sli = row["sli"].strip().strip("`")
+        # 只认「裸 SLI 名」的行：本文件里别的 4 列表格（若有）不该被当成目标表，
+        # 认不出来时宁可跳过也不要误报成"目标列解析不了"。
+        if not re.fullmatch(r"[a-z_]+", sli):
+            continue
+        m = re.match(r"(\d+(?:\.\d+)?)%", row["target"])
+        assert m, f"目标表里 {sli} 的目标列解析不了：{row['target']!r}"
+        targets[sli] = float(m.group(1)) / 100
+    return targets
+
+
 def test_slo_doc_exists():
     assert SLO_DOC.exists(), "缺少 SLO.md —— SLO 不该只存在于 YAML 表达式里"
 
@@ -808,15 +833,27 @@ def test_budget_remaining_is_recorded_for_every_sli(recording_cfg, slo_rules):
     """必须**每个 SLI 各一条**预算录音规则，且告警确实覆盖了全部 SLI。
 
     两种失败都是静默的：
-      * 少了 latency 那条 ⇒ 延迟预算永远不被检查（政策表写的是"任一 SLI"）；
+      * 少了某个 SLI 那条 ⇒ 它的预算永远不被检查（政策表写的是"任一 SLI"）；
       * 告警表达式里加了 `{slo="availability"}` 过滤 ⇒ 覆盖范围悄悄减半，
         而摘要里的 `{{ $labels.slo }}` 照常打印那个唯一的取值，看不出少了什么。
+
+    ⚠️ 期望的 SLI 集合从 **SLO.md §3 的目标表**推导，不在这里写死 ——
+    写死时"新增一个 SLI 但忘了录音"照样绿，而那种缺口没有任何症状。
+    下面那条 `<=` 断言是**下限**（这三个是核心用户旅程，不能被悄悄删掉），
+    不是清单：它只限制"不许少于"，不限制"不许更多"。
     """
+    expected = set(_slo_targets())
+    assert {"availability", "latency", "stream_latency"} <= expected, (
+        f"SLO.md §3 的目标表里缺少核心 SLI（解析到：{sorted(expected)}）—— "
+        "删掉一条 SLI 会让它的预算检查随之消失，且没有任何报错"
+    )
     slis = {r.get("labels", {}).get("slo")
             for g in recording_cfg["groups"] for r in g["rules"]
             if r.get("record") == BUDGET_METRIC}
-    assert slis == {"availability", "latency"}, (
-        f"预算录音规则覆盖的 SLI 是 {slis}，应为 availability 与 latency 两种"
+    assert slis == expected, (
+        f"预算录音规则覆盖的 SLI 是 {sorted(slis)}，而 SLO.md §3 承诺了 "
+        f"{sorted(expected)} —— 差集 {sorted(expected - slis)} 里的 SLI 预算永远不会被检查；"
+        f"多出来的 {sorted(slis - expected)} 则是录音规则里有、文档没承诺的孤儿"
     )
     for name, rule in _of_kind(slo_rules, _BUDGET).items():
         assert 'slo="' not in rule["expr"], (
@@ -874,20 +911,9 @@ def test_budget_targets_match_the_slo_document(recording_cfg):
     与实际承诺脱钩。
     """
     text = SLO_DOC.read_text(encoding="utf-8")
-    rows = _doc_table(text, ["sli", "target", "budget", "meaning"])
-    assert rows, "SLO.md 里没有解析到 §3 的目标表（4 列表格）"
-    targets: dict[str, float] = {}
-    for row in rows:
-        sli = row["sli"].strip().strip("`")
-        # 只认「裸 SLI 名」的行：本文件里别的 4 列表格（若有）不该被当成目标表，
-        # 认不出来时宁可跳过也不要误报成"目标列解析不了"。
-        if not re.fullmatch(r"[a-z_]+", sli):
-            continue
-        m = re.match(r"(\d+(?:\.\d+)?)%", row["target"])
-        assert m, f"目标表里 {sli} 的目标列解析不了：{row['target']!r}"
-        targets[sli] = float(m.group(1)) / 100
-    assert {"availability", "latency"} <= set(targets), (
-        f"SLO.md §3 的目标表里没有解析到 availability 与 latency（解析到：{sorted(targets)}）"
+    targets = _slo_targets()
+    assert {"availability", "latency", "stream_latency"} <= set(targets), (
+        f"SLO.md §3 的目标表里缺少核心 SLI（解析到：{sorted(targets)}）"
     )
 
     win = re.search(r"目标（窗口：(\d+)\s*天）", text)
@@ -908,6 +934,81 @@ def test_budget_targets_match_the_slo_document(recording_cfg):
         assert window in r["expr"], (
             f"slo={slo} 的预算规则没有读 SLO.md §3 声明的 {window} 窗口"
         )
+
+
+def test_availability_counts_stream_timeouts_as_bad_events(slo_rules, recording_cfg):
+    """可用性 SLI 的坏事件必须包含流式超时；流式延迟 SLI 则**不许**再算一次。
+
+    为什么这条必须存在：流式请求超时返回的是 **200 + SSE `timeout` 事件**
+    （连接早就开始写了，改不了状态码），而它又**没有首 token 样本**
+    （一个字都没产出就终止了）。于是它既不是 5xx、也进不了 `stream_latency` ——
+    两条 SLI 都不认它。表现是：用户干等一分钟、一个字没看到，
+    而可用性显示 100%、延迟显示完美。这是本套 SLO 里唯一一处 SLI 之间的缝。
+
+    反向断言同样重要：`stream_latency` 里**不许**再补一次超时。
+    同一个请求在两个 SLI 里各罚一次，会让烧预算的速度凭空翻倍 ——
+    而"预算烧得更快了"看起来像是服务变差了，排查方向会从"超时"偏到别处。
+    """
+    burn = _of_kind(slo_rules, _BURN)
+    avail = {n: r for n, r in burn.items()
+             if (r.get("labels") or {}).get("slo") == "availability"}
+    assert avail, "alerts.yml 里没有 slo=availability 的燃尽率规则"
+    for name, rule in avail.items():
+        assert "request_timeout_total" in rule["expr"], (
+            f"{name} 的分子只有 `http_requests_total{{status=~\"5..\"}}`，"
+            "没有 `request_timeout_total` —— 流式超时返回 200 + SSE timeout，"
+            "不是 5xx，它会从可用性里整个消失（用户什么都没拿到却算成功）"
+        )
+
+    src = [r for g in recording_cfg["groups"] for r in g["rules"]
+           if r.get("record") == "slo:bad_rate_5m"
+           and (r.get("labels") or {}).get("slo") == "availability"]
+    assert src, "recording.yml 里没有 availability 的 slo:bad_rate_5m"
+    for r in src:
+        assert "request_timeout_total" in r["expr"], (
+            "availability 的录音分子缺 `request_timeout_total` —— "
+            "于是燃尽率告警算的是 5xx、预算算的是 5xx+超时，两者是两件事"
+        )
+
+    stream = {n: r for n, r in burn.items()
+              if (r.get("labels") or {}).get("slo") == "stream_latency"}
+    assert stream, "alerts.yml 里没有 slo=stream_latency 的燃尽率规则"
+    for name, rule in stream.items():
+        assert "request_timeout_total" not in rule["expr"], (
+            f"{name} 里出现了超时计数 —— 超时的请求没有首 token 样本，"
+            "已经计入可用性；重复罚会让预算烧得更快"
+        )
+
+
+def test_sli_thresholds_land_on_histogram_bucket_boundaries(slo_rules, recording_cfg):
+    """所有 `le="..."` 取值必须与直方图**实际渲染出来**的桶边界逐字一致。
+
+    `le` 在 PromQL 里是**全串匹配**：写成 `le="3.0"`（不在边界上）或
+    `le="1"`（漏了 `.0`）都**不会报错**，只是匹配不到任何桶 ⇒ 那条 `_bucket`
+    变成空序列。后果取决于它站在哪一侧：
+      * 坏事件一侧（`_count - _bucket`）⇒ 坏事件 = 全部 ⇒ 预算一上线就烧光；
+      * 好事件一侧（`_bucket / _count`）⇒ 好事件恒为 0 ⇒ 同上。
+    两种都表现为"告警照常在工作"，日志里一个字都没有。
+
+    判据取**渲染字符串**而不是 `bucket_bounds()` 的 float：Prometheus 看到的是
+    `str(v)` 的结果（`app/metrics.py::_fmt_labels`）——`0.1` 与 `0.100000`
+    数值相等、标签值不等，而后者永不命中。
+    """
+    from app import metrics as M
+
+    rendered = {str(b) for b in M.bucket_bounds()}
+    exprs = [(n, r.get("expr") or "") for n, r in slo_rules.items()]
+    exprs += [(f"recording:{r.get('record')}", r.get("expr") or "")
+              for g in recording_cfg["groups"] for r in g["rules"]]
+
+    offenders = [(name, v) for name, expr in exprs
+                 for v in re.findall(r'le="([^"]+)"', expr) if v not in rendered]
+    assert not offenders, (
+        f"以下 `le` 取值不在直方图桶边界上：{offenders}。"
+        f"合法值：{sorted(rendered)}。"
+        "PromQL 的 le 是全串匹配，匹配不到任何桶时 `_bucket` 是空序列 —— "
+        "不报错，但好事件/坏事件会算错，预算和燃尽率一起失真"
+    )
 
 
 def test_budget_route_precedes_the_generic_slo_routes(am_cfg):

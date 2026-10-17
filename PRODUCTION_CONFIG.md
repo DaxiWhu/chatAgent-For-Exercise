@@ -34,7 +34,7 @@
 | `USER_DAILY_TOKEN_QUOTA` | ✅ `200000` | 每租户日额度已装。这是**按估计**定的 —— 有了真实用量后应据 `llm_tokens_per_request` 的分布回填 | 按成本预算定，如 `200000` |
 | `REQUEST_TIMEOUT_SECONDS` | ✅ `180` | 单请求**总时限**已装。注意 `_MODEL` 上的 `timeout=30` 只管**单次调用**，而一次请求可以跑多轮（自评审不通过会再来一轮）⇒ 没有它总时长无上界，而且 **`GRACEFUL_SHUTDOWN_TIMEOUT` 的排空上界会形同虚设**（它等的是在途请求，而在途请求自己不会结束）。超时会下发结构化 `timeout` 事件后收流，**已产出的正文照常交付** | `120`（保守可给 `180`） |
 | `TRUST_PROXY_HEADERS` | ✅ `0` | 直连场景下 `0` 是**正确**的。但**一旦部署到 Nginx/网关后面**必须改 `1`：否则限流按**代理 IP** 统计，全体用户共用一个计数桶 ⇒ 要么集体误伤、要么被单人吃满。compose 里已为两个 app 服务注入 `TRUST_PROXY_HEADERS: "1"`（它们确实在 nginx 后面）。<br>⚠️ **设 `1` 只是必要条件**：代理还必须用**覆盖式**写入 `X-Forwarded-For`（`$remote_addr`）。若代理用 nginx 的 `$proxy_add_x_forwarded_for`（**追加式**，客户端那段留在最左），应用取到的第一段仍是**客户端伪造的值**，限流照样被绕过（2026-10-04 修，守卫见 `tests/test_deploy_topology.py`） | 反代后设 `1`；直连保持 `0` |
-| `ALERT_SINK_WECOM_WEBHOOK` 等三个通道 | ⚠️ **全部为空**（当前**最紧的一个待办**） | 告警转发的出口。**不填 ⇒ `alert-sink` 只把事件记进日志**（这是刻意设计：没配通道不阻塞、不报错），于是 Prometheus 里的 FIRING 永远变不成一条发到人手里的消息。**6 组 60 条**规则 + 六级路由全都写好了，差的只有这一步。<br>⚠️ **两个坑**：① 填完必须用 `docker compose --env-file .env -f deploy/app/docker-compose.yml config \| grep -i webhook` 自证值真的传进去了（**漏 `--env-file` 时它静默不生效**，见本文档开头的说明）；② `alert_sink.py --selftest` 只能证明网关进程活着，**必须再真触发一次告警**（停 `app-canary` 让 `ChatAgentDown` 响）才算闭环 | 填企业微信/飞书机器人 URL；自建网关填 `ALERT_SINK_GENERIC_WEBHOOK` |
+| `ALERT_SINK_WECOM_WEBHOOK` 等三个通道 | ⚠️ **全部为空**（当前**最紧的一个待办**） | 告警转发的出口。**不填 ⇒ `alert-sink` 只把事件记进日志**（这是刻意设计：没配通道不阻塞、不报错），于是 Prometheus 里的 FIRING 永远变不成一条发到人手里的消息。**6 组 62 条**规则 + 六级路由全都写好了，差的只有这一步。<br>⚠️ **两个坑**：① 填完必须用 `docker compose --env-file .env -f deploy/app/docker-compose.yml config \| grep -i webhook` 自证值真的传进去了（**漏 `--env-file` 时它静默不生效**，见本文档开头的说明）；② `alert_sink.py --selftest` 只能证明网关进程活着，**必须再真触发一次告警**（停 `app-canary` 让 `ChatAgentDown` 响）才算闭环 | 填企业微信/飞书机器人 URL；自建网关填 `ALERT_SINK_GENERIC_WEBHOOK` |
 | `ALERT_SINK_SHARED_SECRET` | ⚠️ 为空 —— **刻意保持为空，别单独填它** | 网关的来源校验：非空时要求每个 POST 带 `X-Alert-Sink-Secret` 头且匹配，否则回 **403**。⚠️ **陷阱就在这里**：`alertmanager.yml` 的四个 receiver **没有** `http_config`，**根本不会送这个头** ⇒ 你填了这个变量，等于**把全部告警打成 403**（Alertmanager 重试几次后放弃，表现成"配置全对但没人收到"，网关日志里只有一行 403）。要用它必须**两处一起改**：给四个 receiver 补 `http_config: http_headers: X-Alert-Sink-Secret: [...]` —— 而 Alertmanager **不支持 `${VAR}` 插值**，密钥只能写进配置文件，又回到"凭据进版本库"（这正是本网关要避免的事）。<br>**当前实际暴露面本就有限**：宿主机端口是回环绑定（`127.0.0.1:8081:8080`），仅剩"同 compose 网络内其它容器可伪造告警"，那更适合用部署侧网络隔离解决 | **留空**。确实要开 ⇒ 两处一起改，并接受密钥进配置文件 |
 | `REDIS_PASSWORD` / `POSTGRES_PASSWORD` / `GRAFANA_PASSWORD` | ✅ `REDIS_PASSWORD` 已生成；另两个走 compose 默认值 | 编排层口令（由 compose 从 `.env` 插值，`app` 不读）。**`POSTGRES_PASSWORD` 仍是默认 `123456`** —— 上生产前必须换，且注意它**只在数据卷首次初始化时生效**（详见 `deploy/SECRETS.md` §4.3）。密钥管理的整体方案见 `deploy/SECRETS.md` | 见 `deploy/SECRETS.md` |
 
@@ -112,7 +112,7 @@
 
 > 两组 tracing 都留空时行为与"没有这层代码"完全一致（只记一条 `tracing 未配置` 日志）。
 
-**告警要真正接上**：`deploy/monitoring/alerts.yml` 里有 **6 组 60 条**规则
+**告警要真正接上**：`deploy/monitoring/alerts.yml` 里有 **6 组 62 条**规则
 （可用性 / SLO / 成本 / 安全 / **平台自身** / **agent 能力链路**）。其中两条是
 "任何一次即 critical"：`TenantMismatchDetected`（有人在冒充租户）、
 `SessionOwnershipViolation`（有人在猜 `thread_id` 串读会话）—— 这两条一旦触发
@@ -482,7 +482,7 @@ curl -s localhost:8000/health/ready | python -m json.tool
        `python_gc_collected_objects_total`。它们**缺席才是问题** ——
        说明该平台的 RSS 读取分支没命中（只在 Windows / Linux 上实现），
        而不是"暂时没有数据"。
-16. [ ] `deploy/monitoring/alerts.yml` 已加载（**6 组 60 条**），且 `review_pending` 有"长时间 > 0"的告警
+16. [ ] `deploy/monitoring/alerts.yml` 已加载（**6 组 62 条**），且 `review_pending` 有"长时间 > 0"的告警
 17. [ ] `chatagent-slo` 组已加载（面板上能看到 5 条燃尽率规则 + 2 条预算余量规则），
        且 `SLO.md` 的两张表与表达式一致（`pytest tests/test_monitoring_config.py` 会钉住）。
        ⚠️ 还要确认**录音规则真的在跑**（它是 `SLOBudget*` 唯一的数据来源，也是**哑弹重灾区**）：

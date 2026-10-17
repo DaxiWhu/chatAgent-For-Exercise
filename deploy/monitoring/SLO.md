@@ -28,8 +28,34 @@ SLO 把"坏不坏"换成"**按这个速度烧下去，月底还够不够**"，�
 
 | SLI | 事件定义 | 好事件 | 坏事件 | 为什么这么定 |
 | --- | --- | --- | --- | --- |
-| `availability` | 一个 HTTP 请求 | 状态码非 5xx | 状态码 5xx | 用户能感知的"服务不可用"就是 5xx。4xx/429/413 是**我们主动拒绝**，不算可用性故障 |
+| `availability` | 一个 HTTP 请求 | 状态码非 5xx **且**未超时 | 状态码 5xx **或**流式请求超时 | 用户能感知的"服务不可用"是**没拿到服务**。4xx/429/413 是**我们主动拒绝**，不算可用性故障 |
 | `latency` | 一个**非流式** HTTP 请求 | 耗时 ≤ 1 秒 | 耗时 > 1 秒 | 流式接口（`/v1/chat`、`/v1/chat/resume`）耗时等于整段生成的时长，算进来会让该 SLI 恒不达标 |
+| `stream_latency` | 一个**流式**对话请求 | 首 token ≤ 5 秒 | 首 token > 5 秒 | 流式体验的瓶颈是"**等了多久才看见第一个字**"，不是"整段生成多久"—— 后者由回答长短主导，同一套代码写三句话和写三百句差两个数量级。行业口径同样用首 token 延迟（TTFT）描述流式时延，整段总时长不设固定阈值 |
+
+⚠️ **流式超时必须计入可用性**（`request_timeout_total`），这不是补充说明，而是这条口径的**前提**：
+
+流式请求超时返回的是 **200 + SSE `timeout` 事件**（连接早就开始写了，改不了状态码）。
+于是它既不是 5xx，又**没有首 token 样本**（没产出一个字就终止了）——
+两条 SLI 都不认它。结果是"用户干等了 60 秒、一个字都没看到"，而可用性显示 100%、
+流式延迟显示完美。这是本套 SLO 里唯一一处"两条 SLI 之间的缝"，必须显式堵上：
+**超时算可用性坏事件，流式延迟 SLI 只统计真的产出了首 token 的请求**。
+
+这样划分之后，每个请求恰好落进一条：产出了首 token ⇒ 进 `stream_latency`；
+没产出（超时）⇒ 进 `availability`。既不重复罚、也不遗漏。
+
+⚠️ **`stream_latency` 的阈值只能取直方图桶边界上的值**（现有边界见 `app/metrics.py`：
+… 2.5 / 5.0 / 10.0 …）。写成不在边界上的数（如 3.0）不会报错，
+`le="3.0"` 只是**匹配不到任何桶** ⇒ 好事件恒为 0 ⇒ 预算一上线就烧光，
+而告警照常"在工作"。守卫：
+`tests/test_monitoring_config.py::test_sli_thresholds_land_on_histogram_bucket_boundaries`。
+
+⚠️ **为什么是 5 秒 / 95%，而不是更漂亮的 1 秒 / 99%**：首 token 的等待里，
+检索与历史压缩只占小头，**大头是上游模型的排队与首包**——那部分本服务控制不了，
+抖动天然比自己的非流式路径大一个量级。行业里 LLM 接口的 TTFT 目标通常比传统 API
+宽 3~10 倍，本项目在此基础上又留了余量：
+阈值取 5.0s 而不是 2.5s，是**比现有 `FirstTokenTooSlow` 告警（P95 > 8s）更紧、
+但比传统 API 的 1s 宽 5 倍**的位置 —— 让 SLO 先于阈值告警开始烧预算，
+才有"提前发现"的意义。两个数都是**起点**，标定方法见 §8 第 7 条。
 
 ⚠️ **可用性 SLI 不要用 `http_errors_total` 当分子**。它只在**未捕获异常**时自增
 （见 `app/middleware.py`），503 这类"正常返回的失败"（如就绪探针）不计入，
@@ -57,6 +83,7 @@ PromQL 是全串匹配，写成 `le="1"` 会让该规则**永不触发且没有�
 | --- | --- | --- | --- |
 | `availability` | 99.5% | 0.5% | 30 天内允许约 3.6 小时（按 1 rps 折算）的 5xx |
 | `latency` | 99.0% 非流式请求 ≤ 1s | 1.0% | 30 天内允许 1% 的非流式请求超 1 秒 |
+| `stream_latency` | 95% 流式请求首 token ≤ 5s | 5.0% | 30 天内允许 5% 的流式请求首 token 超过 5 秒 |
 
 目标值是**起点**，不是圣旨：若确认某个低价值路由天然易错/易慢，正确做法是**正式**调整
 SLO（改本文 + 改表达式），而不是让告警长期挂着 —— 一条长期 firing 的告警等于没有告警。
@@ -80,6 +107,8 @@ SLO（改本文 + 改表达式），而不是让告警长期挂着 —— 一条
 | SLOAvailabilityBurnSlow | availability | 0.995 | 1 | 3d | 6h | 10% | warning |
 | SLOLatencyBurnFast | latency | 0.99 | 14.4 | 1h | 5m | 2% | warning |
 | SLOLatencyBurnSlow | latency | 0.99 | 1 | 3d | 6h | 10% | warning |
+| SLOStreamLatencyBurnFast | stream_latency | 0.95 | 14.4 | 1h | 5m | 2% | warning |
+| SLOStreamLatencyBurnSlow | stream_latency | 0.95 | 1 | 3d | 6h | 10% | warning |
 
 「消耗预算」= 燃尽率 × 长窗口 ÷ 30 天（例：14.4 × 1h ÷ 720h = 2%）。
 
@@ -92,8 +121,8 @@ SLO（改本文 + 改表达式），而不是让告警长期挂着 —— 一条
 
 | 告警 | 读的序列 | 窗口 | 阈值 | 覆盖 SLI | 严重度 |
 | --- | --- | --- | --- | --- | --- |
-| SLOBudgetLow | slo:budget_remaining_ratio | 30d | 剩余 < 20% | availability / latency | warning |
-| SLOBudgetExhausted | slo:budget_remaining_ratio | 30d | 剩余 ≤ 0（耗尽） | availability / latency | critical |
+| SLOBudgetLow | slo:budget_remaining_ratio | 30d | 剩余 < 20% | availability / latency / stream_latency | warning |
+| SLOBudgetExhausted | slo:budget_remaining_ratio | 30d | 剩余 ≤ 0（耗尽） | availability / latency / stream_latency | critical |
 
 余量的算法在 `recording.yml` 里（两级录音规则），本文只定义**阈值与动作**：
 
@@ -205,3 +234,22 @@ SLO（改本文 + 改表达式），而不是让告警长期挂着 —— 一条
    `test_budget_rules_scope_the_level_one_series_by_sli`。
    ⚠️ 它们只覆盖**配置层**：真的确认"录音规则在跑"，要去
    `http://localhost:9090/rules` 看那一页的 `Health=ok` 与 `Last Evaluation`。
+7. **`stream_latency` 的 5 秒 / 95% 是起点，不是标定值**：它按行业通行口径
+   （流式用首 token 延迟、目标 95%）并结合本服务的链路特点（检索 + 可能的工具调用
+   都在首 token 之前）定下来，但**没有生产分布作为依据**。上线后按这三步标定：
+
+   | 观察到的形状 | 含义 | 动作 |
+   | --- | --- | --- |
+   | P95 长期明显低于 5s（如 2s 附近） | 阈值太松，SLO 没有约束力 —— 预算永远剩 100%，等于没设 | **收紧**到下一个桶边界（2.5s），让 SLO 重新能烧 |
+   | 好事件率长期 90~95%（预算在缓慢外流） | 阈值基本贴合真实分布 | 保持；这就是 SLO 该有的形状 |
+   | 好事件率长期 < 90% | 先怀疑**真的慢**（对照 `FirstTokenTooSlow` 与 `rag_stage_duration_seconds`），再考虑口径 | 不要先降目标 —— 那等于把问题写进合同 |
+
+   改阈值或目标时**三处必须同改**：§3 目标表、§4 燃尽率表的 `target` 列、
+   `recording.yml` 的 `(1 - 0.95)`。少改一处不会有任何报错，只会让预算算的是另一个 SLO。
+8. **只守了流式的"第一眼"，没守"顺不顺"**：行业里流式体验由两个量描述 ——
+   首 token 延迟（TTFT，已覆盖）与 **token 间延迟**（TPOT / ITL：首 token 之后
+   后续 token 之间的间隔）。后者缺失时，用户会遇到"第一个字很快就来了，
+   然后卡住十几秒才继续"—— 这种体验在现有指标里**完全不可见**：
+   `llm_first_token_seconds` 只记一次，整段耗时又被回答长度主导。
+   补法是记录相邻 token 间隔的分布（在单请求内聚合，标签只用 `kind`，不会爆基数），
+   与 TTFT 一起看才完整。**未做**，记在这里以免被当成"已经守住了"。

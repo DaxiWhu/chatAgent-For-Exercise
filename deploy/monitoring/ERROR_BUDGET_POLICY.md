@@ -54,8 +54,11 @@
 | 任一 SLI 剩余 < 20% ⇒ 冻结该 SLI 的变更 | `SLOBudgetLow`（warning） | `slo:budget_remaining_ratio` |
 | 任一 SLI 耗尽 ⇒ 全面冻结 + 48h 复盘 | `SLOBudgetExhausted`（critical） | 同上 |
 
-余量由 `recording.yml` 的**录音规则**算出（两级：先把 SLI 合并成两条每秒速率序列，
-再对 30 天取平均），两条告警只读那一条序列（定义见 `SLO.md` §4b）。
+余量由 `recording.yml` 的**录音规则**算出（两级：先把**每个 SLI** 的分子/分母
+各合并成一条每秒速率序列，再对 30 天取平均），两条告警只读那一条余额序列
+（定义见 `SLO.md` §4b）。新增 SLI 时录音规则必须同步新增 ——
+少一条只是"那个 SLI 的预算永不被检查"，不会有任何报错
+（守卫从 `SLO.md` §3 的目标表推导，见 `test_budget_remaining_is_recorded_for_every_sli`）。
 
 复核时的查询（与告警读的是**同一个数** —— 不会出现"人算一套、告警算另一套"）：
 

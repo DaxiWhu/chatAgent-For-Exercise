@@ -413,12 +413,25 @@ groups:
     rules:
       # ---- 可用性 SLO：30 天 99.5%（错误预算 0.5%） ----
       - alert: SLOAvailabilityBurnFast
+        # ⚠️ 分子 = 5xx **加上** `request_timeout_total`，不是只有 5xx。
+        #    流式请求超时返回的是 **200 + SSE `timeout` 事件**（连接早就开始写了，
+        #    改不了状态码），所以它既不是 5xx、又没有首 token 样本 ——
+        #    只认 5xx 的话，「用户干等 60 秒一个字没看到」会被算成**可用**，
+        #    而延迟 SLI 也不认它 ⇒ 两条 SLI 之间留了一条缝。
+        #    每个请求只落进一条：产出了首 token ⇒ 进 stream_latency；没产出 ⇒ 进这里。
+        #    守卫：`test_availability_counts_stream_timeouts_as_bad_events`。
         expr: |
-          sum(rate(http_requests_total{status=~"5.."}[1h]))
+          (
+            sum(rate(http_requests_total{status=~"5.."}[1h]))
+              + sum(rate(request_timeout_total[1h]))
+          )
             / clamp_min(sum(rate(http_requests_total[1h])), 0.001)
             > 14.4 * (1 - 0.995)
           and
-          sum(rate(http_requests_total{status=~"5.."}[5m]))
+          (
+            sum(rate(http_requests_total{status=~"5.."}[5m]))
+              + sum(rate(request_timeout_total[5m]))
+          )
             / clamp_min(sum(rate(http_requests_total[5m])), 0.001)
             > 14.4 * (1 - 0.995)
         for: 2m
@@ -434,11 +447,17 @@ groups:
 
       - alert: SLOAvailabilityBurnMedium
         expr: |
-          sum(rate(http_requests_total{status=~"5.."}[6h]))
+          (
+            sum(rate(http_requests_total{status=~"5.."}[6h]))
+              + sum(rate(request_timeout_total[6h]))
+          )
             / clamp_min(sum(rate(http_requests_total[6h])), 0.001)
             > 6 * (1 - 0.995)
           and
-          sum(rate(http_requests_total{status=~"5.."}[30m]))
+          (
+            sum(rate(http_requests_total{status=~"5.."}[30m]))
+              + sum(rate(request_timeout_total[30m]))
+          )
             / clamp_min(sum(rate(http_requests_total[30m])), 0.001)
             > 6 * (1 - 0.995)
         for: 15m
@@ -454,11 +473,17 @@ groups:
 
       - alert: SLOAvailabilityBurnSlow
         expr: |
-          sum(rate(http_requests_total{status=~"5.."}[3d]))
+          (
+            sum(rate(http_requests_total{status=~"5.."}[3d]))
+              + sum(rate(request_timeout_total[3d]))
+          )
             / clamp_min(sum(rate(http_requests_total[3d])), 0.001)
             > 1 * (1 - 0.995)
           and
-          sum(rate(http_requests_total{status=~"5.."}[6h]))
+          (
+            sum(rate(http_requests_total{status=~"5.."}[6h]))
+              + sum(rate(request_timeout_total[6h]))
+          )
             / clamp_min(sum(rate(http_requests_total[6h])), 0.001)
             > 1 * (1 - 0.995)
         for: 1h
@@ -521,7 +546,79 @@ groups:
           description: "3 天内平均有 > 1% 的非流式请求超过 1 秒。"
           runbook: "排期优化（典型是 PG 查询缺索引或探针串行等待）；若 1 秒的目标本身定得不合理，改 SLO.md 与表达式两处。"
 
-      # ---- 预算**余量**：与上面 5 条是两种问法，别当成同一族 ----
+      # ---- 流式延迟 SLO：95% 的流式对话请求首 token ≤ 5 秒（预算 5%） ----
+      # 为什么用**首 token**而不是整段耗时：整段由回答长度主导（写三句与写三百句
+      # 差两个数量级），同一个阈值对短答案永远达标、对长答案永远不达标 ——
+      # 它衡量的是"回答有多长"，不是"服务有多快"。行业口径也是如此。
+      #
+      # `kind="chat"` 只算主对话路径，**不含** `resume`（恢复生成 —— 用户预期本就
+      # 不同，他已经等过一轮）与 `review`（内部审核后台）。一个 SLI 必须对应一个
+      # 明确的用户旅程；把三种预期混进同一个分位数，得到的是不对应任何人的数。
+      #
+      # `mode="stream"` 排除 buffered 那一档：agent 链路整段返回，它的"首字节"
+      # 其实是整段生成耗时，与流式差一个数量级。
+      #
+      # `le="5.0"` 必须落在直方图桶边界上（现有边界 … 2.5 / 5.0 / 10.0 …）。
+      # 写成 `le="3.0"` 不会报错，只是**匹配不到任何桶** ⇒ 好事件恒为 0 ⇒
+      # 预算一上线就烧光，而告警照常"在工作"。
+      # 守卫：`test_sli_thresholds_land_on_histogram_bucket_boundaries`。
+      #
+      # 超时的流式请求**刻意不在这里补**：它们没有首 token 样本，已计入
+      # availability 的坏事件（见 SLOAvailabilityBurnFast 的注释）。
+      # 每个请求只进一条 SLI，同一件事不罚两次。
+      - alert: SLOStreamLatencyBurnFast
+        expr: |
+          (
+            sum(rate(llm_first_token_seconds_count{kind="chat",mode="stream"}[1h]))
+              - sum(rate(llm_first_token_seconds_bucket{kind="chat",mode="stream",le="5.0"}[1h]))
+          )
+            / clamp_min(sum(rate(llm_first_token_seconds_count{kind="chat",mode="stream"}[1h])), 0.001)
+            > 14.4 * (1 - 0.95)
+          and
+          (
+            sum(rate(llm_first_token_seconds_count{kind="chat",mode="stream"}[5m]))
+              - sum(rate(llm_first_token_seconds_bucket{kind="chat",mode="stream",le="5.0"}[5m]))
+          )
+            / clamp_min(sum(rate(llm_first_token_seconds_count{kind="chat",mode="stream"}[5m])), 0.001)
+            > 14.4 * (1 - 0.95)
+        for: 2m
+        labels:
+          category: slo
+          severity: warning
+          slo: stream_latency
+          kind: burn
+        annotations:
+          summary: "流式首 token 延迟预算高速燃尽（1h 燃尽率 > 14.4x，slo=stream_latency）"
+          description: "近 5 分钟有 > 72% 的流式对话请求首 token 超过 5 秒（= 14.4 × 5% 错误预算）。注意这是**首 token**，不是整段生成 —— 整段慢由回答长度主导，看它说明不了用户等了多久才看见第一个字。"
+          runbook: "1) 先分诊首 token 之前的每一段：`rag_stage_duration_seconds`（检索）、`agent_history_compaction_seconds{result=\"error\"}`（压缩超时白等一次）、`llm_call_duration_seconds`（模型调用本身）；2) 三者都正常 ⇒ 是**排队**：看 `http_concurrency_in_flight / http_concurrency_limit`、`rate_limited_total` 与上游 429 的重试；3) 同时看 `FirstTokenTooSlow` —— 它（P95 > 8s）通常紧跟在这条之后 firing，那是同一根因的更粗粒度信号；4) 上游整体抖动时优先保护体验（降级到更短的历史、关掉非必要工具），不要调大超时把等待藏起来。"
+
+      - alert: SLOStreamLatencyBurnSlow
+        expr: |
+          (
+            sum(rate(llm_first_token_seconds_count{kind="chat",mode="stream"}[3d]))
+              - sum(rate(llm_first_token_seconds_bucket{kind="chat",mode="stream",le="5.0"}[3d]))
+          )
+            / clamp_min(sum(rate(llm_first_token_seconds_count{kind="chat",mode="stream"}[3d])), 0.001)
+            > 1 * (1 - 0.95)
+          and
+          (
+            sum(rate(llm_first_token_seconds_count{kind="chat",mode="stream"}[6h]))
+              - sum(rate(llm_first_token_seconds_bucket{kind="chat",mode="stream",le="5.0"}[6h]))
+          )
+            / clamp_min(sum(rate(llm_first_token_seconds_count{kind="chat",mode="stream"}[6h])), 0.001)
+            > 1 * (1 - 0.95)
+        for: 1h
+        labels:
+          category: slo
+          severity: warning
+          slo: stream_latency
+          kind: burn
+        annotations:
+          summary: "流式首 token 延迟预算匀速燃尽（3d 燃尽率 > 1x，slo=stream_latency）"
+          description: "3 天内平均有 > 5% 的流式对话请求首 token 超过 5 秒。不紧急，但按此速度月末必然违约 —— 这条的作用是提前一周发现。"
+          runbook: "1) 排期处理，不必立刻叫人；2) 先按 `kind` 与时间分布看是不是集中在特定请求类型（长历史会话更容易慢：压缩 + 检索都随历史增长）；3) 若确认是**本服务的链路**变慢（检索/压缩占比上升），优化那一段；若确认是**上游模型**整体变慢，那是供应商问题 —— 要么换模型/加缓存，要么按 SLO.md §7 正式调整阈值，别让告警长期挂着。"
+
+      # ---- 预算**余量**：与上面 7 条是两种问法，别当成同一族 ----
       # 上面 5 条读的是 `rate`（速率）：回答"按这个速度还要多久烧光"，
       # 所以能在烧掉 2% 时就叫人 —— 但到窗口末尾它对"还剩多少"完全无感。
       # 下面 2 条读的是 `slo:budget_remaining_ratio`（录音规则，见 recording.yml）：

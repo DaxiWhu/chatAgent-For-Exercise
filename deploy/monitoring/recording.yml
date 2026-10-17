@@ -64,8 +64,8 @@ groups:
     # 见上面第 2 条：必须 ≤ lookback delta（默认 5m）的一大截。
     interval: 1m
     rules:
-      # ================= 一级：把 SLI 的分子/分母合并成两条序列 =================
-      # 标签只留 `slo`（availability / latency），其余标签（path/status/release/
+      # ================= 一级：把每个 SLI 的分子/分母各合并成两条序列 =================
+      # 标签只留 `slo`（availability / latency / stream_latency），其余标签（path/status/release/
       # instance…）都在 sum() 里被合并掉 —— 这正是"跨实例聚合、只对全局错误率负责"
       # 这个口径的落地点（见 SLO.md §8 第 1 条）。
       #
@@ -73,7 +73,13 @@ groups:
       # **不能**用 `http_errors_total`（它只在未捕获异常时自增，会系统性低估错误率，
       # 让 SLO 永远显示达标）。守卫：`test_slo_numerator_does_not_use_unhandled_exception_counter`。
       - record: slo:bad_rate_5m
-        expr: sum(rate(http_requests_total{status=~"5.."}[5m]))
+        # ⚠️ 分子 = 5xx **加上**流式超时。超时返回的是 200 + SSE `timeout` 事件，
+        # 不是 5xx；而它又没有首 token 样本、进不了 stream_latency。
+        # 只认 5xx 的话，"用户干等 60 秒一个字没看到"会被算成可用 ——
+        # 这是两条 SLI 之间的缝，必须显式堵上（见 SLO.md §2）。
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+            + sum(rate(request_timeout_total[5m]))
         labels:
           slo: availability
 
@@ -99,15 +105,39 @@ groups:
         labels:
           slo: latency
 
-      # ================= 二级：30 天窗口的预算剩余比例 =================
-      # 两条规则**同一个指标名、只有 `slo` 标签不同** —— 这样告警可以只用一条表达式
-      # 覆盖两种 SLI（政策表写的就是"任一 SLI"），摘要里用 `{{ $labels.slo }}` 点名。
-      # 别把其中一条删掉：删了它只是"少覆盖一种 SLI"，不会有任何报错。
-      # 守卫：`test_budget_remaining_is_recorded_for_every_sli`。
+      # ---- 流式延迟：坏事件 = 首 token 超过 5 秒的那部分 ----
+      # 与 `SLOStreamLatencyBurnFast` 的口径**逐字一致**（`kind="chat"` / `mode="stream"`
+      # / `le="5.0"`）—— 两处不一致时不会报错，只会让"预算里烧的"和"告警里看的"
+      # 是两件不同的事。
       #
-      # ⚠️ 这里**必须**用 `{slo="..."}` 把一级序列限定住。一级的两条 SLI 用的是
+      # `le="5.0"` 必须落在桶边界上：写成 `le="3.0"` 匹配不到任何桶 ⇒
+      # `_bucket` 恒为 0 ⇒ 坏事件 = 总量 ⇒ 预算一周烧光，而没有任何报错。
+      # 守卫：`test_sli_thresholds_land_on_histogram_bucket_boundaries`。
+      #
+      # 分母**只有产出了首 token 的请求**。没产出的（超时）已计入 availability ——
+      # 一个请求只进一条 SLI，不重复罚。
+      - record: slo:bad_rate_5m
+        expr: |
+          sum(rate(llm_first_token_seconds_count{kind="chat",mode="stream"}[5m]))
+            - sum(rate(llm_first_token_seconds_bucket{kind="chat",mode="stream",le="5.0"}[5m]))
+        labels:
+          slo: stream_latency
+
+      - record: slo:total_rate_5m
+        expr: sum(rate(llm_first_token_seconds_count{kind="chat",mode="stream"}[5m]))
+        labels:
+          slo: stream_latency
+
+      # ================= 二级：30 天窗口的预算剩余比例 =================
+      # 每个 SLI 一条规则，**同一个指标名、只有 `slo` 标签不同** —— 这样告警可以只用
+      # 一条表达式覆盖所有 SLI（政策表写的就是"任一 SLI"），摘要里用 `{{ $labels.slo }}` 点名。
+      # 别把其中一条删掉：删了它只是"少覆盖一种 SLI"，不会有任何报错。
+      # 守卫：`test_budget_remaining_is_recorded_for_every_sli`（它从 SLO.md §3 的
+      # 目标表**推导**出该有哪些 SLI，不是写死清单 —— 新增 SLI 忘了录音会立刻红）。
+      #
+      # ⚠️ 这里**必须**用 `{slo="..."}` 把一级序列限定住。一级的所有 SLI 用的是
       # 同一个指标名、只有 `slo` 标签不同，所以不带过滤的 `slo:bad_rate_5m[30d]`
-      # 会同时匹配到两种 SLI 的序列 ⇒ 下面的静态标签 `slo: ...` 会让两条结果的标签集
+      # 会同时匹配到所有 SLI 的序列 ⇒ 下面的静态标签 `slo: ...` 会让几条结果的标签集
       # 撞成同一个（重复样本）⇒ 这条规则每次评估都**报错、什么都不产出**。
       # 守卫：`test_budget_rules_scope_the_level_one_series_by_sli`。
       #
@@ -136,3 +166,12 @@ groups:
           ) / (1 - 0.99)
         labels:
           slo: latency
+
+      - record: slo:budget_remaining_ratio
+        expr: |
+          1 - (
+            avg_over_time(slo:bad_rate_5m{slo="stream_latency"}[30d])
+              / clamp_min(avg_over_time(slo:total_rate_5m{slo="stream_latency"}[30d]), 0.001)
+          ) / (1 - 0.95)
+        labels:
+          slo: stream_latency

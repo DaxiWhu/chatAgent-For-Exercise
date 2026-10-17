@@ -388,6 +388,79 @@
       }
     },
     {
+      "id": 24,
+      "type": "timeseries",
+      "title": "流式首 token 延迟（TTFT，P50 / P95 / P99）",
+      "description": "用户等了多久才看见**第一个字**。只算主对话路径（kind=chat）的流式档：buffered 那一档是 agent 链路整段返回，它的「首字节」其实是整段生成耗时，与流式差一个数量级，混在一起会让分位数失去含义。红色虚线是 SLO 阈值 5 秒（stream_latency：95% 的请求首 token ≤ 5s）。⚠️ 超时的请求**没有样本**、不在这张图里 —— 它们计入可用性 SLI。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(llm_first_token_seconds_bucket{kind=\"chat\",mode=\"stream\"}[5m])))",
+          "legendFormat": "P50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(llm_first_token_seconds_bucket{kind=\"chat\",mode=\"stream\"}[5m])))",
+          "legendFormat": "P95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(llm_first_token_seconds_bucket{kind=\"chat\",mode=\"stream\"}[5m])))",
+          "legendFormat": "P99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "dashed",
+              "line": true
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
       "id": 9,
       "type": "stat",
       "title": "并发饱和率",
@@ -400,7 +473,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 20
+        "y": 28
       },
       "targets": [
         {
@@ -444,7 +517,7 @@
         "h": 8,
         "w": 18,
         "x": 6,
-        "y": 20
+        "y": 28
       },
       "targets": [
         {
@@ -498,7 +571,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 28
+        "y": 36
       },
       "targets": [
         {
@@ -559,7 +632,7 @@
         "h": 8,
         "w": 18,
         "x": 6,
-        "y": 28
+        "y": 36
       },
       "targets": [
         {
@@ -603,7 +676,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 36
+        "y": 44
       },
       "targets": [
         {
@@ -657,7 +730,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 36
+        "y": 44
       },
       "targets": [
         {
@@ -706,7 +779,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 44
+        "y": 52
       },
       "targets": [
         {
@@ -750,7 +823,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 44
+        "y": 52
       },
       "targets": [
         {
@@ -799,7 +872,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 52
+        "y": 60
       },
       "targets": [
         {
@@ -843,7 +916,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 60
+        "y": 68
       },
       "targets": [
         {
@@ -897,7 +970,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 68
+        "y": 76
       },
       "targets": [
         {
@@ -951,7 +1024,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 76
+        "y": 84
       },
       "targets": [
         {
@@ -1000,7 +1073,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 84
+        "y": 92
       },
       "targets": [
         {
@@ -1044,7 +1117,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 92
+        "y": 100
       },
       "targets": [
         {
@@ -1103,7 +1176,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 100
+        "y": 108
       },
       "targets": [
         {
