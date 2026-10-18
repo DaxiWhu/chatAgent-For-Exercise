@@ -338,3 +338,134 @@ def test_endpoint_requires_auth():
     r = anon.post("/v1/sessions/T-sup-anon/messages", json={"message": "hi"})
 
     assert r.status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# 五、幂等键：重试不该把同一句话写两遍
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def idem(monkeypatch):
+    """每个用例一张干净的键表。
+
+    不能共用模块级单例：用例之间只要出现"同键 + 同载荷"，后一个就会拿到**前一个
+    留下的重放**，表现为"怎么没写进历史"。（与 `tests/test_idempotency.py` 同口径。）
+    """
+    import app.main as M
+    from app.idempotency import IdempotencyStore
+
+    store = IdempotencyStore(ttl=600, max_entries=1000, dsn="")
+    monkeypatch.setattr(M, "_IDEMPOTENCY", store)
+    return store
+
+
+def test_the_same_key_writes_once_and_replays_the_same_body(client, idem, monkeypatch):
+    """**这条是幂等在这个端点上的全部价值。**
+    只验状态码等于什么都没验：重新写一遍同样返回 200，而历史里多了一条，
+    模型会以为用户说了两遍、于是把同一句要求当两次强调去执行。
+    """
+    fake = _FakeSession()
+    _patch_session(monkeypatch, fake, "T-sup-idem")
+    h = {"Idempotency-Key": "k-sup-1"}
+    payload = {"message": "再短一点"}
+
+    r1 = client.post("/v1/sessions/T-sup-idem/messages", json=payload, headers=h)
+    assert r1.status_code == 200, r1.text
+    r2 = client.post("/v1/sessions/T-sup-idem/messages", json=payload, headers=h)
+
+    assert r2.status_code == 200, r2.text
+    assert r1.headers.get("idempotency-replayed") is None, "首次请求不该被标成重放"
+    assert r2.headers.get("idempotency-replayed") == "true"
+
+    assert r2.json() == r1.json(), "重放正文必须与首次逐字一致（含同一个 seq）"
+    assert len(fake.items) == 1, "重试又写了一条历史"
+    assert supplements.pending_count("T-sup-idem") == 1
+
+
+def test_same_key_with_a_different_message_is_rejected(client, idem, monkeypatch):
+    """同一个键换了正文 ⇒ 422（草案 2.2 的 MUST NOT）。
+
+    静默当成重复拒掉是更糟的结果：用户确实想说第二句，而服务端一个字都不回。
+    """
+    _patch_session(monkeypatch, _FakeSession(), "T-sup-mm")
+    h = {"Idempotency-Key": "k-sup-mm"}
+
+    first = client.post("/v1/sessions/T-sup-mm/messages",
+                        json={"message": "第一句"}, headers=h)
+    assert first.status_code == 200
+
+    second = client.post("/v1/sessions/T-sup-mm/messages",
+                         json={"message": "第二句"}, headers=h)
+    assert second.status_code == 422
+    assert "不同" in second.json()["detail"]
+
+
+def test_same_key_across_threads_is_rejected(client, idem, monkeypatch):
+    """**同一个键、两个会话、同样一句话**必须 422，不能重放。
+
+    这条防的是一个**完全静默**的错：`thread_id` 在路径里而不在请求体里，
+    只要指纹漏掉它，第二个会话就会拿到第一个会话那次写入的重放 ——
+    客户端以为写进了 B，实际只有 A 有。没有任何报错，只能事后翻历史发现。
+
+    （两个会话都要先认领，否则会先撞上 fail-closed 的 404，测不到这里。）
+    """
+    _patch_session(monkeypatch, _FakeSession(), "T-sup-x1")
+    _patch_session(monkeypatch, _FakeSession(), "T-sup-x2")
+    h = {"Idempotency-Key": "k-sup-cross"}
+    payload = {"message": "同一句"}
+
+    r1 = client.post("/v1/sessions/T-sup-x1/messages", json=payload, headers=h)
+    assert r1.status_code == 200, r1.text
+
+    r2 = client.post("/v1/sessions/T-sup-x2/messages", json=payload, headers=h)
+    assert r2.status_code == 422, "换了一个会话却被当成同一次请求（指纹漏了 thread_id）"
+
+
+class _FlakySession:
+    """第一次写入抛错，之后成功 —— 模拟"PG 抖动一次"。"""
+
+    def __init__(self):
+        self.items = []
+        self.calls = 0
+
+    async def add_items(self, items):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("pg 抖了一下")
+        self.items.extend(items)
+
+
+def test_a_failed_write_does_not_burn_the_key(client, idem, monkeypatch):
+    """写库失败 ⇒ 503，且键**被撤销** ⇒ 同一个键重试能真的再写一次。
+
+    不撤销的后果：一次偶发失败让这个键在 TTL 内彻底不可用，客户端拿着完全正确的
+    重试逻辑，却一直收到 409「正在处理中」，而实际上没有任何东西在处理它。
+    """
+    flaky = _FlakySession()
+    _patch_session(monkeypatch, flaky, "T-sup-flaky")
+    h = {"Idempotency-Key": "k-sup-flaky"}
+    payload = {"message": "别丢掉"}
+
+    bad = client.post("/v1/sessions/T-sup-flaky/messages", json=payload, headers=h)
+    assert bad.status_code == 503
+
+    good = client.post("/v1/sessions/T-sup-flaky/messages", json=payload, headers=h)
+    assert good.status_code == 200, good.text
+    assert good.headers.get("idempotency-replayed") is None, "这是重试成功，不是重放"
+    assert len(flaky.items) == 1
+
+
+def test_without_a_key_nothing_is_deduped(client, idem, monkeypatch):
+    """不带键 = 不去重，行为与这个能力上线之前完全一致。
+
+    草案 2.5.1：带不带键是客户端的自由。默认不要求，所以不带就必须照旧工作 ——
+    否则这次改动会把所有既有客户端打挂。
+    """
+    fake = _FakeSession()
+    _patch_session(monkeypatch, fake, "T-sup-nokey")
+    payload = {"message": "同一句"}
+
+    for _ in range(2):
+        r = client.post("/v1/sessions/T-sup-nokey/messages", json=payload)
+        assert r.status_code == 200
+
+    assert len(fake.items) == 2, "没带键却被去重了（= 用户的第二句被静默吞掉）"

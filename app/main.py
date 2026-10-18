@@ -2955,8 +2955,28 @@ def _replay_from_idem_payload(payload: str | None) -> "EventSourceResponse | Non
                                                  "Idempotency-Replayed": "true"})
 
 
+def _replay_json_from_idem_payload(payload: str | None) -> "JSONResponse | None":
+    """把上一次的 **JSON 响应**原样再回一遍（非流式端点的重放形态）。
+
+    为什么不能复用上面那个 SSE 重放器：它的正文是一串 ``(事件名, 数据)`` 帧，
+    而这里要回的是一个普通 JSON 对象。**要守住的是同一条语义**（标准 2.6：
+    已完成的重试返回上一次的结果），只是"结果长什么样"由端点决定。
+
+    ⚠️ 重放出来的 ``seq`` 是**上一次那个号**，不是新号 —— 这正是对的：它代表
+    "同一次逻辑写入"。若这里重新生成一个号，客户端会以为又写了一条。
+    """
+    if not payload:
+        return None
+    try:
+        body = json.loads(payload)
+    except (TypeError, ValueError):
+        logging.warning("幂等重放正文无法解析，退回 409 指路")
+        return None
+    return JSONResponse(body, headers={"Idempotency-Replayed": "true"})
+
+
 def _idempotency_gate(tenant: str, req_kind: str, raw_key: str, payload,
-                      subject: str = "") -> _IdemGate:
+                      subject: str = "", replay=None) -> _IdemGate:
     """按草案 2.6/2.7 判定这次请求该怎么走。
 
     payload: 参与**请求指纹**（标准 2.4）的载荷。重试必须同键同载荷；
@@ -2967,6 +2987,11 @@ def _idempotency_gate(tenant: str, req_kind: str, raw_key: str, payload,
         猜中别人的键就能按住别人的请求，或在对方完成后拿到对方那次回答的重放。
         ⚠️ 默认空串只是为了让单测/内部调用不必改造；三个 SSE 端点都必须显式传
         `ident.user`，否则这条隔离等于没做（而且是**静默**没做）。
+    replay: "把已完成的正文还原成响应"那个渲染器。默认按 SSE 事件的形态还原
+        （`_replay_from_idem_payload`）；非流式端点传自己的那一个。
+        ⚠️ 这里只换渲染器、**不换状态机** —— 四种状态（NEW / DONE /
+        IN_PROGRESS / MISMATCH）与对应状态码对所有端点必须完全一致，否则
+        `deploy/IDEMPOTENCY.md` 那张判定表就得按端点分叉，客户端没法照一份文档写。
     """
     if not config.IDEMPOTENCY_ENABLED:
         return _IdemGate(None)
@@ -2990,7 +3015,7 @@ def _idempotency_gate(tenant: str, req_kind: str, raw_key: str, payload,
     fp = idem_fingerprint({"op": req_kind, "body": payload})
     result = _IDEMPOTENCY.begin(tenant, key, fp, subject=subject)
     if result.status == IDEM_DONE:
-        replayed = _replay_from_idem_payload(result.payload)
+        replayed = (replay or _replay_from_idem_payload)(result.payload)
         if replayed is not None:
             metrics.inc("idempotency_replay_total")
             return _IdemGate(replayed)
@@ -4034,14 +4059,16 @@ async def session_state_v1(thread_id: str, request: Request,
 @v1.post("/sessions/{thread_id}/messages")
 async def session_message_v1(thread_id: str, req: SessionMessageReq, request: Request,
                              x_tenant_id: str = Header(default=""),
-                             authorization: str = Header(default="")):
+                             authorization: str = Header(default=""),
+                             idempotency_key: str = Header(default="",
+                                                           alias="Idempotency-Key")):
     """POST /v1/sessions/{thread_id}/messages：给**正在进行的任务**补一句话（不触发运行）。
 
     它与 `POST /v1/chat` 的差别只有一件事，但这件事定义了整个接口：
     `/v1/chat` 是"开始一轮"，这里是"给跑着的那一轮补一句"。所以它
     **不启动任何生成**、不占配额、不产生 SSE —— 只是一次写入。
 
-    补的话什么时候生效（三档，按先后）
+    补的话什么时候生效（按先后）
     ------------------------------
       1. **本次模型运行的下一次调用** —— 通过 ``supplements`` 的进程内增量注入。
          这是"用户看到 agent 还在跑，补一句，它下一步就照做"的那一档；
@@ -4075,6 +4102,18 @@ async def session_message_v1(thread_id: str, req: SessionMessageReq, request: Re
     落在两轮之间 —— 落不到 function_call 与 function_call_output 中间。
     这一点如果哪天 SDK 改成逐条写入，这里就会开始产出**非法历史**（下一轮模型调用
     直接报错），所以它不是风格问题，是依赖。
+
+    为什么这个端点也要 `Idempotency-Key`
+    ----------------------------------
+    `/v1/chat` 要它，是因为重试会重复生成、重复计费；这里要它，是因为重试会
+    **把同一句话写两遍**。性质相同（一次请求变成两次副作用），后果不同：
+    那边是账单翻倍，这边是**模型以为用户说了两遍**，于是把同一句要求当成两次强调
+    去执行 —— 而用户只看得到一个"已收到"。
+
+    ⚠️ 指纹里必须带 `thread_id`：它在本端点位于**路径**而不在请求体里，
+    不显式并进去的话，"同一个键、两个不同会话、同样一句话"会被判成同一次请求
+    并**重放** —— 客户端以为写进了 B 会话，而实际只有 A 会话里有。这个错没有任何
+    报错，只能靠事后翻历史发现。
     """
     ident = await _off(_authenticate, x_tenant_id, authorization)
     await _off(_rate_limit, request, thread_id, ident.user, True)
@@ -4098,12 +4137,25 @@ async def session_message_v1(thread_id: str, req: SessionMessageReq, request: Re
             status_code=503,
             detail="会话历史后端不可用（未配置 DB_URL），补充无法保存")
 
+    # 幂等闸门排在**所有业务 4xx 与"没有后端"之后**。理由与 `/review` 那条修正相同：
+    # `begin()` 是"先占后判"的原子抢占，让一个必然失败的请求先占住键，客户端拿同一个
+    # 键重试就会被自己的 409「正在处理中」挡住 —— 而实际上没有任何东西在处理它。
+    gate = await _off(_idempotency_gate, ident.tenant, "session_message",
+                      idempotency_key,
+                      {"thread_id": thread_id, **req.model_dump()},
+                      ident.user, _replay_json_from_idem_payload)
+    if gate.response is not None:
+        return gate.response
+
     line = f"{supplements.PREFIX}{text}"
     try:
         # ⚠️ 这是**异步**方法（官方 Session 协议），必须 await —— 漏掉的话拿到的
         # 是一个从未被 await 的协程，写入不会发生，而接口照样返回 accepted。
         await session.add_items([{"role": "user", "content": line}])
     except Exception as e:  # noqa: BLE001  后端抖动 / 表缺失
+        # 失败**不占用**键（见 idempotency.py 的"失败与未完成不占用键"）：
+        # PG 抖动一次不该让这个键在 TTL 内不可用，而客户端的重试完全正确。
+        await _off(_release_idem_gate, gate, ident.tenant)
         metrics.inc("session_message_errors_total")
         logging.exception("补充写入会话历史失败：session=%s", thread_id)
         raise HTTPException(status_code=503,
@@ -4113,7 +4165,7 @@ async def session_message_v1(thread_id: str, req: SessionMessageReq, request: Re
     metrics.inc("session_message_total")
     logging.info("任务执行中补充：session=%s subject=%s seq=%s chars=%d",
                  thread_id, ident.user, seq, len(text))
-    return {
+    body = {
         "thread_id": thread_id,
         "accepted": True,
         # 0 = 没登记（会话号或正文为空，理论上走不到 —— 上面已经挡过）。
@@ -4121,6 +4173,11 @@ async def session_message_v1(thread_id: str, req: SessionMessageReq, request: Re
         "pending": supplements.pending_count(thread_id),
         "applies_to": ["running_model_call", "next_node", "next_turn"],
     }
+    # 登记"已完成 + 可重放的正文"。同键重试据此原样返回**同一个 seq** —— 那代表
+    # "同一次逻辑写入"，重新生成一个号会让客户端以为又写了一条。
+    await _off(_IDEMPOTENCY.finish, ident.tenant, gate.key, gate.fp,
+               json.dumps(body, ensure_ascii=False), subject=gate.subject)
+    return body
 
 
 @v1.post("/sessions/{thread_id}/stop")

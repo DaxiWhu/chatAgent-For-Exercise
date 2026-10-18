@@ -132,7 +132,7 @@ pytest tests/ -q
 | POST | `/v1/chat` | SSE 流式对话。事件：`token` 增量文本、`citations` 引用、`need_review` 需人工审核、`budget_exceeded` 超 token 预算、`timeout` 超请求总时限（终止性，其后无 `done`）、`stopped` 被用户停止（终止性，其后无 `done`）、`done` 结束、`error` 异常 |
 | POST | `/v1/chat/resume` | **续跑中途断掉的会话**（SSE，事件同 `/v1/chat`）。body：`{thread_id}`。待人工审核时返回 409 并指路 `/v1/review` |
 | GET | `/v1/sessions/{thread_id}` | **会话状态快照**（断点续传的基础）。纯读、幂等，返回 `status` / `resumable` / `draft` / `messages` / `citations` / `pending_review` |
-| POST | `/v1/sessions/{thread_id}/messages` | **任务执行中补一句话**（不触发运行、不占配额、无 SSE）。body：`{message}`。生效时机：本次运行的下一次模型调用 → 下一个 agent 节点 → 下一轮。会话后端不可用时 503（那份补充存不下来） |
+| POST | `/v1/sessions/{thread_id}/messages` | **任务执行中补一句话**（不触发运行、不占配额、无 SSE）。body：`{message}`。生效时机：本次运行的下一次模型调用 → 下一个 agent 节点 → 下一轮。支持 `Idempotency-Key`（重试不会写两遍）。会话后端不可用时 503（那份补充存不下来） |
 | POST | `/v1/sessions/{thread_id}/stop` | **停掉正在跑的那一次运行**。停止后 SSE 收到终止性的 `stopped` 事件（其后无 `done`），已产出正文保留、检查点保留可 `resume`。当前没有在跑的任务返回 409；重复调用幂等 |
 | POST | `/v1/review` | 人工审核 resume。body：`{thread_id, action: "accept"\|"revise", feedback}`。非审核态返回 409 |
 | GET | `/v1/reviews` | 待人工审核队列（分页列举，含草稿摘要与评分） |
