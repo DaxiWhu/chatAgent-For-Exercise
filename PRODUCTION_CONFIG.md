@@ -482,8 +482,12 @@ curl -s localhost:8000/health/ready | python -m json.tool
        `python_gc_collected_objects_total`。它们**缺席才是问题** ——
        说明该平台的 RSS 读取分支没命中（只在 Windows / Linux 上实现），
        而不是"暂时没有数据"。
+       ⚠️ 同理，`llm_inter_chunk_seconds` **要求一次回答至少有两个 chunk** 才会出现
+       第一个样本。所有请求都"一句话答完"时它不会出现，这是正常的；
+       反过来，它在有长回答的时段仍然为空，才说明埋点没走到。
 16. [ ] `deploy/monitoring/alerts.yml` 已加载（**6 组 62 条**），且 `review_pending` 有"长时间 > 0"的告警
-17. [ ] `chatagent-slo` 组已加载（面板上能看到 5 条燃尽率规则 + 2 条预算余量规则），
+17. [ ] `chatagent-slo` 组已加载（面板上能看到 **7 条**燃尽率规则 + 2 条预算余量规则；
+       7 = availability 3 条 + latency 2 条 + stream_latency 2 条），
        且 `SLO.md` 的两张表与表达式一致（`pytest tests/test_monitoring_config.py` 会钉住）。
        ⚠️ 还要确认**录音规则真的在跑**（它是 `SLOBudget*` 唯一的数据来源，也是**哑弹重灾区**）：
        `prometheus.yml` 的 `rule_files` 含 `recording.yml` 且它被挂进容器，

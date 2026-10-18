@@ -63,7 +63,7 @@ SLO 把"坏不坏"换成"**按这个速度烧下去，月底还够不够**"，�
 | 官方指标 | 衡量什么 | 本项目 |
 | --- | --- | --- |
 | `gen_ai.server.time_to_first_token` | 排队 + 预填充（首 token 之前） | ✅ 采用 |
-| `gen_ai.server.time_per_output_token` | 首 token 之后的解码速度（token 间延迟） | ❌ 未做，见 §8 第 8 条 |
+| `gen_ai.server.time_per_output_token` | 首 token 之后的解码速度（token 间延迟） | 🟡 指标已补（`llm_inter_chunk_seconds`），**不设 SLO**，见 §8 第 8 条 |
 | `gen_ai.server.request.duration` | 整段请求耗时（被回答长度主导） | ✅ 已有，但**不做流式 SLI** |
 
 该规范给 TTFT 的建议桶边界里就包含 **2.5 / 5.0 / 10.0**，与本项目
@@ -265,12 +265,24 @@ SLO（改本文 + 改表达式），而不是让告警长期挂着 —— 一条
 
    改阈值或目标时**三处必须同改**：§3 目标表、§4 燃尽率表的 `target` 列、
    `recording.yml` 的 `(1 - 0.95)`。少改一处不会有任何报错，只会让预算算的是另一个 SLO。
-8. **只守了流式的"第一眼"，没守"顺不顺"**：流式体验由**两个**量描述 ——
-   首 token 延迟（TTFT，已覆盖）与 **token 间延迟**（TPOT / ITL：首 token 之后
-   后续 token 之间的间隔）。后者不是可选补充，OpenTelemetry 的 GenAI 语义约定
-   里它是独立的一条（`gen_ai.server.time_per_output_token`，衡量解码阶段）。
-   缺失它时，用户会遇到"第一个字很快就来了，然后卡住十几秒才继续"——
-   这种体验在现有指标里**完全不可见**：
-   `llm_first_token_seconds` 只记一次，整段耗时又被回答长度主导。
-   补法是记录相邻 token 间隔的分布（在单请求内聚合，标签只用 `kind`，不会爆基数），
-   与 TTFT 一起看才完整。**未做**，记在这里以免被当成"已经守住了"。
+8. **流式的"顺不顺"已经**有指标**，但**没有 SLO** —— 这是刻意的**：
+   流式体验由两个量描述，首 token 延迟（TTFT，§2 的 `stream_latency`）与
+   **相邻 chunk 的间隔**。后者记在 `llm_inter_chunk_seconds{kind}`，口径取
+   OpenTelemetry 客户端推理约定里的 `gen_ai.client.inference.time_per_output_chunk`
+   （"首 chunk 之后，每收到一个 chunk 记一次，量的是与上一个 chunk 的间隔"），
+   而不是 `gen_ai.server.time_per_output_token` 的"总时长 ÷ token 数" ——
+   后者会把一次卡顿**平摊到所有 token 上**，正好把要抓的东西抹平。
+
+   为什么不设 SLO：
+   * **没有生产基线**，目标值只能拍。`stream_latency` 的 5s/95% 至少有两条
+     可核对的约束（桶边界、要比 `FirstTokenTooSlow` 的 8s 紧），TPOT 没有；
+   * 它的用途是**分诊**而不是对外承诺：定位"是上游解码慢，还是我们自己把
+     事件循环堵了"（后者看 `event_loop_lag_seconds`）。分诊量不该占预算。
+   要把它升成 SLO，先按 §8 第 7 条的方法回填基线（`CAPACITY.md` §五有清单）。
+
+   ⚠️ 两个必须知道的局限（否则会把它当成"精确的 token 间延迟"）：
+   * **chunk ≠ token**：上游按多 token 批量下发时，这个数会**大于**真实的
+     token 间延迟。它能回答"有没有卡住"，不能回答"每秒吐几个 token"；
+   * **桶边界在该区间的分辨率有限**：全仓共用一套桶（5/10/25/50/100/250ms…），
+     不像官方 TPOT 建议的桶那样在 75~300ms 有细分。P95 只能粗略定位，
+     但"卡到秒级"这类真正需要处置的情况落在 1.0s 以上，分辨率足够。

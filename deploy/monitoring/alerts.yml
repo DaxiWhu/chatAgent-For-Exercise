@@ -311,7 +311,7 @@ groups:
           severity: warning
         annotations:
           summary: "首字节延迟 P95 超过 8 秒（{{ $labels.kind }}）"
-          description: "近 10 分钟流式请求的首字节 P95 = {{ $value }}s。用户在这段时间里看到的是一个空白的回答区。只看 `mode` 为 stream 的那一档：非流式链路（agent 链路整段返回）的「首字节」其实是整段生成耗时，混进同一个分位数会让这个数失去含义。"
+          description: "近 10 分钟流式请求的首字节 P95 = {{ $value }}s。用户在这段时间里看到的是一个空白的回答区。只看 `mode` 为 stream 的那一档：非流式链路（agent 链路整段返回）的「首字节」其实是整段生成耗时，混进同一个分位数会让这个数失去含义。⚠️ 这条只管「第一个字等了多久」：首 token 正常、但用户抱怨「答到一半卡住」的情况**不在它覆盖范围内**，要看 `llm_inter_chunk_seconds`（相邻 chunk 的间隔，见 RUNBOOK 同名条目）。"
           runbook: "1) 先分诊：看 `rag_stage_duration_seconds`（检索是不是慢了）、`llm_call_duration_seconds`（模型调用是不是慢了）、以及 `agent_history_compaction_seconds`（跨轮历史压缩的那次摘要调用）。最后这条容易被漏掉：它压在首 token 之前，但**只在历史超过预算时才发生**，所以整体 P95 里几乎看不见它 —— 要单独看它的分布，并用 `result=error` 那一档区分『压得慢』与『压失败后白等一次超时』；2) 三者都正常 ⇒ 问题在**排队/并发**：看 `http_concurrency_in_flight / http_concurrency_limit` 与 `rate_limited_total`；3) 若同时 `client_disconnected_total` 在涨，说明用户已经在关页面了，优先处理；4) 对照 `llm_tokens_total` 排除「上游整体过载」。"
 
       - alert: LlmCallErrorsHigh

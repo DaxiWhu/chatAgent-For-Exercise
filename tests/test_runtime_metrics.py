@@ -733,6 +733,14 @@ DRILL_ONLY = (
     "process_cpu_seconds_total",
     "python_gc_collections_total",
     "python_gc_collected_objects_total",
+    # 首 token 之后的"顺不顺"：每收到一个 chunk 记一次间隔（口径同 OpenTelemetry
+    # 的 `gen_ai.client.inference.time_per_output_chunk`）。
+    # 为什么只做下钻、不单独设阈值：**没有生产基线**，阈值只能拍；
+    # 而"用户体验已经坏了"这件事有更粗的信号兜着（`client_disconnected_total`
+    # 与端到端延迟）。拍一个阈值出来只会制造长期噪音 —— 噪音告警等于没有告警。
+    # 真正的用法是：`FirstTokenTooSlow` 之外，用户还抱怨"答到一半卡住"时，
+    # 用它区分"上游解码慢"与"我们自己的事件循环被堵"（后者看 `event_loop_lag_seconds`）。
+    "llm_inter_chunk_seconds",
     # 幂等键的另外四个分档都只在 `IdempotencyConflictsHigh` 的 runbook 里被指路：
     # 它们回答的是"冲突是哪种冲突"，属于**下钻**而不是独立的故障信号。
     "idempotency_replay_total",      # 被正确吸收的重试次数（机制的价值体现）

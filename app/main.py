@@ -2425,6 +2425,14 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
     budget = budget if budget is not None else RequestBudget(0)
     deadline = _RequestDeadline(timeout)
     produced: list[str] = []
+    # chunk 间延迟（TPOT）的游标：上一个**已交付** chunk 的到达时刻，以及它属于
+    # 哪一次模型调用。判据必须是"同一次调用"而不能只是"同一个节点" —— 同一个
+    # agent 节点里完全可能调用两次模型，中间隔着一次工具执行（几百毫秒到几十秒），
+    # 那段等待**不是解码耗时**，混进来会把 TPOT 的 P95 直接抬到秒级。
+    # 实测（`tmp_probe/probe_chunk_identity.py`）：同一个节点内接连两次调用，
+    # chunk 的 `id` 不同；同一次调用内的各 chunk 共享同一个 `id`。
+    last_chunk_at = 0.0
+    last_call = None
     # TTFT（首字节延迟）的起点。为什么落在函数体内而不是更外面：本函数是
     # async generator，函数体要等第一次迭代才执行 —— 而 `_sse` 创建它之后
     # **立即** `async for`，两者之间只隔一次事件循环调度（微秒级，可忽略）。
@@ -2482,7 +2490,7 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
             if disconnect is not None and disconnect.closed:
                 break
             try:
-                msg, _meta = await deadline.run(anext)
+                msg, meta = await deadline.run(anext)
             except StopAsyncIteration:
                 break
             except TimeoutError:
@@ -2490,6 +2498,9 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
                 # `aget_state` 本身也是网络调用，继续等下去等于没有时限。
                 yield _record(_timeout_event(req_kind, deadline, produced))
                 return
+            # 到达时刻在**任何处理之前**取：后面还要判预算、拼事件，那些开销
+            # 会随实现变化，而 TTFT / TPOT 量的都该是"用户等了多久"。
+            arrived = time.perf_counter()
             if msg.content:
                 text = msg.content
                 if not budget.add(text):
@@ -2500,13 +2511,28 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
                     yield _record(_sse_json("budget_exceeded",
                                             {"used": budget.used, "limit": budget.limit}))
                     break
+                # "这一次模型调用"的标记：节点名 + 消息 id。
+                # `id` 由 langgraph 按 run 生成（实测形如 `lc_run--<uuid>`），
+                # 同一次调用内恒定、换一次调用就变；节点名在 `id` 缺失时兜底。
+                call = (meta or {}).get("langgraph_node"), getattr(msg, "id", None)
                 if not produced:
                     # 首个 token = TTFT。放在预算判定**之后**：预算被顶掉时
                     # 用户一个字的正文都没看到，把它算成一次首字节会系统性
                     # 压低 TTFT（最需要它的场景反而被抹平）。
                     metrics.observe("llm_first_token_seconds",
-                                    time.perf_counter() - started,
+                                    arrived - started,
                                     kind=req_kind, mode="stream")
+                elif last_chunk_at and call == last_call:
+                    # 第二个及以后的 chunk：记"距上一个 chunk 到达多久"。
+                    # 口径同 OpenTelemetry 的 `gen_ai.client.inference.
+                    # time_per_output_chunk`（每个首 chunk 之后的 chunk 记一次，
+                    # 量的是与上一个 chunk 的间隔），而不是"总时长 ÷ token 数"——
+                    # 后者会把一次卡顿平摊到所有 token 上，正好把要抓的东西抹平。
+                    #
+                    # 换了一次模型调用就**不记**：那中间是工具执行 / 节点调度。
+                    metrics.observe("llm_inter_chunk_seconds",
+                                    arrived - last_chunk_at, kind=req_kind)
+                last_chunk_at, last_call = arrived, call
                 produced.append(text)
                 yield _record({"event": "token", "data": text})
 

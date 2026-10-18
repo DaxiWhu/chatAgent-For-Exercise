@@ -461,6 +461,63 @@
       }
     },
     {
+      "id": 25,
+      "type": "timeseries",
+      "title": "流式 chunk 间延迟（TPOT，P50 / P95 / P99）",
+      "description": "首 token 之后，相邻两个 chunk 之间隔了多久 —— 回答「第一个字很快，然后卡住」这种体验。口径同 OpenTelemetry 的 `gen_ai.client.inference.time_per_output_chunk`：每个首 chunk 之后的 chunk 记一次。\n⚠️ 跨模型调用的等待**不在**里面（那是工具执行，不是解码）；chunk 也**不等于** token（上游可能一次下发多个），所以别用它算 TPS。\n分诊：尖峰同时出现在 `event_loop_lag_seconds` ⇒ 我们自己堵住了事件循环；只有这条有尖峰 ⇒ 上游解码中途卡住。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 28
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(llm_inter_chunk_seconds_bucket{kind=\"chat\"}[5m])))",
+          "legendFormat": "P50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(llm_inter_chunk_seconds_bucket{kind=\"chat\"}[5m])))",
+          "legendFormat": "P95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(llm_inter_chunk_seconds_bucket{kind=\"chat\"}[5m])))",
+          "legendFormat": "P99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineInterpolation": "smooth"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
       "id": 9,
       "type": "stat",
       "title": "并发饱和率",
@@ -473,7 +530,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 28
+        "y": 36
       },
       "targets": [
         {
@@ -517,7 +574,7 @@
         "h": 8,
         "w": 18,
         "x": 6,
-        "y": 28
+        "y": 36
       },
       "targets": [
         {
@@ -571,7 +628,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 36
+        "y": 44
       },
       "targets": [
         {
@@ -632,7 +689,7 @@
         "h": 8,
         "w": 18,
         "x": 6,
-        "y": 36
+        "y": 44
       },
       "targets": [
         {
@@ -676,7 +733,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 44
+        "y": 52
       },
       "targets": [
         {
@@ -730,7 +787,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 44
+        "y": 52
       },
       "targets": [
         {
@@ -779,7 +836,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 52
+        "y": 60
       },
       "targets": [
         {
@@ -823,7 +880,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 52
+        "y": 60
       },
       "targets": [
         {
@@ -872,7 +929,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 60
+        "y": 68
       },
       "targets": [
         {
@@ -916,7 +973,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 68
+        "y": 76
       },
       "targets": [
         {
@@ -970,7 +1027,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 76
+        "y": 84
       },
       "targets": [
         {
@@ -1024,7 +1081,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 84
+        "y": 92
       },
       "targets": [
         {
@@ -1073,7 +1130,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 92
+        "y": 100
       },
       "targets": [
         {
@@ -1117,7 +1174,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 100
+        "y": 108
       },
       "targets": [
         {
@@ -1176,7 +1233,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 108
+        "y": 116
       },
       "targets": [
         {
