@@ -715,6 +715,12 @@ ALERTED = (
     # 客户端在拿同一个 Idempotency-Key 反复提交 —— 挡住的是重复计费，
     # 而**挡不住**的那部分（客户端没带键 / 键过期）在服务端没有任何错误信号。
     "idempotency_conflict_total",
+    # 任务执行中的人机交互两条失败面（2026-10-18）：
+    #   · run_control   —— 登记/停止失败 ⇒ "停不下来"，而它正是成本与安全的止损阀；
+    #   · session_message —— 补充写不进历史 ⇒ "用户说了没听见"，且只有 503 这一个信号。
+    # 两者都不影响"任务能不能跑"，所以不会被任何错误率/延迟告警顺带发现。
+    "run_control_errors_total",
+    "session_message_errors_total",
 )
 
 DRILL_ONLY = (
@@ -747,6 +753,11 @@ DRILL_ONLY = (
     "idempotency_mismatch_total",    # 同键换载荷 = 客户端 bug（非服务端故障）
     "idempotency_rejected_total",    # 键缺失/格式非法 = 接入事故
     "idempotency_truncated_total",   # 响应太大没能缓存 ⇒ 重放退化成 409 指路
+    # 补充与停止的**次数**是正常行为，不是故障信号。它们只在上面两条失败告警的
+    # description 里被指路 —— 用途是回答"这是普遍现象还是个例"。
+    "session_message_total",
+    "run_stop_requested_total",
+    "run_stopped_total",
 )
 
 ALL_NEW_METRICS = ALERTED + DRILL_ONLY

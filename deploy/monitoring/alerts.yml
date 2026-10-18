@@ -385,6 +385,38 @@ groups:
           description: "客户端正在对同一个 Idempotency-Key 重复提交。reason=in_flight 占多数 ⇒ 请求比客户端的重试窗口更慢；reason=not_replayable 占多数 ⇒ 上一次已完成但响应没能缓存下来（重放上限 IDEMPOTENCY_MAX_BODY_BYTES 被撑满）。两者要看的图完全不同。"
           runbook: "1) 先按 reason 分档：sum by (reason) (increase(idempotency_conflict_total[15m]))；2) in_flight 多 ⇒ 对照 HighLatencyP95 与 llm_first_token_seconds 确认是不是上游变慢导致客户端提前重试（若确实更慢，客户端该调的是自己的超时，而不是让服务端放宽幂等）；3) not_replayable 多 ⇒ 看 idempotency_truncated_total 是否同向在涨，并据此调大 IDEMPOTENCY_MAX_BODY_BYTES；4) 顺手核对 idempotency_replay_total —— 它是被**正确吸收**的重试次数，两条曲线一起看才是全貌；5) idempotency_mismatch_total 在涨说明客户端把键用错了（同键换了载荷）—— 那是客户端 bug，不是服务端故障；6) idempotency_rejected_total 在涨说明客户端没按 IDEMPOTENCY_DOC_URL 公布的格式带键（缺头或含非法字符）。"
 
+      - alert: RunControlErrors
+        # 运行登记 / 停止请求 / 状态查询失败。它不影响"任务能不能跑"，只影响
+        # "能不能被停下来" —— 而这正是最难排查的那类：用户点了停止没反应，
+        # 服务端日志里一切正常（登记压根没成功，谁都没报错）。
+        # 为什么值得一条告警：停止是**成本与安全的止损阀**（别继续烧 token、
+        # 别继续改用户的文件），它静默失效时没有别的信号能发现。
+        expr: increase(run_control_errors_total[15m]) > 0
+        for: 5m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "运行控制失败（op={{ $labels.op }}）"
+          description: "近 15 分钟有 {{ $value }} 次运行控制操作失败。op=begin ⇒ 这次运行**无法被停止**；op=request_stop ⇒ 停止请求没写进去（跨副本时表现为「点了没反应」）；op=stop_requested ⇒ 查不到停止状态，服务端会当「没停」继续跑；op=finish ⇒ 登记行残留，下一次 /stop 可能打到一条已经结束的运行上。顺带看 `run_stop_requested_total` 与 `run_stopped_total`：前者是「点了多少次」，后者是「真的收流了多少次」，两条曲线长期对不上说明停止没有真正生效。"
+          runbook: "1) `docker logs` 搜「运行登记」「停止请求」，看是 PG 不可达、连接池耗尽，还是 agent_runs 表不存在（忘了跑 `python -m app.migrations apply`，版本 9）；2) 查表：`SELECT count(*), max(started_at) FROM agent_runs;` —— 行数远大于并发数说明 finish 一直在失败，那些残行要先手工清掉（它们是「幽灵运行」，会让 /stop 打空）；3) 单副本部署可以临时接受降级（停止只对同进程生效），但仍要修：多副本是常态。"
+
+      - alert: SessionMessageErrors
+        # "任务执行中补充"写不进会话历史。影响是**用户说的话丢了**，而且丢得
+        # 很安静：接口会回 503（客户端能看见），但如果客户端把它当可忽略的
+        # 增强接口、不做提示，用户就会以为 agent 已经收到了。
+        # 为什么值得单独一条而不是并进 RunControlErrors：两者失败的**后果**不同 ——
+        # 那条是"停不下来"，这条是"说了没听见"，处置入口完全不一样。
+        expr: increase(session_message_errors_total[15m]) > 0
+        for: 5m
+        labels:
+          category: availability
+          severity: warning
+        annotations:
+          summary: "任务执行中补充写入失败"
+          description: "近 15 分钟有 {{ $value }} 次补充消息写入会话历史失败。这类补充是**唯一持久**的那一份（进程内暂存会随重启/换副本消失），写不进去就意味着下一个节点与下一轮都看不到它。顺带看 `session_message_total`：若它同时为 0，说明这个端点根本没被调用过，问题在上游客户端而不是存储。"
+          runbook: "1) `docker logs` 搜「补充写入会话历史失败」，异常类型会直接写在响应里（503 带 `type(e).__name__`）；2) 常见原因：`DB_URL` 没配（单机开发环境）、`agent_messages` 表没建（迁移版本 7）、PG 连接池耗尽；3) 确认 `session_message_total` 的增速 —— 只有高峰失败 ⇒ 容量问题，一直失败 ⇒ 配置问题；4) 恢复后提醒用户：失败那几句**没有**进历史，需要重发。"
+
   # =========================================================================
   # SLO 与错误预算（定义见 SLO.md，本组的表达式与那份文档一一对应）
   # =========================================================================

@@ -49,7 +49,7 @@ import sys
 from dataclasses import dataclass
 
 #: 当前代码期望的结构版本（新增迁移时同步 +1）
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 #: 迁移元表。**这份 DDL 必须内联**：它是"记录其他迁移的工具"，不能被别的迁移依赖。
 _MIGRATIONS_TABLE = (
@@ -244,6 +244,25 @@ def _m8_account_tables(dsn, ctx):
     AccountStore(dsn=dsn).ensure_schema()
 
 
+def _m9_run_control_table(dsn, ctx):
+    """运行登记表：`agent_runs`（2026-10-18）。
+
+    DDL 出处：`RunControl.schema_statements`（本文件不重写 DDL，与 m1~m6 同口径）。
+
+    为什么单独占一个版本号：与 m4~m8 同理 —— 老库的 `schema_migrations` 里没有这条，
+    `--apply` 才会执行它。只改代码不加版本号的话，`--status` 会报"无待应用迁移"，
+    于是新表在老库上永远不会被建出来，直到第一次点"停止"才炸 —— 而那时报的是
+    SQL 错误，离"忘了跑迁移"很远。
+
+    为什么这张表**可以清空**（与 `agent_sessions` 刻意相反）：它存的是"此刻谁在跑"，
+    不是用户内容。进程崩溃留下的残行没有任何价值，反而会让下一次 `/stop` 打到一条
+    不存在的运行上。
+    """
+    from .run_control import RunControl
+
+    RunControl(dsn=dsn).ensure_schema()
+
+
 MIGRATIONS: tuple = (
     Migration(1, "rag_chunks 向量表", _m1_rag_chunks),
     Migration(2, "review_queue 审核队列表", _m2_review_queue),
@@ -253,6 +272,7 @@ MIGRATIONS: tuple = (
     Migration(6, "session_owners 用户维度列（同租户内隔离到人）", _m6_session_owners_user),
     Migration(7, "agent_sessions / agent_messages 跨轮对话历史表", _m7_agent_session_tables),
     Migration(8, "tenants / users / tenant_join_requests 账号体系表", _m8_account_tables),
+    Migration(9, "agent_runs 运行登记表（停止任务）", _m9_run_control_table),
 )
 
 

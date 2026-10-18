@@ -27,7 +27,9 @@ import logging
 import os
 import random
 import sys
+import threading
 import time
+import uuid
 import warnings
 
 # 1) 日志最先配置：结构化 JSON + request_id，让"一次请求的所有日志"可串起来
@@ -74,6 +76,7 @@ from .middleware import BodySizeLimitMiddleware, ConcurrencyLimitMiddleware, Req
 from .quota import RequestBudget, build_quota_manager, estimate_tokens
 from .ratelimit import build_rate_limiter
 from .review_queue import build_review_queue
+from .run_control import build_run_control
 from .sessions import SessionError, build_session_registry
 
 # ---------------------------------------------------------------------------
@@ -93,6 +96,7 @@ _LIMITER = build_rate_limiter()
 _QUOTA = build_quota_manager()
 _REVIEW_QUEUE = build_review_queue()
 _SESSIONS = build_session_registry()
+_RUNS = build_run_control()
 #: 幂等键表：客户端重试的拦截点（见 `app/idempotency.py` 的语义说明）。
 _IDEMPOTENCY = build_idempotency_store()
 #: 账号体系：租户 / 用户 / 加入申请。
@@ -1696,6 +1700,22 @@ class ChatReq(BaseModel):
         return _bounded(v, config.MAX_MESSAGE_CHARS, "message")
 
 
+class SessionMessageReq(BaseModel):
+    """追加到会话的一句补充（**不触发运行**）。
+
+    与 ``ChatReq`` 的区别只有一处，但它在语义上是全部：``/v1/chat`` 是"开始一轮"，
+    本请求是"给正在跑的那一轮补一句"。所以它没有 thread_id 字段（在路径里）、
+    也不该被当成新任务 —— 见 ``POST /v1/sessions/{id}/messages`` 的说明。
+    """
+
+    message: str
+
+    @field_validator("message")
+    @classmethod
+    def _v_message(cls, v: str) -> str:
+        return _bounded(v, config.MAX_MESSAGE_CHARS, "message")
+
+
 class ReviewReq(BaseModel):
     thread_id: str
     action: str            # accept | revise
@@ -2297,6 +2317,68 @@ async def _watch_disconnect(signal, produced, state):
         logging.debug("断连监听任务异常退出", exc_info=True)
 
 
+def _stopped_event(req_kind: str, produced) -> dict:
+    """用户主动停下：计数 + 日志 + 生成 `stopped` 事件（**终止性**，其后没有 done）。
+
+    与 `timeout` 的区别只有"谁按的"：一个是时限到了，一个是人叫停。两者对客户端
+    的语义一样 —— **已产出的正文照常保留**，不要再等一个 `done`。
+
+    为什么必须给一个明确的事件、而不是静默结束流：客户端无法区分"被停了"与
+    "网络断了"。前者不该自动重试（用户就是不想让它继续），后者应该 —— 混成一个
+    表现，客户端只能二选一，而两种选择都有代价。
+    """
+    chars = sum(len(x) for x in produced)
+    metrics.inc("run_stopped_total", kind=req_kind)
+    logging.warning("%s 被用户停止（已产出 %d 字）；检查点保留，可 /v1/chat/resume 续跑",
+                    req_kind, chars)
+    return _sse_json("stopped", {
+        "produced_chars": chars,
+        # 检查点在节点边界，所以"停"不等于"作废"：客户端想接着跑可以 resume。
+        "resumable": True,
+    })
+
+
+async def _watch_stop(run_id: str, flag, produced, state):
+    """独立任务：轮询"这次运行要不要停"，一旦要停就**尽力**关掉上游。
+
+    为什么也必须是独立任务（与 `_watch_disconnect` 同一条理由）
+    ------------------------------------------------------
+    主循环只在"上游产出 chunk"时才转一圈。上游限流重试、连接挂死时循环体一次都不
+    执行 —— 那时"检查停止标志"永远没机会发生，用户点了停止却像没点一样。
+
+    为什么轮询间隔按后端分档
+    ----------------------
+    内存后端是一次字典读（微秒级），可以密一点；PG 后端是**一次远程查询**，
+    0.5s 一次会把连接池当计数器用。跨副本的停止延迟 2s 是刻意的取舍：
+    真正在意毫秒级的是同副本的那条路（用户与任务通常落在同一个入口）。
+
+    ⚠️ 关流这一步是"尽力"，不是保证：主循环可能正在驱动这个生成器，
+    并发 `aclose()` 会撞上 asyncio 的 "asynchronous generator is already running"。
+    这里吞掉该异常 —— 真正的收尾在生成器自己的 `finally` 里。
+    """
+    interval = 0.5 if not _RUNS.dsn else 2.0
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            if flag.is_set():
+                return
+            if await _off(_RUNS.stop_requested, run_id):
+                flag.set()
+                logging.warning("收到停止请求：run=%s 已产出 %d 段，正在收手上游",
+                                run_id, len(produced))
+                stream = state.get("stream")
+                if stream is not None:
+                    try:
+                        await stream.aclose()
+                    except Exception:  # noqa: BLE001  含"已在运行"竞态
+                        logging.debug("停止时关闭上游流出现异常（已忽略）", exc_info=True)
+                return
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001  监听任务出问题不该影响本次生成
+        logging.debug("停止监听任务异常退出", exc_info=True)
+
+
 #: 在途的后台压缩任务。**必须持有引用** —— `asyncio.create_task` 的返回值只被
 #: 事件循环弱引用，不存起来的话任务可能在跑完前被 GC 掉（表现为"压缩时有时无"，
 #: 而日志里什么都没有）。
@@ -2359,7 +2441,7 @@ def _spawn_history_compaction(thread_id: str) -> None:
 async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
                         subject: str = "", thread_id: str = "", budget=None,
                         disconnect=None, reserved: int = 0, timeout: float = 0,
-                        idem_key: str = "", idem_fp: str = ""):
+                        idem_key: str = "", idem_fp: str = "", run_id: str = ""):
     """把图的流式输出转成 SSE 事件。
 
     incoming: 送进图的输入。三种形态：
@@ -2405,6 +2487,11 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
     timeout: **请求级总时限**（秒），0 = 不限（默认，行为与改造前一致）。
         约束的是"消费上游流"与收尾的 `aget_state` —— 也就是会随上游变慢而失控的
         那部分。超时后下发 `timeout` 事件并**收流**（已产出的正文照常交付）。
+    run_id: 这次运行的登记编号。非空 ⇒ 可以被 `POST /v1/sessions/{id}/stop` 停下，
+        停的时候下发 `stopped` 事件并收流；空串（测试/CLI/未登记）⇒ 完全不可停，
+        行为与改造前一致。**必须由调用方生成并在 `_RUNS.begin` 里登记过** ——
+        这里只用它查状态与收尾，不负责登记（登记要在生成器创建之前完成，
+        否则"刚启动的那一瞬间"是停不了的）。
 
     事件类型：
       token            —— 逐段生成的正文
@@ -2412,6 +2499,7 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
       need_review      —— 需人工审核（附草稿、评分、意见）；同时入队 + 发通知
       budget_exceeded  —— 单请求 token 预算耗尽，生成被提前终止
       timeout          —— **请求级总时限耗尽**，流被终止（终止性事件，其后没有 done）
+      stopped          —— **用户主动停下**，流被终止（终止性事件，其后没有 done）
       done / error
 
     citations 放在 token 之后、done 之前下发：它描述的是"上面这段回答依据了什么"，
@@ -2422,6 +2510,12 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
     # 位置在函数体最开头：本函数是异步生成器，函数体要等第一次迭代才执行，而
     # `_sse` 创建它之后**立即** `async for` —— 所以到这一行事件循环一定在。
     _spawn_history_compaction(thread_id)
+    # 运行登记放在**生成器体内**，而不是端点里：端点先登记的话，配额 429 会让
+    # 请求在生成器创建之前就结束，那一行登记永远没人清 —— 于是这个 thread
+    # 之后每一次 `/stop` 都会打到一条早已不存在的运行上。
+    # 放这里还顺带保证了"登记成功 ⇒ 确实开始跑了"。
+    if run_id:
+        await _off(_RUNS.begin, run_id, thread_id, tenant)
     budget = budget if budget is not None else RequestBudget(0)
     deadline = _RequestDeadline(timeout)
     produced: list[str] = []
@@ -2440,6 +2534,11 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
     started = time.perf_counter()
     stream = None
     watcher = None
+    # 停止标志：``threading.Event`` 而不是 ``asyncio.Event``，因为置位它的是
+    # ``_watch_stop`` 里经线程池返回的结果（跨线程），而读它的既有事件循环里的
+    # 主循环、也有它在 finally 里的收尾。threading.Event 两者都安全。
+    stop = threading.Event() if run_id else None
+    stop_watcher = None
     # `state` 用 dict 跨任务共享（生成器写 stream、watcher 读取后关闭）。
     # 断连标志不在这个 dict 里 —— 它在 `disconnect` 上，那个值由库的回调写。
     state = {"stream": None}
@@ -2477,6 +2576,9 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
         if disconnect is not None:
             watcher = asyncio.create_task(
                 _watch_disconnect(disconnect, produced, state))
+        if stop is not None:
+            stop_watcher = asyncio.create_task(
+                _watch_stop(run_id, stop, produced, state))
         stream = graph.astream(incoming, config=run_config, stream_mode="messages")
         state["stream"] = stream
         # 手工迭代（而不是 `async for`）：只有显式拿到 `__anext__`，才能把**每一次
@@ -2485,9 +2587,11 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
         # `_RequestDeadline` 的说明）。`timeout=0` 时退化成普通 await，无额外开销。
         anext = stream.__anext__
         while True:
-            # 断连信号已置位：停止消费（这里只是兜底 —— 真实链路上库会同时取消
-            # 本生成器，取消会带着 CancelledError 打进下一次挂起点）
+            # 断连 / 停止信号已置位：停止消费（这里只是兜底 —— 真实链路上库会同时
+            # 取消本生成器，取消会带着 CancelledError 打进下一次挂起点）
             if disconnect is not None and disconnect.closed:
+                break
+            if stop is not None and stop.is_set():
                 break
             try:
                 msg, meta = await deadline.run(anext)
@@ -2539,6 +2643,13 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
         if disconnect is not None and disconnect.closed:
             # 客户端已经走了：不必再查状态、不必入队、更不必下发事件（没人收）。
             # 直接返回，finally 里的计费照常执行。
+            return
+
+        if stop is not None and stop.is_set():
+            # 用户主动停下：**终止性**返回。不查状态、不入队、不补 done ——
+            # 那三件事都属于"这一轮要正常收尾"，而停止的含义正好是不收尾。
+            # 检查点已经停在某个节点边界上，所以客户端想接着跑可以 resume。
+            yield _record(_stopped_event(req_kind, produced))
             return
 
         try:
@@ -2661,6 +2772,12 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
         # 两种情况下这次请求都已经**产生了真实消耗与状态**，重试都不该重跑。
         succeeded = True
     except Exception as e:  # noqa: BLE001
+        if stop is not None and stop.is_set():
+            # 停下时上游是被 `aclose()` 打断的，冒出来的形态很杂（StopAsyncIteration /
+            # RuntimeError("already running") / 上游自己的取消异常）。它们全都是
+            # **预期内**的：当成流故障记会污染错误率，正好掩盖真实故障。
+            yield _record(_stopped_event(req_kind, produced))
+            return
         if disconnect is not None and disconnect.closed:
             # 客户端已走：上游被取消是**预期行为**而非真故障；而且此时也没人收
             # error 事件。若照旧记成流异常，会污染错误率指标、掩盖真实故障。
@@ -2680,6 +2797,23 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
                 pass
             except Exception:  # noqa: BLE001
                 logging.debug("等待断连监听退出时异常", exc_info=True)
+
+        if stop_watcher is not None:
+            stop_watcher.cancel()
+            try:
+                await stop_watcher
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                logging.debug("等待停止监听退出时异常", exc_info=True)
+
+        # 登记行必须**无论成败**都删掉：留下一行会让这个 thread 下一次运行
+        # "看起来已经在跑"，而 `/stop` 会打到那次新运行上（误停下一轮）。
+        if run_id:
+            try:
+                await _off(_RUNS.finish, run_id)
+            except Exception:  # noqa: BLE001  清理失败不该覆盖真实结果
+                logging.debug("清理运行登记失败：run=%s", run_id, exc_info=True)
 
         # 显式关闭上游生成器。`async for` 里 break 只是跳出循环，生成器本身要等
         # GC 才被关闭 —— 那段时间底层 LLM 调用仍在跑（这正是"断连了还在计费"的
@@ -2908,7 +3042,7 @@ def _release_idem_gate(gate: _IdemGate, tenant: str) -> None:
 # ---------------------------------------------------------------------------
 def _sse(graph_input, run_cfg, req_kind: str, *, tenant: str, subject: str = "",
          thread_id: str, budget=None, idem_key: str = "", idem_fp: str = "",
-         reserved=None) -> EventSourceResponse:
+         reserved=None, run_id: str = "") -> EventSourceResponse:
     """构造 SSE 响应：断连信号成对接线 + 配额预占（结算交给生成器）。
 
     为什么必须成对构造（而不是各端点自己拼）
@@ -2945,6 +3079,7 @@ def _sse(graph_input, run_cfg, req_kind: str, *, tenant: str, subject: str = "",
         默认空串只对"调用方自己已经预占过"的场景安全 —— 那时 `reserved` 由外部传入。
     thread_id / budget: 透传给 `_stream_graph`（入队、预算止血）。
     idem_key / idem_fp: 已抢占的幂等键与其请求指纹，透传给 `_stream_graph` 收尾。
+    run_id: 已在 `_RUNS.begin` 登记过的运行编号。空串 = 这次运行不可被主动停止。
 
     请求级总时限**在这里读配置**（而不是在各端点）：三个端点都要它，而 `_sse`
     已经是它们共同经过的唯一一处。调用时读（而非模块级常量）才能被测试
@@ -2972,7 +3107,7 @@ def _sse(graph_input, run_cfg, req_kind: str, *, tenant: str, subject: str = "",
                       thread_id=thread_id, budget=budget, disconnect=signal,
                       reserved=reserved,
                       timeout=config.REQUEST_TIMEOUT_SECONDS,
-                      idem_key=idem_key, idem_fp=idem_fp),
+                      idem_key=idem_key, idem_fp=idem_fp, run_id=run_id),
         client_close_handler_callable=signal.mark_closed,
         # 提示词版本随响应头下发（**不改 SSE 事件载荷** —— 那是对外契约）。
         # 颗粒度正好是需要的那个：一条回答 = 一个响应 = 一个版本号，
@@ -3726,7 +3861,10 @@ def chat_v1(req: ChatReq, request: Request,
     budget = RequestBudget(_QUOTA.request_limit)
     return _sse(incoming, run_cfg, "chat", tenant=tenant, subject=ident.user,
                 thread_id=req.thread_id, budget=budget,
-                idem_key=gate.key, idem_fp=gate.fp)
+                idem_key=gate.key, idem_fp=gate.fp,
+                # 每次运行一个编号：`/stop` 靠它精确命中"正在跑的这一次"，
+                # 而不是"这个会话现在还开不开着"。理由见 run_control 模块 docstring。
+                run_id=uuid.uuid4().hex)
 
 
 @v1.post("/review")
@@ -3828,7 +3966,8 @@ async def review_v1(req: ReviewReq, request: Request,
     return _sse(incoming, run_cfg, "review", tenant=tenant, subject=ident.user,
                 thread_id=req.thread_id, budget=RequestBudget(_QUOTA.request_limit),
                 reserved=await _off(_reserve_quota, tenant, ident.user, gate.key),
-                idem_key=gate.key, idem_fp=gate.fp)
+                idem_key=gate.key, idem_fp=gate.fp,
+                run_id=uuid.uuid4().hex)
 
 
 @v1.get("/reviews")
@@ -3892,6 +4031,148 @@ async def session_state_v1(thread_id: str, request: Request,
     return view
 
 
+@v1.post("/sessions/{thread_id}/messages")
+async def session_message_v1(thread_id: str, req: SessionMessageReq, request: Request,
+                             x_tenant_id: str = Header(default=""),
+                             authorization: str = Header(default="")):
+    """POST /v1/sessions/{thread_id}/messages：给**正在进行的任务**补一句话（不触发运行）。
+
+    它与 `POST /v1/chat` 的差别只有一件事，但这件事定义了整个接口：
+    `/v1/chat` 是"开始一轮"，这里是"给跑着的那一轮补一句"。所以它
+    **不启动任何生成**、不占配额、不产生 SSE —— 只是一次写入。
+
+    补的话什么时候生效（三档，按先后）
+    ------------------------------
+      1. **本次模型运行的下一次调用** —— 通过 ``supplements`` 的进程内增量注入。
+         这是"用户看到 agent 还在跑，补一句，它下一步就照做"的那一档；
+      2. **下一个 agent 节点** —— 因为补充这句话被**同时写进了会话历史**
+         （官方 Session 后端），而节点之间是独立的 SDK 运行，各自会重新读一次历史；
+      3. **下一轮 `/v1/chat`** —— 同一个道理，历史里已经有它。
+
+    ⚠️ **当前这次模型调用看不到**：那一次调用的输入在它开始时就定格了。想改它只能
+    打断重来（`POST /v1/sessions/{id}/stop`，见那里的说明）。
+
+    为什么会写两份
+    ------------
+    会话历史那份是**持久**的（跨节点、跨轮、跨副本、跨重启都靠它）；
+    进程内那份是**当次运行**的加速（历史快照已经读过了，不补就只能等下一个节点）。
+    只写进程内 ⇒ 重启或换副本就丢了；只写历史 ⇒ 当次运行完全不生效。
+    两份都写不是冗余，是两段时间尺度各需要一个载体。
+
+    ⚠️ 边界：进程内那份**只在本副本有效**。补充请求落到 A 副本、任务跑在 B 副本时，
+    第 1 档不生效，但第 2/3 档照常生效（它们靠的是库里的历史）。
+
+    为什么正文要带 `【任务执行中补充】` 前缀
+    ------------------------------------
+    不带的话，模型会把这条当成**新一轮的用户请求**，于是可能丢下手头的活去回答它。
+    "补充"与"新指令"的区别没有任何机制能表达，只能靠文案说清楚。前缀在写入历史与
+    注入模型输入两处**共用同一个常量**（`supplements.PREFIX`），不允许各写一份。
+
+    为什么写历史时不切断"工具调用 / 工具结果"这一对
+    --------------------------------------------
+    SDK 是**一轮一次**写入的（`run.py` 里 `save_result_to_session` 每轮 turn 末尾
+    调用一次，把该轮所有条目一起交出去），不是逐条追加。所以我们插进去的那条只会
+    落在两轮之间 —— 落不到 function_call 与 function_call_output 中间。
+    这一点如果哪天 SDK 改成逐条写入，这里就会开始产出**非法历史**（下一轮模型调用
+    直接报错），所以它不是风格问题，是依赖。
+    """
+    ident = await _off(_authenticate, x_tenant_id, authorization)
+    await _off(_rate_limit, request, thread_id, ident.user, True)
+    # fail-closed：多租户下归属不符 403、查不到属主 404（见 `_assert_session_readable`）。
+    await _off(_assert_session_readable, thread_id, ident.tenant, ident.user)
+
+    text = req.message.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="message 不能为空")
+
+    # 延迟导入：`src.agents.*` 依赖官方 SDK，没装 SDK 的环境连图都建不起来，
+    # 不能出现在模块级 import 里（与其它 agent 相关导入同一条纪律）。
+    from src.agents import session as agent_session
+    from src.agents import supplements
+
+    session = agent_session.session_for(thread_id)
+    if session is None:
+        # 没有会话后端就没有第 2/3 档，只剩"当次运行"这一档 —— 而这一档随时会因
+        # 进程重启/换副本而丢。与其给一个"补上了"的假象，不如明确告诉调用方存不下。
+        raise HTTPException(
+            status_code=503,
+            detail="会话历史后端不可用（未配置 DB_URL），补充无法保存")
+
+    line = f"{supplements.PREFIX}{text}"
+    try:
+        # ⚠️ 这是**异步**方法（官方 Session 协议），必须 await —— 漏掉的话拿到的
+        # 是一个从未被 await 的协程，写入不会发生，而接口照样返回 accepted。
+        await session.add_items([{"role": "user", "content": line}])
+    except Exception as e:  # noqa: BLE001  后端抖动 / 表缺失
+        metrics.inc("session_message_errors_total")
+        logging.exception("补充写入会话历史失败：session=%s", thread_id)
+        raise HTTPException(status_code=503,
+                            detail=f"写入会话历史失败：{type(e).__name__}") from e
+
+    seq = supplements.note(thread_id, text)
+    metrics.inc("session_message_total")
+    logging.info("任务执行中补充：session=%s subject=%s seq=%s chars=%d",
+                 thread_id, ident.user, seq, len(text))
+    return {
+        "thread_id": thread_id,
+        "accepted": True,
+        # 0 = 没登记（会话号或正文为空，理论上走不到 —— 上面已经挡过）。
+        "seq": seq,
+        "pending": supplements.pending_count(thread_id),
+        "applies_to": ["running_model_call", "next_node", "next_turn"],
+    }
+
+
+@v1.post("/sessions/{thread_id}/stop")
+async def session_stop_v1(thread_id: str, request: Request,
+                          x_tenant_id: str = Header(default=""),
+                          authorization: str = Header(default="")):
+    """POST /v1/sessions/{thread_id}/stop：**停掉这个会话正在跑的那一次运行**。
+
+    它停的是"**某一次运行**"，不是"这个会话"。差别在于竞态：如果按会话判，
+    任务刚跑完、停止请求才到 ⇒ 标记留下 ⇒ 下一轮一开始就被停，用户看到的是
+    "刚发出去就被打断"，且没有任何线索可查。按 ``run_id`` 就没有这个窗口 ——
+    运行结束即删登记行，请求到达时找不到就是找不到。
+
+    停下之后是什么状态
+    ----------------
+      · **已经产出的正文照常保留**（不是作废）；
+      · SSE 收到一个 **`stopped`** 事件，它是**终止性**的（其后没有 `done`）——
+        客户端必须能区分"被停了"与"网络断了"，因为前者不该自动重试；
+      · **检查点保留**：停在哪个节点边界就在哪儿，`POST /v1/chat/resume` 能接着跑；
+      · 计费按已产出结算（与断连同一条路径）。
+
+    为什么不能只靠"客户端断开"
+    ----------------------
+    断连的语义是"我不要这个响应了"，而停止的语义是"别再花钱了、也别再改我的
+    文件了"。两者的副作用完全不同：断连时服务端仍可能在跑工具、写资产；停止要求
+    那些动作尽快收手 —— 而这需要一个**别人也能触发的**信号，不能只由那条连接自己
+    消失来触发（用户可能只是关了个页面，也可能是另一个管理员要叫停）。
+
+    为什么返回 409 而不是 200 + "没停成"
+    ---------------------------------
+    409 是"你的请求与当前状态冲突"，正是"当前没有在跑的任务"这件事。回 200 会让
+    客户端以为停成功了，于是不再重试、也不再提示用户。
+
+    ⚠️ 重复调用是**幂等**的：同一次运行还在停的过程中，再调一次仍返回同一个
+    ``run_id``。理由见 `RunControl.request_stop` 的说明。
+    """
+    ident = await _off(_authenticate, x_tenant_id, authorization)
+    await _off(_rate_limit, request, thread_id, ident.user, True)
+    # fail-closed：多租户下归属不符 403、查不到属主 404。
+    await _off(_assert_session_readable, thread_id, ident.tenant, ident.user)
+
+    actor = ident.user or ident.tenant
+    run_id = await _off(_RUNS.request_stop, thread_id, actor)
+    if not run_id:
+        raise HTTPException(status_code=409,
+                            detail="该会话当前没有正在运行的任务")
+
+    metrics.inc("run_stop_requested_total")
+    logging.warning("收到停止请求：session=%s run=%s by=%s", thread_id, run_id, actor)
+    return {"thread_id": thread_id, "stopped": True, "run_id": run_id}
+
+
 @v1.delete("/sessions/{thread_id}")
 async def session_delete_v1(thread_id: str, request: Request,
                             x_tenant_id: str = Header(default=""),
@@ -3939,6 +4220,11 @@ async def session_delete_v1(thread_id: str, request: Request,
         "review": await _off(_REVIEW_QUEUE.remove, thread_id),
         "ownership": await _off(_SESSIONS.release, thread_id),
     }
+    # 进程内那份"任务执行中补充"的增量索引也要丢：它不落盘，但不丢的话，
+    # 同一个 thread_id 被复用时会带着上一段对话的补充 —— 而那份内容刚刚被承诺
+    # 删除过（合规口径里"删干净"包含它，它虽然只是副本，但仍是用户内容）。
+    from src.agents import supplements
+    supplements.clear(thread_id)
     metrics.inc("session_deleted_total")
     logging.info("会话已删除：session=%s tenant=%s deleted=%s",
                  thread_id, ident.tenant, deleted)
@@ -4000,7 +4286,8 @@ async def chat_resume_v1(req: ResumeReq, request: Request,
     return _sse(None, run_cfg, "resume", tenant=tenant, subject=ident.user,
                 thread_id=req.thread_id, budget=RequestBudget(_QUOTA.request_limit),
                 reserved=await _off(_reserve_quota, tenant, ident.user, gate.key),
-                idem_key=gate.key, idem_fp=gate.fp)
+                idem_key=gate.key, idem_fp=gate.fp,
+                run_id=uuid.uuid4().hex)
 
 
 app.include_router(v1)

@@ -88,7 +88,7 @@ from agents import (
 
 from .. import observability
 from ..envutil import env_int
-from . import approval, fallback, reflection, runtime
+from . import approval, fallback, reflection, runtime, supplements
 from .context import TaskContext
 from .frontline import frontline_agent
 from .guards import (
@@ -248,23 +248,75 @@ def _guardrail_name(exc: BaseException) -> str | None:
 
 
 async def model_input_filter(data: Any) -> Any:
-    """``RunConfig.call_model_input_filter`` 的**装配处**：裁剪之后再注入反思提醒。
+    """``RunConfig.call_model_input_filter`` 的**装配处**：裁剪 → 注入反思 → 注入补充。
 
-    三步各有归属，这里只负责顺序：
+    四步各有归属，这里只负责顺序：
 
     ① ``history_budget.trim_model_input`` —— 窗口压缩 + 按 token 硬截断；
-    ② ``reflection.inject_reflections`` —— 追加一条 system 消息（反思闸门的结论）。
+    ② ``reflection.inject_reflections`` —— 追加一条 system 消息（反思闸门的结论）；
+    ③ ``_inject_supplements`` —— 追加用户在本节点运行期间补说的话。
 
     ⚠️ **顺序不能反**：注入排在裁剪**之后**，塞进去的提醒才不会在下一次模型调用时
     被当成"超预算的老历史"裁掉。反过来的症状是"提醒过、但模型没按提醒做"，而日志与
     指标里完全看不出来（提醒确实生成了、也确实进了输入，只是在下一轮被丢了）。
+    补充排在反思之后：一条来自用户的补充是**要求**，反思结论是**自检提醒**，
+    两者同时出现时，让用户的要求落在最后（模型对末尾内容的注意力更强）。
+
     ⚠️ 注入**不占**预算：它排在预算判定之后，所以输入可能比 ``AGENT_HISTORY_TOKEN_LIMIT``
     略高一点 —— 那是有意的，一条几十字的提醒远小于"提醒没生效"的代价。
     """
     trimmed = await trim_model_input(data)
-    return await reflection.inject_reflections(
+    injected = await reflection.inject_reflections(
         trimmed, context=getattr(data, "context", None)
     )
+    return _inject_supplements(injected, getattr(injected, "context", None)
+                              or getattr(data, "context", None))
+
+
+def _item_text(item: Any) -> str:
+    """取一条输入项的文本（输入项可能是 dict，也可能是 SDK 的 Item 对象）。"""
+    content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+    return content if isinstance(content, str) else ""
+
+
+def _inject_supplements(data: Any, context: Any) -> Any:
+    """把"本次运行开始之后用户补说的话"拼到模型输入末尾。
+
+    context: ``TaskContext``。它带着两个值 —— ``thread_id`` 与
+        ``supplement_cursor``（run 开始时定格的水位）。
+    data: ``ModelInputData``（有 ``input`` 列表）。
+
+    为什么每次模型调用都拼、而且拼完**不**从暂存里删：注入口的改写是"本次调用
+    专用"的（实测：拼进去的内容下一次调用就没了），所以删掉就再也不会出现；
+    留着才能让模型在后续每一轮都还知道这条要求。同一次调用内不会重复 ——
+    ``data.input`` 是这一轮的快照，不是一个跨调用累积的列表。
+
+    ⚠️ 末尾去重是防御而不是主路径：正常情况下水位已经把"run 开始前就写进会话的
+    补充"挡在外面了（那条会随会话历史一起进输入）。这一层只在"某条补充既被写进
+    会话、又落在水位之后"这种边界情形下挡住重复。
+    """
+    thread_id = getattr(context, "thread_id", "") or ""
+    if not thread_id:
+        return data
+    items = getattr(data, "input", None)
+    if not isinstance(items, list):
+        return data
+    try:
+        texts = supplements.since(thread_id, int(getattr(context, "supplement_cursor", 0) or 0))
+    except Exception:  # noqa: BLE001  补充是增强，任何故障都不该让模型调用失败
+        logging.debug("取任务执行中补充失败（已忽略）", exc_info=True)
+        return data
+    if not texts:
+        return data
+
+    tail = {_item_text(i) for i in items[-4:]}
+    for text in texts:
+        line = f"{supplements.PREFIX}{text}"
+        if line in tail:
+            continue
+        items.append({"role": "user", "content": line})
+        tail.add(line)
+    return data
 
 
 def build_run_config(model: Any | None = None) -> RunConfig:
@@ -518,6 +570,14 @@ async def run_agent(
     else:
         session = session_for(session_id)
         run_input = _build_input_items(prompt, context, session, append_prompt)
+        # ★ 任务执行中补充：水位必须在 run **开始之前**定格。
+        # 现取的话，注入口每次模型调用都会把"调用之前的所有补充"当成新的，
+        # 同一条要求会在每一轮被重复拼进去（表现成"模型突然反复强调一句补充"）。
+        # ⚠️ 恢复（``resume``）那条分支刻意不设：它的输入是"被打断的运行现场"，
+        # 现场里已经含当时的会话历史，再叠一条增量会让"模型看到的内容"与
+        # "那次运行实际收到的"对不上，排查时无从复现。
+        context.thread_id = session_id
+        context.supplement_cursor = supplements.cursor(session_id)
 
     answer = ""
     exit_reason = "error"

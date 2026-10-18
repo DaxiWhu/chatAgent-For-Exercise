@@ -176,6 +176,20 @@
         "title": "ReviewReq",
         "type": "object"
       },
+      "SessionMessageReq": {
+        "description": "追加到会话的一句补充（**不触发运行**）。\n\n与 ``ChatReq`` 的区别只有一处，但它在语义上是全部：``/v1/chat`` 是\"开始一轮\"，\n本请求是\"给正在跑的那一轮补一句\"。所以它没有 thread_id 字段（在路径里）、\n也不该被当成新任务 —— 见 ``POST /v1/sessions/{id}/messages`` 的说明。",
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "SessionMessageReq",
+        "type": "object"
+      },
       "TenantRenameReq": {
         "description": "租户改名。挂靠用户的租户字段会被**同批改写**（见 AccountStore.rename_tenant）。",
         "properties": {
@@ -2107,6 +2121,138 @@
           }
         },
         "summary": "Session State V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/sessions/{thread_id}/messages": {
+      "post": {
+        "description": "POST /v1/sessions/{thread_id}/messages：给**正在进行的任务**补一句话（不触发运行）。\n\n它与 `POST /v1/chat` 的差别只有一件事，但这件事定义了整个接口：\n`/v1/chat` 是\"开始一轮\"，这里是\"给跑着的那一轮补一句\"。所以它\n**不启动任何生成**、不占配额、不产生 SSE —— 只是一次写入。\n\n补的话什么时候生效（三档，按先后）\n------------------------------\n  1. **本次模型运行的下一次调用** —— 通过 ``supplements`` 的进程内增量注入。\n     这是\"用户看到 agent 还在跑，补一句，它下一步就照做\"的那一档；\n  2. **下一个 agent 节点** —— 因为补充这句话被**同时写进了会话历史**\n     （官方 Session 后端），而节点之间是独立的 SDK 运行，各自会重新读一次历史；\n  3. **下一轮 `/v1/chat`** —— 同一个道理，历史里已经有它。\n\n⚠️ **当前这次模型调用看不到**：那一次调用的输入在它开始时就定格了。想改它只能\n打断重来（`POST /v1/sessions/{id}/stop`，见那里的说明）。\n\n为什么会写两份\n------------\n会话历史那份是**持久**的（跨节点、跨轮、跨副本、跨重启都靠它）；\n进程内那份是**当次运行**的加速（历史快照已经读过了，不补就只能等下一个节点）。\n只写进程内 ⇒ 重启或换副本就丢了；只写历史 ⇒ 当次运行完全不生效。\n两份都写不是冗余，是两段时间尺度各需要一个载体。\n\n⚠️ 边界：进程内那份**只在本副本有效**。补充请求落到 A 副本、任务跑在 B 副本时，\n第 1 档不生效，但第 2/3 档照常生效（它们靠的是库里的历史）。\n\n为什么正文要带 `【任务执行中补充】` 前缀\n------------------------------------\n不带的话，模型会把这条当成**新一轮的用户请求**，于是可能丢下手头的活去回答它。\n\"补充\"与\"新指令\"的区别没有任何机制能表达，只能靠文案说清楚。前缀在写入历史与\n注入模型输入两处**共用同一个常量**（`supplements.PREFIX`），不允许各写一份。\n\n为什么写历史时不切断\"工具调用 / 工具结果\"这一对\n--------------------------------------------\nSDK 是**一轮一次**写入的（`run.py` 里 `save_result_to_session` 每轮 turn 末尾\n调用一次，把该轮所有条目一起交出去），不是逐条追加。所以我们插进去的那条只会\n落在两轮之间 —— 落不到 function_call 与 function_call_output 中间。\n这一点如果哪天 SDK 改成逐条写入，这里就会开始产出**非法历史**（下一轮模型调用\n直接报错），所以它不是风格问题，是依赖。",
+        "operationId": "session_message_v1_v1_sessions__thread_id__messages_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionMessageReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Session Message V1",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/sessions/{thread_id}/stop": {
+      "post": {
+        "description": "POST /v1/sessions/{thread_id}/stop：**停掉这个会话正在跑的那一次运行**。\n\n它停的是\"**某一次运行**\"，不是\"这个会话\"。差别在于竞态：如果按会话判，\n任务刚跑完、停止请求才到 ⇒ 标记留下 ⇒ 下一轮一开始就被停，用户看到的是\n\"刚发出去就被打断\"，且没有任何线索可查。按 ``run_id`` 就没有这个窗口 ——\n运行结束即删登记行，请求到达时找不到就是找不到。\n\n停下之后是什么状态\n----------------\n  · **已经产出的正文照常保留**（不是作废）；\n  · SSE 收到一个 **`stopped`** 事件，它是**终止性**的（其后没有 `done`）——\n    客户端必须能区分\"被停了\"与\"网络断了\"，因为前者不该自动重试；\n  · **检查点保留**：停在哪个节点边界就在哪儿，`POST /v1/chat/resume` 能接着跑；\n  · 计费按已产出结算（与断连同一条路径）。\n\n为什么不能只靠\"客户端断开\"\n----------------------\n断连的语义是\"我不要这个响应了\"，而停止的语义是\"别再花钱了、也别再改我的\n文件了\"。两者的副作用完全不同：断连时服务端仍可能在跑工具、写资产；停止要求\n那些动作尽快收手 —— 而这需要一个**别人也能触发的**信号，不能只由那条连接自己\n消失来触发（用户可能只是关了个页面，也可能是另一个管理员要叫停）。\n\n为什么返回 409 而不是 200 + \"没停成\"\n---------------------------------\n409 是\"你的请求与当前状态冲突\"，正是\"当前没有在跑的任务\"这件事。回 200 会让\n客户端以为停成功了，于是不再重试、也不再提示用户。\n\n⚠️ 重复调用是**幂等**的：同一次运行还在停的过程中，再调一次仍返回同一个\n``run_id``。理由见 `RunControl.request_stop` 的说明。",
+        "operationId": "session_stop_v1_v1_sessions__thread_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Authorization",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Session Stop V1",
         "tags": [
           "v1"
         ]

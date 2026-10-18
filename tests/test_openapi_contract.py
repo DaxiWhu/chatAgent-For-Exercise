@@ -47,6 +47,12 @@ EXPECTED_ROUTES = {
     # 履行删除请求（合规要求）。它是 #87「数据保留与会话删除」加进来的对外端点，
     # 当初漏了同步这份手写清单 —— 于是快照与代码都被 --write 抹平了，只有这里红着。
     "DELETE /v1/sessions/{thread_id}",
+    # 任务执行中的人机交互（2026-10-18）：
+    #   · messages —— **不触发运行**的追加（补一句话）；
+    #   · stop     —— 停掉**正在跑的那一次**运行（按 run 而不是按会话，见端点说明）。
+    # 两个都是写操作，因此**不豁免**鉴权；也都要过会话归属校验。
+    "POST /v1/sessions/{thread_id}/messages",
+    "POST /v1/sessions/{thread_id}/stop",
     "POST /v1/chat/resume",
     # 用户鉴权（第二档，2026-10-01）。
     # ⚠️ login / refresh 是**未认证可达**的（见 _UNAUTHENTICATED_ROUTES）：
