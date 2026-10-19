@@ -1211,7 +1211,7 @@ groups:
         annotations:
           summary: "单次任务的平均模型调用次数偏高（{{ $value | humanize }} 次）"
           description: "AGENT_MAX_TURNS 默认 12。平均值已超过它就说明相当一部分任务在**贴着上限跑**，成本和延迟都会显著抬升，且更易触发 max_turns 收尾。"
-          runbook: "1) 对照 agent_runs_total{exit_reason=max_turns} 确认是否已出现步数耗尽；2) ⚠️ 拆分之后一次请求 = N 次运行，`agent_model_calls` 是**各行运行之和** —— 先看 agent_runs_total 的 agent 标签确认是**哪一段**在涨（前台还是文学），只看总数会把「文学那段绕圈」误读成「整体变慢」；3) 检查专家 instructions 里的 Routine 是否被写得过长（每多一条规则就多一次工具调用）；4) 对照 agent_tool_calls 的平均值 —— 它与 agent_model_calls 同向上涨说明是「工具用得越来越多」（拓扑/提示词问题），只有模型调用涨而工具调用不涨则更可能是「模型在原地自说自话」。"
+          runbook: "1) 对照 agent_runs_total{exit_reason=max_turns} 确认是否已出现步数耗尽；2) ⚠️ 拆分之后一次请求 = N 次运行，`agent_model_calls` 是**各行运行之和** —— 先看 agent_runs_total 的 agent 标签确认是**哪一段**在涨（前台还是文学），只看总数会把「文学那段绕圈」误读成「整体变慢」；3) 检查专家 instructions 里的 Routine 是否被写得过长（每多一条规则就多一次工具调用）；4) 对照 agent_tool_calls 的平均值 —— 它与 agent_model_calls 同向上涨说明是「工具用得越来越多」（拓扑/提示词问题），只有模型调用涨而工具调用不涨则更可能是「模型在原地自说自话」；5) 落到**具体哪个工具**看 `agent_tool_result_total{tool,status,reason}`：`reason=\"bad_args\"` 是模型照着工具定义也填不出合法参数 ⇒ 改描述或参数结构；`reason=\"error\"` 是参数对、工具跑起来之后坏 ⇒ 查实现或依赖（两者处置相反，别一起当成「工具不稳」）；6) 再看 `agent_tool_exposed_total{tool}`（每次 agent 开始运行时，给它挂的每个工具各记一次，结果计数只在被调用时才有序列）—— **曝光在涨而结果没有**就是「挂了但从没被选中」，通常是指令里没提它、或它的描述与另一个工具重叠。"
 
       - alert: AgentGuardrailTripsFrequent
         # 出口护栏（引用可追溯 / 长度）与入口护栏（注入扫描）的拦截次数。

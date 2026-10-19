@@ -272,6 +272,20 @@ def test_literary_run_returns_the_work_as_plain_text(tmp_path):
     assert out.final_agent == "literary_writer"
 
 
+_RUN_LEVEL_METRICS = frozenset({
+    "agent_runs_total",
+    "agent_run_duration_seconds",
+    "agent_model_calls",
+    "agent_tool_calls",
+    "agent_review_rounds",
+})
+"""以 ``agent`` 为维度的**运行级**指标 —— 下面那条用例只守这几条。
+
+工具级指标（``agent_tool_exposed_total`` / ``agent_tool_result_total``）不在其中：
+它们以 ``tool`` 为维度，两侧必须同口径，"选中率 = 结果 / 曝光"才算得出来。
+"""
+
+
 def test_each_run_reports_its_own_agent_label(tmp_path, monkeypatch):
     """★★ 单次运行的指标必须带上**这次运行的那个 agent 名**。
 
@@ -298,14 +312,26 @@ def test_each_run_reports_its_own_agent_label(tmp_path, monkeypatch):
     ctx = make_ctx(tmp_path)
     asyncio.run(_run_frontline("写个开场", ctx=ctx,
                                model=ScriptedModel([decide("开场。")])))
-    assert seen, "一次运行一条指标都没播报"
-    assert {labels.get("agent") for _n, labels in seen} == {"frontline_agent"}, seen
+
+    # 只断言**run 级**指标。工具级指标（曝光 / 结果）刻意不带 agent 维度 —— 它必须与
+    # 结果侧同口径，"选中率 = 结果 / 曝光"才算得出来；把它们算进这里会让这条用例在
+    # 每次给工具层加指标时误红（2026-10-19 加曝光计数时正是如此）。
+    run_seen = [(n, labels) for n, labels in seen if n in _RUN_LEVEL_METRICS]
+    assert run_seen, "一次运行一条 run 级指标都没播报"
+    assert {labels.get("agent") for _n, labels in run_seen} == {"frontline_agent"}, run_seen
+
+    # 反过来钉住另一侧：工具级指标**不许**带 agent 标签，否则分子（结果）与
+    # 分母（曝光）的口径会分家，而症状是指标都在、比值算不出来。
+    assert any(n == "agent_tool_exposed_total" for n, _l in seen), "曝光没有被播报"
+    assert all("agent" not in labels for n, labels in seen
+               if n in ("agent_tool_exposed_total", "agent_tool_result_total")), seen
 
     # 同一个函数跑另一个 agent ⇒ 标签必须跟着换（钉住"不是写死的常量"）
     seen.clear()
     asyncio.run(run_agent(LITERARY_AGENT, prompt="写个开场", context=make_ctx(tmp_path),
                           model=ScriptedModel([say("作品。")]), append_prompt=False))
-    assert {labels.get("agent") for _n, labels in seen} == {"literary_writer"}, seen
+    run_seen = [(n, labels) for n, labels in seen if n in _RUN_LEVEL_METRICS]
+    assert {labels.get("agent") for _n, labels in run_seen} == {"literary_writer"}, run_seen
 
 
 def test_failed_run_does_not_move_the_conversation(tmp_path, monkeypatch):

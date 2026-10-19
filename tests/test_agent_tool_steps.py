@@ -406,10 +406,13 @@ def test_as_list_is_json_serializable_for_the_fallback_exit():
     rows = log.as_list()
     assert [r["status"] for r in rows] == ["ok", "failed"]
     assert set(rows[0]) == {"seq", "tool", "fingerprint", "call_id",
-                            "status", "detail", "duration"}
+                            "status", "reason", "detail", "duration"}
     json.dumps(rows)      # 不能抛
     assert rows[0]["call_id"] == "c1"
     assert rows[0]["fingerprint"]
+    # 成功那条不带失败档位；失败那条必须带上，否则下游分不出该改描述还是改代码
+    assert rows[0]["reason"] == ""
+    assert rows[1]["reason"] == "error"
 
 
 def test_detail_is_clipped_to_one_line():
@@ -904,3 +907,150 @@ def test_repeat_is_not_broadcast_when_disabled(monkeypatch, sink):
     assert log.steps == []
     assert log.repeat_counts() == {} and log.max_repeat == 0
     assert sink.counters("agent_action_repeats_total") == []
+
+
+# --------------------------------------------------------------------------- #
+# 十、失败分两档：该改描述，还是该改代码
+# --------------------------------------------------------------------------- #
+# 为什么盯这一组：两种失败的**处置相反**。
+#   * 模型照着工具定义也填不出合法参数 ⇒ 要改的是描述或参数结构；
+#   * 参数是对的、工具跑起来之后坏 ⇒ 要查实现或依赖。
+# 合并成 "failed" 一档时，看板只说"这个工具爱报错"，值班的人得先翻日志才知道该动
+# 哪一边 —— 而这个分类的全部价值就是省掉那一步。
+def _validation_error() -> Exception:
+    """造一个**真实的** pydantic 校验失败（不是手工拼的假对象）。"""
+    from pydantic import BaseModel
+
+    class _Args(BaseModel):
+        name: str
+
+    try:
+        _Args(name=123)          # type: ignore[arg-type]
+    except Exception as exc:     # noqa: BLE001  这里要的就是那个异常本身
+        return exc
+    raise AssertionError("构造不出校验失败")
+
+
+def test_bad_arguments_are_told_apart_from_execution_failures(sink):
+    """★ 参数错与执行错分成两档，且**播报里也带着这一档**。
+
+    只写进清单、不进指标是不行的：清单只活在一次运行内部，运维看不到它；指标里
+    没有这个维度，看板就永远只有"failed"。
+    """
+    from agents.exceptions import ModelBehaviorError
+
+    log = StepLog()
+    _begin(log, "kb_search", '{"query": 1}', "c1")
+    log.fail("kb_search", ModelBehaviorError("Invalid JSON input for tool kb_search"))
+    _begin(log, "save_text_asset", '{"name": 1}', "c2")
+    log.fail("save_text_asset", _validation_error())
+    _begin(log, "generate_image", '{"prompt": "p"}', "c3")
+    log.fail("generate_image", OSError("磁盘满"))
+
+    assert [s.reason for s in log.steps] == ["bad_args", "bad_args", "error"]
+    reasons = [e[3].get("reason") for e in sink.counters("agent_tool_result_total")]
+    assert reasons == ["bad_args", "bad_args", "error"]
+
+
+def test_a_successful_call_carries_an_empty_reason(sink):
+    """成功那条不带失败档位 —— 否则看板上"成功"会被拆成好几个无意义的序列。"""
+    log = StepLog()
+    _begin(log, "kb_search", '{"query": "q"}', "c1")
+    log.finish("kb_search", "命中")
+
+    assert log.steps[0].reason == ""
+    assert sink.counters("agent_tool_result_total")[0][3]["reason"] == ""
+
+
+def test_failure_reason_looks_at_the_type_not_the_text():
+    """★ 判据必须是**异常类型**：按错误文本匹配会在 SDK 升版后静默全判成 error。
+
+    这条专门钉住那个退化写法 —— 下面第二个断言里的文本与第一个完全相同，但类型
+    不是 ``ModelBehaviorError``，所以它必须落到 ``error``。写成关键词匹配的版本
+    会把它判成 ``bad_args``，而症状是"分类看着有数、其实全靠字符串猜"。
+    """
+    from agents.exceptions import ModelBehaviorError
+
+    from src.agents.steps import _failure_reason
+
+    assert _failure_reason(ModelBehaviorError("Invalid JSON input")) == "bad_args"
+    assert _failure_reason(RuntimeError("Invalid JSON input")) == "error"
+    assert _failure_reason(_validation_error()) == "bad_args"
+
+
+def test_the_failed_reason_survives_a_later_finish(sink):
+    """失败定格之后 ``on_tool_end`` 又来了（官方一定会来）⇒ 档位不许被抹成空串。"""
+    log = StepLog()
+    _begin(log, "save_text_asset", '{"name": "n"}', "c1")
+    log.fail("save_text_asset", OSError("坏"))
+    log.finish("save_text_asset", "官方转述的错误文本")
+
+    assert log.steps[0].status == "failed"
+    assert log.steps[0].reason == "error"
+    assert len(sink.counters("agent_tool_result_total")) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 十一、曝光：一次没被选过的工具也必须能在指标里看见
+# --------------------------------------------------------------------------- #
+# 为什么盯这一组：结果计数器只在**被调用时**产生时间序列。所以"挂了三个月一次没用"
+# 与"这个部署根本没有它"在 /metrics 上是同一个样子 —— **空白**。空白不是 0，
+# 它没法被查询、也不会出现在任何看板上。曝光计数就是那个分母。
+def test_exposure_is_recorded_for_every_tool_on_the_agent(sink):
+    """每个挂上的工具各记一次曝光。"""
+    log = StepLog()
+    log.note_exposed(["research", "build_slide_deck", "evaluate_draft_tool"])
+
+    rows = sink.counters("agent_tool_exposed_total")
+    assert [e[3]["tool"] for e in rows] == ["research", "build_slide_deck", "evaluate_draft_tool"]
+    assert all(e[2] == 1 for e in rows)
+
+
+def test_exposure_skips_blank_and_duplicate_names(sink):
+    """空名与重复名不许各算一次 —— 重复会把选中率的分母抬高，选中率随之系统性偏低。"""
+    log = StepLog()
+    log.note_exposed(["kb_search", "", "kb_search"])
+
+    assert len(sink.counters("agent_tool_exposed_total")) == 1
+
+
+def test_a_tool_that_was_never_selected_still_shows_up(sink):
+    """★ 本次改动的目的：曝光有值、结果没有 ⇒ "一次没选过"是一个可查的数。
+
+    挂在 agent 上的两个工具只用了其中一个，另一个必须**仍然在指标里出现**
+    （以曝光的形式）。这正是改之前看不见的那一侧。
+    """
+    log = StepLog()
+    log.note_exposed(["research", "make_illustration"])
+    _begin(log, "research", '{"question": "q"}', "c1")
+    log.finish(log.steps[0].tool, "结论")
+
+    exposed = {e[3]["tool"] for e in sink.counters("agent_tool_exposed_total")}
+    selected = {e[3]["tool"] for e in sink.counters("agent_tool_result_total")}
+    assert exposed == {"research", "make_illustration"}
+    assert selected == {"research"}
+    assert "make_illustration" not in selected
+
+
+def test_on_agent_start_records_exposure(sink):
+    """★ 接线：钩子的 agent 开始回调必须真的登记曝光。
+
+    只测 ``note_exposed`` 而不测接线，等于"方法对了但没接上"—— 这种情况全绿，
+    而指标永远没有数据。本文件里同类接线（``on_agent_start`` 记 agent 名）也有守卫。
+    """
+    task, wrapper = _pipeline()
+    agent = SimpleNamespace(name="frontline_agent",
+                            tools=[_tool("research"), _tool("save_text_asset")])
+
+    asyncio.run(H.AGENT_HOOKS.on_agent_start(wrapper, agent))
+
+    names = [e[3]["tool"] for e in sink.counters("agent_tool_exposed_total")]
+    assert names == ["research", "save_text_asset"]
+
+
+def test_exposure_is_silent_when_disabled(monkeypatch, sink):
+    """关掉步骤记录 ⇒ 曝光也一起关（跟随同一个开关，没有独立开关）。"""
+    monkeypatch.setenv("AGENT_TOOL_STEPS", "0")
+    StepLog().note_exposed(["kb_search"])
+
+    assert sink.counters("agent_tool_exposed_total") == []

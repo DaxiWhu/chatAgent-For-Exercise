@@ -35,6 +35,24 @@
 
 清单侧对应 ``StepLog.repeat_counts()`` / ``StepLog.max_repeat``：下一次反思闸门
 直接读它判"该不该介入"，不必另建一份重复状态 —— 两处分别维护一定会漂。
+
+两个"看板上必然看不见"的缺口（2026-10-19 补）
+---------------------------------------------
+1. **一个从没被选过的工具，在指标里根本不存在。** 计数器只在被调用时产生时间序列，
+   所以"挂了但一次没用"这件事在 ``/metrics`` 里是**空白**，而不是 0 —— 空白与
+   "这个部署根本没有这个工具"读起来一模一样。补法是另计一条**曝光**：每次 agent
+   开始运行，把它挂的每个工具各记一次（``agent_tool_exposed_total{tool}``）。于是
+   选中率 = 结果数 / 曝光数，而"一次没选过"表现为**曝光有值、结果没有**。
+2. **失败只有一档，但两种失败的处置完全相反。** 模型把参数给错（JSON 不合法、
+   缺必填、类型不对）要改的是**工具描述或参数结构**；工具实现抛异常要改的是
+   **代码或依赖**。两者都落成 ``status="failed"`` 时，看板只会告诉你"这个工具爱
+   报错"，而值班的人无从判断该动哪一边。所以再分一档 ``reason``：
+
+   * ``bad_args`` —— 模型给的参数不合法（``ModelBehaviorError`` / 校验失败）；
+   * ``error`` —— 工具跑起来之后失败（实现 bug、外部服务不可用、磁盘问题）。
+
+   ⚠️ 判据必须看**异常类型**，不能看错误文本 —— 文本是官方默认实现的产物，版本一升
+   就可能变，而"文本里有没有某个词"这种判据会在升级后静默全判成 ``error``。
 """
 
 from __future__ import annotations
@@ -92,6 +110,40 @@ def _fingerprint(name: str, arguments: Any) -> str:
 def _clip(value: Any) -> str:
     """压成一行并截断（要的是摘要，不是原文）。"""
     return " ".join(str(value).split())[:_MAX_DETAIL]
+
+
+def _failure_reason(error: Any) -> str:
+    """把一次失败分成 ``bad_args`` 与 ``error`` 两档（判据是**异常类型**）。
+
+    为什么非要分开：这两种失败的处置**相反**。``bad_args`` 说明模型照着工具定义
+    也填不出合法参数 ⇒ 要改的是**描述或参数结构**（例如一个参数名有歧义、一个本该
+    有默认值的字段被 strict 模式变成了必填）；``error`` 说明参数是对的、工具跑起来
+    之后才坏 ⇒ 要查的是**实现或依赖**。混成一档时看板只说"这个工具爱报错"，值班的
+    人得先去翻日志才知道该动哪一边。
+
+    判据用类型而不是文本，有两个具体理由：错误文本是官方默认实现的产物（``clip``
+    之后还要截断），而且按关键词匹配会在 SDK 升版后**静默全判成 error** —— 那正好
+    让这个分类失去意义，且不会有任何东西报错。
+
+    ⚠️ 已知的粗糙点：``as_tool`` 包出来的专家工具，失败可能是**子 agent 自己的
+    结构化输出解析不出来**（同样抛 ``ModelBehaviorError``），这里会归到
+    ``bad_args``，而实际要动的是子 agent 的输出契约。判断"参数错 vs 执行错"所需的
+    信息（工具函数体有没有开始执行）在错误处理函数这一侧拿不到 —— 如实记在这里，
+    不要在这个基础上做"谁的责任"的归因。
+    """
+    try:
+        from agents.exceptions import ModelBehaviorError
+    except Exception:  # pragma: no cover  SDK 缺失时按执行错处理
+        return "error"
+    if isinstance(error, ModelBehaviorError):
+        return "bad_args"
+    try:
+        from pydantic import ValidationError
+    except Exception:  # pragma: no cover
+        return "error"
+    if isinstance(error, ValidationError):
+        return "bad_args"
+    return "error"
 
 
 def calls_from_response(response: Any) -> list[tuple[str, str, str]]:
@@ -162,6 +214,12 @@ class ToolStep:
     """定位编号。模型请求时给、工具结果带同一个回来 ⇒ 将来"退回第几步"的定位键。"""
     status: str = "running"
     """``running`` / ``ok`` / ``failed``。"""
+    reason: str = ""
+    """失败档位：``bad_args``（模型给错参数）/ ``error``（工具跑起来之后失败）。
+
+    只在 ``failed`` 时有意义；成功时留空。判据是**异常类型**，不是错误文本
+    （理由见模块 docstring 末尾）。
+    """
     detail: str = ""
     """结果或错误的**摘要**（截断，不是原文）。"""
     duration: float = 0.0
@@ -176,6 +234,7 @@ class ToolStep:
             "fingerprint": self.fingerprint,
             "call_id": self.call_id,
             "status": self.status,
+            "reason": self.reason,
             "detail": self.detail,
             "duration": round(self.duration, 4),
         }
@@ -222,6 +281,31 @@ class StepLog:
         return [s.as_dict() for s in self.steps]
 
     # -- 写入（钩子与工具错误处理函数调用）--
+    def note_exposed(self, tools: list[str]) -> None:
+        """登记"这些工具被摆到模型面前过一次"（每个工具各计一次）。
+
+        为什么需要这条：结果计数器只回答"被选中的那几次"，而**没被选中的工具在指标里
+        什么都不留**。于是"某个工具挂了三个月一次没用过"与"这个部署根本没有它"在
+        ``/metrics`` 上完全一样 —— 都是空白。有了曝光计数，"一次没选过"才是一个可以
+        直接查到的数（曝光有值、结果没有），选中率也才有分母。
+
+        ⚠️ 粒度是"每次 agent 开始运行"，不是"每次模型调用"：同一个 agent 在一次运行里
+        连跑几圈，工具集只摆出来一次（``on_agent_start`` 只在 agent 变化时触发）。这是
+        想要的 —— 它回答的是"这套工具被交给模型多少回"，不是"模型有多少次机会选它"。
+
+        去重放在**这里**，不放在调用方：这是唯一的播报点，任何调用方（含将来新加的）
+        都自动受保护。两处各写一份去重一定会漂 —— 而漂的表现是分母偏大、选中率偏低，
+        看板上看起来像"模型不太爱用这些工具"。
+        """
+        if not steps_enabled():
+            return
+        seen: set[str] = set()
+        for name in tools:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            observability.counter("agent_tool_exposed_total", tool=name)
+
     def note_calls(self, calls: list[tuple[str, str, str]]) -> None:
         """登记"模型这次请求了哪些工具"（还没执行 ⇒ 先入队）。"""
         if not steps_enabled():
@@ -273,7 +357,9 @@ class StepLog:
         """
         if not steps_enabled():
             return
-        self._settle(self._open(tool) or self._append(tool), "failed", error)
+        self._settle(
+            self._open(tool) or self._append(tool), "failed", error, reason=_failure_reason(error)
+        )
 
     # -- 内部 --
     def _append(self, tool: str) -> ToolStep:
@@ -300,7 +386,7 @@ class StepLog:
         """**已经定格**的同指纹步骤有几条（调用它的那条自己还没定格）。"""
         return sum(1 for s in self.steps if s.settled and s.fingerprint == fingerprint)
 
-    def _settle(self, step: ToolStep, status: str, detail: Any) -> None:
+    def _settle(self, step: ToolStep, status: str, detail: Any, reason: str = "") -> None:
         """定格一条步骤并**播报一次**（重复调用直接返回，不与业务交互）。"""
         if step.settled:
             return
@@ -311,9 +397,14 @@ class StepLog:
         repeated = bool(step.fingerprint) and self._count_settled(step.fingerprint) > 0
         step.settled = True
         step.status = status
+        step.reason = reason
         step.detail = _clip(detail)
         step.duration = max(0.0, time.perf_counter() - step.started) if step.started else 0.0
-        observability.counter("agent_tool_result_total", tool=step.tool, status=step.status)
+        # reason 只在失败时有内容，成功时是空串。多一个维度不会让既有查询失效
+        # （`status="failed"` 仍然匹配全部失败），但能把"该改描述"与"该改代码"分开。
+        observability.counter(
+            "agent_tool_result_total", tool=step.tool, status=step.status, reason=step.reason
+        )
         if repeated:
             observability.counter("agent_action_repeats_total", tool=step.tool)
         if step.duration:

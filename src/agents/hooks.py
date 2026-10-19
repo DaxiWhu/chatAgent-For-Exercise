@@ -67,6 +67,24 @@ def steps_of(context: Any) -> StepLog | None:
     return None
 
 
+def _tool_names(agent: Any) -> list[str]:
+    """这个 agent 挂了哪些工具（按名字取，跳过空名）。
+
+    口径必须与 ``on_tool_start`` 一致 —— 那里记的也是 ``tool.name``。若这里改用类名
+    或对象 id，曝光侧与结果侧就再也对不上，而症状是"曝光有值、选中率恒为 0"，
+    看板上看起来像"模型从来不用工具"。
+
+    这里**不去重**：去重只在播报点做（``StepLog.note_exposed``），两处各写一份一定
+    会漂，而漂的表现是分母偏大、选中率偏低。
+    """
+    out: list[str] = []
+    for tool in getattr(agent, "tools", None) or []:
+        name = getattr(tool, "name", "") or ""
+        if name:
+            out.append(name)
+    return out
+
+
 class AgentRunHooks(RunHooks[TaskContext]):
     """把 SDK 的生命周期事件累计进 ``TaskContext``（统计 + 动作清单）。"""
 
@@ -89,11 +107,20 @@ class AgentRunHooks(RunHooks[TaskContext]):
             log.note_calls(calls_from_response(response))
 
     async def on_agent_start(self, context, agent) -> None:
-        """当前 agent 变更时触发（含首次）。"""
+        """当前 agent 变更时触发（含首次）。
+
+        除了记名字，这里还要**登记一次曝光**：这个 agent 挂的工具从此摆到模型面前了。
+        漏掉这一句的后果很窄但很隐蔽 —— 只要某个工具真的被用过，选中率照样算得出来；
+        只有当它**一次都没被用过**时，指标里才什么都不留，而"从没用过"与"根本没挂"
+        在 ``/metrics`` 上是同一个样子。所以这一句的价值全在"零调用"那一侧。
+        """
         stats = stats_of(context)
         name = getattr(agent, "name", "")
         if stats is not None and name and name not in stats.agents:
             stats.agents.append(name)
+        log = steps_of(context)
+        if log is not None:
+            log.note_exposed(_tool_names(agent))
 
     async def on_handoff(self, context, from_agent, to_agent) -> None:
         """handoff 发生时触发。这是拓扑是否真的被走到的**唯一直接证据**。

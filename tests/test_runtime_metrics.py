@@ -729,6 +729,11 @@ DRILL_ONLY = (
     "circuit_opened_total",          # 状态由 circuit_open 兜住，这里是次数
     "circuit_rejected_total",        # 同上：省下了多少次白等
     "agent_tool_calls",              # 异常收尾由 agent_runs_total{exit_reason} 兜住
+    # 工具层两点：一个工具是不是**从没被选过**、失败是**参数错**还是**实现错**。
+    # 它们都不该单独告警（没有一个"正常值"可断言），但都是 `agent_tool_calls`
+    # 那条 runbook 在分诊时真正要落到的那一层 —— 所以必须在 alerts.yml 里被指路。
+    "agent_tool_exposed_total",
+    "agent_tool_result_total",
     # 跨轮压缩那一次摘要调用的耗时：它压在首 token 之前，但**不是每一次请求**都会
     # 触发（只有历史超过预算时才压），所以不适合单独设阈值告警 —— 它是
     # `FirstTokenTooSlow` 的分诊入口（runbook 指路）。
