@@ -1,14 +1,26 @@
 # chatAgent
 
-基于 LangGraph 的内容生成 Agent：生成 → 自动评分 → 低分重生成 / 人工审核 → 结束，
-并提供 FastAPI 流式服务（SSE）与基于 TF-IDF 的轻量 RAG。
+基于 **OpenAI Agents SDK** 的内容生成 Agent：入口 agent 自己决定「直接交付 / 叫帮手 /
+转人工审核」，并提供 FastAPI 流式服务（SSE）与基于 TF-IDF 的轻量 RAG。
+
+> 编排原语只有 `Agent`（instructions + tools + handoffs + guardrails）和 `Runner`
+> 主循环 —— **没有图、没有节点、没有边**。一轮请求 = 一次 `Runner.run`（见
+> `src/turn.py`）；需要人做决定时运行停在官方 `RunState` 上，由 `app/runs.py` 落库。
 
 ## 目录结构
 
 ```
 chatAgent/
 ├─ src/                  生产代码（唯一真源）
-│  ├─ graph.py           Agent 编排层：init → retrieve → generate → evaluate → route → human
+│  ├─ turn.py            **一轮请求 = 一次 `Runner.run`**（入口在这里，没有编排图）
+│  ├─ agents/            agent 装配：入口 / 专家 / 工具 / 护栏 / 审批 / 历史压缩
+│  │  ├─ runner.py           `Runner` 的调用与结果整理（`TaskOutcome`）
+│  │  ├─ frontline.py        入口 agent（判定 reply / transfer）+ 交付工具
+│  │  ├─ specialists.py      专家 agent（检索、文学创作…）
+│  │  ├─ tools.py            `kb_search` 等工具（citations 从这里出来）
+│  │  ├─ approval.py         工具审批：`deliver(needs_review=True)` 停在交付前
+│  │  ├─ compaction.py       跨轮历史压缩
+│  │  └─ session.py          官方 `Session` 的 PG 后端（跨轮历史唯一载体）
 │  └─ rag/               RAG 数据链路（解析 → 切分 → 向量化 → 检索 → 引用）
 │     ├─ retrieval.py        RAG 检索库：语料装载 + TF-IDF / embedding / pgvector + 引用回溯
 │     ├─ loaders.py          多格式解析：txt/md/csv/tsv/json/jsonl/html/docx/xlsx/pptx
@@ -82,15 +94,20 @@ python -m app.serve                      # 推荐：自动适配事件循环（�
 pytest tests/ -q
 ```
 
-> **为什么用 `python -m app.serve` 而不是裸 `uvicorn`**：检查点持久化用的是
-> `AsyncPostgresSaver`，它底层是 psycopg 的**异步**连接，而 psycopg 异步**不支持
-> Windows 的 ProactorEventLoop** —— uvicorn 在 win32 上恰好默认用它（且 0.36+ 直接
-> 指定 loop_factory，`set_event_loop_policy` 无效）。`app/serve.py` 注入了一个
-> 平台自适应的事件循环工厂（win32→Selector，Linux→uvloop/Selector），
-> 让持久化在两种平台都能生效。**不这么做时服务仍能起，但会静默降级为内存检查点
-> （重启丢状态）**，`/health/ready` 的 `checkpointer` 项会显示 `<...>Saver（内存…）`。
+> **为什么用 `python -m app.serve` 而不是裸 `uvicorn`**：它统一处理 `APP_HOST` /
+> `APP_PORT` / `APP_WORKERS`（兼容平台注入的 `WEB_CONCURRENCY`）与优雅关闭排空上界
+> `GRACEFUL_SHUTDOWN_TIMEOUT`，这几项裸命令都要自己敲对。
+>
+> ⚠️ **历史说明（2026-10-20 更新）**：这个入口原本还有一个理由 —— 检查点用的是
+> `AsyncPostgresSaver`（psycopg 异步），而 psycopg 异步**不支持 Windows 的
+> ProactorEventLoop**，所以要注入自适应的事件循环工厂。**异步检查点已经随图一起退役**：
+> 现在所有 PG 访问都是同步 psycopg + 工作线程（见 `app/pg.py` 的「为什么是同步池」），
+> 因此那条约束不再成立，`app/serve.py` 里的 `loop_factory` 只剩兼容作用。
 >
 > 入口是 `app.main:app`（旧命令 `uvicorn serve:app` 已随文件迁移失效）。
+>
+> 判断「运行现场有没有真的落库」的唯一可靠信号：`/health/ready` 的 `run_state` 项。
+> 显示 `memory（进程内存，重启丢现场！）` 就是没接上。
 
 ## 常用命令
 
@@ -109,7 +126,7 @@ pytest tests/ -q
 | **提交前门禁** | `tasks check` |
 | **热路径微基准** | `tasks bench`（`tasks bench -- --check` 走 CI 门禁口径；`-- --baseline <文件>` 与本机留档对比） |
 | 起本地栈 / 含监控 / 停 | `tasks up` / `tasks up-observability` / `tasks down` |
-| **端到端自检**（真起栈） | `tasks e2e`（SSE 分帧 / 灰度权重 / 持久化检查点；`--keep` 保留现场） |
+| **端到端自检**（真起栈） | `tasks e2e`（SSE 分帧 / 灰度权重 / 运行现场落库；`--keep` 保留现场） |
 | 看服务状态 / 跟日志 | `tasks ps` / `tasks logs`（`tasks logs -- app-stable` 只看一个） |
 | 备份 / **恢复演练** | `tasks backup-pg` / `tasks drill` |
 | 灰度发布 / 回滚 | `tasks release -- <镜像tag> --dry-run` / `tasks rollback -- <镜像tag>` |
@@ -130,15 +147,15 @@ pytest tests/ -q
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/v1/chat` | SSE 流式对话。事件：`token` 增量文本、`citations` 引用、`need_review` 需人工审核、`budget_exceeded` 超 token 预算、`timeout` 超请求总时限（终止性，其后无 `done`）、`stopped` 被用户停止（终止性，其后无 `done`）、`done` 结束、`error` 异常 |
-| POST | `/v1/chat/resume` | **续跑中途断掉的会话**（SSE，事件同 `/v1/chat`）。body：`{thread_id}`。待人工审核时返回 409 并指路 `/v1/review` |
-| GET | `/v1/sessions/{thread_id}` | **会话状态快照**（断点续传的基础）。纯读、幂等，返回 `status` / `resumable` / `draft` / `messages` / `citations` / `pending_review` |
+| POST | `/v1/chat/resume` | **续跑停在审批上的运行**（SSE，事件同 `/v1/chat`）。body：`{thread_id}`。⚠️ 当前**恒回 409**：官方只在「产生 interruption」时给可恢复现场，而本项目唯一的中断点就是交付审批 ⇒ 那就该走 `/v1/review`；断流 / 超时那一类没有现场（官方明确写明留给应用自己），如实回 409 并指路「重发消息」 |
+| GET | `/v1/sessions/{thread_id}` | **会话状态快照**。纯读、幂等，返回 `status` / `resumable` / `draft` / `messages` / `citations` / `pending_review` |
 | POST | `/v1/sessions/{thread_id}/messages` | **任务执行中补一句话**（不触发运行、不占配额、无 SSE）。body：`{message}`。生效时机：本次运行的下一次模型调用 → 下一个 agent 节点 → 下一轮。支持 `Idempotency-Key`（重试不会写两遍）。会话后端不可用时 503（那份补充存不下来） |
-| POST | `/v1/sessions/{thread_id}/stop` | **停掉正在跑的那一次运行**。停止后 SSE 收到终止性的 `stopped` 事件（其后无 `done`），已产出正文保留、检查点保留可 `resume`。当前没有在跑的任务返回 409；重复调用幂等 |
+| POST | `/v1/sessions/{thread_id}/stop` | **停掉正在跑的那一次运行**。停止后 SSE 收到终止性的 `stopped` 事件（其后无 `done`），已产出正文保留。⚠️ 停止是**取消**，官方不会为取消产出可恢复现场 ⇒ `stopped` 里的 `resumable` 恒为 false。当前没有在跑的任务返回 409；重复调用幂等 |
 | POST | `/v1/review` | 人工审核 resume。body：`{thread_id, action: "accept"\|"revise", feedback}`。非审核态返回 409 |
 | GET | `/v1/reviews` | 待人工审核队列（分页列举，含草稿摘要与评分） |
 | GET | `/health` | 兼容旧路径，等价于 `/health/live`，恒返回 `{"status":"ok"}` |
 | GET | `/health/live` | 存活探针：只反映本进程，不查外部依赖 |
-| GET | `/health/ready` | 就绪探针：真探 LLM 配置 / 数据库 / 向量扩展 / 检查点类型；不健康回 503 |
+| GET | `/health/ready` | 就绪探针：真探 LLM 配置 / 数据库 / 向量扩展 / 运行现场存储（`run_state`）；不健康回 503 |
 | GET | `/metrics` | Prometheus 文本指标（`METRICS_ENABLED=0` 时返回 404） |
 
 `/chat`、`/review` 保留为 `/v1/*` 的兼容别名（标记 deprecated，功能一致）。
@@ -182,34 +199,45 @@ python scripts/snapshot_openapi.py --write    # 确认变更后重新生成
 
 **改模板文本必须 bump `PROMPT_VERSION`**：`tests/test_prompts.py` 里存着
 「版本号 → 三个模板渲染后的 sha256」映射，只改文本不改版本号会直接测红。
-该测试同时用 AST 断言提示词**没有回流**到 `src/graph.py` 的代码里。
+该测试同时断言提示词**没有回流**到 `src/` 的代码里（只允许出现在 `src/prompts.py`）。
 
 ### 断点续传
 
-SSE 一断（弱网、切后台、代理超时），客户端手里往往只剩"已经打到屏幕上的那半句"。
-但**状态其实一直在检查点里** —— 每个节点边界都会落一次，`aget_state()` 随时能取回
-完整对话、最新草稿、评分与引用。这两个端点就是把已有事实暴露出来：
+SSE 一断（弱网、切后台、代理超时），客户端手里往往只剩「已经打到屏幕上的那半句」。
+但先把一件事说清楚：**可恢复的现场不是客户端断流时产生的**。
+
+| 情形 | 有没有可恢复的现场 | 客户端该怎么办 |
+|---|---|---|
+| 模型在交付那一刻声明要人审（`needs_review`） | **有** —— 运行真的停在官方 `RunState` 上，由 `app/runs.py` 落库 | 调 `/v1/review`（要的是**人的决定**，不是 resume） |
+| 客户端断流 / 请求超时 / 用户点「停止」 | **没有** —— 那是取消，官方只对 interruption 产现场 | 重发消息；带同一个 `Idempotency-Key` 会重放上次结果 |
+| 正常跑完 | 没有（也不需要） | 直接渲染 `draft` / `messages` |
+
+这一层的失效方式是**静默**的：假设"断流后还能接着跑"，接口会返回 200，客户端以为
+续上了，实际上是从头又跑一遍 —— 已经发出去的 token 重发一遍、已经落盘的资产再做一次。
+
+> 官方对「崩溃恢复与副作用对账」是**明确不管**的：`human_in_the_loop.md` 把这一层
+> 指给 Dapr / Temporal / Restate / DBOS 这类耐久执行引擎。本项目不引第二个编排框架，
+> 所以**不假装能续** —— 没有现场时 `/v1/chat/resume` 如实回 409 并指路重发消息。
 
 ```text
 ① SSE 断了
    └─> GET /v1/sessions/{thread_id}
-         status=incomplete  → resumable=true  → POST /v1/chat/resume   （机器能自己跑完）
-         status=awaiting_review            → POST /v1/review           （需要人的决定）
-         status=completed                  → 结束了，取 draft/messages 渲染即可
+         status=awaiting_review → POST /v1/review     （需要人的决定）
+         status=completed       → 取 draft/messages 渲染即可
+         status=unknown         → 从未开始，或已被清理
 ```
 
-`status` 由 `state.next`（未执行完的节点）推导：
+`status` 只有三种，判据是「有没有现场 / 有没有待审记录 / 有没有历史」：
 
-| `next` | status | 客户端该做什么 |
+| 判据 | status | 客户端该做什么 |
 |---|---|---|
-| 含 `human_review` | `awaiting_review` | 弹审核界面，调 `/v1/review`；`pending_review` 里有草稿与评分 |
-| 非空、不含 `human_review` | `incomplete` | 提示"继续生成"，调 `/v1/chat/resume` |
-| 空 | `completed` | 直接渲染 `draft` / `messages` / `citations` |
+| `run_store` 里有现场，或审核队列里有 `pending` 记录 | `awaiting_review` | 弹审核界面，调 `/v1/review`；`pending_review` 里有草稿 |
+| 该会话有历史条目（官方 `Session`） | `completed` | 直接渲染 `draft` / `messages` |
+| 两者都没有 | `unknown` | 当新会话处理 |
 
-> **续跑的语义是"重新执行未完成的那个节点"**，不是"接上上次的半个 token"。
-> 实测确认：流被取消后检查点停在**该节点之前**（`next` 里留着它），所以续跑会
-> 从头把这次回答重新流一遍，客户端拿到的是完整自洽的正文。代价是**再花一次该节点的
-> token**（前面已完成的检索与多轮迭代不会重跑）。
+> `resumable` **只在真有现场时为 true**。有历史 ≠ 能接着跑：历史只证明这一轮收过尾。
+> 把这两件事混成一个字段，客户端就会对着一条已完成的会话反复调 resume。
+
 
 > 快照端点是**只读**的：它只查会话属主、**不写**登记表。否则"先读一次"就能把别人
 > 还没开始的 `thread_id` 占为己有。多租户下查不到属主一律 404（fail-closed），
@@ -436,14 +464,24 @@ START → init → retrieve → generate ─┬─(有 tool_calls)→ tool_node 
                                     └─(无)→ evaluate → route_review
 route_review → END（高分 >=80 / 不需评审 / 超过 10 轮 / 降级）
              → generate（60~79，自动重生成）
-             → human_review（<60，interrupt 等人工 accept / revise）
-human_review → END（accept）| generate（revise，带人工意见重写）
+             → request_review（<60，**只写标记**，不挂起）
+request_review → END
 ```
+
+> ⚠️ 2026-10-20 起 `request_review` 只写 `review_requested` / `review_reason` 就收尾，
+> **图里没有任何 `interrupt`**。真正的"停下来等人"是图外的停机容器
+>（`src/review_gate.py`）：接口层看到标记就把产出押进去，`/v1/review` 从那里取决定。
+> 为什么必须分开：官方的中断只能在**运行中**产生（工具要审批），而"跑偏 / 护栏拦下 /
+> 低分"全是**运行结束后**才知道的结论 —— 没有运行可以倒回去停在交付之前。
+>
+> 人工决定的两条路：`accept` → 什么都不跑，把执行图里的 `output` 直接交付；
+> `revise` → **新起一轮运行**，意见走 `configurable.human_feedback`（不进 state、
+> 不进对话历史）。
 
 关键容错：
 - `evaluate` 连续失败 5 次 → `force_exit` 降级为固定报错文案，图不崩；
 - `retrieve` 未配置知识库或检索异常 → 降级为空上下文，主流程照常；
-- 人工输入非法（action 越界 / revise 无意见）→ 重新 `interrupt` 让人补填。
+- 审核输入非法（action 越界 / revise 无意见）→ 容器**抛错**，不推进也不漏出草稿。
 
 ## 环境变量
 
@@ -457,7 +495,7 @@ human_review → END（accept）| generate（revise，带人工意见重写）
 | `AGNES_API_KEY` | 是 | **LLM** API Key（生成用） |
 | `AGNES_API_BASE` | 否 | 默认 `https://apihub.agnes-ai.com/v1` |
 | `AGNES_MODEL` | 否 | 默认 `agnes-2.0-flash` |
-| `DB_URL` | 否 | PG 连接串。**检查点 + pgvector + 审核队列 + 会话归属共用**；留空则检查点用内存（重启丢状态） |
+| `DB_URL` | 否 | PG 连接串。**跨轮历史 + 运行现场 + pgvector + 审核队列 + 会话归属共用**；留空则历史不可用、运行现场落内存（重启丢现场） |
 | `DOCS_DIR` | 否 | RAG 语料目录，默认 `data` |
 
 **服务与安全**（这一组配错多半**不报错**，只是静默不生效 —— 核对方法见「部署」段）
@@ -475,7 +513,7 @@ human_review → END（accept）| generate（revise，带人工意见重写）
 | `MAX_REQUEST_BYTES` | 否 | 请求体字节上限，默认 `1048576`（1 MiB）。超限 **413**，在**读之前**就拒（防内存打爆） |
 | `MAX_MESSAGE_CHARS` | 否 | `/v1/chat` 的 `message` 长度上限，默认 `100000`。超限 **422** 并点名字段 |
 | `MAX_FEEDBACK_CHARS` | 否 | `/v1/review` 的 `feedback` 上限，默认 `20000` |
-| `MAX_THREAD_ID_CHARS` | 否 | `thread_id` 上限，默认 `128`（它同时是检查点主键、限流桶键、归属表主键） |
+| `MAX_THREAD_ID_CHARS` | 否 | `thread_id` 上限，默认 `128`（它同时是会话历史主键、运行现场主键、限流桶键、归属表主键） |
 | `RATE_LIMIT_ENABLED` / `RATE_LIMIT_BY_SESSION` | 否 | 两个限流维度各自的开关，默认都开 |
 | `RATE_LIMIT_PER_MINUTE` / `RATE_LIMIT_SESSION_PER_MINUTE` | 否 | 按 IP、按会话的每分钟上限，默认 `120` |
 | `LLM_MAX_TOKENS_PER_REQUEST` | 否 | 单请求 token 预算，超限**停止继续生成**（已产出的照常返回）。`0`=不限 |
@@ -489,7 +527,7 @@ human_review → END（accept）| generate（revise，带人工意见重写）
 | `LOG_FORMAT` / `LOG_LEVEL` | 否 | `json`（默认，生产）/ `text`（本地人眼友好）；级别默认 `INFO` |
 | `HEALTH_READY_TIMEOUT` | 否 | 就绪探针探依赖的超时（秒），默认 `3` |
 | ~~`DISCONNECT_POLL_INTERVAL`~~ | — | **已废弃**。断连检测改为 sse_starlette 的 `client_close_handler_callable` 回调（事件驱动，无轮询间隔可调） |
-| `LANGFUSE_*` / `LANGSMITH_API_KEY` / `LANGCHAIN_PROJECT` | 否 | 链路追踪，两组都留空 = 不接（行为与没有这层代码一致） |
+| `LANGFUSE_*` / `LANGSMITH_API_KEY` / `LANGCHAIN_PROJECT` | 否 | 链路追踪。两组都留空 = **不产生任何 trace**（连 SDK 默认的 OpenAI 后台上报也会被关掉）。Langfuse 还需要额外装 `langfuse` + `openinference-instrumentation-openai-agents` 两个包，见 `PRODUCTION_CONFIG.md` §3.1 |
 | `REVIEW_NOTIFY_WEBHOOK` / `REVIEW_NOTIFY_FORMAT` | 否 | 待审通知（`generic` / `wecom` / `feishu`）。**留空 = 只入队不通知** |
 
 **RAG 检索**
@@ -548,7 +586,7 @@ python -m app.serve 2>&1 | grep 服务启动配置
 #       'rate_limit': {'shared_configured': True, 'backend': 'redis'},
 #       'quota': {'shared_configured': True, 'backend': 'redis'}
 
-# 就绪探针真探依赖（llm / db / vector_store / checkpointer 四项，各自带耗时）
+# 就绪探针真探依赖（llm / db / vector_store / run_state 四项，各自带耗时）
 curl -s localhost:8000/health/ready | python -m json.tool
 ```
 
@@ -612,7 +650,7 @@ python -m scripts.pg_backup restore <file> --yes     # 覆盖当前库（默认�
 ### 5) 上线前自检
 
 ```bash
-curl -s localhost:8000/health/ready | python -m json.tool      # llm / db / vector_store / checkpointer 四项
+curl -s localhost:8000/health/ready | python -m json.tool      # llm / db / vector_store / run_state 四项
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/docs    # 生产应为 404
 python -m scripts.load_test --requests 200 --concurrency 20     # 默认打 /health/live，不花 token
 python -m scripts.load_test --endpoint chat --yes-spend --disconnect-after 3   # 断连止损验证
@@ -741,7 +779,7 @@ python scripts/eval_generation.py --show-miss  # 看是哪条判据没过
   **httpx 默认会连本机请求也走 `HTTP_PROXY`**（表现为莫名其妙的 502）。
   其余 `examples/` 脚本是教程原型（PDF 切分、Chroma 灌库），依赖 `chromadb` / `openai`，
   需要时按 `requirements.txt` 末尾的注释单独安装。
-- 修改图逻辑请只改 `src/graph.py`；`notebooks/chatAgent.ipynb` 仅作探索，不参与生产。
+- 改编排请只改 `src/agents/`（装配）与 `src/turn.py`（一轮的入口）；`notebooks/chatAgent.ipynb` 仅作探索，不参与生产。
 
 ### CI 门禁（`.github/workflows/ci.yml`）
 

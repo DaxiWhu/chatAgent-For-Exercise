@@ -1,5 +1,10 @@
 # 方案：多步任务的检测 / 处理 / 兜底（2026-10-09）
 
+> ⚠️ **2026-10-20 注**：本文里的「节点 / 检查点 / 图状态」指的是**已删除**的旧编排图。
+> 行为结论（步骤记录、重复计数判据、反思闸门、第 2 级退回、第 3 级停止）**全部仍然有效**，
+> 落点是 `src/agents/{steps,reflection,guard_context}.py`；只把"装在哪张图的哪个节点上"
+> 换成"装在一次 `Runner.run` 的钩子上"来读。
+
 > 状态：**第 1~4 步已落地**（2026-10-09：步骤记录 / 重复计数 / 反思闸门 / 三级升级的第 2 级），
 > 第 5~7 步待做（兜底出口与第 3 级 · 结构化摘要 · 指标告警收口）。
 > ✅ §8 的两处"必须先验证"**都已验完**（输入侧 `call_id` 在、响应侧形态确认）。
@@ -330,7 +335,7 @@
 | `agent_recovery_level_total` | counter | `level` | 1 / 2 / 3 各发生几次 ✅ 第 3、4、5 步已全部落地（`1` = 注入提醒、`2` = 撤回那一步、`3` = 踩刹车中断本次运行）。⚠️ `3` 是在**抛出那一下**计的、不是在"判定出来"那一下 —— 判定 ≠ 真的停成了（判定发生时运行可能已经没有下一次模型调用了） |
 | `agent_recovery_skipped_total` | counter | `reason` | **到线了却没撤成**：`not_found`（那一步已被裁剪/压缩吃掉）/ `side_effect`（动作有副作用、白名单外）/ `capped`（额度用完）。⚠️ 它在涨说明"问题还在、但已经没得退了" ⇒ 该调额度，或该上第 3 级 ✅ 第 4 步已落地（这三个值现在**各对应一个第 3 级停因**，见 `PLAN_step5_fallback.md` §5） |
 | `agent_task_outcome_total` | counter | `outcome` / `agent` | **任务完成率**（缺口二）：delivered / partial / manual / failed ✅ 第 5 步已落地。⚠️ 标签值就是代码里那四个常量（同名同值 ⇒ 看板上"完成率掉了"能直接对到判定，中间不过一次翻译） |
-| `agent_fallback_total` | counter | `reason` / `agent` | 兜底各类原因各几次（`reason` 是**有限枚举**：none / error / off_track / review_failed / guardrail / no_output / loop / stuck / max_turns / guard_stop）✅ 第 5 步已落地 |
+| `agent_fallback_total` | counter | `reason` / `agent` | 兜底各类原因各几次（`reason` 是**有限枚举**：none / error / off_track / guardrail / no_output / loop / stuck / max_turns / guard_stop）。⚠️ 2026-10-19 起枚举里**没有** `review_failed` —— 评审没过不再进兜底表（见 `PLAN_step5_fallback.md` §4 第③行） |
 
 ⚠️ **两个 `agent` 标签是硬约定、不是风格**：一次请求 = N 次运行（转交那一轮是
 前台 + 文学 2 次），少了它按 `outcome` 聚合的看板会把"运行数"当"请求数"，阈值随之失真

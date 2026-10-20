@@ -150,7 +150,9 @@ route:
     # ⑤ agent 能力链路：请求有没有被正确地走完 agent 链路。
     #    复用 oncall —— 处置的人和可用性同一批（先判断是不是"功能坏了"），
     #    但等待更长：agent 的问题极少需要立刻叫醒人，多是"这一轮产出质量不对"。
-    #    ⚠️ AgentLinkDegraded 是这条路由下的 critical，真要叫醒时由 severity 区分。
+    #    ⚠️ 这一组里**没有 critical 了**：原来那条 `AgentLinkDegraded`（链路不可用 ⇒
+    #    静默退回问答链路）随图一起删除 —— 现在链路不可用的表现是**进程起不来**，
+    #    由 availability 组的 `up == 0` / 容器重启覆盖，不该在这里再有一条。
     - matchers:
         - category = "agent"
       receiver: oncall

@@ -32,7 +32,7 @@
  ├─ ⑥ 向量化与索引 ──────────────────────────────── src/rag/retrieval.py
  │    TfidfRetriever（字符 n-gram）| EmbeddingRetriever（bge-m3）| HybridRetriever（RRF 融合）
  │
- └─ ⑦ 检索 → 生成 → 引用（含原页返图）────────────── src/graph.py · app/main.py
+ └─ ⑦ 检索 → 生成 → 引用（含原页返图）────────────── src/agents/tools.py · src/turn.py · app/main.py
       citations：来源 / 页码 / 章节 / 坐标 / chunk_id / 保真节选 / 表格网格 / 原页截图
 ```
 
@@ -86,10 +86,10 @@
 
 | 工具 | 版本 | 作用 |
 |---|---|---|
-| LangGraph | 1.1.2 | 状态图：init → retrieve → generate → evaluate → human_review |
+| OpenAI Agents SDK | 0.20.0 | 唯一编排原语：`Agent`（instructions + tools + handoffs + guardrails）+ `Runner` 主循环。**没有图/节点**；停机靠官方 `RunState` |
 | LangChain Core / OpenAI | 1.2.18 / 1.1.11 | 消息与模型封装（`ChatOpenAI`） |
 | FastAPI + sse-starlette | 0.135.1 / 3.3.4 | `/chat`·`/review` SSE 流式（含 `citations` 事件） |
-| psycopg + PostgresSaver | 3.3.3 | 会话检查点持久化（缺 `DB_URL` 时回退内存） |
+| psycopg（同步池） | 3.3.3 | 跨轮历史（官方 `Session`）+ 运行现场（`app/runs.py`）落 PG；缺 `DB_URL` 时回退内存 |
 | pydantic | 2.12.5 | 结构化输出校验（评审结果 / 人工决策） |
 
 ### 1.5 本地模型权重（1.5GB → 清理后 430MB）

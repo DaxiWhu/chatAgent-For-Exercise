@@ -77,8 +77,10 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml logs alertmanage
   流式回答会变成"卡十几秒然后一次性吐出来"，而进程内测试压根不经过 nginx；
 - **灰度权重是否真的生效** —— 靠 `/health/live` 的 `release` 字段分布判断。
   这是唯一能自证"那 10% 流量真的进了新版本"的检查；
-- **检查点是否真的落了库** —— 退回内存时服务照常工作、回答照常出，**只在容器重启后
-  丢状态**（`/health/ready` 的 `checkpointer` 明细是唯一能看出它的地方）。
+- **运行现场是否真的落了库** —— 退回内存时服务照常工作、回答照常出，**只在容器重启后
+  丢现场**（`/health/ready` 的 `run_state` 明细是唯一能看出它的地方）。
+- **跨轮历史是否可用** —— 没配 `DB_URL` 时模型只看得到当轮那一句，而所有指标都正常
+  （启动日志里有一条专门的 warning）。
 
 第 ⑤ 步只在启用了邮件时才有意义，但那时它**不能省**：邮件是唯一**不经 alert-sink** 的
 通道（走 Alertmanager 原生 `email_configs`），两条链路在 Alertmanager 里就分叉了 ——
@@ -213,9 +215,9 @@ readiness 一直 503 ⇒ 实例被摘掉流量，等于"没在服务"。
 ```bash
 curl -sS localhost:8000/health/ready | python -m json.tool
 ```
-逐项看 `llm / db / vector_store / checkpointer` 哪个 `ok=false`。
+逐项看 `llm / db / vector_store / run_state` 哪个 `ok=false`。
 
-> ⚠️ **`checkpointer` 这一项是最容易搞错的**：检查点后端若降级成内存实现，
+> ⚠️ **`run_state` 这一项是最容易搞错的**：运行现场若降级成内存实现，
 > 它的文案会明确写 `InMemorySaver（内存，重启丢状态！）`。
 > 这是判断"持久化到底有没有接上"的**唯一可靠信号** —— 服务看起来一切正常，
 > 但所有会话状态在重启后会丢。
@@ -330,12 +332,12 @@ GC 在抖、还是 CPU 打满」，不负责发通知。RSS 的绝对值**跨部
 
 
 #### `StreamErrorsHigh`（critical，5m）
-SSE 流中途抛异常。典型成因：检查点后端故障、模型超时、配额被拒。
+SSE 流中途抛异常。典型成因：运行现场落库故障、模型超时、配额被拒。
 
 ```bash
 docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=500 app-stable | grep '流异常'
 ```
-重点看 `DB_URL` 连通性（检查点写失败会让流在输出中途断掉）与上游模型是否可用。
+重点看 `DB_URL` 连通性（落库失败会让流在输出中途断掉）与上游模型是否可用。
 
 > 这类问题**不会**在 HTTP 状态码上体现（响应头早就发出去了），
 > 所以只看 `HighErrorRate` 会完全漏掉它 —— 这就是这条规则独立存在的原因。
@@ -538,7 +540,7 @@ curl -s localhost:8000/metrics | grep -E '^llm_first_token_seconds|^llm_call_dur
 用户看到的是"依据不足"。此前这里只有一行 warning 日志，于是"检索一直失败"
 在指标上**完全看不出来**。
 
-1. **先看 `RagRetrievalDegraded` 的 `stage` 标签**：`graph_retrieve` 是主问答链路、
+1. **先看 `RagRetrievalDegraded` 的 `stage` 标签**：`kb_search` 是主问答链路、
    `agent_search` 是 agent 链路。只有一条在涨 ⇒ 问题在对应链路的调用姿势，不是检索器本身。
 2. 看 `circuit_open` 是否同时为 1 —— 是则按 `RetrievalCircuitOpen` 处置
    （**熔断打开时降级是预期行为**，别把两条告警当成两个问题）。
@@ -620,27 +622,32 @@ token（chunk ≠ token）；② **不要**把跨模型调用的等待算进去�
    `error` 会把限流(429)/超时/协议错/代码 bug 压成同一桶，**要看日志里的 `error` 字段**
    （`TaskOutcome.error` 形如 `"类型: 消息"`）才能分开处置 —— 限流该退避、bug 该改代码。
 
-#### `CheckpointErrorsHigh`（warning，5m）
+#### `RunStatePersistFailed`（warning，5m）
 
-**检查点（LangGraph 持久化）读写失败。** 它是**硬依赖**：失败意味着会话状态读不到 /
-写不进去，表现成"续跑拿到旧状态"或"请求卡住"，而 HTTP 可能仍是 200。
-⚠️ `/health/ready` 里的 `checkpointer` 项是**启动探针**，答不了"此刻的读写有没有失败"。
+**运行现场没能落库。** 触发指标是 `review_gate_failed_total`
+（`app.main._hold_for_review` 写 `agent_run_state` 失败时计数）。
+
+它意味着什么、不意味着什么：
+
+- **不**影响已经发出的正文 —— 用户那轮回答是完整的；
+- **意味着**这一轮的"待人审"现场没了：`/v1/review` 会因为找不到现场而回 409，
+  审核台上点「同意」没反应。`RunStore.save` 此时会**降级成内存**并打 warning
+  （"这次能不能接着跑"比"存在哪个介质上"重要），所以进程不重启就还能救回来 ——
+  重启就真丢了。
 
 ```bash
-docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 app-stable | grep '检查点'
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 app-stable | grep -E '运行现场|agent_run_state'
 ```
 
-1. 看是**连接类**失败（`DB_URL` / PG 容器 / 连接池耗尽）还是**序列化**失败
-   （state 里进了不可 msgpack 的类型）。
-2. 看 `checkpoint_duration_seconds{op=...}` 是否同步变慢：慢 ⇒ 连接池或磁盘；
-   不变 ⇒ 更可能是逻辑/序列化错误。
-3. 检查 PG 磁盘空间（见 `DiskSpaceLow`）与连接数上限。
-4. ⚠️ 恢复后**必须核对**这段时间的会话能否正常续跑（走一遍 `thread_id` 续传路径）——
-   `op=put*` 失败意味着**那一轮的状态根本没落库**，指标只告诉你发生了，
-   具体哪些会话受影响要自己查。
-5. 指标里出现 `checkpoint_*` 本身是个信号：接不上时 `main._instrument_checkpointer`
-   会**降级为原样返回**（宁可不埋点也不能把持久化换掉），日志里会有
-   「检查点计时未能接入」。**看不到这些序列时先去日志确认是"没接上"还是"没流量"。**
+1. 看是**连接类**失败（`DB_URL` / PG 容器 / 连接池耗尽 / `PoolNotConfigured`）
+   还是**表结构**问题（`agent_run_state` 不存在 ⇒ 跑 `python -m app.migrations apply`）。
+2. 检查 PG 磁盘空间（见 `DiskSpaceLow`）与连接数上限。
+3. 恢复后**必须核对**这段时间的待审会话：日志里 grep `会话 <thread_id>` 的 warning，
+   把它们捞出来通知审核人**重新触发一次**（客户端重发原消息即可，不会重复计费 ——
+   幂等键会重放上次结果）。
+4. ⚠️ 这一项**没有**耗时直方图：它已经套在请求总时限里（超时会先被 `timeout`
+   事件收掉），所以"慢"不会再表现为这里的失败。看不到序列时先确认有没有待审流量
+   （`review_needed_total`）。
 
 #### `OnlineHallucinationDetected`（warning，15m）
 
@@ -1015,7 +1022,8 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml exec pgvector ps
 ```
 - `agent_messages` 涨得快 ⇒ 对照 `http_requests_total` 看是不是被刷（真被刷时
   `agent_history_dropped_items` 也会同步放大）；
-- `checkpoints` 涨得快 ⇒ 长会话变多，通常属预期；
+- `agent_run_state` 涨得快 ⇒ 待审会话积压（对照 `review_needed_total` 与审核队列长度）；
+  它按会话**覆盖**写，正常不会无限涨 ⇒ 持续线性增长说明有人在反复触发待审。
 - 确认是预期增长就**调大阈值**（按盘容量与业务量定），**不要**关掉这条规则 ——
   它是磁盘告警唯一的提前量。
 
@@ -1024,51 +1032,49 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml exec pgvector ps
 前面几组管的是"服务活没活 / 花了多少 token"，这一组管的是
 "**这个能力有没有跑起来、跑得好不好**"。
 
-> ⚠️ **拓扑（2026-10-03 起）**：链路是图里的两个节点 —— **前台**（决定自己答还是
-> 把创作交给下一个节点）与**文学**。检索 / PPT / 插图仍然只是前台手里的**工具**，
-> 不是节点。于是指标的**口径也分了两种**，看板时必须分清：
-> * **请求口径**：`agent_route_total`、`agent_handoff_total`、`agent_rework_total`
->   （一次用户请求算一次）；
-> * **运行口径**：`agent_runs_total`、`agent_model_calls`、`agent_tool_calls`
->   （一次请求可能算 1~2 次，带 `agent` 标签）。
+> ⚠️ **拓扑（2026-10-20 起）**：链路是两个 **agent** —— **前台**（自己作答，或把
+> 创作交出去）与**文学**。交接走官方 `handoff`，它发生在**同一次运行的内部**，
+> 不是一个新节点、也不新起一次运行（`tests/test_agents_pipeline.py` 钉着这一点）。
+> 检索 / PPT / 插图仍然只是前台手里的**工具**。
 >
-> 拿分母时混用这两者，算出来的比率会错得没有告警能发现。
+> 所以现在**只有一种口径**：一次用户请求 = 一次运行
+> （`agent_runs_total` / `agent_model_calls` / `agent_tool_calls`，带 `agent` 标签）。
+> 想知道"这一轮换过人没有"看 `agent_participants_total{agent}` 与
+> `agent_handoff_total{src,dst}` —— 它们才是"多了一个人"的证据；运行数不会变多。
+>
+> ⚠️ 哪天一次请求又变成多次运行（比如把某个帮手挪成独立的运行），分母必须重新
+> 拆成"请求口径 / 运行口径"两套 —— 混用会让比率系统性偏差，而且没有任何告警能发现。
 
 > ⚠️ 先分清两种"看起来正常"：
-> - **指标序列不存在** ⇒ 从没走过 agent 链路（可能没有流量，也可能被关了）；
-> - **`agent_unavailable_total` 在涨** ⇒ 有人要用，但**链路起不来**（配置缺失）。
+> - **指标序列不存在** ⇒ 从没走过 agent 链路（没有流量，最常见）；
+> - **进程压根没起来** ⇒ 没装 SDK / 没配 Key，`app.main._assert_agents_ready` 会
+>   让启动**直接失败**（`missing_sdk` / `missing_api_key` / `build_failed`）。
+>   ⚠️ 这等于是 `up == 0` 与容器重启计数的事，**不要**再去指标里找"降级计数"——
+>   那条降级路径已经在 2026-10-20 随图删除，找不到是正常的。
 >
-> 前者不是故障，后者是。分不清就会把"没有这个能力"读成"能力正常"。
+> 前者不是故障，后者也不是"能力失灵"而是"服务没起来"。分不清就会把"没有这个能力"
+> 读成"能力正常"。
 
-#### `AgentLinkDegraded`（critical，5m）—— 这一组最优先看的一条
-**想走 agent，但走不了**。此时请求会**静默退回问答链路**，
-服务零报错、探针全绿、答案看起来"像那么回事"。
+**这一组里没有 `AgentLinkDegraded` 这条了（2026-10-20 删）** —— 不要找它。
 
-```bash
-# ① 启动自检里 agents 段的 enabled / ready / reason（三者分开回显）
-docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 app-stable | grep -A6 '"agents"'
-# ② 指标侧确认是哪个 reason 在涨
-curl -s --noproxy '*' localhost:8000/metrics | grep agent_unavailable_total
-```
-- `reason=module_unavailable` ⇒ **没装 `openai-agents`**：
-  ```bash
-  docker compose --env-file .env -f deploy/app/docker-compose.yml exec app-stable python -c "import agents; print(agents.__version__)"
-  ```
-  装包时**必须看版本**：它受 `langchain-openai` 的 `openai<3` 约束牵制
-  （本仓库钉 `0.20.0`），装高了会在**导入期**与 `openai` 冲突 ⇒ 照样 unavailable。
-- `reason=runtime_not_ready` ⇒ 装了但模型没装配成功：核 `AGNES_API_KEY` /
-  `AGNES_MODEL` / `AGNES_API_BASE`（缺 Key 即不 ready）。
-- 恢复判据：`agent_unavailable_total` **停止增长**，且自检里 `ready=true`。
+它盯的是"想走 agent 但走不了 ⇒ 静默退回问答链路"，而**降级路径已经不存在**：
+agent 链路是唯一链路，SDK 缺失 / 模型没配时进程**直接起不来**（
+`app.main._assert_agents_ready`，报 `missing_sdk` / `missing_api_key` / `build_failed`）。
 
-> **不要**把 `disabled` 也算进这条：主动关掉开关是灰度回退的正常操作，刻意不告警。
+那么"起不来"靠什么发现？靠 **`up == 0`** 与容器重启计数 —— 这是部署层的事实，
+不是应用指标。当初那条告警唯一的触发序列 `agent_unavailable_total` 也已一起删除，
+所以你在 `/metrics` 里 grep 不到它，**那不是漏埋点**。
+
+> 判断这段语境是否还成立，只看一句：**还有没有"不走 agent 也能答"的第二条链路。**
+> 只要没有，就不该再有"降级面"的指标与告警。
 
 #### `AgentHistoryDegraded`（warning，5m）—— 链路活着，但模型"失忆"了
 15 分钟内有会话后端故障（`increase(agent_session_errors_total[15m]) > 0`）。
 此时链路**照常跑、答案照常返回 200**，但送进模型的**只有用户刚说的这一句**，
 上文全丢 —— 也就是"带完整上下文"这个能力悄悄退回了单轮。
 
-> **和 `AgentLinkDegraded` 的区别**：那条是"走不了 agent"（整体退回问答链路），
-> 这条是"走得动，但没有记忆"。用户侧最典型的症状：
+> **和"服务起不来"的区别**：那种是整条链路没起来（`up == 0`，客户端连 200 都拿不到），
+> 这条是"走得动，但没有记忆"—— 服务零报错、探针全绿。用户侧最典型的症状：
 > 用户说「**接着上一轮那个方案，把篇幅压一半**」，模型回一句「不知道您指的是什么」，
 > 或者干脆当作一个全新话题从头写 —— 因为它真的没看到上文。
 
@@ -1089,7 +1095,7 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=300 
   主机端口、PG 容器状态与网络。⚠️ 特别注意：`create_async_engine` 是**懒连接** ——
   地址写错在构造期完全不报错，要到"第一次取历史"才炸，而那一步在 `Runner.run` 内部、
   会被 `run_agent` 的宽 `except` 接住 ⇒ 节点抛 `AgentRunFailed`，接口返回 `incomplete`
-  （检查点停在当前节点之前，可续跑）。
+  （⚠️ 这里**没有**可续跑的现场：进程没崩、是一轮运行失败了，客户端重发消息即可）。
   **别从"agent 链路答不出来"开始排查，先看这条指标**（启动自检那条 ERROR 也直接给结论）。
 
 > ⚠️ **"表不存在"（`relation "agent_sessions" does not exist`）不在这条指标里**：
@@ -1175,15 +1181,16 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=300 
 返工率 > 50%（未一次通过的任务占比）。这是**能力**最直接的代理指标，
 而且它直接对应成本 —— 每次返工 = 再跑一整轮模型调用。
 
-> ⚠️ 分母是 `agent_route_total{route="agent"}`（**请求**口径），不是 `agent_runs_total`。
-> 拆分之后一次请求 = N 次运行，拿运行数当分母会让返工率凭空缩小一半 ——
-> 而"腰斩的返工率"看起来像是能力提升了。
+> ⚠️ 分母是 `agent_runs_total`（**运行**口径）。2026-10-20 起这两者**重合**：
+> 一次请求 = 一次运行（换人发生在运行内部）。哪天一次请求又变成多次运行，
+> 分母必须跟着换，否则返工率会被系统性低估 —— 而"腰斩的返工率"看起来像是
+> 能力提升了。
 
 ```bash
-curl -s --noproxy '*' localhost:8000/metrics | grep -E 'agent_review_outcome_total|agent_rework_total|agent_route_total'
+curl -s --noproxy '*' localhost:8000/metrics | grep -E 'agent_runs_total|agent_rework_total|agent_handoff_total'
 ```
 - `score=needs_improvement` 居多 ⇒ 评审判据与产出不匹配：
-  文学节点查篇幅/基调约束是否够明确；PPT 那串工具调用查 `SlideDeck` 的结构化字段是否过严；
+  文学 agent 查篇幅/基调约束是否够明确；PPT 那串工具调用查 `SlideDeck` 的结构化字段是否过严；
 - 同时看 `agent_participants_total` —— 若某个专家**从不出现**，说明它从没被调用
   （多是对它的工具描述写得不够明确，模型不知道什么时候该用）。
 
@@ -1191,19 +1198,20 @@ curl -s --noproxy '*' localhost:8000/metrics | grep -E 'agent_review_outcome_tot
 平均每次 **agent 运行**的模型调用 > 12（`AGENT_MAX_TURNS` 的默认值）。
 均值贴着上限，说明相当一部分任务在**贴着上限跑**，成本与延迟都会显著抬升。
 
-> ⚠️ 直方图是**运行口径**（带 `agent` 标签）。拆分后一次请求 = N 次运行，
-> 所以它不等于"每个用户请求的成本" —— 要请求口径得乘上 `agent_route_total` 的请求数。
+> ⚠️ 直方图是**运行口径**（带 `agent` 标签）。一次请求 = 一次运行 ⇒ 它现在**也等于**
+> 每个用户请求的成本，不需要再乘任何东西。
 
 ```bash
 curl -s --noproxy '*' localhost:8000/metrics | grep -E 'agent_model_calls_(sum|count)'
-# 哪一段在涨（前台 / 文学）—— 拆分后这一步不能省
+# 哪一段在涨（前台 / 文学）—— 看 agent 标签；handoff 之后收尾的是文学，别混着看
 curl -s --noproxy '*' localhost:8000/metrics | grep 'agent_runs_total'
 ```
 - 先按 `agent` 标签定位，再看是"模型在想"（`agent_model_calls` 涨）还是"工具在往返"
   （`agent_tool_calls` 同向涨）；
-- `agent_handoff_total` 现在只可能是 **前台 → 文学** 这一种组合（请求口径）。
-  ⚠️ 别再去查"A→B→A 的往返"：文学节点**没有回程边**（2026-10-03 拍板丢掉），
-  图里不可能出现环 —— 拿一个结构上不可能发生的模式去排查，只会浪费时间；
+- `agent_handoff_total` 现在只可能是 **前台 → 文学** 这一种组合。
+  ⚠️ 别再去查"A→B→A 的往返"：只配了 `handoffs=[文学]` 一条交接，文学 agent
+  没有配回程 handoff，所以那个模式结构上不可能出现 —— 拿一个不可能发生的模式
+  去排查只会浪费时间；
 - 检查专家 instructions 的 Routine 是否过长 —— **每多一条规则就多一次工具调用**。
 
 #### `AgentGuardrailTripsFrequent`（warning，5m）

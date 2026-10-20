@@ -34,7 +34,7 @@
 | `USER_DAILY_TOKEN_QUOTA` | ✅ `200000` | 每租户日额度已装。这是**按估计**定的 —— 有了真实用量后应据 `llm_tokens_per_request` 的分布回填 | 按成本预算定，如 `200000` |
 | `REQUEST_TIMEOUT_SECONDS` | ✅ `180` | 单请求**总时限**已装。注意 `_MODEL` 上的 `timeout=30` 只管**单次调用**，而一次请求可以跑多轮（自评审不通过会再来一轮）⇒ 没有它总时长无上界，而且 **`GRACEFUL_SHUTDOWN_TIMEOUT` 的排空上界会形同虚设**（它等的是在途请求，而在途请求自己不会结束）。超时会下发结构化 `timeout` 事件后收流，**已产出的正文照常交付** | `120`（保守可给 `180`） |
 | `TRUST_PROXY_HEADERS` | ✅ `0` | 直连场景下 `0` 是**正确**的。但**一旦部署到 Nginx/网关后面**必须改 `1`：否则限流按**代理 IP** 统计，全体用户共用一个计数桶 ⇒ 要么集体误伤、要么被单人吃满。compose 里已为两个 app 服务注入 `TRUST_PROXY_HEADERS: "1"`（它们确实在 nginx 后面）。<br>⚠️ **设 `1` 只是必要条件**：代理还必须用**覆盖式**写入 `X-Forwarded-For`（`$remote_addr`）。若代理用 nginx 的 `$proxy_add_x_forwarded_for`（**追加式**，客户端那段留在最左），应用取到的第一段仍是**客户端伪造的值**，限流照样被绕过（2026-10-04 修，守卫见 `tests/test_deploy_topology.py`） | 反代后设 `1`；直连保持 `0` |
-| `ALERT_SINK_WECOM_WEBHOOK` 等三个通道 | ⚠️ **全部为空**（当前**最紧的一个待办**） | 告警转发的出口。**不填 ⇒ `alert-sink` 只把事件记进日志**（这是刻意设计：没配通道不阻塞、不报错），于是 Prometheus 里的 FIRING 永远变不成一条发到人手里的消息。**6 组 64 条**规则 + 六级路由全都写好了，差的只有这一步。<br>⚠️ **两个坑**：① 填完必须用 `docker compose --env-file .env -f deploy/app/docker-compose.yml config \| grep -i webhook` 自证值真的传进去了（**漏 `--env-file` 时它静默不生效**，见本文档开头的说明）；② `alert_sink.py --selftest` 只能证明网关进程活着，**必须再真触发一次告警**（停 `app-canary` 让 `ChatAgentDown` 响）才算闭环 | 填企业微信/飞书机器人 URL；自建网关填 `ALERT_SINK_GENERIC_WEBHOOK` |
+| `ALERT_SINK_WECOM_WEBHOOK` 等三个通道 | ⚠️ **全部为空**（当前**最紧的一个待办**） | 告警转发的出口。**不填 ⇒ `alert-sink` 只把事件记进日志**（这是刻意设计：没配通道不阻塞、不报错），于是 Prometheus 里的 FIRING 永远变不成一条发到人手里的消息。**6 组 63 条**规则 + 六级路由全都写好了，差的只有这一步。<br>⚠️ **两个坑**：① 填完必须用 `docker compose --env-file .env -f deploy/app/docker-compose.yml config \| grep -i webhook` 自证值真的传进去了（**漏 `--env-file` 时它静默不生效**，见本文档开头的说明）；② `alert_sink.py --selftest` 只能证明网关进程活着，**必须再真触发一次告警**（停 `app-canary` 让 `ChatAgentDown` 响）才算闭环 | 填企业微信/飞书机器人 URL；自建网关填 `ALERT_SINK_GENERIC_WEBHOOK` |
 | `ALERT_SINK_SHARED_SECRET` | ⚠️ 为空 —— **刻意保持为空，别单独填它** | 网关的来源校验：非空时要求每个 POST 带 `X-Alert-Sink-Secret` 头且匹配，否则回 **403**。⚠️ **陷阱就在这里**：`alertmanager.yml` 的四个 receiver **没有** `http_config`，**根本不会送这个头** ⇒ 你填了这个变量，等于**把全部告警打成 403**（Alertmanager 重试几次后放弃，表现成"配置全对但没人收到"，网关日志里只有一行 403）。要用它必须**两处一起改**：给四个 receiver 补 `http_config: http_headers: X-Alert-Sink-Secret: [...]` —— 而 Alertmanager **不支持 `${VAR}` 插值**，密钥只能写进配置文件，又回到"凭据进版本库"（这正是本网关要避免的事）。<br>**当前实际暴露面本就有限**：宿主机端口是回环绑定（`127.0.0.1:8081:8080`），仅剩"同 compose 网络内其它容器可伪造告警"，那更适合用部署侧网络隔离解决 | **留空**。确实要开 ⇒ 两处一起改，并接受密钥进配置文件 |
 | `REDIS_PASSWORD` / `POSTGRES_PASSWORD` / `GRAFANA_PASSWORD` | ✅ `REDIS_PASSWORD` 已生成；另两个走 compose 默认值 | 编排层口令（由 compose 从 `.env` 插值，`app` 不读）。**`POSTGRES_PASSWORD` 仍是默认 `123456`** —— 上生产前必须换，且注意它**只在数据卷首次初始化时生效**（详见 `deploy/SECRETS.md` §4.3）。密钥管理的整体方案见 `deploy/SECRETS.md` | 见 `deploy/SECRETS.md` |
 
@@ -97,7 +97,7 @@
 | `APP_WORKERS` / `WEB_CONCURRENCY` | 由 compose 注入 | worker 数，默认 1。**刻意默认 1**：多 worker 会各自持有检索器与限流计数，没配 `REDIS_URL` 时额度会翻倍。compose 里 `app-stable` 给 `2`、`app-canary` 给 `1`（因为 Redis 已接上）。两者都认，前者优先（容器/PaaS 常注入后者） | 生产 `2`~`4`，**且必须先确认 `REDIS_URL` 生效** |
 | ~~`DISCONNECT_POLL_INTERVAL`~~ | — | **已废弃（2026-09-29）**：断连检测改为 sse_starlette 的 `client_close_handler_callable` 回调，不再有轮询间隔。旧值留着无害，会被忽略 | 删除该行 |
 | `HEALTH_READY_TIMEOUT` | 未设置 | 就绪探针里探依赖的超时（秒），默认 `3`。网络慢的跨机房环境可加大 | 默认即可 |
-| `RETENTION_DAYS` | ✅ `0`（2026-10-03 起**永久保留**） | 数据保留清理的判定口径。**2026-10-03 起默认 `0` = 不清理** —— 对话历史改为**永久保留**（产品口径：用户隔多久回来都应该还能接上上一轮）。`retention-sweep` 服务仍保留运行，但在 `0` 时不删任何东西、每轮播报"未配置"；⚠️ `0` 在脚本里是**拒绝执行的哨兵**（安全默认），不是"清 0 天"。⇒ 五组表（`agent_messages` / `agent_sessions` / 检查点三张表 / `review_queue` / `session_owners`）从此**只增不减**，因此**必须**配套容量观测（见 `pg-stats` 与 `deploy/CAPACITY.md` 第四节）。要恢复清理就同时改这里与 `scripts/retention_sweep.py` | `0`（永久保留）；按合规要求定期删则设 `90` 之类 |
+| `RETENTION_DAYS` | ✅ `0`（2026-10-03 起**永久保留**） | 数据保留清理的判定口径。**2026-10-03 起默认 `0` = 不清理** —— 对话历史改为**永久保留**（产品口径：用户隔多久回来都应该还能接上上一轮）。`retention-sweep` 服务仍保留运行，但在 `0` 时不删任何东西、每轮播报"未配置"；⚠️ `0` 在脚本里是**拒绝执行的哨兵**（安全默认），不是"清 0 天"。⇒ 五组表（`agent_messages` / `agent_sessions` / `agent_run_state` / `review_queue` / `session_owners`）从此**只增不减**，因此**必须**配套容量观测（见 `pg-stats` 与 `deploy/CAPACITY.md` 第四节）。要恢复清理就同时改这里与 `scripts/retention_sweep.py` | `0`（永久保留）；按合规要求定期删则设 `90` 之类 |
 | `BACKUP_INTERVAL_HOURS` / `BACKUP_KEEP` / `QDRANT_BACKUP_KEEP` | ✅ `6` / `56` / `28`（2026-09-30 落盘） | 备份节奏。**间隔 × 份数 = 可回溯窗口**，改一个必须改另一个：原来 `24h × 14 = 14 天`；压到 6h 而份数不动会**静默缩到 3.5 天**。现在 6h × 56 = 14 天（pg）、6h × 28 = 7 天（qdrant）。改间隔还要**同步改** `alerts.yml` 里 `BackupLoopFailing` 的 54000s（15h）阈值 | `6 / 56 / 28`；RPO 要求更严就继续压间隔 |
 | `CANARY_IMAGE` | 由 `deploy/release.sh` 注入 | 灰度实例的镜像引用。**不要手工 export 它**：发布/回滚都走脚本（`deploy/release.sh` / `deploy/rollback.sh`），否则容易在"改完忘记 `--env-file`"和"忘记 reload"这两处出错 | `ghcr.io/<org>/chatagent:sha-<短哈希>` |
 
@@ -105,14 +105,34 @@
 
 | 变量 | 当前状态 | 说明 |
 |---|---|---|
-| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_HOST` | 未设置 | Langfuse 链路。**三填二**（host 可留空用官方云）；与 LangSmith 二选一 |
-| `LANGSMITH_API_KEY` / `LANGCHAIN_PROJECT` | 未设置 | LangSmith 链路，LangGraph 原生支持 |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_HOST` | 未设置 | Langfuse 链路。**三填二**（host 可留空用官方云）；与 LangSmith 二选一。⚠️ **还需要额外装两个包**：`langfuse` + `openinference-instrumentation-openai-agents`（不在生产 `requirements.txt` 里，见 §3.1）。装了才真的上报；没装时启动日志会明确写"缺依赖"，`tracing` 后端回落 `none` —— **不会**出现"日志说接上了、面板里一条都没有" |
+| `LANGSMITH_API_KEY` / `LANGCHAIN_PROJECT` | 未设置 | LangSmith 链路（`app/tracing.py` 把这两个值翻译成 LangChain 侧认的三个环境变量：开启开关 / API Key / 项目名 —— LangChain **只认环境变量**，没有别的配置入口）。⚠️ 它覆盖的是 LangChain 那一层调用（如 `scripts/eval_generation.py`），**不覆盖**官方 Agents SDK 自己的 tracing |
 | `METRICS_ENABLED` | ✅ `1` | `/metrics` 已开 |
 | `LOG_FORMAT` | ✅ `json` | 一行一 JSON，便于日志系统检索；本地想看人眼友好改 `text` |
 
-> 两组 tracing 都留空时行为与"没有这层代码"完全一致（只记一条 `tracing 未配置` 日志）。
+> 两组 tracing 都留空时**官方 SDK 的 tracing 会被显式关掉**（`set_tracing_disabled(True)`），
+> 行为与"没有这层代码"完全一致 —— 注意这**不等于什么都不做**：SDK 的 trace provider
+> 在第一次访问时会自动注册一个往 OpenAI 后端上报的处理器，不关的话每一轮的 prompt
+> 与回复全文都会尝试发往 `api.openai.com`（用环境里可能残留的 OpenAI 平台密钥 ——
+> **本项目不读那个变量**，所以它要么用错 key、要么失败被吞），
+> 失败被吞、不报错、不体现在任何指标上。守卫见
+> `tests/test_observability.py::test_no_configured_backend_means_no_trace_at_all`。
 
-**告警要真正接上**：`deploy/monitoring/alerts.yml` 里有 **6 组 64 条**规则
+**§3.1 Langfuse 怎么接**（2026-10-20 重写，照官方文档
+`langfuse.com/integrations/frameworks/openai-agents`）：
+
+```bash
+pip install langfuse openinference-instrumentation-openai-agents
+```
+
+接法是 OpenInference 的 OTel 插桩，**不是**自己写 `TracingProcessor`，也**不是**
+把 LangChain 的 callback handler 挂到运行配置里（旧实现就是后者：那个键官方
+`Runner.run` 根本不读，于是 trace 一条都没出去，而代码看起来是接上的）。
+插桩内部调 `agents.set_trace_processors([...])` **替换**默认处理器，所以默认的
+OpenAI 后台上报会被一并顶掉 —— 这也是为什么配了 Langfuse 时**不能**再关 tracing
+（关了连 span 都不产生，插桩收不到东西）。
+
+**告警要真正接上**：`deploy/monitoring/alerts.yml` 里有 **6 组 63 条**规则
 （可用性 / SLO / 成本 / 安全 / **平台自身** / **agent 能力链路**）。其中两条是
 "任何一次即 critical"：`TenantMismatchDetected`（有人在冒充租户）、
 `SessionOwnershipViolation`（有人在猜 `thread_id` 串读会话）—— 这两条一旦触发
@@ -123,11 +143,18 @@
 > `alerts.yml`：那里每一条都必须是告警（要 category / severity / runbook），
 > 混进录音规则会让那套纪律被稀释。加载它的是 `prometheus.yml` 的 `rule_files`。
 
-`agent` 组（2026-10-02 新增 6 条，同日补跨轮历史后为 7 条）回答的是**"请求到底有没有被正确地跑完 agent 链路"**：
-`AgentLinkDegraded`（想走 agent 却走不了）、`AgentHistoryDegraded`（**跨轮历史不可用，
-模型看不到上文**）、`AgentRunFailureRateHigh`（异常收尾率）、
-`AgentReworkRateHigh`（返工率）、`AgentModelCallsPerRunHigh`（单任务模型调用数）、
+`agent` 组（2026-10-02 新增 6 条，同日补跨轮历史后为 8 条）回答的是**"请求到底有没有被正确地跑完 agent 链路"**：
+`AgentHistoryDegraded`（**跨轮历史不可用，模型看不到上文**）、
+`AgentHistoryBudgetExhausted`（历史取到了、但裁到只剩本句仍超预算）、
+`AgentHistoryBudgetErrors`（预算算不出来 ⇒ 本轮整段不裁剪）、
+`AgentRunFailureRateHigh`（异常收尾率）、`AgentReworkRateHigh`（返工率）、
+`AgentModelCallsPerRunHigh`（单任务模型调用数）、
 `AgentGuardrailTripsFrequent`（护栏频繁拦截）、`AgentRetrievalEmptyHigh`（检索空召回率）。
+⚠️ 2026-10-20 删掉了这里的第 9 条 `AgentLinkDegraded`（连同它唯一的触发序列
+`agent_unavailable_total`）：它盯的是"想走 agent 却走不了 ⇒ 静默退回问答链路"，
+而**降级路径本身已经不存在** —— agent 链路现在是唯一链路，SDK 缺失或模型没配时
+进程**直接起不来**（守卫 `tests/test_startup_guard.py`），"服务起不来"由 `up == 0`
+与容器重启计数覆盖。看到这里少一条不要以为是被误删。
 它与另外五组的分工很清晰：那几组管"服务活没活 / 花了多少 token"，
 这一组管"这个能力有没有跑起来、跑得好不好"。
 ⚠️ 这些序列**只在真的走了 agent 链路时才存在**（不是恒为 0）—— 一个从没走过
@@ -215,14 +242,20 @@ PromQL 是全串匹配，写成 `le="1"` 不会报错，只会让该规则**永�
 
 ### 五之二、agent 能力链路（`src/agents`，2026-10-02 新增）
 
+> ⚠️ **这里没有"开关"**：AGENTS_ENABLED 已于 2026-10-20 删除（守卫
+> `tests/test_startup_guard.py::test_agents_enabled_knob_is_gone`）。它的语义是
+> "关掉 agent、回落另一条链路"，而回落目标已经随图一起删掉 —— 留一个只能取 true
+> 的开关，会让人以为可以关；更糟的是关掉之后进程照常启动、却答不出任何东西。
+> 让 agent 链路"不工作"的唯一办法是不配 `AGNES_API_KEY` / 不装 `openai-agents`，
+> 而那会让进程**拒绝启动**（`app.main._assert_agents_ready`）。
+
 | 变量 | 当前 | 说明 |
 |---|---|---|
-| `AGENTS_ENABLED` | ✅ `1`（默认开） | **所有请求**都走 `src/agents`（**每轮入口固定是前台** agent，由它自己决定直接作答还是叫帮手：文学 / PPT / 插图）；原 RAG 链路降级为**兜底**，只在 agent 链路不可用时启用。关掉 ⇒ 全部退化为原有问答链路（行为与改造前完全一致）。⚠️ **默认开，但没装 `openai-agents` 或没配模型时行为必须与关一致** —— 可用性自检把理由记成 `module_unavailable` / `runtime_not_ready`，并由 `AgentLinkDegraded` 告警盯住。这是"能力开关默认开、开着且没配时不能坏"这条原则的落点 |
-| `AGENT_MAX_ATTEMPTS` | `3` | 评审回灌的轮数上限。**必须与 evaluator instructions 里写的停止条件一致** —— 停止条件写在 prompt 里（官方做法），代码只兜上界 |
+| `AGENT_MAX_ATTEMPTS` | `3` | ⚠️ **当前无代码读取（死配置）**。它原本是"评审回灌的轮数上限"；2026-10-02 评审改成模型可选的 `as_tool` 之后就没有回灌循环了，2026-10-19 删评分闸后连"按评审结论重跑"这条路也不存在 —— 现在只有 `app/config.py` 把它读进来回显，`src/agents` 一处都不读。留着是为了不破坏既有 `.env` 与启动自检，**不要按它去调行为** |
 | `AGENT_MAX_TURNS` | `12` | 单次 `Runner.run` 内允许的 **LLM 调用次数**（官方语义，**不是对话轮次**）。设成对话轮次的量级（比如 3）会让正常的"查两次资料"直接抛 `MaxTurnsExceeded` |
 | `AGENT_TIMEOUT_SECONDS` | `30` | 单次模型调用的超时（OpenAI 客户端级） |
-| `AGENT_EVALUATOR_TRIES` | `2` | 评审调用的重试次数。结构化输出解析失败是常见抖动，但**评审失败不该等于交付失败**，也不能无限重试（那是上游抖动的放大器） |
-| `AGENT_KB_TOP_K` | `3` | agent 链路单轮检索返回的片段数上限（与 `graph.TOP_K` 同量级：链路可以多查几轮，单轮不必更大） |
+| `AGENT_EVALUATOR_TRIES` | `2` | ⚠️ **当前无代码读取（死配置）**。原意是"评审调用的重试次数"；评审改成 `as_tool` 之后，嵌套 run 的重试由 SDK 自己管，这个值没人用。与 `AGENT_MAX_ATTEMPTS` 同一条：留配置、别指望它改变行为 |
+| `AGENT_KB_TOP_K` | `3` | agent 链路单轮检索返回的片段数上限（与检索层默认的 `retrieval.TOP_K`（3）同量级：链路可以多查几轮，单轮不必更大） |
 | `AGENT_MAX_ANSWER_CHARS` | `8000` | 交付物字符上限，即出口护栏 `length_guardrail` 的阈值。纯确定性、零模型调用 |
 | `AGENT_ASSET_DIR` | `var/agent_assets` | PPT 大纲 / 插图资产的落盘目录。⚠️ 容器里应挂成卷，否则重启即丢（客户端拿到过的路径会失效） |
 | `AGENT_TOOL_STEPS` | ✅ `1`（**默认开**） | **工具步骤记录**（2026-10-09 新增，2026-10-19 补两点）。记下每次运行里每一步调了哪个工具、参数指纹、成没成、花了多久 ⇒ 播 `agent_tool_result_total{tool,status,reason}`（工具正确率，**失败分两档**：`bad_args` = 模型给错参数 ⇒ 改描述/参数结构；`error` = 工具跑起来之后失败 ⇒ 查实现或依赖）、`agent_tool_duration_seconds{tool}`（哪个工具慢）、**同一动作做第二次起**的 `agent_action_repeats_total{tool}`（**"原地打转"的唯一判据** —— 打转时总工具次数不高、重量级动作也不多，只有"同一动作反复做"能把它暴露出来），以及 `agent_tool_exposed_total{tool}`（**每次 agent 开始运行时，给它挂的每个工具各记一次**）。最后这条补的是一个看板盲区：结果计数只在**被调用时**产生时间序列，所以"挂了但从没被选过"与"根本没挂这个工具"在 `/metrics` 上同样是空白 —— 有了曝光，"零选中"才是可查的数（曝光涨、结果没有）。⚠️ **默认开是"新能力默认关"这条惯例的例外**，且是有意的：它是**纯观察** —— 回给模型的错误文本仍由官方实现产出、指标走旁路、记录失败只降级为日志 ⇒ "关掉时与今天一致"天然满足；而默认关掉等于这些数**永远没有数据**，那正是它要补的缺口。曝光与失败分档都**跟随本开关**，没有独立开关 |
@@ -244,7 +277,7 @@ PromQL 是全串匹配，写成 `le="1"` 不会报错，只会让该规则**永�
 | 变量 | 当前 | 说明 |
 |---|---|---|
 | `AGENT_HISTORY_TOKEN_LIMIT` | `100000` | 送进模型的**输入预算**（token，`0` = 不限）。⚠️ 这是**输入**预算、不是整个窗口：工具清单与输出长度不在那个口子的视野里（官方 `RunConfig.call_model_input_filter` 只看"指令 + 输入条目"），必须留余量。⚠️ 2026-10-03 起取代了 `AGENT_HISTORY_LIMIT`（**条数**口径，已删除）—— 条数与 token 是**互不知道对方**的两套判据，两处都设上限时条数那份会先切，所以只保留 token 一个口径 |
-| `AGENT_HISTORY_COMPACT` | `0`（关） | **跨轮历史压缩总开关**（2026-10-08 新增）。不设即为关，关着时今天的行为逐字节不变。打开后：老历史超过"保留轮数"就压成一段摘要（会话表 + 图状态两份都压），送进模型的输入超过**预算 × 0.85** 时另做一次窗口压缩 |
+| `AGENT_HISTORY_COMPACT` | `0`（关） | **跨轮历史压缩总开关**（2026-10-08 新增）。不设即为关，关着时今天的行为逐字节不变。打开后：老历史超过"保留轮数"就压成一段摘要（压的是**库里那份会话历史**，`agent_sessions` 那张表），送进模型的输入超过**预算 × 0.85** 时另做一次窗口压缩（只改这一次调用、不写回） |
 | `AGENT_HISTORY_KEEP_ROUNDS` | `5` | 压缩时**保留最近多少轮原样不动**。⚠️ 下限是 **1**（配 `0`/负数会被夹到 1，不是"全部压掉"）：人工打回那一轮靠"原话已经躺在会话里"决定不重传原话，压成 0 会让第二遍只看到一句"人工审核意见：…"、**不知道在改什么**，而且不报错 |
 | `AGENT_HISTORY_COMPACT_RATIO` | `0.85` | **窗口压缩的触发比例**（`0.1`~`1.0`）。触发线 = `AGENT_HISTORY_TOKEN_LIMIT × 这个值` = 85,000。做成配置是为了"网关换成更大窗口的模型时只改配置" |
 | `AGENT_HISTORY_COMPACT_TIMEOUT` | `30` | 写摘要那次模型调用的超时（秒）。它是**额外**的一次调用，独立可调 |
@@ -252,8 +285,8 @@ PromQL 是全串匹配，写成 `le="1"` 不会报错，只会让该规则**永�
 | `AGENT_SESSION_CACHE_MAX` | `256` | 进程内缓存的会话对象数上限（不写这个键就用默认值）。防"构造陌生 `thread_id` 吃内存"这个 DoS 面 |
 | `AGENT_SESSION_PING_TIMEOUT` | `5` | 启动自检探测 PG 连通性的超时（秒）。不设的话 PG 主机**不可达**时启动会被拖住几十秒到几分钟 |
 
-> ⚠️ **跨轮历史只有一个后端：`DB_URL` 指的那个 PostgreSQL**（与检查点同库，表名
-> `agent_sessions` / `agent_messages`）。**没有 Redis 分支、也没有本地文件回退** ——
+> ⚠️ **跨轮历史只有一个后端：`DB_URL` 指的那个 PostgreSQL**（与审核停机现场同一张库，
+> 表名 `agent_sessions` / `agent_messages`）。**没有 Redis 分支、也没有本地文件回退** ——
 > 2026-10-03 把原来"配了 `REDIS_URL` 走 Redis、否则落本地 sqlite 文件"那套整段删掉了。
 >
 > - **多副本天然共享**：不再需要"所有副本必须指向同一个 Redis"那条约束。
@@ -266,7 +299,7 @@ PromQL 是全串匹配，写成 `le="1"` 不会报错，只会让该规则**永�
 
 > **关于压缩（2026-10-08）**：打开 `AGENT_HISTORY_COMPACT` 后，压缩**不是删除** ——
 > 被压掉的那段变成**一条 `system` 摘要**，仍然永久留在库里；它只是不再逐条重复出现在
-> 每份检查点快照里（这正是"平方增长"的来源：轮数翻一倍、落盘总量翻四倍）。
+> 每一轮的输入里（这正是"平方增长"的来源：轮数翻一倍、送进模型的条目总量翻四倍）。
 > 两个入口都**有阈值守卫**，没到门槛一个字节都不动：历史压缩的"门槛"是老历史超过保留
 > 轮数，窗口压缩的"门槛"是输入超过预算的 85%。**不按请求类型额外设门**（人工打回轮
 > 也照常判、照常压），因为门槛已经设在"该不该压"上了。
@@ -307,7 +340,7 @@ PromQL 是全串匹配，写成 `le="1"` 不会报错，只会让该规则**永�
 | `AGNES_API_KEY` / `AGNES_API_BASE` / `AGNES_MODEL` | 已配 / `apihub.agnes-ai.com/v1` / `agnes-2.0-flash` | 主模型（生成） |
 | `EMBEDDING_API_BASE` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` | 已配 / SiliconFlow / `BAAI/bge-m3` | 检索用 embedding，与 LLM 分开配 |
 | `EMBEDDING_QUERY_PREFIX` | 已配（英文指令） | BGE 系靠它拉开区分度（实测 Top1 38% → 62%） |
-| `DB_URL` | 已配（指向容器内 PG） | 会话检查点 **+** pgvector **+** 审核队列 **+** 会话归属 共用 |
+| `DB_URL` | 已配（指向容器内 PG） | 跨轮对话历史 **+** 被打断的运行现场（`agent_run_state`） **+** pgvector **+** 审核队列 **+** 会话归属 共用 |
 | `RAG_VECTOR_STORE` / `RAG_EMBEDDING` | **`qdrant`** / `hybrid` | 稀疏（BM25 哈希稀疏向量）+ 稠密（BGE-M3）**同库同集合**，双路 RRF 融合。⚠️ 2026-09-29 从 `pg` 迁到 `qdrant` —— 本文档 §六 此前仍写着 `pg`，属文档漂移，已修正；同类漂移由 `tests/test_doc_drift.py` 钉住 |
 | `QDRANT_URL` | 本机 `http://localhost:6333`；容器内由 compose 覆盖为 `http://qdrant:6333` | 容器里**必须**用服务名 —— `localhost` 指容器自身，连不上会**静默回退 memory**（检索仍可用，但向量库等于没接上） |
 | `DOCLING_ARTIFACTS_PATH` / `DOCLING_DEVICE` / `DOCLING_OCR` / `HF_ENDPOINT` | `./models/docling` / `cpu` / `auto` / `hf-mirror.com` | 离线解析链路 |
@@ -364,20 +397,27 @@ uvicorn app.main:app --loop app.serve:loop_factory
 docker compose --env-file .env -f deploy/app/docker-compose.yml up -d --build
 ```
 
-**为什么不能再用裸 `uvicorn app.main:app`**：检查点持久化用 `AsyncPostgresSaver`，
-底层 psycopg 的**异步**连接**不支持 Windows ProactorEventLoop**，而 uvicorn 在 win32
-上恰好默认用它。裸启动时服务照样能起，但会**静默降级为内存检查点（重启丢状态）**。
-`app/serve.py` 注入平台自适应的事件循环工厂解决这件事。
+**为什么仍然建议用 `python -m app.serve` 而不是裸 `uvicorn app.main:app`**：`app/serve.py`
+注入了平台自适应的事件循环工厂（有 uvloop 用 uvloop，win32 上退到保守选择）。
+⚠️ 它**原来的**那个理由已经消失（2026-10-20）：当时是 psycopg 的**异步**连接不支持
+Windows ProactorEventLoop，而异步检查点已经随图一起删掉了。现在不裸启动只剩
+"与容器 / CI 用同一个入口"这一个理由 —— 要删掉这层，得一起改 Dockerfile / compose /
+CI / RUNBOOK，别只删 `serve.py`。
 
-**怎么确认持久化真的接上了**（这是唯一可靠信号）：
+**怎么确认"停机现场"真的落库了**（这是唯一可靠信号）：
 
 ```bash
 curl -s localhost:8000/health/ready | python -m json.tool
 ```
 
-看 `checks.checkpointer`：
-- `AsyncPostgresSaver（已持久化）` ← 正常
-- `InMemorySaver（内存，重启丢状态！）` ← 降级了，回看启动日志里的 warning（会点名原因）
+看 `checks.run_state`：
+- `postgres（已持久化，被打断的运行可跨重启恢复）` ← 正常
+- `postgres（表尚未建立：首次写入时建）` ← 正常（还没运行被打断过；第一次写入建表）
+- `memory（进程内存，重启丢现场！）（未配 DB_URL，属预期）` ← 没接上，回看启动日志
+- `disabled（运行现场不落库，停机一律不可恢复）` ← 明确关了
+
+⚠️ 这一项**不判 not-ready**（内存后端只是"重启丢现场"，服务本身还能用；判失败会让实例
+被摘流量，反而更糟）。所以它必须靠人看一眼，而不是靠探针变红。
 
 ## 七、告警邮件通道（可选，**默认关闭**）
 
@@ -432,8 +472,10 @@ curl -s localhost:8000/health/ready | python -m json.tool
 
 **依赖与数据**
 
-7. [ ] `/health/ready` 四项全 ok（llm / db / vector_store / checkpointer）
-8. [ ] `checks.checkpointer` 显示 `AsyncPostgresSaver（已持久化）`
+7. [ ] `/health/ready` 五项都在（llm / db / vector_store / run_state / pg_pool），前三项 ok
+8. [ ] `checks.run_state` 显示 `postgres（已持久化，被打断的运行可跨重启恢复）`
+       （`memory（进程内存，重启丢现场！）` ⇒ 停机现场没落库，重启即丢；
+       ⚠️ 这一项**刻意不判 ok=false**，所以探针不会替你发现它，只能人看）
 9. [ ] `python -m app.migrations --status` 退出码 0（缺迁移 / 维度不符都会非 0）
 10. [ ] `python -m scripts.pg_backup drill` 跑通（**没恢复过的备份不算备份**）。
        它会把结果写进 `backups/drill-pg.prom`；**这一点必须核对** —— 没写出来就说明
@@ -485,7 +527,7 @@ curl -s localhost:8000/health/ready | python -m json.tool
        ⚠️ 同理，`llm_inter_chunk_seconds` **要求一次回答至少有两个 chunk** 才会出现
        第一个样本。所有请求都"一句话答完"时它不会出现，这是正常的；
        反过来，它在有长回答的时段仍然为空，才说明埋点没走到。
-16. [ ] `deploy/monitoring/alerts.yml` 已加载（**6 组 64 条**），且 `review_pending` 有"长时间 > 0"的告警
+16. [ ] `deploy/monitoring/alerts.yml` 已加载（**6 组 63 条**），且 `review_pending` 有"长时间 > 0"的告警
 17. [ ] `chatagent-slo` 组已加载（面板上能看到 **7 条**燃尽率规则 + 2 条预算余量规则；
        7 = availability 3 条 + latency 2 条 + stream_latency 2 条），
        且 `SLO.md` 的两张表与表达式一致（`pytest tests/test_monitoring_config.py` 会钉住）。
@@ -626,33 +668,36 @@ curl -s localhost:8000/health/ready | python -m json.tool
        ③ 日志里有一行 `引用校验未通过（unsupported），按策略 block：不下发引用`；
        ④ **答案照常下发** —— block 只吞引用、不吞答案。核完把 action 改回 `warn`。
 
-**agent 能力链路（`AGENTS_ENABLED`，默认开）**
+**agent 能力链路（唯一作答路径，**没有开关**）**
 
-38. [ ] 启动自检里有 `agents` 段，且 **`enabled` 与 `ready` 分开回显**：
-       - `enabled=true, ready=true` —— 请求真的会走 agent 链路。
-       - `enabled=true, ready=false, reason=runtime_not_ready` —— ⚠️ **模型没装配成功**
-         （缺 `AGNES_API_KEY` 等）。此时请求**静默退回问答链路**：服务零报错、
-         探针全绿、答得"像那么回事"。这正是 `AgentLinkDegraded` 存在的理由。
-       - `enabled=true, ready=false, reason=module_unavailable` —— ⚠️ **没装
-         `openai-agents`**。同上，也是静默降级。
-       - `enabled=false` —— **主动关的，不是故障**（刻意不告警）。
+38. [ ] 自检 JSON 的 `agents` 段里**只有行为参数**（`asset_dir` / `max_turns` /
+       `history`），**没有 `enabled` / `ready` / `reason` 三个键** —— 这是刻意的：
+       有那三个键就说明代码里还留着"能不能走 agent"的判定，而那条判定连同它的
+       降级目标已经一起删了（2026-10-20）。判据变成**进程起没起来**：
+       - 起来了 ⇒ 启动日志有一行 `agent 链路就绪：请求走 src/agents（...）`，
+         此时**所有**请求都走这条链路，没有第二条。
+       - 起不来 ⇒ 日志里有 `agent 链路不可用（<reason>）⇒ 拒绝启动`，`reason` 只有三档：
+         `missing_sdk`（镜像里没装 `openai-agents`）、`missing_api_key`（没配
+         `AGNES_API_KEY`）、`build_failed`（装配期抛异常，具体见上一条 warning）。
+         ⚠️ **不要再去找"静默降级"**：没有降级了，起不来就是起不来。
        ⚠️ **装包还要看版本**：`openai-agents` 受 `langchain-openai` 的 `openai<3`
-       约束牵制（本项目钉 `0.20.0`），装高了会在**导入期**与 `openai` 冲突，
-       于是照样 `module_unavailable`。
+       约束牵制（本项目钉 `0.20.0`），装高了会在**导入期**与 `openai` 冲突 ——
+       那时的现象是 `build_failed`，报错文本看着跟版本无关。
 
 39. [ ] **发一条请求，确认它真的走进 agent 链路**（这条只能真跑，看配置不算）：
        ① 发 `写一篇关于灯塔的短篇小说`，SSE 里应收到一个 `token` 事件
           —— agent 链路是**整段**产出的，不产生逐 token 事件，`main._sse` 会把它
           补成一个 `token`；**若收到"零 token + done"**，客户端会表现成"服务没回答"
           （最容易被误判成前端 bug 的一种）；
-       ② `/metrics` 里应出现 `agent_route_total{route="agent", reason="ready"}`、
-          `agent_runs_total{exit_reason="passed"}`、`agent_participants_total{agent=...}`；
+       ② `/metrics` 里应出现 `agent_runs_total{exit_reason="passed"}`、
+          `agent_participants_total{agent="frontline_agent"}`，以及（这一单会写小说）
+          `agent_handoff_total{src="frontline_agent", dst="literary_writer"}` 与
+          `agent_participants_total{agent="literary_writer"}`；
        ③ ⚠️ **再发一条问答请求**（`限流是怎么算的`），它**同样应该走 agent 链路** ——
-          入口不做内容分诊，问答也是前台的职责。表现为 `agent_route_total` 与
-          `agent_runs_total` **继续增长**（差别只在 `agent_participants_total` 的
-          agent 名：问答通常只有前台，不产生 handoff）。
-          若反而是 `agent_unavailable_total{reason=...}` 在涨、`agent_runs_total` 不涨，
-          那才是**降级**（链路不可用走了 RAG 兜底），照 §AgentLinkDegraded 处置。
+          入口不做内容分诊，问答也是前台的职责。表现为 `agent_runs_total`
+          **继续增长**，而 `agent_handoff_total` **不涨**（问答只有前台参与）。
+          ⚠️ 这里**只有一条链路**：`agent_runs_total` 不涨就说明请求根本没进来
+          （看 `http_requests_total` 与 `up`），不存在"退回另一条链路"这回事。
 
 40. [ ] **跨轮记忆**（只能真跑；这一条失灵时服务**照常出答案**，只是记不住上文，
        所以它是所有验收项里最容易被漏掉的一个）：

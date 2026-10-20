@@ -723,8 +723,8 @@
     {
       "id": 13,
       "type": "timeseries",
-      "title": "agent 路由与移交",
-      "description": "请求走的是 agent 链路还是问答兜底（`agent_route_total` 按 route）、跨节点转交的次数（`agent_handoff_total` 按 src/dst。⚠️ 拆分后只有 **前台 → 文学** 这一种组合，且是**请求口径** —— 它答的是「多少请求被交给了专家」，不是运行数）、以及**想走却走不了**的次数（`agent_unavailable_total` 按 reason）。⚠️ `agent_*` 序列**不存在**只说明最近没有 agent 流量，不等于链路正常；`reason=module_unavailable`（没装 openai-agents）或 `runtime_not_ready`（没配模型）在涨才是故障 —— 此时请求静默退回问答链路，零报错、探针全绿、答得「像那么回事」。对应告警 AgentLinkDegraded。",
+      "title": "agent 移交与参与",
+      "description": "跨 agent 移交的次数（`agent_handoff_total` 按 src/dst。现在只有 **前台 → 文学** 这一种组合，计数口径就是「发生了多少次交接」—— 当前一次请求最多一次交接，所以它也等于「多少请求被交给了专家」）、以及各 agent 参与次数（`agent_participants_total`）。⚠️ 2026-10-20 删了两条序列：`agent_route_total`（没有「问答兜底 / agent 链路」的路由了，agent 是唯一链路）与 `agent_unavailable_total`（走不了 agent 时进程直接起不来，不是运行时降级）。",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -738,8 +738,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (route) (rate(agent_route_total[5m]))",
-          "legendFormat": "路由 {{route}}"
+          "expr": "sum by (agent) (rate(agent_participants_total[30m]))",
+          "legendFormat": "参与 {{agent}}"
         },
         {
           "refId": "B",
@@ -748,8 +748,8 @@
         },
         {
           "refId": "C",
-          "expr": "sum by (reason) (rate(agent_unavailable_total[5m]))",
-          "legendFormat": "降级 {{reason}}"
+          "expr": "sum by (exit_reason) (rate(agent_runs_total[5m]))",
+          "legendFormat": "收尾 {{exit_reason}}"
         }
       ],
       "fieldConfig": {
@@ -778,7 +778,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "agent 运行结果与评审结论",
-      "description": "每次 **agent 运行**的收尾方式（`agent_runs_total` 按 exit_reason：passed / unreviewed / review_failed / transfer / input_guardrail / output_guardrail / max_turns / error）与评审判定分布（`agent_review_outcome_total` 按 score）。⚠️ 链路拆成前台 / 文学两个节点后，**一次请求 = N 次运行**（转交那一轮是 2 次）—— 本面板是**运行口径**，不是请求口径，排查时先看 `agent_*` 的 agent 标签定位是哪一段。exit_reason=error 现在**会抛出去**（接口返回 incomplete、客户端看得到失败），不再被兜成 200 的友好话术。成因分两类：上游限流（429）与真实故障，处置完全不同（日志里 `TaskOutcome.error` 会带出异常类型）。对应告警 AgentRunFailureRateHigh。",
+      "description": "每次 **agent 运行**的收尾方式（`agent_runs_total` 按 exit_reason：passed / unreviewed / review_failed / transfer / input_guardrail / output_guardrail / max_turns / error）（评审结论不再单独成一条序列，`exit_reason=review_failed` 就是「评了没过」）。⚠️ 一次请求 = **一次运行** —— handoff 是在同一次运行内部换人，不新起一次运行，所以本面板的运行数就是请求数；想知道这一轮「换过人没有」看 `agent_participants_total{agent}` 与 `agent_handoff_total{src,dst}`。排查时仍要按 `agent` 标签分辨是哪一段收的尾。exit_reason=error 现在**会抛出去**（接口返回 incomplete、客户端看得到失败），不再被兜成 200 的友好话术。成因分两类：上游限流（429）与真实故障，处置完全不同（日志里 `TaskOutcome.error` 会带出异常类型）。对应告警 AgentRunFailureRateHigh。",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -797,7 +797,7 @@
         },
         {
           "refId": "B",
-          "expr": "sum by (score) (rate(agent_review_outcome_total[10m]))",
+          "expr": "sum by (exit_reason) (rate(agent_runs_total[10m]))",
           "legendFormat": "评审 {{score}}"
         }
       ],
@@ -827,7 +827,7 @@
       "id": 15,
       "type": "timeseries",
       "title": "agent 返工率",
-      "description": "未一次通过的任务占比（`agent_rework_total` / `agent_route_total{route=agent}`，**两边都是请求口径**）。⚠️ 别用 `agent_runs_total` 当分母：拆分后它是**运行**数（一次请求 1~2 次），会让这个比率凭空缩小一半。这是 **agent 能力**最直接的代理指标，也直接对应成本 —— 每次返工 = 再跑一整轮模型调用。持续偏高说明规划或执行不稳（prompt / 拓扑问题），而不是「模型慢」。对应告警 AgentReworkRateHigh。",
+      "description": "未一次通过的任务占比（`agent_rework_total` / `agent_runs_total`）。⚠️ 2026-10-20 分母从 `agent_route_total{route=agent}` 改回 `agent_runs_total`：图删掉之后**一轮 = 一次 `Runner.run`**（handoff 在运行内部换人，不新起运行），两个口径重合，而 `agent_route_total` 已随图删除。哪天又出现「一次请求多次运行」，分母必须同步换掉 —— 否则这个比率会被系统性低估。这是 **agent 能力**最直接的代理指标，也直接对应成本 —— 每次返工 = 再跑一整轮模型调用。持续偏高说明规划或执行不稳（prompt / 拓扑问题），而不是「模型慢」。对应告警 AgentReworkRateHigh。",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -841,7 +841,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(agent_rework_total[30m])) / clamp_min(sum(rate(agent_route_total{route=\"agent\"}[30m])), 0.001)",
+          "expr": "sum(rate(agent_rework_total[30m])) / clamp_min(sum(rate(agent_runs_total[30m])), 0.001)",
           "legendFormat": "返工率"
         }
       ],
@@ -871,7 +871,7 @@
       "id": 16,
       "type": "timeseries",
       "title": "agent 单任务模型 / 工具调用（均值）",
-      "description": "平均每次 **agent 运行**花掉多少次模型调用与工具调用（直方图 `_sum` / `_count`，带 agent 标签）。⚠️ 拆分后一次请求 = N 次运行，所以这是**运行口径**均值，不等于「每个用户请求的成本」；要请求口径请乘上 `agent_route_total` 的请求数。两者合起来才能回答「agent 绕圈子时是**模型在想**还是**工具在往返**」—— 前者要收紧 prompt，后者要减少或合并工具。均值贴近 `AGENT_MAX_TURNS`（默认 12）说明相当一部分任务在贴着上限跑，成本与延迟都会显著抬升。对应告警 AgentModelCallsPerRunHigh。",
+      "description": "平均每次 **agent 运行**花掉多少次模型调用与工具调用（直方图 `_sum` / `_count`，带 agent 标签）。⚠️ 一次请求 = 一次运行（handoff 在运行内部换人），所以这是**运行口径**均值，**也等于**每个用户请求的成本 —— 不需要再乘任何东西。两者合起来才能回答「agent 绕圈子时是**模型在想**还是**工具在往返**」—— 前者要收紧 prompt，后者要减少或合并工具。均值贴近 `AGENT_MAX_TURNS`（默认 12）说明相当一部分任务在贴着上限跑，成本与延迟都会显著抬升。对应告警 AgentModelCallsPerRunHigh。",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -920,7 +920,7 @@
       "id": 17,
       "type": "timeseries",
       "title": "agent 跨轮历史后端故障",
-      "description": "会话后端（PostgreSQL，与 LangGraph 检查点共用同一个 DB_URL）读写失败的次数，按异常类型（`agent_session_errors_total` by kind）。⚠️ 这条序列**只在出过错之后才存在** —— 一直为空恰恰是**好事**（与上面 `agent_*` 那几块「为空只说明没流量」的语义相反）。一旦出现，意味着链路还在跑、答案照常 200，但送进模型的**只有用户刚说的这一句**，上文全丢：「接着改上一轮的东西」会被当成全新话题。`kind=ModuleNotFoundError` 是没装 sqlalchemy；`NoSuchModuleError`/`ArgumentError` 是 DB_URL 写法不对（异步前缀要 `postgresql+psycopg://`）；`OperationalError`/`TimeoutError` 是 PG 连不上或探不通。对应告警 AgentHistoryDegraded。",
+      "description": "会话后端（PostgreSQL —— 就是 `DB_URL` 指的那个库，与审核停机现场 `agent_run_state` 同库）读写失败的次数，按异常类型（`agent_session_errors_total` by kind）。⚠️ 这条序列**只在出过错之后才存在** —— 一直为空恰恰是**好事**（与上面 `agent_*` 那几块「为空只说明没流量」的语义相反）。一旦出现，意味着链路还在跑、答案照常 200，但送进模型的**只有用户刚说的这一句**，上文全丢：「接着改上一轮的东西」会被当成全新话题。`kind=ModuleNotFoundError` 是没装 sqlalchemy；`NoSuchModuleError`/`ArgumentError` 是 DB_URL 写法不对（异步前缀要 `postgresql+psycopg://`）；`OperationalError`/`TimeoutError` 是 PG 连不上或探不通。对应告警 AgentHistoryDegraded。",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

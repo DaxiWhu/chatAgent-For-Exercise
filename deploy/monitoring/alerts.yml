@@ -60,7 +60,7 @@ groups:
         annotations:
           summary: "就绪探针持续返回 503"
           description: "10 分钟内出现 {{ $value }} 次 503，说明 /health/ready 的某个依赖不健康。"
-          runbook: "curl localhost:8000/health/ready | python -m json.tool，看 checks 里哪一项 ok=false（llm / db / vector_store / checkpointer）。"
+          runbook: "curl localhost:8000/health/ready | python -m json.tool，看 checks 里哪一项 ok=false（llm / db / vector_store / run_state）。"
 
       - alert: HighErrorRate
         # 用 uptime 做分母保护：0 流量时不报警（否则重启后必误报）
@@ -332,19 +332,23 @@ groups:
           description: "当前失败率 {{ $value | humanizePercentage }}。stage=evaluate 高 ⇒ 评审环节（有重试兜底，会推高返工）；stage=answer/revise 高 ⇒ 用户直接拿不到答案；stage=step_* ⇒ agent 链路。"
           runbook: "1) 按 stage 定位环节；2) 看 `llm_call_duration_seconds` 的分布 —— 失败集中在超时（≈timeout 上限）说明上游变慢，否则更可能是 4xx/协议错误（查 `AGNES_API_BASE` 与模型名）；3) 同时看 `llm_budget_exceeded_total` 排除「预算被顶掉被误记成失败」；4) 若为 agent 链路，对照 `agent_runs_total{exit_reason}` 的分档。"
 
-      - alert: CheckpointErrorsHigh
-        # 检查点（LangGraph 持久化）读写失败。它是**硬依赖**：失败意味着会话状态
-        # 读不到/写不进，表现为"续跑拿到旧状态"或"卡住"，而 HTTP 可能仍是 200。
-        # `/health/ready` 的 checkpointer 项是**启动探针**，答不了运行期的读写故障。
-        expr: increase(checkpoint_errors_total[15m]) > 0
-        for: 5m
+      - alert: RunStatePersistFailed
+        # 被中断的那次运行**没能把现场存下来**（`_hold_for_review` 失败）。
+        # 为什么必须单独告警：这一条失败**不报错**，用户照样收到 200 —— 代价是
+        # "该等人审的内容被直接交付"或者"用户点开审核台发现没有这条"。
+        # 它同时也是 `/v1/review` 之后回 409 的唯一来源（现场没了 = 无可恢复）。
+        #
+        # ⚠️ 判据是 `increase(...) > 0` 而不是比率：它本应**恒为 0**，出现一次就说明
+        # 有一条本该被拦下的内容漏了出去。
+        expr: increase(review_gate_failed_total[15m]) > 0
+        for: 1m
         labels:
           category: availability
           severity: warning
         annotations:
-          summary: "检查点读写失败（op={{ $labels.op }}）"
-          description: "近 15 分钟有 {{ $value }} 次检查点操作失败（op=get_tuple 读 / put 写 / put_writes 写中间态）。op=put* 失败意味着**这轮执行的状态没有落库**，断点续跑与人工审核都会拿到过期状态。"
-          runbook: "1) `docker logs` 搜「检查点」，看是连接失败（DB_URL / PG 容器 / 连接池耗尽）还是序列化错误（state 里进了不可 msgpack 的类型）；2) 看 `checkpoint_duration_seconds` 是否同步变慢（慢 ⇒ 连接池或磁盘；不变 ⇒ 逻辑错误）；3) 检查 PG 磁盘空间与 `DiskSpaceLow`；4) 恢复后**核对**这段时间的会话能否正常续跑（`/v1/sessions` 的续传路径）。"
+          summary: "运行现场没有落库（{{ $value }} 次）"
+          description: "近 15 分钟有 {{ $value }} 次「该停下来等人审、却没能存下现场」。后果分两种：声明要人审的轮次退化成直接交付（内容没经过审核就发出去了）；或审核台点接受时回 409（现场已不存在）。两者都不会报错。"
+          runbook: "1) `docker logs` 搜「存运行现场失败」/「运行没有产生现场」/「运行现场没有落库」，三种日志对应三种成因；2) 连不上库 ⇒ 查 DB_URL、PG 容器、`agent_run_state` 建表（首次写入时才建，权限不足会静默失败）；3) 「没有产生现场」⇒ 是 SDK 侧没有给出 `RunState`（工具没挂审批回调 / 中断没发生），查 `approval.py` 的接线；4) 恢复后抽查一次 `/v1/review` 的 accept 流程。"
 
       - alert: OnlineHallucinationDetected
         # 线上真实流量的幻觉率（**编造标识符 / 编造引用编号**这两类可被代码证明的错误）。
@@ -1000,7 +1004,7 @@ groups:
         annotations:
           summary: "PG 表 6 小时内增长超过 1.5GB（table={{ $labels.table }}）"
           description: "{{ $labels.table }} 在 6 小时内增长了 {{ $value }} 字节。历史数据是**永久保留**的（刻意如此），所以增长本身不是故障 —— 要判断的是**跑得快的那一张**是不是在异常膨胀。"
-          runbook: "1) 先确认采集链路还活着：`curl -s localhost:9100/metrics | grep pg_table_size_bytes`；为空 ⇒ 修 pg-stats 容器（`docker compose --env-file .env -f deploy/app/docker-compose.yml logs pg-stats`），否则这条告警本身就是哑的；2) `docker compose exec pgvector psql -U langgraph_app -d langgraph_checkpoints -c \"SELECT relname, pg_size_pretty(pg_total_relation_size(oid)) FROM pg_class WHERE relkind='r' ORDER BY pg_total_relation_size(oid) DESC LIMIT 10\"` 看排名；3) agent_messages 涨得快 ⇒ 对照 http_requests_total 看是否被刷；checkpoints 涨得快 ⇒ 长会话变多，属预期；4) 确认是预期增长就调大阈值，**不要**关掉这条规则。"
+          runbook: "1) 先确认采集链路还活着：`curl -s localhost:9100/metrics | grep pg_table_size_bytes`；为空 ⇒ 修 pg-stats 容器（`docker compose --env-file .env -f deploy/app/docker-compose.yml logs pg-stats`），否则这条告警本身就是哑的；2) `docker compose exec pgvector psql -U langgraph_app -d langgraph_checkpoints -c \"SELECT relname, pg_size_pretty(pg_total_relation_size(oid)) FROM pg_class WHERE relkind='r' ORDER BY pg_total_relation_size(oid) DESC LIMIT 10\"` 看排名；3) agent_messages 涨得快 ⇒ 对照 http_requests_total 看是否被刷；agent_run_state 涨得快 ⇒ 被打断的运行变多（每条含整段历史），对照 retention_sweep 的保留期看是否该收紧；4) 确认是预期增长就调大阈值，**不要**关掉这条规则。"
 
       - alert: DiskSpaceLow
         # 为什么这条必须有：compose 里每个容器的 json-file 日志默认**无上限**，
@@ -1081,35 +1085,26 @@ groups:
   # 一个只用问答的服务，这一组的全部序列都不存在（不是 0）—— 那正是它与
   # "agent 悄悄失灵"之间的区别：前者是**没有这个能力**，后者是**有这个能力但没跑起来**。
   #
-  # 判据全部来自 `src/agents/*` 的埋点经 `app/main.py` 翻译（`_record_agent_metrics`
-  # 与降级面的 `agent_unavailable_total`）。标签一律是**有限取值**
-  # （route / reason / exit_reason / guardrail），绝不包含 thread_id 或用户输入。
+  # 判据全部来自 `src/agents/*` 的埋点经 `app/main.py` 翻译（`_record_agent_metrics`）。
+  # 标签一律是**有限取值**（agent / exit_reason / guardrail / tool / kind），
+  # 绝不包含 thread_id 或用户输入。
   #
   # ⚠️ 这些序列**只在真的走了 agent 链路时才有**。没有 agent 流量 ⇒ 序列不存在 ⇒
   #    规则不触发（而不是"报 0"）。这是刻意的：没有能力与能力失灵要能分开。
   - name: chatagent-agent
     rules:
-      - alert: AgentLinkDegraded
-        # ★ 这一组里最该看的一条：**想走 agent，但走不了**。
-        #   module_unavailable ⇒ 装了开关却没装 openai-agents；
-        #   runtime_not_ready ⇒ 装了但模型 / Key 没配成功。
-        # 两种情形下请求都会**静默退回问答链路** —— 用户收到一段看起来
-        # 合理的答复，服务零报错、探针全绿。没有这条告警，只能靠用户抱怨"答得不对"。
-        expr: increase(agent_unavailable_total[15m]) > 0
-        for: 5m
-        labels:
-          category: agent
-          severity: critical
-        annotations:
-          summary: "agent 链路不可用，请求正降级为问答链路（reason={{ $labels.reason }}）"
-          description: "过去 15 分钟有 {{ $value }} 次路由判定为走不了 agent 链路。reason=module_unavailable ⇒ 未安装 openai-agents；reason=runtime_not_ready ⇒ 已安装但模型未装配成功。"
-          runbook: "1) 看启动自检里的 agents 段（enabled / ready / reason 三个字段分开回显）；2) module_unavailable ⇒ pip install openai-agents 后重启；3) runtime_not_ready ⇒ 核对 AGNES_API_KEY / AGNES_MODEL / AGNES_API_BASE；4) 观察 agent_unavailable_total 停止增长即为恢复。"
+      # ⚠️ `AgentLinkDegraded` 已于 2026-10-20 **删除**（连同 `agent_unavailable_total`）。
+      #   它盯的是"想走 agent 但走不了 ⇒ 静默退回问答链路"。那条降级路径已经不存在：
+      #   agent 链路是唯一链路，SDK 缺失 / 模型没配时 `app.main._assert_agents_ready`
+      #   会让进程**直接起不来**（守卫 `tests/test_startup_guard.py`）。
+      #   "服务起不来"由 `up == 0` / 容器重启计数覆盖，不需要一条永远为空的指标。
+      #   ⇒ 看到告警规则里少了一条不要以为是被误删。
 
       - alert: AgentHistoryDegraded
-        # ★ 与 AgentLinkDegraded 同一类：**能力悄悄少了一半**。
+        # ★ 这一组里"最容易被漏掉"的那一类：**能力悄悄少了一半**。
         #   这条盯的是**跨轮历史存不上**：链路照常跑、答案照常出、延迟与错误率全正常，
         #   只是模型看不到上文 —— 用户说"接着改上一轮的东西"时它会反问"改什么的"。
-        #   正因为没有任何异常信号，它是这一组里最容易被漏掉的一条。
+        #   正因为没有任何异常信号，它比错误率那几条更值得盯。
         # 触发源有两处（同一个 PG 后端故障的不同表现）：
         #   ① 启动自检 `跨轮对话历史**不可用**`（ERROR，只打一次）；
         #   ② 每轮取会话失败（`session_for` 建引擎 / 建会话，日志去首条、其余只计数）。
@@ -1182,12 +1177,16 @@ groups:
         # 返工率 = 未一次通过的**请求** / 总请求。这是"agent 能力"最直接的代理指标：
         # 高返工说明规划或执行不稳（prompt / 拓扑问题），而不是"模型慢"。
         #
-        # ⚠️ 分母**必须**是 agent_route_total{route="agent"}（请求口径），不能是
-        # agent_runs_total：拆分后后者是**运行**数（一次请求 1~2 次），拿它当分母
-        # 会让返工率凭空缩小一半 —— 而"腰斩的返工率"看起来像是能力提升了。
+        # 分母用 `agent_runs_total`（**运行**口径）。这个选择在 2026-10-20 又变回来了：
+        # 图在的时候一次请求可能是 1~2 次运行，那时必须用请求口径的
+        # `agent_route_total{route="agent"}` 当分母（拿运行数会让返工率凭空腰斩）。
+        # 现在一轮 = **一次** `Runner.run`（handoff 在运行内部换人，不新起运行），
+        # 两个口径重新重合，而 `agent_route_total` 已随图删除。
+        # ⚠️ 哪天又出现"一次请求多次运行"，这条分母必须同步换掉，否则返工率会
+        # 被系统性低估 —— 而"腰斩的返工率"看起来像是能力提升了。
         expr: |
           rate(agent_rework_total[30m])
-          / clamp_min(rate(agent_route_total{route="agent"}[30m]), 0.001) > 0.5
+          / clamp_min(rate(agent_runs_total[30m]), 0.001) > 0.5
         for: 15m
         labels:
           category: agent
@@ -1195,7 +1194,7 @@ groups:
         annotations:
           summary: "agent 返工率过高（超过一半的任务需要多轮）"
           description: "当前 {{ $value | humanizePercentage }} 的任务在第 2 轮及以后才交付。它直接对应成本（每次返工 = 再跑一整轮模型调用）。"
-          runbook: "1) 看 agent_review_outcome_total{score=...} 是 needs_improvement 居多还是 pass 居多；2) 若集中在文学节点，检查文学 agent 的 instructions 是否给了足够的篇幅/基调约束；3) 若集中在 PPT 那串工具调用，检查结构化输出（SlideDeck）的字段约束是否过严导致反复重试。"
+          runbook: "1) 先看 agent_runs_total{exit_reason=\"review_failed\"} 占多少：它才是\"评了没过\"那一类的分母（`agent_review_outcome_total` 已在 2026-10-20 随图删除）；2) 若集中在文学那一段，检查文学 agent 的 instructions 是否给了足够的篇幅/基调约束；3) 若集中在 PPT 那串工具调用，检查结构化输出（SlideDeck）的字段约束是否过严导致反复重试。"
 
       - alert: AgentModelCallsPerRunHigh
         # 平均每次任务的模型调用次数（histogram 的 _sum/_count）。

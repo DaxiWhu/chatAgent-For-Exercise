@@ -11,6 +11,158 @@
 
 ## [Unreleased]
 
+### 破坏性变更 — 编排图整体删除：一轮请求 = 一次 `Runner.run`（2026-10-20）
+
+官方 Agents SDK **没有图**这种原语。此前"图还在、只是把某个职责搬出去"的做法到此为止：
+`src/graph.py`、`src/review_gate.py`、`src/rag/answer.py` 全部删除，一起删掉的还有
+`tests/test_graph.py`、`test_nodes.py`、`test_review_gate.py`、`test_session_resume.py`、
+`test_agents_route.py`。
+
+- **一轮 = 一次 `Runner.run`**（`src/turn.py`）：`init → retrieve → generate → evaluate →
+  route → human` 那条链不存在了。谁先说话、要不要叫帮手、什么时候交付，全部由入口
+  agent 的 instructions + tools + handoffs 决定。
+- **停机交给官方 `RunState`**：运行停在 `deliver(needs_review=True)` 这个待批工具上，
+  `result.to_state()` 的 JSON 存进 `agent_run_state` 表（`app/runs.py`）。
+  `/v1/review` 的 `accept` / `revise` 用 `Runner.run(agent, state)` 接着跑 —— 不再是
+  langgraph 的 checkpoint resume。
+- **`/v1/chat/resume` 现在恒回 409**：官方只在"产生 interruption"时给可恢复现场，而本
+  项目唯一的中断点就是交付审批（该走 `/v1/review`）。断流 / 超时 / 用户停止都是**取消**，
+  没有现场；官方明确把"崩溃恢复与副作用对账"划给 Dapr / Temporal / Restate / DBOS。
+  不假装能续 —— 假装能续的实现是"再跑一轮"，会把已发出的 token 重发一遍。
+- **`GET /v1/sessions/{id}` 的三种状态改由"现场 / 待审记录 / 历史"推导**，`resumable`
+  只在真有现场时为 true。
+
+指标面的对应改动（**旧名字在仪表盘与告警里都要改**）：
+
+| 删除 | 原因 | 替代 |
+|---|---|---|
+| `agent_route_total{route=...}` | 路由不再由代码判定 | 无需 |
+| `checkpoint_duration_seconds{op}` | 没有检查点这东西了 | 无需（落库已计入请求总时限） |
+| `checkpoint_errors_total` | 同上 | `review_gate_failed_total`（停机落库失败） |
+| `agent_review_rounds` 之外的"循环轮次"判据 | 评审改成 `as_tool`，不是代码 `while` | `review_rounds > 1` ⇒ `agent_rework_total`（`attempts` 恒为 1，判不出返工） |
+
+清理与探针同步（**否则是空转 + 永不触发**）：
+
+- `scripts/retention_sweep.py` 从清 `checkpoints/checkpoint_blobs/checkpoint_writes`
+  三张表（早已不存在）改成清 `agent_run_state`；
+- `deploy/monitoring/alerts.yml` 的 `CheckpointErrorsHigh` 换成 `RunStatePersistFailed`；
+- `/health/ready` 的 `checkpointer` 项换成 `run_state`。
+
+顺手修掉三个**静默**缺陷（都不报错、只是行为错了）：
+
+1. **待审内容会被当正文发出去**：`_stream_run` 取会话编号时只看参数，调用方忘传就落到
+   空串 ⇒ `review_requested` 那一支直接跳过，"该转人工的轮次悄悄变成正常交付"。
+   现在按「参数 → `turn.thread_id`」的顺序兜底（原来还有一级"从运行配置的
+   `configurable.thread_id` 取"，随图一起删了 —— 官方 `Runner.run` 不认那个键）。
+2. **收尾 IO 没有上界**：写运行现场（一次 PG 写）没套在请求总时限里，库端卡住就无限等，
+   而用户正文早就拿到了，只觉得"怎么还没结束"。现在它和正文的等待同一个 deadline。
+3. **断连被表现成"请求被取消"**：`_turn_events` 收尾时 `await task` 抛的
+   `CancelledError` 是**我们自己刚发出去那次取消的回执**，却一路穿过 `aclose()`
+   冒到 `_stream_run` 之外（那里只 catch `Exception`），于是断连这一轮的配额结算与
+   幂等键收尾都被跳过。改成连 `BaseException` 一起吃掉。
+
+### 变更 — tracing 从「看起来接上了」改成真的接上（2026-10-20）
+
+`app/tracing.py` 的旧实现把 Langfuse 的 **LangChain** callback handler 挂到"执行图的
+运行 config"（`configurable` / `callbacks`）里。那个键**没有读者** —— 官方
+`Runner.run` 不认识它 —— 所以 Langfuse 从来没收到过 agent 链路的 trace，而启动日志
+照样写"tracing 已启用：Langfuse"。更糟的是有三条用例还在守这个死行为，看起来一切正常。
+
+- **改成官方接法**：OpenInference 的 OTel 插桩（`OpenAIAgentsInstrumentor`）。它的
+  `_instrument()` 在 `exclusive_processor=True`（默认）时调
+  `agents.set_trace_processors([...])` **替换**处理器列表 —— 顺带把 SDK 默认那个
+  "往 OpenAI 后端上报"的处理器顶掉，所以这条路上**不能**再关 tracing（关了连 span
+  都不产生，插桩收不到东西）。
+- **没配任何后端时显式 `set_tracing_disabled(True)`**。不这么做，`get_trace_provider()`
+  第一次被访问会自动注册 `BatchTraceProcessor(BackendSpanExporter())`：拿环境里可能
+  残留的 OpenAI 平台密钥，把每一轮的 prompt 与回复全文发往 `api.openai.com` ——
+  失败被吞、不报错、不体现在任何指标上。本项目模型走自建客户端（配置项 `AGNES_*`），
+  所以它要么用错 key，要么根本发不出去。
+- **配了但缺依赖 ⇒ 如实回落 `none`**，启动日志写清缺哪个包；不再有"日志说接上了、
+  面板里一条都没有"。Langfuse 分支**不做启动期连通性校验**（不调 `auth_check`）：那是
+  一次网络请求，配错凭据时会把启动拖住甚至拖死，而可观测配错不该影响可用性。
+- `build_run_config` / `trace_callbacks` 与 `_stream_run` 的 `run_config` 参数一并删除
+  （唯一的读者是一句"兜底取 `thread_id`"，而 `TurnRequest.thread_id` 是必填字段）。
+- ⚠️ **`request_id` → trace 这条链现在确实不在**：旧实现把它写进那个没人读的
+  metadata。要恢复得在 OTel 那一层做（resource attribute 或 `TraceConfig`），本次没做
+  —— 别把"日志里有 rid"读成"trace 里能按 rid 搜"。
+- 新增依赖是**可选的**（`requirements.txt` 里以注释形式列出）：`langfuse` +
+  `openinference-instrumentation-openai-agents`，不装则整条能力不存在，其余功能不受影响。
+
+### 变更 — 停机点搬出执行图：图不再 `interrupt`，审核在容器里（2026-10-20）
+
+上一批把 agent 拓扑收回到官方形态；这一批处理"跑完之后要人看一眼"这件事 ——
+它是删图的最后一块前置，也是唯一一个**官方给不了**的能力。
+
+- **执行图的 `human_review` 节点换成 `request_review`**：它只写
+  `review_requested` / `review_reason` 就走到 END，**一次都不挂起**。图里现在
+  没有任何 `interrupt`。
+- **停机由 `src/review_gate.py` 承担**（`START → await_review → END` 一张单节点图）。
+  它与执行图在同一个 checkpointer 上，但**会话编号独立**（`review::<thread_id>`）——
+  langgraph 的检查点只按 `thread_id` 存、不区分图，共用编号会互相覆盖。
+- **`after_human` / `route_revise` / `refine` 三个节点/函数删除**。人工决定不再是图内
+  的一次 resume：`accept` 什么都不跑（正文早在 `output` 里，直接交付）；`revise`
+  **新起一轮运行**，意见走 `configurable.human_feedback`（不进 state、不进对话历史）。
+- **`generate` 的修订判据从"轮次"改成"有没有人工意见"**。打回轮是新起一轮运行，
+  `init` 会把 `iteration` 清零 —— 只看轮次会把打回走成"首次生成"，审核意见被
+  完全忽略、重新答一遍原问题，而且不报错。
+- **`POST /v1/session/{id}` 的 `awaiting_review` 与 `POST /v1/review` 的 409
+  改读容器的 `next`**。执行图跑完就走 END，它的 `next` 恒为空；继续读它等于
+  把所有审批挡在 409 门外（不报错、不告警，只表现为"审核台点了没反应"）。
+- **`/v1/chat/resume` 的"等人审"分支同样改读容器**，否则会回一句"没有未完成的生成"。
+
+为什么要分开（不是风格问题）：官方的中断只能发生在**运行中**（模型请求一个需要审批
+的工具），而"跑偏 / 护栏拦下 / RAG 低分"全都是**运行结束后**才判出来的结论 ——
+知道"这次要不要人审"的时刻，晚于"还能停下来"的时刻。所以图只负责下结论，
+"停下来"只能由外层承担（官方文档也把 long waits / process restarts 划给工作流引擎）。
+
+两个不报错的坑，都钉了守卫：
+
+- **接受之后必须跳过开审**。`accept` 走的是 `astream(None)`（图早已 END，不重跑
+  `init`），state 里的 `review_requested` 还是上一轮那个 `True` ⇒ 不跳过就会把
+  刚批过的内容立刻再押回队列，形成"批一次、进一次"的死循环（用户永远收不到东西）。
+- **开审必须清掉上一次的决定**。实测：同编号第二次进容器时，`ainvoke` 的入参与
+  已有 checkpoint 合并，上一次的 `human_action="accept"` 会原样保留 ⇒ 审核台会把
+  一份还没人看过的草稿显示成"已接受"。
+
+验证：变异 `tmp_probe/mutate_review_offload.py` **8/8 全红**、逐字节恢复一致；
+ruff 全绿；全量 **2060 passed / 14 skipped**。
+
+### 变更 — agent 链路回到官方形态：一次运行跑完整条链（2026-10-20）
+
+用户要求「全部按照 openai 的来做，后面再根据需要改动，不再保留跟 langgraph 相关的
+代码，主循环、历史消息记录、和续跑等等都按 openai 的来」，RAG 能力保留。
+
+**这一批只动 agent 拓扑，服务层仍在跑图**（删图是下一批，此刻线上行为没变）。
+
+- **前台 → 文学专家改回官方 `handoffs=[literary_agent]`**。2026-10-03 之所以改成
+  `output_type=FrontlineDecision` + 图的一条边，是因为当时 agent 链路被拆成了多个
+  LangGraph 节点，而 SDK 的 handoff 会在"节点内部"把整条链跑完 ⇒ 节点边界（= 续跑
+  边界）形同不存在。图去掉之后这个前提没了，于是回到官方形态。
+- **`types.FrontlineDecision` 删除**，前台不再有 `output_type`。答复就是普通文本 ——
+  模型不用额外产出 JSON，用户也不会看到 `action='reply' content='...'`。
+- **"转交"的判据换成 `result.last_agent`**（既成事实），不再读模型的自述字段：
+  `transfer = 起始 agent 是前台 且 结束在别人手上`。前半个条件不能省 —— 直接跑文学
+  专家时 `last_agent` 也不是前台，但那不是一次转交。
+- **`transfer` 现在有交付物**：handoff 在同一次运行内完成，接手方写的作品就是
+  `answer`。`passed` 把 `transfer` 并进来，`deliverable` 不再为空。⚠️ 按旧形态写的
+  "转交没有产出"会让**每一部作品都被丢掉**，而日志里一切正常。
+- **`graph.literary` 节点与它的边删除**，`route_frontline` 不再返回 `"literary"`。
+  留着它会让作品生成两遍（一次在 handoff 里、一次在节点里），症状是"模型费用翻倍"。
+- **`graph.frontline` 删掉"转交就提前返回"那一支**：那一支是为"没有交付物"写的，
+  现在提前返回等于把作品丢掉。
+- `guards._deliverable` 删掉 `action == "transfer"` 分支（没有第三种输出形态了），
+  并把"空产出"明确算作**没有交付物**（返回 `None`、不计数）。
+- `literary_agent` 补上 `handoff_description` —— 前台靠这句话决定要不要把整段对话
+  交出去（官方唯一读取方是 `Handoff.default_tool_description`）。
+- `hooks.on_handoff` 重新成为 `agent_handoff_total` 的真实来源（此前那段是死代码，
+  图节点里手工补记）。
+
+新增守卫：`test_handoff_ends_the_run_on_the_literary_agent`、
+`test_handoff_is_one_way_and_no_unkeepable_promise`、
+`test_graph_handoff_happens_inside_a_single_run`、
+`test_handed_off_work_still_goes_through_the_output_guardrail`。
+
 ### 移除（破坏性：删掉两扇门，而不是把它们的开关拨到"关"）
 
 > 刻意排在 `### 新增` 之前：它是**破坏性**变更（老调用方会立刻 401），
@@ -80,7 +232,45 @@
   ⚠️ 返回值**绝不为空串**：空串在检索层的含义正是"不加过滤"，用它表达"什么都看不到"
   会恰好得到最坏的结果。
 
-### 观测 — 工具层补两个盲区：从没被选过 / 失败分两档（2026-10-19）
+### 变更（破坏性：agent 链路不再产分）— 删掉收尾处的评分闸（2026-10-19）
+
+用户要求：「让 llm 自己决定是否收尾，决定是否应该启用评分机制，而不是你硬加一道
+评分闸在最后」；追问"评审没过怎么办"时回答：「查出来了就继续执行啊，带着上下文
+打回去执行」。
+
+**改动前**：评审（`review_draft`）确实是模型可选的 `as_tool`，但**结论被代码拿去
+办事** —— `TaskOutcome.score_hint()` 把 `review_failed` 映射成 40 分，
+`graph.route_agent_review()` 按 `>= HIGH(80)` 判"收尾 / 转人工"。于是模型只要评一次，
+收尾权就被接管：它觉得"这条不改也行"，代码仍然把这次产出拦进人工队列。
+
+**现在整条拆掉**：
+
+- `TaskOutcome.score_hint()` **删除**；`graph.MANUAL_SCORE` 删除。
+- `route_agent_review` 只读兜底结论（`force_exit` / `task_outcome == "manual"`），
+  **不读 `score`**。转人工只剩三件事：跑偏、护栏拦下、等授权。
+- `fallback.decide` 删掉 `review_failed ⇒ manual` 那一行。评了没过**照样交付**。
+- `human_review` 的 interrupt 载荷里，agent 回合 `score=None`；
+  `GET /v1/sessions/{id}` / 审核队列 / `need_review` 事件同样返回 `null` 而不是 0
+  —— **0 分读作"AI 判了 0 分"，真相是"这条链路不产分"**，两者对审核人意义相反。
+- 提示词里"交付正式产出之前必须调用 review_draft 自查一次"改成"要不要自查由你判断；
+  一旦调用，就按改进项改完再交 —— 它是一份给你自己的第二意见，不是一道必须通过的关卡"。
+- `passed` 的判据扩到含 `review_failed`，语义变成"**这次运行正常收口了**"，
+  不再等价于"评审通过"。评审结论看 `agent_stats.last_score`
+  （`pass` / `needs_improvement` / `fail`）。
+
+**"带着上下文打回去执行"落在哪**：`review_draft` 是 `as_tool`，`{feedback, score}`
+作为**工具返回值**进对话历史，模型在同一次 run 里接着改 —— 上下文（工具结果 + 已做
+步骤）天然还在。**没有代码 `while` 循环，也没有"结束后再起一次 run"**：那两者都会把
+收尾权重新交回代码。
+
+**观测没有丢**：`agent_runs_total{exit_reason="review_failed"}` 仍能回答"多少比例的
+交付是在评审没过时给出的"。看见不等于拦截 —— 想收紧就去改 instructions，不要加闸。
+
+验证：新增 4 条守卫（路由不读分 / 判定表无 review_failed / agent 回合分数位为 null /
+人审载荷为 null）；变异 **5/5 全红**（逐条把闸装回去，每条都被对应测试抓住）。
+全量 `2038 passed / 14 skipped`，ruff 全绿。
+
+
 
 `agent_tool_result_total`（成没成）与 `agent_tool_duration_seconds`（多慢）早就有了，
 这次补的是它们**看不见的两侧**，都属于"看板正常、问题在别处"那一类。

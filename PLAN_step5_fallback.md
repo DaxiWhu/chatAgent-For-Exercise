@@ -1,5 +1,11 @@
 # 第 5 步方案：兜底出口 + 第 3 级「停止重试」
 
+> ⚠️ **2026-10-20 注**：本文写于"编排还是图"的时期，里面出现的「节点 / 条件边 /
+> 检查点 / `src/graph.py`」**都已随图删除**（一轮 = 一次 `Runner.run`）。
+> 与拓扑无关的部分（兜底出口与第 3 级停止的判定、`transfer` 不属于兜底档）
+> **仍然有效**，代码里的原注释就是这么写的；要看落地位置请直接读
+> `src/agents/fallback.py`、`src/agents/reflection.py`。
+
 > 状态：**口径已拍板，可开工**（初版框架作废的部分已在 §1 说明）。
 > 覆盖 `PLAN_multistep_guard.md` §3.6（兜底出口）+ §5（`agent_task_outcome_total`）+ §7 第 5 步。
 > 口径确认后本文正文并入 `PLAN_multistep_guard.md`，本文件删除。
@@ -58,7 +64,7 @@
 | 4 | 外部服务故障（超时 / 限流 / 协议错 / 推不动） | **系统类** ⇒ 停止 + 开发信号 |
 | 5 | 中途单次工具报错、但运行继续跑下去了 | **不算异常**，不看它 |
 | 6 | 内容跑偏 `off_track` | **业务类** ⇒ 转人工 |
-| 7 | 评审不过 `review_failed` | **业务类** ⇒ 转人工（今天已经是这样，不用改） |
+| 7 | 评审不过 `review_failed` | ~~**业务类** ⇒ 转人工~~ **⚠️ 2026-10-19 已作废**：评审结论是过程内反馈，模型在同一次 run 里接着改，"评了没过"不再转人工（见 `AGENT_CONSTRAINTS.md` §2 的评分闸一节） |
 | 8 | 入口护栏 / 出口护栏拦下的 | **业务类** ⇒ 转人工，**并且把被拦下的那段内容一并带给审核人**（见 §11） |
 | 9 | "该退却退不了"（那一步找不到 / 落盘类不可撤 / 额度用完） | **系统类** ⇒ 停止 + 开发信号 |
 | 10 | 什么都没产出、也没有任何异常信号 | **系统类** ⇒ 停止 + **给开发人员留信号**（日志 + 指标） |
@@ -74,10 +80,13 @@
 
 | outcome | 交付给用户什么 | 走哪条路 |
 |---|---|---|
-| `delivered` | 正常答复 | 现状（`score >= HIGH` ⇒ `end`） |
-| `partial` | 答复 + 正文一句"部分结果"提醒 + 字段带清单 | `end`（照常交付，`score = 90`） |
-| `manual` | **不交内容**，压进审核队列（草稿 + 原因 + 清单） | `score = 40` ⇒ `route_agent_review` 走 `human_review` |
+| `delivered` | 正常答复 | 现状（`force_exit` 为假且 `task_outcome` 不是 `manual` ⇒ `end`） |
+| `partial` | 答复 + 正文一句"部分结果"提醒 + 字段带清单 | `end`（照常交付，**不打分**） |
+| `manual` | **不交内容**，压进审核队列（草稿 + 原因 + 清单） | `task_outcome = "manual"` ⇒ `route_agent_review` 走 `human_review` |
 | `failed` | **不交这次的产出内容**，给通用错误说明 | `output = ERROR_REPORT` + `force_exit` |
+
+> ⚠️ **2026-10-19 起这张表不再经过分数**：上面三处 `score = 90 / 40` 的写法已删，
+> 转人工由 `task_outcome` 直接表达（agent 链路不产 0-100 分）。见 `AGENT_CONSTRAINTS.md` §2。
 
 > `failed` 给的那句是 `ERROR_REPORT`（"服务出现问题请稍后重试"），与今天 `max_turns` 的行为**逐字相同**。
 > 它**不是**"这次产出的内容" —— 半成品一律不交，但要让用户看到明确结局（否则是"零 token + done"，
@@ -93,11 +102,15 @@
 |---|---|---|---|
 | ① | `exit_reason == "error"`（崩溃 / 限流 / 协议错） | `failed` | 系统类 |
 | ② | 反思报过 **跑偏**（`off_track`，含第 3 级因跑偏停） | `manual` | 业务类 |
-| ③ | `exit_reason == "review_failed"`（评审不过） | `manual` | 业务类 |
+| ~~③~~ | ~~`exit_reason == "review_failed"`（评审不过）~~ **2026-10-19 已删** | — | — |
 | ④ | `exit_reason ∈ {input_guardrail, output_guardrail}` | `manual` | 业务类 |
 | ⑤ | **没有可交付的答复**（`answer` 去空白后为空） | `failed` | 系统类 |
 | ⑥ | 有答复，但**出现过问题信号** | `partial` | 系统类 |
 | ⑦ | 其余 | `delivered` | — |
+
+> ⚠️ 第③行删掉后，`review_failed` 会落到第⑦行走正常交付 —— 这是**有意的**：
+> 评审是模型自己调的工具，结论只回给它自己。指标上仍能从
+> `agent_runs_total{exit_reason="review_failed"}` 看见比例（看见 ≠ 拦截）。
 
 两条容易看错的地方，写清楚：
 
@@ -221,7 +234,7 @@ exit_reason='error'   outcome.error='Boom: 第 3 级：立即停'
 |---|---|---|
 | `agent_task_outcome_total` | `outcome=delivered/partial/manual/failed` | 任务完成率（方案 §5 缺口二） |
 | `agent_recovery_level_total` | `level=3` | 第 3 级触发了几次 |
-| `agent_fallback_total` | `reason=off_track/loop/stuck/review_failed/guardrail/no_output` | **给开发人员的信号**（决策 10） |
+| `agent_fallback_total` | `reason=off_track/loop/stuck/guardrail/no_output` | **给开发人员的信号**（决策 10）。⚠️ 2026-10-19 起**没有** `review_failed`（它不再进兜底表）；那一项改看 `agent_runs_total{exit_reason="review_failed"}` |
 
 - 决策 10 的"开发人员需要知道"落成：**一条 WARNING 日志 + 上面第三个指标**。告警规则本身属 §7 第 7 步。
 - ⚠️ `reason` 是有限枚举 ⇒ 可做标签；`error_kind`（`TaskOutcome.error`）**绝不能**进标签
@@ -261,7 +274,8 @@ exit_reason='error'   outcome.error='Boom: 第 3 级：立即停'
    而是"内容在审核中"；被拦下的那段内容会**存进审核队列**给审核人看（有意偏离官方"被拒输出不落库"）。
 4. **agent 链路转人工时不再把草稿当正文发给用户**（§6.5 的接口层顺序修正）。
    这条是"不交半成品"能不能成立的前提 —— 不改的话 `manual` 只是个标签，用户照样先看到内容。
-   ⚠️ 它同时改变了**现有** `review_failed` 那条路径的用户可见行为（今天草稿会先流出去）。
+   ⚠️ 它当时也改变了 `review_failed` 那条路径的用户可见行为（草稿会先流出去）。
+   **2026-10-19 起这一句对 `review_failed` 已不适用** —— 它不再转人工（见 §4 第③行的作废说明）。
 5. 第 2 级仍然只撤**无副作用**的动作（不变）。第 2 级的撤不掉现在会**升级成停止**（决策 9）。
 
 ---

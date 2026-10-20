@@ -1,5 +1,20 @@
 # chatAgent 项目结构与文件归类分析
 
+> ## ⚠️ 本文是 2026-09-20 的**历史快照**，不是现状
+>
+> 全文多处把 `src/graph.py`（以及它的 `init/retrieve/generate/evaluate/route/human`
+> 节点、`PostgresSaver` 检查点）当作真源描述。**那些东西已经在 2026-10-20 全部删除**：
+>
+> | 本文说的 | 现在是什么 |
+> |---|---|
+> | `src/graph.py`（图 + 节点） | `src/turn.py`（一轮 = 一次 `Runner.run`）+ `src/agents/` 装配 |
+> | `src/review_gate.py`（停机容器，单节点图） | 官方 `RunState` + `app/runs.py`（`agent_run_state` 表） |
+> | `PostgresSaver` / 检查点续跑 | 官方 `Session` 存跨轮历史；运行现场存 `agent_run_state` |
+> | `tests/test_graph.py` / `test_nodes.py` / `test_review_gate.py` / `test_agents_route.py` | 均已删除，覆盖迁到 `test_agents_pipeline.py` / `test_agents_entry.py` / `test_run_state.py` |
+>
+> 想读现状请看 `README.md`（接口与启动）、`PIPELINE.md`（RAG 链路）与
+> `DESIGN_agent_architecture.md`（拓扑取舍）。本文保留只为存档当时的审计结论。
+
 > 生成时间：2026-09-20
 > 分析范围：项目内全部文件（不含 `.git/`、`__pycache__/`、`.idea/`、`.pytest_cache/` 等缓存）
 
@@ -56,7 +71,7 @@
 
 | 文件 | 行数 | 作用 | 状态 / 问题 |
 |------|------|------|-------------|
-| `src/graph.py` | 215 | 图逻辑**真源**：`build_graph(model, checkpointer, tools)`。节点 init/generate/evaluate/tool_node/human_review；`route_review` 阈值 LOW=60/HIGH=80、iteration>=10 封顶；`human_review` 用 `interrupt`+`HumanDecision` 校验 | ✅ 质量最好、可注入、测试友好。❌ **缺 `retrieve` 节点与 `context` 字段**，落后于 notebook |
+| `src/graph.py` | 215 | 图逻辑**真源**：`build_graph(model, checkpointer, tools)`。节点 init/generate/evaluate/tool_node/request_review；`route_review` 阈值 LOW=60/HIGH=80、iteration>=10 封顶；`request_review` **只写 `review_requested` 标记**（2026-10-20 起不再 `interrupt`，停机在 `src/review_gate.py`） | ✅ 质量最好、可注入、测试友好。❌ **缺 `retrieve` 节点与 `context` 字段**，落后于 notebook |
 | `src/__init__.py` | 0 | 使 `src` 成为包 | ✅ 正常 |
 | `serve.py` | 296 | FastAPI 服务：`/health`、`/chat`(SSE 流式)、`/review`(人工审核 resume) | ⚠️ **前半段(1–196)已验证可用**；🔴 **后半段(197–296)断裂**：`import logger` 无模块、`lifespan` 未挂载到 `app`、`API_TYPE`/`CHROMADB_DIRECTORY` 等全局从未赋值、与 `rag.py` 重复实现 → 属死代码 |
 | `chatAgent.ipynb` | 388 | 原型笔记本。**含 `retrieve` 节点**（`get_retriever()` 懒加载单例 + `DOCS_DIR`）、`OverAllState.context`、`except (ValidationError, OutputParserException)` 更细粒度降级、`PostgresSaver(psycopg.connect(DB_URL))` | ⚠️ **逻辑最全，已与 `src/graph.py` 分叉**。另有两处小瑕疵：`generate` 首轮把整个 `messages` 列表拼进 prompt（应为最后一条的 content）；f-string 内嵌同种引号依赖 Python≥3.12 |

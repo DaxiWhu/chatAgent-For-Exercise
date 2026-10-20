@@ -2,16 +2,16 @@
 
 > ## ⚠️⚠️ 本目录是**修订前**的历史参考，不是当前生产形态
 >
-> 它的设计早于两次修订（2026-10-02 与 2026-10-03），**与 `src/agents/` + `src/graph.py`
-> 已经不一致**。读它之前先知道这四处差异（细节见
-> [`DESIGN_agent_architecture.md`](../../DESIGN_agent_architecture.md) §8 缺口 1）：
+> 它的设计早于三次修订（2026-10-02 / 2026-10-03 / 2026-10-20），**与 `src/agents/` +
+> `src/turn.py` 已经不一致**。读它之前先知道这四处差异（细节见
+> [`DESIGN_agent_architecture.md`](../../DESIGN_agent_architecture.md) 页首的第三次修订）：
 >
 > | 本目录（旧） | 生产实现（现在） |
 > |---|---|
-> | 文学专家走 `handoff()`（`frontline.py` 里还有回程边） | 文学是**图里的一个独立节点**，由前台的结构化判定经条件边路由过去；**没有回程边**，链路里**一处 handoff 都不剩** |
+> | 文学专家走 `handoff()`，且 `frontline.py` 里还有**回程边** | **仍然走官方 `handoff()`**（2026-10-20 改回来的；中间那版"图里的独立节点 + 条件边"已随图删除），但**没有回程边** —— 入口固定为前台 |
 > | 评审是代码 `while`（每轮必跑、`MAX_ATTEMPTS` 兜底） | 评审是挂在产出方身上的 `as_tool`，**调不调由模型决定** ⇒ 多一档 `exit_reason="unreviewed"` |
 > | 跨轮历史靠局部变量 `result.to_input_list()` | 官方 `Session`（`Runner.run(session=...)`）+ PostgreSQL 后端 |
-> | 入口跟随上一轮结束点（`current_agent = result.last_agent`） | 每轮入口**固定为前台** |
+> | 入口跟随上一轮结束点（`current_agent = result.last_agent`） | 每轮入口**固定为前台**（`Runner.run(ENTRY_AGENT, ...)`） |
 >
 > `selftest` / `mutate` 全绿只说明**这个目录自己自洽**，**不能**当作"当前设计正确"的证据。
 > 判据一律以 `DESIGN_agent_architecture.md` 与 `src/agents/` 为准。

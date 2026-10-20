@@ -1,10 +1,46 @@
 # 智能体架构设计（按 OpenAI Agents SDK 官方原语）
 
-> 状态：**设计已两次修订**（2026-10-02 / 2026-10-03）。本页描述的是**最新**的设计。
-> 参考实现：`examples/sub_agents/`（53 条断言 + 6 组变异全绿，但=**两次修订之前**的决策）
-> 生产实现：`src/agents/` + `src/graph.py`（**已按最新决策落地**）
+> 状态：**设计已三次修订**（2026-10-02 / 2026-10-03 / **2026-10-20**）。
+> 生产实现：`src/agents/`（装配）+ `src/turn.py`（一轮的入口）
 > 取代：`PLAN_task_routing.md`、`examples/task_routing/`（已归档到 `examples/_archive/`）
 > 取证基线：`openai-agents`（0.22.3 与 0.20.0 两代都读过源码）；官方示例源码逐文件读过
+
+### ⚠️⚠️ 2026-10-20 第三次修订：**第三次修订把第二次修订整个推翻了**
+
+第二次修订（下面那一节）做的全部事情，都是为了让"跨 agent 转移"能被**检查点**看见：
+拆两个图节点、用条件边表达转交、把判定写进 state。**前提已经不成立 —— 图被整体删掉了。**
+官方 Agents SDK 没有 graph / node / edge / checkpointer 这些原语，硬留着它就是"用别人的
+名字描述自己造的东西"。
+
+| 维度 | 本页 §「2026-10-03 修订」与 §6.3 说的（**已作废**） | 现在（2026-10-20 起） |
+|---|---|---|
+| 编排 | `src/graph.py` 的图：`init → retrieve → generate → evaluate → route → human` | 一轮 = **一次 `Runner.run`**（`src/turn.py`），没有任何图 |
+| 停机等人审 | `src/review_gate.py`（一张单节点图） | 官方 **`RunState`**：运行停在 `deliver(needs_review=True)` 上，现场由 `app/runs.py` 落 `agent_run_state` 表 |
+| 跨 agent 转移 | **结构化判定 + 图的一条条件边**（`output_type=FrontlineDecision`，删掉全部 `handoffs`） | **官方 `handoffs=[literary_agent]`**，`output_type=FrontlineDecision` 已删除 |
+| 为什么这样改 | 「handoff 不离开当前节点 ⇒ 检查点看不见 ⇒ 必须拆成两个节点」 | 没有检查点了，那条理由随之消失；`handoffs` 才是官方给「整段对话换人」的原语 |
+| 「叫帮手」 | `as_tool` | **仍然是 `as_tool`**（检索、图片描述这类"拿个结果回来"的子任务） |
+| 续跑边界 | 节点边界 = 续跑边界 | 没有可续跑的现场（取消不产 `RunState`）；`/v1/chat/resume` 恒 409 |
+| 一次请求 = N 次运行 | N = 图节点数 | N = 1 次 `Runner.run`；handoff 在**同一次运行内**换人，`as_tool` 是同一运行内的嵌套 run |
+
+两条**没有**改变、仍然有效的结论（它们与"有没有图"无关）：
+
+1. **`handoffs` 与 `as_tool` 是两种语义，别混**：`handoffs` = 换人（之后整段对话都由
+   新 agent 接），`as_tool` = 叫帮手（拿结果回来，控制权还在原来那个 agent）。
+2. **没有回程 handoff**：入口固定为前台，下一轮用户说话自然回到前台；加回程会让
+   一次运行内的转移出现环，模型可能来回横跳。守卫
+   `test_handoff_is_one_way_and_no_unkeepable_promise` 仍在。
+
+本页中**已被引用但已删除**的守卫（别再去 grep 它们）：`test_no_handoffs_anywhere_and_no_unkeepable_promise`
+（改名成 `test_handoff_is_one_way_and_no_unkeepable_promise`）、
+`test_graph_routes_a_transfer_to_the_literary_node`、
+`test_transfer_note_is_not_judged_as_a_deliverable`（"转交不是交付物"这条随判定对象一起
+消失，现在由 `handoff` 语义本身保证）。仍然存在的是
+`test_frontline_topology_is_exactly_what_the_design_claims`、
+`test_transfer_is_not_filed_under_unreviewed`、`test_handoff_ends_the_run_on_the_literary_agent`。
+
+> 读法建议：本页的**原理部分**（官方原语怎么工作、`as_tool` 的嵌套 run 语义、护栏与
+> 审批的边界）仍然准确且值得读；**凡出现「节点 / 条件边 / 检查点 / `src/graph.py` /
+> `src/review_gate.py`」的段落，一律按上表替换后再理解。**
 
 ### ⚠️ 2026-10-03 修订（只改了一件事，但它改变了拓扑的形状）
 
@@ -223,6 +259,14 @@ user-facing conversation**」⇒ `as_tool`；「**routing itself is part of the 
 
 ## 5. 本项目拓扑
 
+> ⚠️ **本节画的是 2026-10-03 的图（已作废）**：下面出现的 `graph.dispatch` / 条件边 /
+> 「节点 1」「节点 2」/ `output_type=FrontlineDecision` 全都已经删掉。
+> 现在的拓扑一句话说完：**一轮 = 一次 `Runner.run`**，起点固定是 `frontline_agent`；
+> 它自己决定直接作答、`as_tool` 叫帮手（检索 / PPT / 插图 / 评审 / 落盘），
+> 还是 `handoffs=[literary_agent]` 把整段对话交给文学-agent。
+> 代码：`src/turn.py`（一轮）+ `src/agents/frontline.py` / `literary.py`。
+> 下面这张图保留，是为了让页首那张对照表有可引用的"原来长什么样"。
+
 ```
 用户提问
    │ 原文（取 state 里**最后一条用户消息**，不是"最后一条消息"）
@@ -269,10 +313,19 @@ user-facing conversation**」⇒ `as_tool`；「**routing itself is part of the 
 ┌──────────────────────────────────────────────────────────┐ │
 │ 出口护栏（RunConfig）→ 记录 → route_agent_review          │ │
 │   达标 ⇒ END（用户看到答复）                              │ │
-│   不达标 ⇒ human_review（人工复核；agent 链路**不**产生   │ │
+│   不达标 ⇒ request_review（只打标记；"停下来等人"在 │ │
+│            图外的 src/review_gate.py；agent 链路**不**产生 │ │
 │            "regenerate" —— 不能拿 RAG 的生成器改 agent 产出）│ │
 └──────────────────────────────────────────────────────────┘ │
 ```
+
+> ⚠️ **2026-10-20：下面这四条的前提是"两个节点 = 两次独立运行"，这个前提已经不存在。**
+> 现在一次请求 = **一次 `Runner.run`**：`TaskContext` 只有一份（"跨运行共享上下文"
+> 这个问题本身消失）、指标只有一种口径（页首表格第 7 行）、异常由 `run_agent` 的收尾
+> 统一判定（不再有"节点兜不兜"这回事）。要看现在的真实装配，读 `src/agents/runner.py`
+> 与 `src/turn.py`；下面的文字只当"为什么当初那样设计"的存档。
+> 紧接其后的**护栏接线（327 行起）仍然有效** —— 它描述的是"挂在哪一层"，
+> 与"有几个节点"无关。
 
 > **两个 agent 节点各是一次独立的 SDK 运行**（`runner.run_agent`），所以：
 >
@@ -423,7 +476,13 @@ await run_input_guardrails(..., copy_input_items(original_input), ...)
 守卫：`test_input_guardrail_scans_the_new_message_not_the_whole_history`（两个方向都钉）、
 `test_input_guardrail_is_wired_in_exactly_one_pool`（只许出现在一个池子里）。
 
-### 6.3 跨节点转移：**不再用 handoff**，改用「结构化判定 + 图的一条边」
+### 6.3 跨节点转移：~~不用 handoff~~ → **已改回官方 handoff**（本节结论作废，保留为复盘）
+
+> **⚠️ 2026-10-20 作废**：本节"必须拆成两个图节点、用条件边表达转交"的结论建立在
+> 「检查点要能看见转移」这个前提上，而**检查点已经随图一起删除**。现在的实现是
+> 官方 `handoffs=[literary_agent]`（见页首第三次修订的对照表）。
+> 下面这段留着的价值只有一个：说明**当年为什么会做出那样的取舍**，以及为什么那个
+> 取舍在"没有检查点"之后就不成立了。
 
 > 本节在 2026-10-03 被**整节改写**。上一版标题是"handoff 单向 ⇒ 回程边必须显式注册" ——
 > 那个结论随着"拆成两个图节点"一起作废了：链路里**已经没有 handoff**。
