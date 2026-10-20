@@ -8,15 +8,13 @@
 
 三条边界判据，每条都对应一个**会把数据搞坏**的错法：
   * 首个 chunk 不产生间隔（否则那条间隔其实是 TTFT，"首字等了多久"会被重复计）；
-  * 换一次模型调用**必须**断开（否则工具执行 / 节点调度的几百毫秒到几十秒
+  * 换一次模型调用**必须**断开（否则工具执行的那几百毫秒到几十秒
     会被当成"解码变慢"，把 P95 抬到秒级）；
   * 一个 chunk 只记一次（否则 count 虚高，`histogram_quantile` 仍然能算，
     但"平均"类聚合会偏）。
 """
 
 import asyncio
-import time
-from types import SimpleNamespace
 
 import pytest
 
@@ -31,37 +29,41 @@ def _clean_metrics():
     metrics.reset()
 
 
-class _FakeStreamGraph:
-    """按脚本产出 chunk 的替身图。
+class _FakeTurn:
+    """按脚本吐字的替身运行（替换 `app.main.run_turn`）。
 
-    chunks 里每一项是 `(content, node, msg_id, delay_before)`：
-      * `node`  —— 写进 metadata 的 `langgraph_node`（真实链路里由 langgraph 填）；
-      * `msg_id` —— chunk 的 `id`。真实链路里同一次模型调用内恒定、换调用就变
-        （实测见 `tmp_probe/probe_chunk_identity.py`）；
-      * `delay_before` —— **到达之前**睡多久，用来模拟解码间隔与工具执行。
+    chunks 里每一项是 `(content, call_id, delay_before)`：
+      * `call_id` —— 官方 `ResponseTextDeltaEvent.item_id`。真实链路里**同一次
+        模型调用内恒定、换调用就变**（实测见 `tmp_probe/probe_chunk_identity.py`），
+        这也是"这一次模型调用"的唯一标记；
+      * `delay_before` —— **交出这一段之前**睡多久，用来模拟解码间隔与工具执行。
     """
 
     def __init__(self, chunks):
         self._chunks = list(chunks)
 
-    async def astream(self, incoming, config, stream_mode):
-        for content, node, msg_id, delay in self._chunks:
+    async def __call__(self, req, *, context, on_text=None):
+        from src.agents.runner import TaskOutcome
+
+        for content, call_id, delay in self._chunks:
             if delay:
-                time.sleep(delay)          # 模拟"下一个 chunk 还没来"
-            yield SimpleNamespace(content=content, id=msg_id), {"langgraph_node": node}
+                await asyncio.sleep(delay)      # 模拟"下一段还没来"
+            if on_text is not None:
+                await on_text(content, call_id)
+        return TaskOutcome(answer="".join(c for c, _, _ in self._chunks), attempts=1,
+                           final_agent="frontline_agent", passed=True,
+                           exit_reason="passed")
 
-    async def aget_state(self, config):
-        return SimpleNamespace(next=(), values={"citations": [], "output": ""})
 
-
-def _run(monkeypatch, chunks):
-    """把替身图装进 `app.main`，收完整个流，返回事件类型列表。"""
+def _run(monkeypatch, chunks, kind="chat"):
+    """把替身运行装进 `app.main`，收完整个流，返回事件类型列表。"""
     import app.main as M
 
-    monkeypatch.setattr(M, "graph", _FakeStreamGraph(chunks))
+    monkeypatch.setattr(M, "run_turn", _FakeTurn(chunks))
 
     async def collect():
-        return [ev async for ev in M._stream_graph({}, {}, "chat")]
+        return [ev async for ev in M._stream_run(
+            M.TurnRequest(prompt="hi", thread_id="tpot"), kind)]
 
     return asyncio.run(collect())
 
@@ -81,9 +83,9 @@ def test_interval_is_recorded_between_chunks_of_one_model_call(monkeypatch):
     所以值只能给一个很松的下限。
     """
     events = _run(monkeypatch, [
-        ("第一段", "answer", "lc_run--a", 0.0),
-        ("第二段", "answer", "lc_run--a", 0.02),
-        ("第三段", "answer", "lc_run--a", 0.02),
+        ("第一段", "lc_run--a", 0.0),
+        ("第二段", "lc_run--a", 0.02),
+        ("第三段", "lc_run--a", 0.02),
     ])
     assert [e["event"] for e in events] == ["token", "token", "token", "done"]
 
@@ -99,7 +101,7 @@ def test_a_single_chunk_produces_no_interval(monkeypatch):
     在 `llm_inter_chunk_seconds` 里多出一条等于 TTFT 的观测，直方图的 P95
     会被首字等待时间主导。
     """
-    _run(monkeypatch, [("只有一段", "answer", "lc_run--solo", 0.0)])
+    _run(monkeypatch, [("只有一段", "lc_run--solo", 0.0)])
     assert _stats(kind="chat")[0] == 0
 
 
@@ -114,20 +116,25 @@ def test_a_new_model_call_breaks_the_interval(monkeypatch):
     "工具耗时"，从此这条指标只会反映工具执行慢，与解码速度无关。
     """
     _run(monkeypatch, [
-        ("调用一", "answer", "lc_run--1", 0.0),
-        ("调用二", "answer", "lc_run--2", 0.25),   # ← 中间是工具执行
-        ("调用二续", "answer", "lc_run--2", 0.02),
+        ("调用一", "lc_run--1", 0.0),
+        ("调用二", "lc_run--2", 0.25),   # ← 中间是工具执行
+        ("调用二续", "lc_run--2", 0.02),
     ])
     count, total = _stats(kind="chat")
     assert count == 1, f"只有后两个 chunk 属于同一次调用，应记 1 次，实际 {count}"
     assert total < 0.2, f"把 0.25s 的工具执行算进来了：总和 {total:.3f}s"
 
 
-def test_a_node_switch_breaks_the_interval(monkeypatch):
-    """节点变了也要断开 —— 即使 id 恰好相同（不同 agent 之间不该有间隔）。"""
+def test_a_new_item_id_breaks_the_interval_even_for_the_same_agent(monkeypatch):
+    """同一个 agent 内的**两次模型调用**也要断开（`item_id` 变了就算换调用）。
+
+    为什么单独一条：上面那条用"两个不同的 agent"来体现换调用，容易让人以为
+    判据是"换了谁在说"。真实判据只有 `item_id` —— 同一个 agent 连续调两次模型
+    （先检索再组织语言），中间那段等待同样不是解码耗时。
+    """
     _run(monkeypatch, [
-        ("前台", "front", "lc_run--same", 0.0),
-        ("文学", "literary", "lc_run--same", 0.2),
+        ("先叫我查一下", "lc_run--1", 0.0),
+        ("查完了，答案是", "lc_run--2", 0.2),
     ])
     assert _stats(kind="chat")[0] == 0
 
@@ -142,8 +149,8 @@ def test_the_first_interval_does_not_include_the_wait_for_the_first_chunk(monkey
     会让每条间隔都拖着一个 TTFT 的尾巴，指标从此只反映"首字多慢"。
     """
     _run(monkeypatch, [
-        ("首段", "answer", "lc_run--t", 0.2),
-        ("次段", "answer", "lc_run--t", 0.02),
+        ("首段", "lc_run--t", 0.2),
+        ("次段", "lc_run--t", 0.02),
     ])
     count, total = _stats(kind="chat")
     assert count == 1
@@ -155,16 +162,7 @@ def test_the_first_interval_does_not_include_the_wait_for_the_first_chunk(monkey
 # ---------------------------------------------------------------------------
 def test_kind_label_separates_the_two_streaming_paths(monkeypatch):
     """`kind` 必须有：`chat` 与 `review` 的期望完全不同，混在一起没意义。"""
-    import app.main as M
-
-    monkeypatch.setattr(M, "graph", _FakeStreamGraph([
-        ("一", "answer", "lc_run--k", 0.0),
-        ("二", "answer", "lc_run--k", 0.01),
-    ]))
-
-    async def collect(kind):
-        return [ev async for ev in M._stream_graph({}, {}, kind)]
-
-    asyncio.run(collect("review"))
+    _run(monkeypatch, [("一", "lc_run--k", 0.0), ("二", "lc_run--k", 0.01)],
+         kind="review")
     assert _stats(kind="review")[0] == 1
     assert _stats(kind="chat")[0] == 0, "review 的观测不该落到 chat 上"

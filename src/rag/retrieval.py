@@ -376,7 +376,7 @@ PARENT_MAX_CHARS = max(200, _env_int("RAG_PARENT_MAX_CHARS", 1200))
 # 这是切分侧唯一**显著花钱**的改进（每块一次 LLM 调用），所以默认关。
 CONTEXTUAL = os.getenv("RAG_CONTEXTUAL", "off").strip().lower() in ("1", "on", "true", "yes")
 
-# 引用（citations）里每条的原文节选长度。状态会被 checkpointer 持久化，
+# 引用（citations）里每条的原文节选长度。引用会随答复一起进会话历史，
 # 塞进整块原文会让会话状态线性膨胀，所以默认只给"够定位 + 能核对"的片段。
 CITE_SNIPPET_CHARS = max(100, _env_int("RAG_CITE_SNIPPET_CHARS", 1000))
 
@@ -1799,7 +1799,7 @@ def build_citations(hits, snippet_chars=None) -> list:
       - `snippet` 取 `content`（保真）而不是 `text`（加工过），否则回显出来的"原文"
         其实是文字化之后的形态，会误导人工核对；
       - `parent_text` **不**放进引用（那是生成用的窗口，不是原文）；
-      - 内容按 `RAG_CITE_SNIPPET_CHARS` 截断：状态会被 checkpointer 持久化，
+      - 内容按 `RAG_CITE_SNIPPET_CHARS` 截断：引用会随答复一起进会话历史，
         把整块原文都塞进每轮状态里会随会话线性膨胀。要看全文请调大这个值，
         或用 `chunk_id` 回原文件核对。
     """

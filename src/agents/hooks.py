@@ -125,15 +125,10 @@ class AgentRunHooks(RunHooks[TaskContext]):
     async def on_handoff(self, context, from_agent, to_agent) -> None:
         """handoff 发生时触发。这是拓扑是否真的被走到的**唯一直接证据**。
 
-        ⚠️ 2026-10-03 起本项目**一处 ``handoffs=`` 都不剩**（跨节点转移改由图的条件
-        边做，见 ``src/agents/types.FrontlineDecision``），所以这个回调**当前不会
-        被触发**。留着它是有意的：它是官方钩子的实现，一旦有人把 handoff 加回来，
-        "谁交给了谁"必须立刻重新被计数 —— 而"加了 handoff 却没加钩子"的表现是
-        指标静默少一块，读代码看不出来。
-
-        ⇒ 跨节点的转移由 ``src/graph.py`` 的 ``frontline`` 节点**手工补记**一条
-        （同一个 ``stats.handoffs`` 字段）。两处写同一个字段不是重复：一处覆盖
-        SDK 内部的换人，一处覆盖图节点之间的跳转。
+        ⚠️ 2026-10-20：前台 → 文学专家重新改回官方 ``handoffs=``（此前是图的条件边），
+        所以这个回调**又开始真的被触发了**。它记的 ``stats.handoffs`` 就是
+        ``agent_handoff_total`` 的来源 —— 这条指标回答"多少请求被交给了专家"。
+        改拓扑时如果忘了它，指标会静默归零，而代码看起来完全正常。
         """
         stats = stats_of(context)
         if stats is not None:

@@ -592,7 +592,7 @@ def test_every_write_is_a_noop_when_disabled(monkeypatch, sink):
 # 七、接线：七处都不能漏
 # --------------------------------------------------------------------------- #
 def test_all_tools_that_can_fail_install_a_handler():
-    """★ 七处接线**一个都不能漏**（三个 ``function_tool`` + 四个 ``as_tool``）。
+    """★ 八处接线**一个都不能漏**（四个 ``function_tool`` + 四个 ``as_tool``）。
 
     为什么按清单数而不是抽查：漏掉一处的症状是**那一类失败彻底不可见** ——
     "专家整体失败"（结构化产出解析不出来）与"专家内部某个工具失败"完全是两回事，
@@ -602,14 +602,14 @@ def test_all_tools_that_can_fail_install_a_handler():
     而不是"参数传没传"这种看代码的事 —— 后者挡不住"以为装了、其实传的是 None"。
     """
     from src.agents.frontline import frontline_agent
-    from src.agents.tools import generate_image, kb_search, save_text_asset
+    from src.agents.tools import deliver, generate_image, kb_search, save_text_asset
 
     def installed(tool) -> bool:
         handler = _installed_handler(tool)
         return handler is not None and handler is not default_tool_error_function
 
-    # 1. 三个普通工具（kb_search 不在前台工具表里，它在 researcher 内部）
-    for tool in (kb_search, save_text_asset, generate_image):
+    # 1. 四个普通工具（kb_search 不在前台工具表里，它在 researcher 内部）
+    for tool in (kb_search, save_text_asset, generate_image, deliver):
         assert installed(tool), f"{tool.name} 没装错误处理函数"
 
     # 2. 前台工具表里那四个（三个专家 + 评审）
@@ -619,9 +619,12 @@ def test_all_tools_that_can_fail_install_a_handler():
     for name in sorted(expected):
         assert installed(on_frontline[name]), f"{name} 没装错误处理函数"
 
-    # 3. 前台工具表里"装了处理函数"的恰好是这五个 —— 将来新增一个能失败的工具
+    # 3. 前台工具表里"装了处理函数"的恰好是这六个 —— 将来新增一个能失败的工具
     #    却忘了装，这条立刻红；反过来多装了一个也要有人看一眼。
-    assert {n for n, t in on_frontline.items() if installed(t)} == expected | {"save_text_asset"}
+    assert {n for n, t in on_frontline.items() if installed(t)} == expected | {
+        "save_text_asset",
+        "deliver",
+    }
 
 
 def test_render_slide_deck_is_deliberately_not_a_tool():

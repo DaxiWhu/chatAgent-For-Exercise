@@ -178,7 +178,7 @@ def test_a_subject_less_key_does_not_collide_with_a_scoped_one():
 def test_finish_and_forget_must_use_the_same_subject_as_begin():
     """收尾漏传 / 传错 subject 时**不能生效**。
 
-    这不是在测一个显然的行为，而是钉住一个**静默**失效：`_stream_graph` 的 finally
+    这不是在测一个显然的行为，而是钉住一个**静默**失效：`_stream_run` 的 finally
     （finish/forget）与端点抢键处各写一遍 subject，两处若不一致，键会停在"在途"
     直到 TTL —— 客户端拿同一个键重试永远拿到 409"正在处理中"，而没有任何日志。
     """
@@ -305,72 +305,45 @@ def test_the_fingerprint_ignores_field_order_but_not_values():
 
 
 # ---------------------------------------------------------------------------
-# 4. 端点层：假图（不碰模型/检查点）
+# 4. 端点层：替身运行（不碰模型 / 不碰数据库）
 # ---------------------------------------------------------------------------
-class _Msg:
-    def __init__(self, content):
-        self.content = content
+class _FakeTurn:
+    """替身 `src.turn.run_turn`：数"这一轮真的跑了几次"，按需抛错。
 
-
-class _FakeStream:
-    def __init__(self, items):
-        self._items = list(items)
-        self.closed = False
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        if not self._items:
-            raise StopAsyncIteration
-        return self._items.pop(0), {}
-
-    async def aclose(self):
-        self.closed = True
-
-
-class _FakeState:
-    def __init__(self, values, next_=()):
-        self.values = values
-        self.next = next_
-
-
-class _FakeGraph:
-    """`fail_first=True` 时第一次 `astream` 抛异常（模拟上游偶发失败）。
-
-    `next_` 决定检查点"停在哪一步"：`/v1/review` 要求它含 `human_review`、
-    `/v1/chat/resume` 要求它非空且不含 —— 这两处校验都排在幂等闸门**之前**，
-    所以要验闸门就必须把假状态摆成"能过前置校验"的样子。
+    为什么还要数次数：幂等的价值全在"重试时**没有**再跑一次"上。只看状态码等于
+    什么都没验 —— 重新跑一遍同样返回 200，而账单上是两倍。
     """
 
-    def __init__(self, items, values=None, fail_first=False, next_=()):
-        self._items = list(items)
-        self._values = values or {}
-        self._fail_first = fail_first
-        self._next = tuple(next_)
+    def __init__(self, chunks=("甲", "乙"), fail_first=False):
+        self.chunks = list(chunks)
+        self.fail_first = fail_first
         self.calls = 0
 
-    def astream(self, incoming, config=None, stream_mode=None):
-        self.calls += 1
-        if self._fail_first and self.calls == 1:
-            raise RuntimeError("upstream 500")
-        return _FakeStream(self._items)
+    async def __call__(self, req, *, context, on_text=None):
+        from src.agents.runner import TaskOutcome
 
-    async def aget_state(self, config):
-        return _FakeState(self._values, self._next)
+        self.calls += 1
+        if self.fail_first and self.calls == 1:
+            raise RuntimeError("upstream 500")
+        for chunk in self.chunks:
+            if on_text is not None:
+                await on_text(chunk, "call-1")
+        return TaskOutcome(answer="".join(self.chunks), attempts=1,
+                           final_agent="frontline_agent", passed=True,
+                           exit_reason="passed")
 
 
 @pytest.fixture
-def fake_graph(monkeypatch):
-    g = _FakeGraph([_Msg("甲"), _Msg("乙")])
-    monkeypatch.setattr(M, "graph", g)
+def fake_turn(monkeypatch):
+    g = _FakeTurn()
+    monkeypatch.setattr(M, "run_turn", g)
     return g
 
 
 # ---------------------------------------------------------------------------
 # 5. 端点层：四种状态
 # ---------------------------------------------------------------------------
-def test_a_retried_chat_is_replayed_without_running_the_graph_again(fake_graph):
+def test_a_retried_chat_is_replayed_without_running_the_graph_again(fake_turn):
     """**这一条是整套机制的价值所在。**
     "图跑了几次"必须是 1 —— 只看状态码等于什么都没验：重新执行一遍同样返回 200，
     而账单上是两倍。响应体逐字节相等也是必需的（客户端会把它当成一次正常回答）。
@@ -380,18 +353,18 @@ def test_a_retried_chat_is_replayed_without_running_the_graph_again(fake_graph):
 
     r1 = client.post("/v1/chat", json=body, headers=h)
     assert r1.status_code == 200
-    assert fake_graph.calls == 1
+    assert fake_turn.calls == 1
 
     r2 = client.post("/v1/chat", json=body, headers=h)
     assert r2.status_code == 200
-    assert fake_graph.calls == 1, "重试又跑了一遍图（= 重复计费）"
+    assert fake_turn.calls == 1, "重试又跑了一遍图（= 重复计费）"
     assert r2.text == r1.text, "重放出来的流与首次不一致"
     assert r2.headers.get("idempotency-replayed") == "true"
     assert r1.headers.get("idempotency-replayed") is None, \
         "首次请求不该被标成重放"
 
 
-def test_the_replayed_response_keeps_the_original_prompt_version(fake_graph):
+def test_the_replayed_response_keeps_the_original_prompt_version(fake_turn):
     """重放的是**当初那次**的产出，所以版本号必须是它的，不是"现在这份代码的"。"""
     body = _chat_body("t-pv")
     h = {"Idempotency-Key": "k-pv"}
@@ -400,18 +373,18 @@ def test_the_replayed_response_keeps_the_original_prompt_version(fake_graph):
     assert r2.headers.get("x-prompt-version") == PROMPT_VERSION
 
 
-def test_a_chat_retried_while_in_flight_is_rejected_with_409(fake_graph):
+def test_a_chat_retried_while_in_flight_is_rejected_with_409(fake_turn):
     """在途 ⇒ 409（标准 2.6）。直接抢占键来构造"正在跑"，比让一个真请求挂住可靠。"""
     body = _chat_body("t-inflight")
     M._IDEMPOTENCY.begin(TENANT, "k-inflight", _fp("chat", body), subject=SUBJECT)
 
     r = client.post("/v1/chat", json=body, headers={"Idempotency-Key": "k-inflight"})
     assert r.status_code == 409
-    assert fake_graph.calls == 0, "被判成在途重复的请求仍然进了图"
+    assert fake_turn.calls == 0, "被判成在途重复的请求仍然进了图"
     assert r.headers["content-type"].startswith("application/problem+json")
 
 
-def test_the_same_key_with_a_different_message_is_rejected_with_422(fake_graph):
+def test_the_same_key_with_a_different_message_is_rejected_with_422(fake_turn):
     """同键换载荷 ⇒ 422（标准 2.7）。**不能**回 409：那会让客户端以为"等会儿再试"，
     而它其实需要换一个键。"""
     client.post("/v1/chat", json=_chat_body("t-422", "第一个问题"),
@@ -419,10 +392,10 @@ def test_the_same_key_with_a_different_message_is_rejected_with_422(fake_graph):
     r = client.post("/v1/chat", json=_chat_body("t-422", "完全不同的问题"),
                     headers={"Idempotency-Key": "k-422"})
     assert r.status_code == 422
-    assert fake_graph.calls == 1, "换了载荷的请求不该被执行"
+    assert fake_turn.calls == 1, "换了载荷的请求不该被执行"
 
 
-def test_the_same_message_with_a_new_key_is_a_new_request(fake_graph):
+def test_the_same_message_with_a_new_key_is_a_new_request(fake_turn):
     """键的语义是「这一次请求」，不是「这个问题」。
 
     用户真心想再问一遍时，客户端换个新键就该真的再跑一次 —— 服务端**绝不能**
@@ -431,10 +404,10 @@ def test_the_same_message_with_a_new_key_is_a_new_request(fake_graph):
     body = _chat_body("t-newkey", "同一个问题")
     client.post("/v1/chat", json=body, headers={"Idempotency-Key": "k-a"})
     client.post("/v1/chat", json=body, headers={"Idempotency-Key": "k-b"})
-    assert fake_graph.calls == 2, "服务端按内容去重了（用户再也问不到同一个问题）"
+    assert fake_turn.calls == 2, "服务端按内容去重了（用户再也问不到同一个问题）"
 
 
-def test_one_users_key_does_not_block_another_user_of_the_same_tenant(fake_graph):
+def test_one_users_key_does_not_block_another_user_of_the_same_tenant(fake_turn):
     """**接线守卫**：端点是真把 `ident.user` 传进闸门了吗（2026-10-06 修）。
 
     存储层按 (tenant, subject) 分命名空间**不等于**这条隔离已经生效 ——
@@ -458,23 +431,23 @@ def test_one_users_key_does_not_block_another_user_of_the_same_tenant(fake_graph
         f"同租户的另一个用户被自己邻居用过的键挡住了（{r2.status_code}：{r2.text[:120]}）"
     assert r2.headers.get("idempotency-replayed") is None, \
         "B 拿到的是 A 那次结果的**重放**（跨用户的响应体泄露）"
-    assert fake_graph.calls == 2, "两次请求各自该真跑一遍"
+    assert fake_turn.calls == 2, "两次请求各自该真跑一遍"
 
 
 # ---------------------------------------------------------------------------
 # 6. 端点层：不带键 / 缺键 / 非法键
 # ---------------------------------------------------------------------------
-def test_a_request_without_the_key_is_completely_untouched(fake_graph):
+def test_a_request_without_the_key_is_completely_untouched(fake_turn):
     """**默认行为不变的守卫。** 不带这个头时不去重、不报错、不拦截。"""
     body = _chat_body("t-nokey")
     r1 = client.post("/v1/chat", json=body)
     r2 = client.post("/v1/chat", json=body)
     assert (r1.status_code, r2.status_code) == (200, 200)
-    assert fake_graph.calls == 2, "不带键的请求被去重了（默认行为被改了）"
+    assert fake_turn.calls == 2, "不带键的请求被去重了（默认行为被改了）"
 
 
 def test_a_missing_key_is_rejected_with_400_only_when_the_service_requires_it(
-        fake_graph, monkeypatch):
+        fake_turn, monkeypatch):
     """标准 2.7 的第一条只在"该操作**要求**这个头"时适用（2.5.1 说带不带是客户端的自由）。
 
     两个方向都要断言：默认放行（否则所有既有客户端当场 400），开了才拦。
@@ -490,14 +463,14 @@ def test_a_missing_key_is_rejected_with_400_only_when_the_service_requires_it(
     assert r.headers["content-type"].startswith("application/problem+json")
 
 
-def test_an_invalid_key_is_rejected_with_400(fake_graph):
+def test_an_invalid_key_is_rejected_with_400(fake_turn):
     r = client.post("/v1/chat", json=_chat_body("t-badkey"),
                     headers={"Idempotency-Key": "bad key with spaces"})
     assert r.status_code == 400
-    assert fake_graph.calls == 0
+    assert fake_turn.calls == 0
 
 
-def test_the_400_and_422_bodies_carry_the_documented_link(fake_graph, monkeypatch):
+def test_the_400_and_422_bodies_carry_the_documented_link(fake_turn, monkeypatch):
     """标准 2.7 要求响应体带一个**指向文档的链接**（用户不知道键该怎么写时，
     唯一能自救的信息就是它）。"""
     monkeypatch.setattr(config, "IDEMPOTENCY_DOC_URL",
@@ -520,8 +493,8 @@ def test_a_failed_run_releases_the_key_so_the_same_key_can_be_retried(monkeypatc
     不释放的后果是：这次失败把那个键锁死一整个 TTL（客户端逻辑全对，却始终 409）。
     所以断言的不只是"第二次是 200"，还有"图真的又跑了一次"。
     """
-    g = _FakeGraph([_Msg("甲")], fail_first=True)
-    monkeypatch.setattr(M, "graph", g)
+    g = _FakeTurn(("甲",), fail_first=True)
+    monkeypatch.setattr(M, "run_turn", g)
     body = _chat_body("t-fail")
     h = {"Idempotency-Key": "k-fail"}
 
@@ -534,7 +507,7 @@ def test_a_failed_run_releases_the_key_so_the_same_key_can_be_retried(monkeypatc
     assert g.calls == 2, "失败后键没被释放，重试被 409 挡住了"
 
 
-def test_a_quota_rejection_releases_the_claimed_key(fake_graph, monkeypatch):
+def test_a_quota_rejection_releases_the_claimed_key(fake_turn, monkeypatch):
     """配额 429 发生在"抢占键之后、生成器创建之前"—— 必须显式退还。
 
     不退还的后果很隐蔽：客户端等额度恢复后拿同一个键重试，收到 409"正在处理中"，
@@ -560,42 +533,46 @@ def test_a_quota_rejection_releases_the_claimed_key(fake_graph, monkeypatch):
 # ---------------------------------------------------------------------------
 # 8. 端点层：另外两个端点也要受同一套语义保护
 # ---------------------------------------------------------------------------
-def test_the_review_endpoint_is_guarded_too(monkeypatch):
-    """`/v1/review` 同样是一次真实生成（续跑被打断的图），重试代价一样大。
+def test_the_review_endpoint_is_guarded_too():
+    """`/v1/review` 同样是一次真实生成（接着跑被打断的运行），重试代价一样大。
 
-    ⚠️ 这道题有个坑：`/v1/review` 的**前置校验**（会话必须停在 human_review）
-    本身就返回 409，而它排在幂等闸门之前 —— 不把假状态摆成"真的停在审核态"，
-    这个用例会拿到一个**来自别处**的 409 而**假绿**（第一版就是这样）。
-    判据因此不能只看状态码，必须看响应**媒体类型**：幂等闸门回的是
-    `application/problem+json`，其余 4xx 回的是 `{"detail": ...}`。
+    ⚠️ 这道题有个坑：`/v1/review` 自己也有前置校验（这条会话当前不在审核态 ⇒
+    409），**两条 409 撞在同一个状态码上**。只看状态码的断言无法区分"被幂等闸门
+    挡住了"与"根本没进到那一步"，而后者正是**假绿**的经典形态。
+    判据因此只能取响应**媒体类型**：幂等闸门回 `application/problem+json`，
+    业务校验回 `application/json` + `{"detail": ...}`。
+    （不能改用"body 里有没有 `detail`"来分辨 —— problem+json 的 body 自身
+    也带 `detail` 字段，那个判据恒为真，等于没写。）
     """
-    g = _FakeGraph([], next_=("human_review",))
-    monkeypatch.setattr(M, "graph", g)
-
     body = {"thread_id": "t-review", "action": "accept", "feedback": ""}
     M._IDEMPOTENCY.begin(TENANT, "k-review", _fp("review", body), subject=SUBJECT)
     r = client.post("/v1/review", json=body, headers={"Idempotency-Key": "k-review"})
     assert r.status_code == 409
+    # ⚠️ 只能靠媒体类型分辨：problem+json 的 body 自身也带 `detail` 字段，
+    # 而业务校验回的是 `application/json` + `{"detail": ...}`。
     assert r.headers["content-type"].startswith("application/problem+json"), \
         f"拿到的 409 不是幂等闸门给的（看 body：{r.text[:120]}）"
-    assert g.calls == 0, "被判成在途重复的请求仍然进了图"
 
 
-def test_the_resume_endpoint_is_guarded_too(monkeypatch):
-    g = _FakeGraph([], next_=("generate",))     # 非空且不含 human_review
-    monkeypatch.setattr(M, "graph", g)
+def test_the_resume_endpoint_is_guarded_too():
+    """`/v1/chat/resume` 现在**只会**回 409（没有可续跑的现场，见端点里的长注释），
+    所以这条更要点明：那个 409 必须是**幂等闸门**给的，而不是业务校验给的。
 
+    否则"幂等闸门接线掉了一个端点"会被业务 409 完全掩盖 —— 客户端拿同一个键
+    重试，永远收到"没有可续跑的运行现场"，而它上一次的结果其实早就缓存好了。
+    """
     body = {"thread_id": "t-resume"}
     M._IDEMPOTENCY.begin(TENANT, "k-resume", _fp("resume", body), subject=SUBJECT)
     r = client.post("/v1/chat/resume", json=body,
                     headers={"Idempotency-Key": "k-resume"})
     assert r.status_code == 409
+    # ⚠️ 只能靠媒体类型分辨：problem+json 的 body 自身也带 `detail` 字段，
+    # 而业务校验回的是 `application/json` + `{"detail": ...}`。
     assert r.headers["content-type"].startswith("application/problem+json"), \
         f"拿到的 409 不是幂等闸门给的（看 body：{r.text[:120]}）"
-    assert g.calls == 0
 
 
-def test_the_legacy_chat_alias_inherits_the_same_semantics(fake_graph):
+def test_the_legacy_chat_alias_inherits_the_same_semantics(fake_turn):
     """旧路径是别名，行为必须一致 —— 只在 `/v1/chat` 上接线的话，走旧路径的
     客户端会静默失去保护（而且没有任何迹象）。"""
     body = _chat_body("t-legacy")
@@ -603,4 +580,4 @@ def test_the_legacy_chat_alias_inherits_the_same_semantics(fake_graph):
     client.post("/chat", json=body, headers=h)
     r2 = client.post("/chat", json=body, headers=h)
     assert r2.headers.get("idempotency-replayed") == "true"
-    assert fake_graph.calls == 1
+    assert fake_turn.calls == 1

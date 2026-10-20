@@ -85,42 +85,23 @@ def _fmt_handoffs(pairs) -> str:
 
 
 async def _run_turn(prompt: str, ctx, *, session_id: str = ""):
-    """跑**一整轮**：前台，以及"判定为转交时"接手的文学作者。
+    """跑**一整轮** = **一次** `run_agent(ENTRY_AGENT, ...)`。
 
-    为什么不能只跑一次前台运行：拆分之后**一次请求 = N 次运行**，而前台判定为转交时
-    它**本身没有交付物**（那一句是给下一个 agent 看的交接说明，不是给用户的答复）。
-    只跑前台的话，"文学创作"这一条会显示产出为空 —— 读起来像链路坏了，
-    实际只是漏跑了第二段。这里刻意与 `src/graph.py` 的两个节点同构，
-    探针看到的才和图里跑的是同一件事。
+    ⚠️ 2026-10-20 修：这里以前是"先跑前台，判定为 transfer 再手动跑一次文学"。
+    那是"图里的两个节点"时代的写法。现在跨 agent 转移走官方 `handoffs`，**发生在
+    同一次运行内部** —— 再补一次运行就会把同一轮跑两遍：文学那段的产出被覆盖、
+    token 与工具调用统计翻倍，而探针照样"看起来正常"。
 
-    为什么第二段**复用同一个 ctx**（图里是每个节点各建一份、再从 state 续回来）：
-    图必须重建是因为两个节点是两次独立调用；探针里顺序执行，复用同一份 ctx 天然就
-    得到"整轮"的累计统计与引用，反而更直接地对应 state 里的 `agent_stats`。
-    第二段传 `append_prompt=False`（本轮那句输入在第一次运行时就已经进会话了）。
-
-    返回 `(outcome, ctx, frontline_action)`：`frontline_action` 是**前台那一次运行**
-    给出的判定（`reply` / `transfer` / 空串=没拿到结构化判定）。单独带出来是因为
-    转交之后 `outcome` 已经是文学那次的，判定字段在它身上已经没有了。
+    返回 `(outcome, ctx, action)`：`action` 取自 `outcome.decision`，它是 runner
+    从**既成事实**（最终 agent 是不是入口 agent）推出来的，不是模型另给的字段。
     异常**不**在这里兜 —— 调用方要把失败本身报出来。
     """
-    from src.agents.runner import ENTRY_AGENT, LITERARY_AGENT, run_agent
+    from src.agents.runner import ENTRY_AGENT, run_agent
 
     outcome = await run_agent(
         ENTRY_AGENT, prompt=prompt, context=ctx, session_id=session_id
     )
-    action = outcome.decision.get("action") or ""
-    if action == "transfer":
-        # 图里这条补记在 `graph.frontline` 做（SDK 侧已无 handoff 事件）。探针不算
-        # 指标，但补上才能让"发生转交"这一栏读得出来。
-        ctx.stats.handoffs.append((ENTRY_AGENT.name, LITERARY_AGENT.name))
-        outcome = await run_agent(
-            LITERARY_AGENT,
-            prompt=prompt,
-            context=ctx,
-            session_id=session_id,
-            append_prompt=False,
-        )
-    return outcome, ctx, action
+    return outcome, ctx, (outcome.decision.get("action") or "")
 
 
 async def _run_one(
@@ -131,7 +112,7 @@ async def _run_one(
     def build_ctx() -> TaskContext:
         retriever_factory = None
         if use_kb:
-            from src.graph import get_retriever
+            from src.rag.pool import get_retriever
 
             retriever_factory = lambda: get_retriever(None)  # noqa: E731
         return TaskContext(

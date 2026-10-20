@@ -31,6 +31,7 @@ __all__ = [
     "call",
     "decide",
     "feedback",
+    "handoff_to",
     "make_ctx",
     "say",
 ]
@@ -57,15 +58,25 @@ def feedback(text: str, score: str) -> ResponseOutputMessage:
     return say(json.dumps({"feedback": text, "score": score}, ensure_ascii=False))
 
 
-def decide(content: str, action: str = "reply") -> ResponseOutputMessage:
-    """前台的结构化判定（``FrontlineDecision``）。
+def decide(content: str) -> ResponseOutputMessage:
+    """前台的一次答复。
 
-    ⚠️ 结构化产出在 SDK 里的落点就是"**最后一条助手消息的文本**"：``final_output``
-    会拿它按 ``output_type`` 反序列化。所以这里必须走 ``say(json.dumps(...))`` ——
-    与 ``feedback()`` 是同一个机制（官方 0.20 的实现如此，不是本项目的规定）。
-    用 ``ModelResponse`` 里别的条目类型（例如 function_call）反而不行。
+    ⚠️ 2026-10-20：前台**没有** ``output_type`` 了（``FrontlineDecision`` 已删，
+    交接改回官方 handoff），所以这里就是一条普通文本消息 —— 不再包 JSON。
+    加回结构化产出会让 ``result.final_output`` 变成 pydantic 对象，而它会被当成
+    给用户的答复交付出去（用户看到 ``action='reply' content='...'``）。
     """
-    return say(json.dumps({"action": action, "content": content}, ensure_ascii=False))
+    return say(content)
+
+
+def handoff_to(target: str = "literary_writer") -> ResponseFunctionToolCall:
+    """模型请求把对话交给另一个 agent（官方 handoff 在模型眼里就是一次函数调用）。
+
+    工具名规则来自 SDK：``transfer_to_{agent.name}``（``Handoff.default_tool_name``，
+    见 ``agents/handoffs/__init__.py``）。参数按官方 handoff 的约定是空对象 ——
+    handoff 的载荷来自 ``Handoff.get_transfer_message``，不是模型给的参数。
+    """
+    return call(f"transfer_to_{target}", {}, f"h-{target}")
 
 
 class ScriptedModel(Model):

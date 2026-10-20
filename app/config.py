@@ -205,7 +205,7 @@ CORS_ALLOW_ORIGINS = [o.strip() for o in
 MAX_REQUEST_BYTES = max(1024, _env_int("MAX_REQUEST_BYTES", 1048576))   # 1 MiB
 MAX_MESSAGE_CHARS = max(1, _env_int("MAX_MESSAGE_CHARS", 100000))
 MAX_FEEDBACK_CHARS = max(1, _env_int("MAX_FEEDBACK_CHARS", 20000))
-# thread_id 会被用作检查点主键、限流桶键与归属表主键 ⇒ 必须有界
+# thread_id 会被用作运行现场主键、限流桶键与归属表主键 ⇒ 必须有界
 MAX_THREAD_ID_CHARS = max(1, _env_int("MAX_THREAD_ID_CHARS", 128))
 # 认证字段上限（字段级闸门，与上面同理：给语义明确的 422 而不是笼统的 413）。
 # JWT 实际大小通常 1–2KB，8KB 已是宽裕上限；用户名/密码给的是"明显超出即异常"的量级。
@@ -289,10 +289,10 @@ MAX_CONCURRENT_REQUESTS = max(0, _env_int("MAX_CONCURRENT_REQUESTS", 0))
 # --------------------------------------------------------------------------
 # 数据保留期（合规与容量）
 # --------------------------------------------------------------------------
-# 检查点（完整对话历史）、`review_queue`（草稿与审核意见）、`session_owners` 三类
+# 跨轮历史（完整对话）、`review_queue`（草稿与审核意见）、`session_owners` 三类
 # 数据此前**永久保留**，没有任何回收机制。两个后果：
 #   ① 合规：含 PII 的对话长期驻留，用户要求删除时无从履行；
-#   ② 容量：检查点表存**每条消息的完整状态**，表随对话量无界增长 ——
+#   ② 容量：历史表存**每条消息的全文**，表随对话量无界增长 ——
 #      它在某个时间点会突然从"慢"变成"不可用"（VACUUM 跟不上、索引膨胀、
 #      备份窗口拉长），而在此之前没有任何指标会预警。
 #
@@ -722,19 +722,19 @@ if PG_POOL_MIN > PG_POOL_MAX:
 PG_POOL_TIMEOUT = max(1, _env_int("PG_POOL_TIMEOUT", 5))
 
 # --------------------------------------------------------------------------
-# agent 链路（请求默认全部走这里；实现见 src/agents/）
+# agent 链路（**唯一**的作答路径；实现见 src/agents/）
 # --------------------------------------------------------------------------
-# 为什么这段配置集中在这里、而链路层（src/graph.py、src/agents/*）直接读环境变量
+# 为什么这段配置集中在这里、而链路层（src/agents/*）直接读环境变量
 # ------------------------------------------------------------------------------
 # 与 `DOCS_DIR` 完全同构：链路层要在**导入期/请求期**就拿到这些值，走 config 会形成
 # `src/ → app/` 的反向依赖（见 src/observability.py 的说明）。所以两边各读一次，
-# 这里这一份的用途是**启动自检回显** —— 运维能从启动日志确认"agent 链路到底开没开、
-# 用哪个目录落资产"，而不是只能靠猜。
+# 这里这一份的用途是**启动自检回显** —— 运维能从启动日志确认"用哪个目录落资产"，
+# 而不是只能靠猜。
 #
-# 取值约定沿用本模块的两条原则：能力开关默认**开**；但只要"开着且实际不可用"
-# （没装 `openai-agents` / 没配 API Key），行为必须与关闭时**一致** ——
-# 全部请求回落原问答链路。见 `src/agents/runtime.py` 与 `src/graph.dispatch`。
-AGENTS_ENABLED = _env_bool("AGENTS_ENABLED", True)
+# ⚠️ 这里**没有** `AGENTS_ENABLED` 这个开关：图退役之后 agent 链路是唯一的作答路径，
+# 没有"关掉它、走另一条链路"这回事。"开关 + 关掉就回落"的组合已经删除 —— 回落目标
+# 不存在了，留一个只能取 true 的开关只会让人以为可以关。
+# 链路不可用（没装 SDK / 没配 Key）时 `app.main` 直接拒绝启动，见 `_assert_agents_ready`。
 
 #: 资产落盘目录（PPT 大纲渲染、插图占位文件）。
 #: ⚠️ 默认**不是** `data/` —— 那是 RAG 语料目录，往里写文件会被灌库当成资料。
@@ -938,13 +938,9 @@ def as_dict(runtime=None):
         "model": MODEL_NAME,
         "db": bool(DB_URL),
         "docs_dir": DOCS_DIR,
-        # agent 链路：`ready` 由调用方在装配后填入（与 rate_limit 的
-        # "configured vs backend" 同一个理由）—— 配了 AGENTS_ENABLED=true 不等于
-        # 真的能用（没装 SDK / 没配 Key 都会静默降级为"全部走问答链路"）。
+        # agent 链路：已经**没有开关**了（唯一作答路径，不可用就拒绝启动），
+        # 所以这里只回显"落资产用的目录"与几个行为参数。
         "agents": {
-            "enabled": AGENTS_ENABLED,
-            "ready": bool(runtime.get("agents_ready")),
-            "reason": runtime.get("agents_reason", ""),
             "asset_dir": AGENT_ASSET_DIR,
             "max_attempts": AGENT_MAX_ATTEMPTS,
             "max_turns": AGENT_MAX_TURNS,
@@ -954,7 +950,7 @@ def as_dict(runtime=None):
             # 所以这里只回显"打算怎么配"，实际结论由 lifespan 单独打一行日志
             # （`app.main` 的跨轮历史自检）—— 宁可少一个键，也不要谎报一个后端名。
             "history": {
-                # 历史与检查点同库（PG）⇒ 多副本天然共享，不再需要"所有副本指向
+                # 历史与运行现场同库（PG）⇒ 多副本天然共享，不再需要"所有副本指向
                 # 同一个 Redis"那条约束。
                 "shared_configured": bool(DB_URL),
                 # 送进模型的**输入预算**（token），None = 不限。

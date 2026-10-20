@@ -66,9 +66,8 @@ def _code_keys() -> set[str]:
       - `app/config.py`：统一入口，用 `_env_str/bool/int/float("KEY")` 读；
       - `app/serve.py`：**例外**，argparse 直接读 `APP_WORKERS` /
         `WEB_CONCURRENCY` / `GRACEFUL_SHUTDOWN_TIMEOUT`（有意绕过 config）；
-      - `src/*.py`：编排层（`graph.py` 在导入期读 `DOCS_DIR` / `AGENTS_ENABLED` 等）；
       - `src/rag/*.py`：检索链路模块在导入期 `os.getenv(...)` 读一批
-        `RERANK_*` / `EMBEDDING_*` / `DOCLING_*`；
+        `DOCS_DIR` / `RERANK_*` / `EMBEDDING_*` / `DOCLING_*`；
       - `src/agents/*.py`：agent 链路模块同样直读（`AGENT_SESSION_CACHE_MAX` /
         `AGENT_SESSION_PING_TIMEOUT`）。**2026-10-03 补** —— 缺这一段时，那两个
         真实存在的键会被误判成"文档在教一个不存在的变量"；

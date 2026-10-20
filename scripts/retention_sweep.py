@@ -5,9 +5,9 @@
 --------
 三类数据此前**永久驻留**，没有任何回收机制：
 
-  1. **检查点**（`checkpoints` / `checkpoint_blobs` / `checkpoint_writes`，
-     由 langgraph 的 `AsyncPostgresSaver.setup()` 建）——
-     存的是完整消息历史、中间草稿、评分与引用。数据主体；
+  1. **运行现场**（`agent_run_state`，见 `app/runs.py`）——
+     存的是"被打断的那次运行"的官方 `RunState` 快照（**含整段对话历史**）与待审草稿。
+     数据主体：它只在"工具等审批"时存在，但一份都不删会永久累积；
   2. **`review_queue`** —— 待审/已审的草稿正文与审核意见；
   3. **`session_owners`** —— 会话归属登记行。
 
@@ -59,9 +59,15 @@ os.chdir(ROOT)
 
 from app import config  # noqa: E402
 
-# langgraph 的 pg saver 建的三张表。表名是**内部常量白名单**（不是外部输入），
-# 因此下面的 f-string 拼表名是安全的；但仍然只从这份白名单里取值。
-CHECKPOINT_TABLES = ("checkpoints", "checkpoint_blobs", "checkpoint_writes")
+#: 被中断的运行现场（`app/runs.py` 的 ``agent_run_state``）。
+#: 表名是**内部常量白名单**（不是外部输入），因此下面的 f-string 拼表名是安全的；
+#: 但仍然只从这份白名单里取值。
+#:
+#: ⚠️ 这里只有一张表，是因为现场已经被收成"一条会话一行"（官方 ``RunState`` 的 JSON）。
+#: 图时代 langgraph 把状态摊在三张表里（checkpoints / blobs / writes），那三张表
+#: 现在连建表语句都没有了 —— 留着它们在这里，清理会**静默空转**（脚本按"表存不存在"
+#: 过滤，不存在的表不报错，只是永远清不到真正在涨的那张）。
+RUN_STATE_TABLES = ("agent_run_state",)
 
 # ⚠️ `agent_sessions` / `agent_messages` **刻意不在清理名单里**（2026-10-03 产品口径拍板：
 # 对话历史**永久保留**）。这不是遗漏，加进来之前请先读 `src/agents/session.py` 的
@@ -159,28 +165,28 @@ def plan(cur, cutoff) -> dict:
 
 def sweep(cur, cutoff) -> dict:
     """执行清理。返回实际删除的行数。"""
-    result = {"checkpoints": {}, "review_queue": 0, "session_owners": 0, "threads": []}
+    result = {"run_state": {}, "review_queue": 0, "session_owners": 0, "threads": []}
 
     # 先用**归属表**确定超期会话清单（它是"最后活动时间"的权威来源），
-    # 再用这份清单去删检查点 —— 检查点表本身没有可靠的"最后更新时间"列。
+    # 再用这份清单去删运行现场 —— 现场表本身没有可靠的"最后更新时间"列。
     cur.execute("SELECT thread_id FROM session_owners WHERE updated_at < %s", (cutoff,))
     threads = [r[0] for r in cur.fetchall()]
     result["threads"] = threads
 
-    tables = _existing_tables(cur, CHECKPOINT_TABLES) & set(CHECKPOINT_TABLES)
-    # ⚠️ `& set(CHECKPOINT_TABLES)` 不是多余的：上面那句 SQL 已经按名单过滤过了，
+    tables = _existing_tables(cur, RUN_STATE_TABLES) & set(RUN_STATE_TABLES)
+    # ⚠️ `& set(RUN_STATE_TABLES)` 不是多余的：上面那句 SQL 已经按名单过滤过了，
     # 但**表名最终是拼进 DELETE 语句的**，所以白名单必须在 Python 侧再收一次口。
     # 只靠 SQL 的 `= ANY(%s)` 保证，一旦哪天有人改了那句查询（或传错参数），
     # 后面的 `DELETE FROM {t}` 就会照着查询结果删 —— 而它不会报错，只会删多。
     # （这条是测试先发现的：假游标不按参数过滤时，脚本试图 DELETE FROM review_queue
-    #   并用它去索引 checkpoints 计数，直接 KeyError。）
-    for t in CHECKPOINT_TABLES:
-        result["checkpoints"][t] = 0
+    #   并用它去索引白名单计数，直接 KeyError。）
+    for t in RUN_STATE_TABLES:
+        result["run_state"][t] = 0
     for i in range(0, len(threads), BATCH):
         chunk = threads[i:i + BATCH]
         for t in sorted(tables):
             cur.execute(f"DELETE FROM {t} WHERE thread_id = ANY(%s)", (chunk,))
-            result["checkpoints"][t] += cur.rowcount
+            result["run_state"][t] += cur.rowcount
 
     # 审核队列独立清理（不依赖归属表）：它有自己的时间戳，
     # 且即使归属表未启用（单租户），队列数据也照样需要回收。
@@ -246,7 +252,7 @@ def main():
                         print(f"  超期会话       {preview['threads']}"
                               "（含其检查点与归属登记行）")
                         print(f"  审核队列记录   {preview['review_queue']}")
-                        print("（检查点按超期会话清单删除，行数需实际执行才能确定）")
+                        print("（运行现场按超期会话清单删除，行数需实际执行才能确定）")
                         print(_agent_history_line(preview["agent_history"]))
                         for w in preview["warnings"]:
                             print(f"  ⚠️ {w}", file=sys.stderr)
@@ -261,7 +267,7 @@ def main():
                 else:
                     print(f"[apply] 保留 {days} 天，已删除：")
                     print(f"  超期会话       {len(done['threads'])}")
-                    for t, n in done["checkpoints"].items():
+                    for t, n in done["run_state"].items():
                         print(f"    {t}: {n}")
                     print(f"  审核队列记录   {done['review_queue']}")
                     print(f"  归属登记行     {done['session_owners']}")

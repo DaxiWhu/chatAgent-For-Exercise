@@ -22,7 +22,6 @@
 import asyncio
 import json
 import time
-from types import SimpleNamespace
 
 import pytest
 
@@ -59,52 +58,38 @@ class _RawReceive:
         self._q.put_nowait({"type": "http.disconnect"})
 
 
-class _SlowStream:
-    """模拟 langgraph 的 astream：慢速吐字，并记录自己有没有被 aclose。
+class _SlowTurn:
+    """替身运行：慢速吐字，并记录"有没有被取消、有没有收尾"。
 
     慢速是必须的：纯 CPU 循环会在断连消息投递之前就跑完，测不到"断开后停止产出"。
+
+    `cancelled` 才是"取消真的传导到上游"的证据 —— `closed` 在正常完成时也会置位，
+    单看它会让"断连后上游仍在后台跑"这种失效照样绿。
     """
 
-    def __init__(self, total, delay):
-        self._left = total
-        self._delay = delay
+    def __init__(self, total=40, delay=0.02):
+        self.left = total
+        self.delay = delay
         self.closed = False
+        self.cancelled = False
 
-    def __aiter__(self):
-        return self
+    async def __call__(self, req, *, context, on_text=None):
+        from src.agents.runner import TaskOutcome
 
-    async def __anext__(self):
-        if self._left <= 0:
-            raise StopAsyncIteration
-        self._left -= 1
-        await asyncio.sleep(self._delay)
-        return SimpleNamespace(content="片段"), {}
-
-    async def aclose(self):
-        self.closed = True
-
-
-class _SlowGraph:
-    """假图：astream 返回慢速流；aget_state 记录是否被访问（断开后不该访问）。"""
-
-    def __init__(self, total=40, delay=0.02, pending=()):
-        self.stream = _SlowStream(total, delay)
-        self.pending = tuple(pending)
-        self.state_queried = False
-
-    def astream(self, incoming, config, stream_mode):
-        return self.stream
-
-    async def aget_state(self, config):
-        self.state_queried = True
-        if "human_review" in self.pending:
-            return SimpleNamespace(
-                next=self.pending,
-                values={"output": "草稿", "score": 0.1, "feedback": "太短",
-                        "citations": []},
-            )
-        return SimpleNamespace(next=self.pending, values={"citations": []})
-
+        try:
+            while self.left > 0:
+                self.left -= 1
+                await asyncio.sleep(self.delay)
+                if on_text is not None:
+                    await on_text("片段", "call-1")
+            return TaskOutcome(answer="片段", attempts=1,
+                               final_agent="frontline_agent", passed=True,
+                               exit_reason="passed")
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        finally:
+            self.closed = True
 
 def _scope(path, body: bytes, method="POST") -> dict:
     """够用的 HTTP scope（真实服务器会填的字段这里都填上）。"""
@@ -190,8 +175,8 @@ def test_disconnect_is_detected_counted_and_stops_generation(offline, monkeypatc
 
     把 `_sse()` 里的 `client_close_handler_callable=` 去掉，本用例立刻变红。
     """
-    g = _SlowGraph(total=40, delay=0.02)
-    monkeypatch.setattr(M, "graph", g)
+    g = _SlowTurn(total=40, delay=0.02)
+    monkeypatch.setattr(M, "run_turn", g)
 
     body = json.dumps({"thread_id": "t-disc", "message": "hi"}).encode()
     sse = asyncio.run(_drive(M.app, _scope("/v1/chat", body), _RawReceive(body),
@@ -202,8 +187,8 @@ def test_disconnect_is_detected_counted_and_stops_generation(offline, monkeypatc
     assert sse.count(b"event: token") >= 3, f"断开得太早，没产出内容：{sse[:200]!r}"
     assert sse.count(b"event: token") <= 6, f"断开后仍在继续产出：{sse.count(b'event: token')} 个 token"
     assert b"event: done" not in sse, "已断开却仍下发了收尾事件"
-    assert g.stream.closed is True, "上游生成器未被关闭，取消没有传导下去"
-    assert g.state_queried is False, "已断开却仍去查状态（会白白入队 + 浪费一次 DB 往返）"
+    assert g.cancelled is True, "取消没有传导到上游运行 —— 它会在后台跑到底（边断边计费）"
+    assert g.closed is True, "上游运行没有收尾"
 
 
 def test_review_endpoint_is_wired_for_disconnect_too(offline, monkeypatch):
@@ -213,8 +198,17 @@ def test_review_endpoint_is_wired_for_disconnect_too(offline, monkeypatch):
     （这正是 `_sse()` 收敛成一处的原因，但收敛本身也需要被钉住）。
     指标标签应为 `kind="review"`。
     """
-    g = _SlowGraph(total=40, delay=0.02, pending=("human_review",))
-    monkeypatch.setattr(M, "graph", g)
+    g = _SlowTurn(total=40, delay=0.02)
+    monkeypatch.setattr(M, "run_turn", g)
+    # 前提：审核队列里真躺着一条待审记录。2026-10-20 起 `/v1/review` 的 409 判据是
+    # "这条会话**当前**有没有待审记录"（`needs_review` 那类看运行现场，`manual`
+    # 那类只有队列），不造这个前提先返回的是 409 —— 用例照样"绿"，
+    # 但测的根本不是断连。
+    from app.review_queue import ReviewQueue
+
+    q = ReviewQueue(dsn="")
+    q.add(thread_id="t-review", draft="草稿", feedback="", tenant="")
+    monkeypatch.setattr(M, "_REVIEW_QUEUE", q)
 
     body = json.dumps({"thread_id": "t-review", "action": "accept",
                        "feedback": ""}).encode()
@@ -223,7 +217,7 @@ def test_review_endpoint_is_wired_for_disconnect_too(offline, monkeypatch):
 
     assert metrics.value("client_disconnected_total", kind="review") == 1
     assert b"event: done" not in sse
-    assert g.stream.closed is True
+    assert g.cancelled is True
 
 
 def test_normal_completion_is_not_counted_as_disconnect(offline, monkeypatch):
@@ -232,8 +226,8 @@ def test_normal_completion_is_not_counted_as_disconnect(offline, monkeypatch):
     少了这条，把 `client_disconnected_total` 写在生成器出口（而不是断连回调里）
     这种错误永远不会被发现 —— 指标会恒等于"请求数"，彻底失去意义。
     """
-    g = _SlowGraph(total=3, delay=0.01)
-    monkeypatch.setattr(M, "graph", g)
+    g = _SlowTurn(total=3, delay=0.01)
+    monkeypatch.setattr(M, "run_turn", g)
 
     body = json.dumps({"thread_id": "t-ok", "message": "hi"}).encode()
     sse = asyncio.run(_drive(M.app, _scope("/v1/chat", body), _RawReceive(body)))
@@ -241,7 +235,8 @@ def test_normal_completion_is_not_counted_as_disconnect(offline, monkeypatch):
     assert b"event: done" in sse
     assert sse.count(b"event: token") == 3
     assert metrics.value("client_disconnected_total", kind="chat") == 0
-    assert g.state_queried is True, "正常收尾必须查状态（citations / 人审判定都靠它）"
+    assert g.closed is True, "正常跑完也必须收尾（上游协程不能留成孤儿）"
+    assert g.cancelled is False, "正常完成的请求被当成被取消的（会误导断连排查）"
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +249,7 @@ def test_close_handler_is_async_and_wired():
     `TypeError: object NoneType can't be used in 'await' expression` ——
     且炸在库的清理路径上，现场噪声很大。所以在这里钉住。
     """
-    resp = M._sse({"messages": []}, {"configurable": {"thread_id": "x"}}, "chat",
+    resp = M._sse({"messages": []}, "chat",
                   tenant="t", thread_id="x")
 
     handler = resp.client_close_handler_callable

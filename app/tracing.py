@@ -1,127 +1,129 @@
-"""可选的可观测接入：Langfuse / LangSmith。两者都留空则完全不介入。
+"""可观测接入：把官方 Agents SDK 的链路交给 Langfuse（可选，不配则不产生任何 trace）。
 
-为什么必须"可选且不硬依赖"
-------------------------
-本项目的可用性优先原则：**没配 tracing 时行为必须与没这层代码完全一致**。
-所以这里所有第三方包都在函数内延迟导入，失败只打一条 warning，绝不抛。
+⚠️ 2026-10-20 重写。旧版把 Langfuse 的 **LangChain** callback handler 挂到"执行图
+的运行 config"（`configurable` / `callbacks`）里。删图之后那条路**没有任何读者** ——
+官方 `Runner.run` 不认识这两个键，于是 Langfuse 从来没收到过 agent 链路的 trace，
+而代码看起来是接上的（三条用例还在守那个死行为）。
 
-两条路线的差别（决定了代码写法）
------------------------------
-- **LangSmith / LangChain tracing**：认环境变量 —— 只要 `LANGCHAIN_TRACING_V2=true`
-  + `LANGCHAIN_API_KEY` 在进程环境里，LangChain/LangGraph 自己就上报，**不需要
-  显式传 callback**。所以这里只负责"把配置写进 os.environ"。
-- **Langfuse**：走 LangChain callback handler，需要把 handler 挂到 `graph.astream`
-  的 config 里才会生效。老版本路径是 `langfuse.callback.CallbackHandler`，
-  3.x 挪到了 `langfuse.langchain.CallbackHandler` —— 两个都试，谁在就用谁。
+现在的接法照官方文档（`langfuse.com/integrations/frameworks/openai-agents`）：
+OpenInference 的 OTel 插桩 `OpenAIAgentsInstrumentor`。为什么是它、而不是自己写
+一个 `TracingProcessor`——**这一点看过源码，不是猜的**：`_instrument()` 里
+
+    if exclusive_processor:                      # 默认 True
+        from agents import set_trace_processors
+        set_trace_processors([OpenInferenceTracingProcessor(...)])
+    else:
+        from agents import add_trace_processor
+
+也就是说它用官方原语**替换**当前处理器列表。由此得到两条硬结论：
+
+1. **装了且配了 Langfuse** ⇒ SDK 默认那个"往 OpenAI 后端上报"的
+   `BatchTraceProcessor` 被**替换掉**，不会重复上报、也不会把内容发给 OpenAI。
+   我们**不需要**（也**不能**）再调 `set_tracing_disabled(True)` —— 那会让 SDK
+   根本不产生 span，插桩收不到任何东西。
+2. **没配** ⇒ 这里必须显式 `set_tracing_disabled(True)`。不做的话默认处理器还活着，
+   它会拿环境里的 `OPENAI_API_KEY` 往 api.openai.com 发 span（含 prompt 与回复
+   全文）。本项目用自建 `AsyncOpenAI` 客户端、配置项叫 `AGNES_*`，所以那条上报
+   要么失败被吞（白跑线程），要么用错 key 把对话内容发给第三方。
+
+LangSmith 那一支**只覆盖还在用 LangChain 的脚本**（`scripts/eval_generation.py`
+用 `ChatOpenAI.invoke`），agent 链路不进 LangSmith —— 它的 tracing 认的是
+LangChain 的回调，与官方 SDK 不是一个体系。别把"配了 LANGCHAIN_API_KEY"读成
+"agent 链路也有 trace"。
 """
 
 import logging
 import os
 
 from . import config
-from .logging_setup import get_request_id
 
 
 def init_tracing() -> str:
-    """按配置初始化 tracing，返回生效的后端名（"langsmith"/"langfuse"/"none"）。
+    """按配置初始化 tracing，返回生效的后端名（"langfuse"/"langsmith"/"none"）。
 
     无参数：全部信息来自 app.config（进而来自环境变量）。
 
-    副作用：LangSmith 分支会写 `os.environ`（这是它被 LangChain 识别的唯一方式）。
-    Langfuse 分支不写环境变量，只把密钥留在 config 里供 `trace_callbacks()` 使用。
+    副作用（三种，互斥）：
+      - 没配任何后端 ⇒ `agents.set_tracing_disabled(True)`，**彻底不产生 trace**；
+      - 配了 Langfuse ⇒ 设置 `LANGFUSE_*` 环境变量并插桩（处理器由插桩自己替换）；
+      - 配了 LangSmith ⇒ 只写 `LANGCHAIN_*` 环境变量（对 agent 链路无效，见模块说明）。
     """
     if config.LANGSMITH_API_KEY:
-        # LangChain 官方 tracing 只认这几个环境变量名（LANGCHAIN_* 为旧名，同义）
+        # LangChain 官方 tracing 只认这几个环境变量名（LANGCHAIN_* 为旧名，同义）。
         os.environ["LANGCHAIN_TRACING_V2"] = "true"
         os.environ["LANGCHAIN_API_KEY"] = config.LANGSMITH_API_KEY
         os.environ["LANGCHAIN_PROJECT"] = config.LANGCHAIN_PROJECT
-        logging.info("tracing 已启用：LangSmith（project=%s）", config.LANGCHAIN_PROJECT)
+        logging.info("tracing 已启用：LangSmith（project=%s）—— ⚠️ 只覆盖仍用 LangChain "
+                     "的脚本，agent 链路不进 LangSmith", config.LANGCHAIN_PROJECT)
         return "langsmith"
 
     if config.LANGFUSE_PUBLIC_KEY and config.LANGFUSE_SECRET_KEY:
-        # 顺手把密钥塞进环境变量：langfuse SDK 自己也读它们，避免两处配置
-        os.environ.setdefault("LANGFUSE_PUBLIC_KEY", config.LANGFUSE_PUBLIC_KEY)
-        os.environ.setdefault("LANGFUSE_SECRET_KEY", config.LANGFUSE_SECRET_KEY)
-        if config.LANGFUSE_HOST:
-            os.environ.setdefault("LANGFUSE_HOST", config.LANGFUSE_HOST)
-        try:
-            _langfuse_handler()
-        except Exception as e:  # noqa: BLE001  （没装包 / 版本不符都不该影响服务）
-            logging.warning("Langfuse 已配置但初始化失败，tracing 关闭：%s", e)
-            return "none"
-        logging.info("tracing 已启用：Langfuse")
-        return "langfuse"
+        if _enable_langfuse():
+            logging.info("tracing 已启用：Langfuse（OpenInference OTel 插桩）")
+            return "langfuse"
+        logging.warning("Langfuse 已配置但初始化失败，本次不产生任何 trace")
+        _disable_sdk_tracing()
+        return "none"
 
-    logging.info("tracing 未配置（Langfuse/LangSmith 均未填），本次不上报链路")
+    _disable_sdk_tracing()
+    logging.info("tracing 未配置（Langfuse/LangSmith 均未填），本次不产生 trace")
     return "none"
 
 
-def _langfuse_handler():
-    """构造 Langfuse 的 LangChain callback handler，兼容 2.x / 3.x 两个导入路径。
+def _enable_langfuse() -> bool:
+    """按官方文档接 Langfuse：写环境变量 → OTel 插桩 → 构造客户端。
 
-    返回 handler 实例；两个路径都导入失败时抛 ImportError（由调用方降级）。
+    ⚠️ **不做启动期连通性校验**（不调 `auth_check()`）：那是一次网络请求，而这里在
+    启动路径上。凭据填错或 Langfuse 暂时不可达时，它会把启动拖住、甚至让服务起不来
+    —— 可观测配错了绝不该影响可用性。凭据错的症状是 trace 发不出去，SDK 自己会打日志。
+
+    返回 True 表示插桩成功；任何一步失败都返回 False（由调用方降级为"不产生 trace"）。
+    **绝不抛** —— tracing 配错了不该让服务起不来。
     """
-    try:                                   # langfuse >= 3
-        from langfuse.langchain import CallbackHandler  # type: ignore
-    except Exception:                      # langfuse 2.x
-        from langfuse.callback import CallbackHandler  # type: ignore
-    return CallbackHandler()
-
-
-def trace_callbacks() -> list:
-    """返回要挂到图运行 config 上的 callback 列表（未配置则空列表）。
-
-    LangSmith 路线返回空 —— 它靠环境变量自动上报，不需要 callback，
-    重复挂反而会产生重复 trace。
-    """
-    if not (config.LANGFUSE_PUBLIC_KEY and config.LANGFUSE_SECRET_KEY):
-        return []
-    if config.LANGSMITH_API_KEY:
-        return []                          # 走 LangSmith 时不同时挂 Langfuse，避免双份上报
+    os.environ.setdefault("LANGFUSE_PUBLIC_KEY", config.LANGFUSE_PUBLIC_KEY)
+    os.environ.setdefault("LANGFUSE_SECRET_KEY", config.LANGFUSE_SECRET_KEY)
+    if config.LANGFUSE_HOST:
+        # ⚠️ 官方文档的变量名是 `LANGFUSE_BASE_URL`；历史版本认 `LANGFUSE_HOST`。
+        # 两个都写：前者给新 SDK，后者给还在读旧名的地方 —— 只写一个会造成
+        # "配了 host 却仍然发往 cloud.langfuse.com"这种静默错发。
+        os.environ.setdefault("LANGFUSE_BASE_URL", config.LANGFUSE_HOST)
+        os.environ.setdefault("LANGFUSE_HOST", config.LANGFUSE_HOST)
     try:
-        return [_langfuse_handler()]
+        from langfuse import get_client  # type: ignore
+        from openinference.instrumentation.openai_agents import (  # type: ignore
+            OpenAIAgentsInstrumentor,
+        )
+    except Exception as e:  # noqa: BLE001  （没装包 = 没这层能力，不是故障）
+        logging.warning("Langfuse 已配置但缺依赖（装 langfuse 与 "
+                        "openinference-instrumentation-openai-agents）：%s", e)
+        return False
+    try:
+        # 默认 exclusive_processor=True ⇒ 用它自己的 `set_trace_processors` 替换掉
+        # SDK 默认的 OpenAI 后台上报（见模块 docstring 贴的那段源码）。
+        OpenAIAgentsInstrumentor().instrument()
+        # ⚠️ **不做 `get_client().auth_check()`**：那是一次网络请求，而这里在
+        # **启动路径**上。凭据填错 / Langfuse 暂时不可达时，它要么把启动拖住几十秒，
+        # 要么让服务起不来 —— 而"可观测"配错了绝不该影响服务可用性。凭据错的症状
+        # 是 trace 发不出去，Langfuse SDK 自己会打日志。
+        get_client()
+        return True
     except Exception as e:  # noqa: BLE001
-        logging.warning("Langfuse callback 构造失败，本次不挂：%s", e)
-        return []
+        logging.warning("Langfuse 插桩失败，本次不产生 trace：%s", e)
+        return False
 
 
-def build_run_config(base_config: dict, thread_id: str = "", tenant: str = "",
-                     rag_tenant: str | None = None) -> dict:
-    """给 langgraph 的运行 config 补上 tracing 回调、元数据与检索租户。
+def _disable_sdk_tracing() -> None:
+    """关掉官方 SDK 的 tracing —— 包括它默认那个往 OpenAI 后端上报的处理器。
 
-    base_config: 原始 config，形如 `{"configurable": {"thread_id": ...}}`。
-    thread_id: 会话 id，写进 metadata，便于在 tracing 面板按会话过滤。
-    tenant: 租户 id，同上（**仅用于可观测**）。
-    rag_tenant: 交给检索层的租户。None = 不下发该键，检索节点沿用进程级 RAG_TENANT。
-        与 tenant 分开是刻意的：tenant 是"这条 trace 属于谁"（可观测维度），
-        rag_tenant 是"去哪个租户的库里查"（行为参数）。二者在 Key 绑定模式下相同，
-        但在**自报租户**模式下必须不同 —— 详见 main._retrieval_tenant。
-
-    返回**新的** dict（不就地改入参），带上：
-      - callbacks：Langfuse handler（无则省略该键）；
-      - metadata：app_version / release / thread_id / tenant / request_id —— 线上复盘时
-        "这条 trace 属于哪个版本、哪个租户"是最先要看的两个维度，而 `request_id` 是
-        **用户唯一报得出来的那个标识**（它与日志里的 rid 是同一个值，两边能对上）；
-      - configurable.rag_tenant：检索隔离用（仅当显式传入时）。
+    为什么必须有这一步：`get_trace_provider()` 在**第一次访问时**会自动注册
+    `default_processor()`（`BatchTraceProcessor(BackendSpanExporter())`）。不关的话，
+    每一轮对话的 prompt 与回复全文都会尝试发往 `api.openai.com`，用的还是环境里
+    那个 `OPENAI_API_KEY`（可能是别的项目留下的）。失败会被 SDK 吞掉，所以它
+    既不报错、也不体现在任何指标上。
     """
-    cfg = dict(base_config or {})
-    cbs = trace_callbacks()
-    if cbs:
-        cfg["callbacks"] = list(cfg.get("callbacks") or []) + cbs
-    meta = {
-        "app_version": config.APP_VERSION,
-        "release": config.APP_RELEASE,
-        "thread_id": thread_id,
-        "tenant": tenant,
-        # ⚠️ `request_id` 由 middleware 写进 contextvar，这里读的是**当前请求**的值
-        # （不在请求上下文里时是空串，下面的过滤会把它整个丢掉 —— 不留空键）。
-        # 为什么必须有它：`X-Request-ID` 是**用户唯一能报出来的**标识（日志里也是它），
-        # 而在此之前它反查不到任何一条 trace ⇒ "用户说这次答得不对"就只能靠时间点大海捞针。
-        "request_id": get_request_id(),
-    }
-    cfg["metadata"] = {**(cfg.get("metadata") or {}), **{k: v for k, v in meta.items() if v}}
-    if rag_tenant is not None:
-        # 深拷一层 configurable：与 base_config 共享同一个 dict 时，
-        # 后续任何写入都会"渗透"回调用方，这类隐式耦合极难排查。
-        cfg["configurable"] = {**(cfg.get("configurable") or {}), "rag_tenant": rag_tenant}
-    return cfg
+    try:
+        from agents.tracing import set_tracing_disabled
+
+        set_tracing_disabled(True)
+    except Exception as e:  # noqa: BLE001  （没装 SDK 的极端场景：本来就没 trace）
+        logging.debug("关闭 SDK tracing 失败（可忽略）：%s", e)

@@ -328,31 +328,116 @@ def test_middleware_records_metrics_and_error_counter():
 
 
 # ---------------------------------------------------------------------------
-# trace 元数据与 request_id 对齐（2026-10-04 补）
+# tracing 接线（2026-10-20 重写：从"往 LangGraph config 里塞 metadata"改成
+# "接管官方 SDK 的 trace provider"）
 # ---------------------------------------------------------------------------
-def test_run_config_carries_the_request_id_for_trace_lookup():
-    """trace 元数据里必须带上 `request_id`。
+# ⚠️ 这里原本有两条用例在测 `tracing.build_run_config` 把 `request_id` 写进
+# `metadata`（"用户报 X-Request-ID，就能在面板里反查到那条 trace"）。那个字典
+# 从来没有读者 —— 官方 `Runner.run` 不认 `configurable` / `metadata` —— 所以那
+# 两条用例守的是一个**死行为**，随函数一起删掉了。
+#
+# **request_id → trace 这条链现在确实不在**：要在 OTel 那一层做（resource
+# attribute 或 `TraceConfig`），本次没做。别把"日志里有 rid"读成"trace 里也能按
+# rid 搜"。
+def test_no_configured_backend_means_no_trace_at_all(monkeypatch):
+    """没配任何后端 ⇒ 官方 SDK **根本不产生 trace**，而不是"产生但没地方送"。
 
-    它是用户唯一报得出来的标识（日志里的 rid 与它是同一个值），而在此之前
-    它反查不到任何一条 trace ⇒ "用户说这次答得不对"只能按时间点大海捞针。
+    ⚠️ 为什么必须钉住：SDK 的 trace provider 在**第一次访问时**会自动注册
+    `default_processor()` —— 那是 `BatchTraceProcessor(BackendSpanExporter())`，
+    会拿环境里的 `OPENAI_API_KEY` 往 api.openai.com 发 span（**含 prompt 与
+    回复全文**）。本项目模型走自建 `AsyncOpenAI` 客户端（配置项叫 `AGNES_*`），
+    所以那条上报要么用错 key 把对话发给第三方、要么失败被吞 —— 两种都不报错、
+    也不体现在任何指标上。
+
+    判据取自官方 `DefaultTraceProvider.create_trace`：disabled 时返回
+    `NoOpTrace`（`trace_id == "no-op"`），而不是"照常建 trace 但没人收"。
     """
+    from agents.tracing import get_trace_provider
+
     from app import tracing
 
-    token = set_request_id("rid-abc123")
-    try:
-        cfg = tracing.build_run_config({}, thread_id="t1", tenant="acme")
-    finally:
-        reset_request_id(token)
-    assert cfg["metadata"]["request_id"] == "rid-abc123"
+    monkeypatch.setattr(tracing.config, "LANGSMITH_API_KEY", "")
+    monkeypatch.setattr(tracing.config, "LANGFUSE_PUBLIC_KEY", "")
+    monkeypatch.setattr(tracing.config, "LANGFUSE_SECRET_KEY", "")
+    assert tracing.init_tracing() == "none"
+    assert get_trace_provider().create_trace("probe").trace_id == "no-op", (
+        "tracing 没被关掉：SDK 的默认处理器仍活着，会把 prompt 与回复发往 OpenAI 后端"
+    )
 
 
-def test_run_config_omits_request_id_outside_a_request():
-    """不在请求上下文里（脚本、定时任务）不写这个键。
+def test_langfuse_without_its_dependencies_is_not_claimed(monkeypatch):
+    """配了 Langfuse 但缺依赖 ⇒ 必须如实返回 "none"。
 
-    写个空串进去会让面板里多出一列全是空值的维度 —— 与"有值才写"的既有口径不一致
-    （`build_run_config` 对其它元数据也是这么处理的）。
+    这是旧实现的反面教材：它把回调挂在那个没人读的 config 键上，却返回
+    "langfuse" —— 面板里一条 trace 都没有，而启动日志说"已启用"。
+    这里用 `sys.modules[name] = None` 制造"导入失败"（import 会抛 ImportError），
+    与真实环境有没有装包无关，所以将来装了包这条也不会变红。
     """
+    import sys
+
     from app import tracing
 
-    cfg = tracing.build_run_config({}, thread_id="t1", tenant="acme")
-    assert "request_id" not in cfg["metadata"]
+    monkeypatch.setattr(tracing.config, "LANGSMITH_API_KEY", "")
+    monkeypatch.setattr(tracing.config, "LANGFUSE_PUBLIC_KEY", "pk-lf-x")
+    monkeypatch.setattr(tracing.config, "LANGFUSE_SECRET_KEY", "sk-lf-x")
+    monkeypatch.setitem(sys.modules, "langfuse", None)
+    monkeypatch.setitem(sys.modules, "openinference.instrumentation.openai_agents", None)
+    assert tracing.init_tracing() == "none"
+
+
+def test_langfuse_goes_through_the_official_instrumentor(monkeypatch):
+    """配齐密钥且依赖在时，必须走 `OpenAIAgentsInstrumentor` 这条路。
+
+    为什么这条要单独钉：真的 langfuse 没装，所以"配了"这条分支在 CI 里永远不会
+    被执行。而**旧实现就是在这一支上骗人的** —— 它返回 "langfuse"，实际只是把
+    一个回调塞进没人读的 config 键。用两个替身模块把"到底调了什么"钉住：
+
+      · 必须调用插桩的 `instrument()`（它内部才做
+        `agents.set_trace_processors([...])`，把默认的 OpenAI 上报顶掉）；
+      · **不能**在这条路上再调 `set_tracing_disabled(True)` —— 那会让 SDK
+        根本不产生 span，插桩收不到任何东西（配了等于没配）。
+    """
+    import sys
+    import types
+
+    from agents.tracing import get_trace_provider
+
+    from app import tracing
+
+    calls: dict[str, object] = {}
+
+    class _FakeInstrumentor:
+        def instrument(self, **kwargs):
+            calls["instrument"] = kwargs
+
+    def _fake_pkg(name: str) -> types.ModuleType:
+        mod = types.ModuleType(name)
+        mod.__path__ = []  # 让它像个包，`from a.b import c` 才走得通
+        return mod
+
+    oi_agents = types.ModuleType("openinference.instrumentation.openai_agents")
+    oi_agents.OpenAIAgentsInstrumentor = _FakeInstrumentor
+    lf = types.ModuleType("langfuse")
+    lf.get_client = lambda: calls.setdefault("client", object())
+
+    monkeypatch.setitem(sys.modules, "openinference", _fake_pkg("openinference"))
+    monkeypatch.setitem(sys.modules, "openinference.instrumentation",
+                        _fake_pkg("openinference.instrumentation"))
+    monkeypatch.setitem(sys.modules, "openinference.instrumentation.openai_agents", oi_agents)
+    monkeypatch.setitem(sys.modules, "langfuse", lf)
+
+    monkeypatch.setattr(tracing.config, "LANGSMITH_API_KEY", "")
+    monkeypatch.setattr(tracing.config, "LANGFUSE_PUBLIC_KEY", "pk-lf-x")
+    monkeypatch.setattr(tracing.config, "LANGFUSE_SECRET_KEY", "sk-lf-x")
+    # 上一个用例可能把 provider 置成了 disabled（`_manual_disabled` 优先于环境变量），
+    # 这里复位回"未手工干预"，否则本用例的断言会因为**别的用例**的副作用而假绿。
+    provider = get_trace_provider()
+    monkeypatch.setattr(provider, "_manual_disabled", None, raising=False)
+    provider._refresh_disabled_flag()
+
+    assert tracing.init_tracing() == "langfuse"
+    assert "instrument" in calls, "配了 Langfuse 却没调插桩 —— 那就等于什么都没接"
+    assert "client" in calls, "没构造 Langfuse 客户端（OTel exporter 没装上）"
+    assert provider.create_trace("probe").trace_id != "no-op", (
+        "tracing 被关掉了：插桩拿不到 span，配了等于没配"
+    )

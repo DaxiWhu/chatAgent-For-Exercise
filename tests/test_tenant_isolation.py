@@ -13,7 +13,7 @@
 这种"大部分隔离 + 一处不隔离"比完全不隔离更危险，因为它看起来是安全的。
 
 本文件锁住三件事：
-  1. 租户确实从运行配置传到了 `get_retriever`；
+  1. 租户确实从**请求**经 `build_context` 传到了 `get_retriever`；
   2. 不同租户拿到的是**不同**的检索器实例（而不是共享第一个请求的那个）；
   3. 只有"租户由 Key 反查"时才允许用它做隔离 —— 自报租户模式下必须退回默认值，
      否则等于给了攻击者一个"改成别人的租户就读到别人资料"的开关。
@@ -22,9 +22,9 @@
 from __future__ import annotations
 
 import pytest
-from langchain_core.messages import HumanMessage
 
-import src.graph as g
+import src.rag.pool as P
+from src import turn
 from src.rag import retrieval as R
 
 
@@ -122,17 +122,22 @@ def test_tenant_label_renders_the_sentinel_readably():
 # ---------------------------------------------------------------------------
 @pytest.fixture
 def isolated_retriever_state(monkeypatch):
-    """把 get_retriever 的模块级状态清空，并让 build_retriever 变成可观测的假实现。"""
-    monkeypatch.setattr(g, "_RETRIEVER", None)
-    monkeypatch.setattr(g, "_CHUNKS", [{"text": "块"}])
-    monkeypatch.setattr(g, "_TENANT_RETRIEVERS", {})
+    """把 get_retriever 的模块级状态清空，并让 build_retriever 变成可观测的假实现。
+
+    ⚠️ patch 的目标**必须是函数真正读状态的那个模块**（这里是 ``src.rag.pool``）。
+    在别的模块上 setattr 一个同名属性只会创建一个**只属于那个模块**的新变量，
+    函数体根本读不到它 —— 症状是用例照常通过，断言的是一个与生产无关的假对象。
+    """
+    monkeypatch.setattr(P, "_RETRIEVER", None)
+    monkeypatch.setattr(P, "_CHUNKS", [{"text": "块"}])
+    monkeypatch.setattr(P, "_TENANT_RETRIEVERS", {})
     built: list[str | None] = []
 
     def fake_build(chunks, tenant=None):
         built.append(tenant)
         return {"tenant": tenant, "chunks": chunks}
 
-    monkeypatch.setattr(g, "build_retriever", fake_build)
+    monkeypatch.setattr(P, "build_retriever", fake_build)
     return built
 
 
@@ -142,8 +147,8 @@ def test_retrievers_are_distinct_per_tenant(isolated_retriever_state):
     退回"单例缓存"的实现时，第二次调用会返回第一次的对象 ⇒ 本用例红。
     """
     built = isolated_retriever_state
-    a = g.get_retriever("acme")
-    b = g.get_retriever("globex")
+    a = P.get_retriever("acme")
+    b = P.get_retriever("globex")
     assert a is not b, "不同租户共用了同一个检索器（隔离失效）"
     assert a["tenant"] == "acme"
     assert b["tenant"] == "globex"
@@ -153,8 +158,8 @@ def test_retrievers_are_distinct_per_tenant(isolated_retriever_state):
 def test_same_tenant_hits_cache(isolated_retriever_state):
     """同一租户第二次必须走缓存 —— 否则每个请求都重建索引（pg 后端还会重连库）。"""
     built = isolated_retriever_state
-    first = g.get_retriever("acme")
-    again = g.get_retriever("acme")
+    first = P.get_retriever("acme")
+    again = P.get_retriever("acme")
     assert first is again
     assert built == ["acme"], "同一租户被重复构建"
 
@@ -162,8 +167,8 @@ def test_same_tenant_hits_cache(isolated_retriever_state):
 def test_no_tenant_uses_process_default_and_shares_one_instance(isolated_retriever_state):
     """tenant=None（CLI/脚本/老调用点）回到"进程内只建一次"的原有语义。"""
     built = isolated_retriever_state
-    r1 = g.get_retriever()
-    r2 = g.get_retriever()
+    r1 = P.get_retriever()
+    r2 = P.get_retriever()
     assert r1 is r2
     assert built == [None], "无租户语境下不应重复构建"
 
@@ -171,9 +176,9 @@ def test_no_tenant_uses_process_default_and_shares_one_instance(isolated_retriev
 def test_injected_retriever_takes_priority_and_ignores_tenant(monkeypatch):
     """测试/自定义注入的检索器优先，且不分片（注入即"调用方自负隔离"）。"""
     sentinel = object()
-    monkeypatch.setattr(g, "_RETRIEVER", sentinel)
-    assert g.get_retriever("acme") is sentinel
-    assert g.get_retriever() is sentinel
+    monkeypatch.setattr(P, "_RETRIEVER", sentinel)
+    assert P.get_retriever("acme") is sentinel
+    assert P.get_retriever() is sentinel
 
 
 def test_tenant_cache_is_bounded(monkeypatch, isolated_retriever_state):
@@ -182,73 +187,63 @@ def test_tenant_cache_is_bounded(monkeypatch, isolated_retriever_state):
     租户字符串来自请求；若某天有人在自报租户模式下用它分片，无上限的缓存
     等于"发一串不同的租户名就能把内存打满"。这里钉住"超限会淘汰"。
     """
-    monkeypatch.setattr(g, "_TENANT_CACHE_MAX", 2)
+    monkeypatch.setattr(P, "_TENANT_CACHE_MAX", 2)
     for t in ("t1", "t2", "t3"):
-        g.get_retriever(t)
-    assert len(g._TENANT_RETRIEVERS) <= 2, "分片缓存没有上界，存在内存膨胀风险"
+        P.get_retriever(t)
+    assert len(P._TENANT_RETRIEVERS) <= 2, "分片缓存没有上界，存在内存膨胀风险"
     # 最新的那个必须还在（淘汰的是最老的，不是刚建的）
-    assert "t3" in g._TENANT_RETRIEVERS
+    assert "t3" in P._TENANT_RETRIEVERS
 
 
 def test_eviction_does_not_lose_the_just_built_retriever(monkeypatch,
                                                          isolated_retriever_state):
     """淘汰顺序：丢最老的、保留刚建的。丢错方向会让"每次请求都重建"。"""
-    monkeypatch.setattr(g, "_TENANT_CACHE_MAX", 1)
-    r1 = g.get_retriever("t1")
-    r2 = g.get_retriever("t2")
-    assert g.get_retriever("t2") is r2, "刚构建的分片被淘汰了，导致反复重建"
-    assert g.get_retriever("t1") is not r1
+    monkeypatch.setattr(P, "_TENANT_CACHE_MAX", 1)
+    r1 = P.get_retriever("t1")
+    r2 = P.get_retriever("t2")
+    assert P.get_retriever("t2") is r2, "刚构建的分片被淘汰了，导致反复重建"
+    assert P.get_retriever("t1") is not r1
 
 
 # ---------------------------------------------------------------------------
-# retrieve 节点：从运行配置取租户
+# build_context：租户从请求传到检索器工厂
 # ---------------------------------------------------------------------------
-class _RecordingRetriever:
-    def __init__(self):
-        self.queries: list[tuple[str, int]] = []
+def test_context_carries_request_tenant_and_builds_retriever_lazily(monkeypatch):
+    """租户走「请求 → 上下文 → 检索器工厂」，且**构造上下文时不建检索器**。
 
-    def search(self, query, top_k=3):
-        self.queries.append((query, top_k))
-        return []
-
-
-def test_retrieve_reads_tenant_from_config(monkeypatch):
-    """租户走 configurable.rag_tenant —— 这是"运行参数"，不该进 state。
-
-    走 state 的话会被检查点持久化，续跑时可能带着过期的租户值。
+    为什么这条必须钉住：租户在某一层被丢掉时，`get_retriever(None)` 会静默退回
+    进程默认租户 —— 全部租户共用一份索引，且没有任何报错。
     """
     seen: list[str | None] = []
-    inner = _RecordingRetriever()
 
     def fake_get(tenant=None):
         seen.append(tenant)
-        return inner
+        return {"tenant": tenant}
 
-    monkeypatch.setattr(g, "get_retriever", fake_get)
-    state = {"messages": [HumanMessage(content="六堡茶是什么")]}
-    g.retrieve(state, {"configurable": {"rag_tenant": "acme"}})
-    assert seen == ["acme"], "retrieve 没把配置里的租户传给检索器"
+    monkeypatch.setattr(turn, "get_retriever", fake_get)
+    ctx = turn.build_context(tenant="acme")
+
+    assert ctx.tenant == "acme"
+    assert seen == [], "构造上下文就建检索器 = 把「可能用不上」的构建提前做掉"
+    ctx.retriever_factory()
+    assert seen == ["acme"], "租户没传到检索器"
 
 
-def test_retrieve_without_config_uses_default(monkeypatch):
-    """没有 config（直接调用节点）时不能炸 —— 退回默认租户。"""
+def test_blank_tenant_is_normalized_to_none(monkeypatch):
+    """空串必须归一成 ``None``（= 进程默认租户），不能原样传下去。
+
+    空串在检索层是一个**独立的租户键**（不是一个"不隔离"的开关），
+    所以原样传下去等于查了一个谁都没有文档的租户 —— 结果为空、且不报错。
+    """
     seen: list[str | None] = []
-    monkeypatch.setattr(g, "get_retriever",
-                        lambda tenant=None: (seen.append(tenant), _RecordingRetriever())[1])
-    g.retrieve({"messages": [HumanMessage(content="q")]})
-    assert seen == [None]
+    monkeypatch.setattr(turn, "get_retriever",
+                        lambda tenant=None: (seen.append(tenant), {})[1])
 
-
-def test_retrieve_tolerates_malformed_config(monkeypatch):
-    """config 结构异常（不是 dict / configurable 不是 dict）时同样退回默认。"""
-    seen: list[str | None] = []
-    monkeypatch.setattr(g, "get_retriever",
-                        lambda tenant=None: (seen.append(tenant), _RecordingRetriever())[1])
-    state = {"messages": [HumanMessage(content="q")]}
-    g.retrieve(state, None)
-    g.retrieve(state, "not-a-dict")
-    g.retrieve(state, {"configurable": "not-a-dict"})
-    assert seen == [None, None, None]
+    for raw in ("", "   "):
+        ctx = turn.build_context(tenant=raw)
+        assert ctx.tenant == ""
+        ctx.retriever_factory()
+    assert seen == [None, None]
 
 
 # ---------------------------------------------------------------------------
@@ -580,30 +575,58 @@ def test_retrieval_tenant_ignores_any_self_reported_value(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# tracing：租户确实进了 configurable
+# tracing 与租户（2026-10-20 整节重写）
 # ---------------------------------------------------------------------------
-def test_build_run_config_writes_rag_tenant():
-    from app import tracing as T
-    cfg = T.build_run_config({"configurable": {"thread_id": "t1"}},
-                             thread_id="t1", tenant="acme", rag_tenant="acme")
-    assert cfg["configurable"]["rag_tenant"] == "acme"
-    assert cfg["configurable"]["thread_id"] == "t1", "原有配置被覆盖了"
+# 这一节原本有三条用例在测 `tracing.build_run_config(...)` 把 `rag_tenant` 写进
+# `configurable` 段。那个键**没有任何读者**：官方 `Runner.run` 不认 `configurable`，
+# 检索租户实际是从 `TurnRequest.tenant` 进 `TaskContext` 的。三条用例守的是一个
+# 死行为，随函数一起删掉了。
+#
+# 现在真正要钉的是下一件事：**归一后的租户有没有被交给运行**。
+# （`_retrieval_tenant` 自己的判据在上面那几条，两条一起才完整 —— 函数算对了，
+# 但没接上，接口层照样漏。）
+def test_chat_hands_the_normalised_tenant_to_the_run(monkeypatch):
+    """`/v1/chat` 交给运行的必须是**归一后**的检索租户，不是身份里的原始值。
 
+    为什么要这一条（2026-10-20）
+    ---------------------------
+    上面几条测的是 `_retrieval_tenant` **函数自己**算得对不对。但"函数算对了"
+    和"这个值真的被交给了检索层"是两件事，而中间断掉过一次：端点当时把
+    `ident.tenant`（可能是空串）原样塞进 `TurnRequest`，归一后的值只被塞进一个
+    **没人读的运行配置键**。后果不是报错，而是**分叉** —— 空串从这条路走进检索层
+    的"进程级默认值"，于是 `_retrieval_tenant` 那套 fail-closed（无租户⇒公共租户
+    ⇒什么都看不到）在这条路上只剩文档上的。三条函数级用例全绿，接口层照样漏。
 
-def test_build_run_config_omits_rag_tenant_when_none():
-    """不传时不写该键 —— 让检索节点走"进程级默认"这条老路径。"""
-    from app import tracing as T
-    cfg = T.build_run_config({"configurable": {"thread_id": "t1"}}, thread_id="t1")
-    assert "rag_tenant" not in cfg["configurable"]
-
-
-def test_build_run_config_does_not_mutate_input():
-    """返回新 dict，且不就地改入参的 configurable。
-
-    就地改会让调用方的 cfg 被悄悄污染 —— 例如 review 端点复用同一个 cfg
-    先查状态、再拼 run_cfg，污染后两者语义就分叉了。
+    判据：把 `ident.tenant` 设成空串、公共租户配成 `public`，跑一次 `/v1/chat`，
+    看运行收到的 tenant 是 `public` 还是 `""`。后者说明归一被绕过了。
     """
-    from app import tracing as T
-    base = {"configurable": {"thread_id": "t1"}}
-    T.build_run_config(base, thread_id="t1", tenant="acme", rag_tenant="acme")
-    assert base["configurable"] == {"thread_id": "t1"}, "入参被就地修改了"
+    from fastapi.testclient import TestClient
+
+    from app import main as M
+    from app.quota import QuotaManager
+    from app.ratelimit import RateLimiter
+    from src.agents.runner import TaskOutcome
+    from tests.auth_util import auth_headers
+
+    monkeypatch.setattr(M.config, "DEFAULT_TENANT", "public")
+    monkeypatch.setattr(M, "_LIMITER", RateLimiter(per_minute=1000))
+    monkeypatch.setattr(M, "_QUOTA", QuotaManager(daily_limit=10 ** 6, request_limit=500))
+    # 身份里**没有租户**（自助注册未获批入租的那类账号）
+    monkeypatch.setattr(M, "_authenticate", lambda *a, **k: M.Identity(""))
+
+    seen: dict[str, str] = {}
+
+    async def _capture(req, *, context, on_text=None):
+        seen["tenant"] = req.tenant
+        return TaskOutcome(answer="好", attempts=1, final_agent="frontline",
+                           passed=True, exit_reason="passed")
+
+    monkeypatch.setattr(M, "run_turn", _capture)
+    r = TestClient(M.app, headers=auth_headers()).post(
+        "/v1/chat", json={"thread_id": "norm-1", "message": "hi"})
+    assert r.status_code == 200
+    assert seen["tenant"] == "public", (
+        f"运行收到的租户是 {seen['tenant']!r}。空串说明 `ident.tenant` 被原样传下去了，"
+        "`_retrieval_tenant` 的 fail-closed 在这条路上不生效（它只是「函数对」）。"
+    )
+

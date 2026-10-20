@@ -37,7 +37,14 @@ from . import approval
 from .context import TaskContext
 from .steps import tool_error_handler
 
-__all__ = ["generate_image", "kb_search", "render_deck", "render_slide_deck", "save_text_asset"]
+__all__ = [
+    "deliver",
+    "generate_image",
+    "kb_search",
+    "render_deck",
+    "render_slide_deck",
+    "save_text_asset",
+]
 
 DEFAULT_TOP_K = env_int("AGENT_KB_TOP_K", 3, lo=1)
 """单次检索返回的片段数上限。与 ``graph.TOP_K`` 同量级：agent 链路可以多查几轮，
@@ -188,6 +195,58 @@ def generate_image(ctx: RunContextWrapper[TaskContext], prompt: str, style: str 
         context.stats.assets += 1
     observability.counter("agent_assets_total", kind="image_placeholder")
     return str(path)
+
+
+# --------------------------------------------------------------------------- #
+# 交付：这一次要发给用户的正文（顺带承载"要不要人先过目"这个声明）
+#
+# 为什么交付要变成一个工具调用，而不是"最终输出就是交付物"（2026-10-20）
+# --------------------------------------------------------------------
+# 交付前的人审原本挂在图里一个独立节点上（``graph.human_review`` + ``interrupt``）。
+# 2026-10-20 把"停下来"搬到官方 ``RunState``（现场存 ``agent_run_state``），
+# 那两代实现都随图删掉了。
+# 而"按内容决定这一次要不要人看"这件事，官方机制里只有**工具审批**能做
+# （模型请求一个需要批准的工具 ⇒ 运行就地停下）。
+#
+# 于是交付本身必须是一次工具调用：只有"正在交付的那个人"知道这次交的是什么、
+# 该不该让人先看。判定时刻也就从"运行结束后的判定表"前移到"交付那一刻"——
+# 这两个时刻原本对不上，是这道闸迁过来时唯一真正的约束（见 ``approval`` 模块
+# ``delivery_needs_approval`` 的说明）。
+#
+# ⚠️ 调用它不是强制的：模型不调，``runner`` 照旧用 ``final_output`` 作为答复，
+# 行为与改造前逐字节一致。所以"模型忘了调"的后果是**少了一道自选的审核**，
+# 不是"用户收不到东西"。
+# --------------------------------------------------------------------------- #
+@function_tool(
+    failure_error_function=tool_error_handler("deliver"),
+    needs_approval=approval.delivery_needs_approval,
+)
+def deliver(ctx: RunContextWrapper[TaskContext], content: str, needs_review: bool = False) -> str:
+    """把这一次要给用户的正文交付出去。
+
+    正式产出（说明文、大纲、作品、以及任何你要作为最终答复的正文）都用它交付，
+    把**要给用户看的正文本身**放进 ``content``。闲聊、打招呼、追问上下文不用调它，
+    直接回答即可。
+
+    Args:
+        content: 要给用户看的正文本身（不要放"已完成"这类过程说明）。
+        needs_review: 这次产出要不要先让人过目再发出去。题材敏感、结论影响面大、
+            或者你自己拿不准质量时设为 True；普通答复保持 False。
+            设为 True 时整个运行会**停在这里**等人工处理，人同意后继续，人打回时
+            你会收到他写的修改意见，改完再交一次即可。
+    """
+    context = ctx.context
+    text = (content or "").strip()
+    if not isinstance(context, TaskContext):
+        return "交付失败：缺少任务上下文，这次未交付。"
+    if not text:
+        return "交付失败：content 是空的。请把要发给用户的正文放进去再交一次。"
+    context.delivered["delivery"] = text
+    context.delivered["delivery_reviewed"] = bool(needs_review)
+    observability.counter(
+        "agent_delivery_total", reviewed="true" if needs_review else "false"
+    )
+    return "已交付（人工已过目）。" if needs_review else "已交付。"
 
 
 def render_slide_deck(deck_json: str, asset_dir: Path | str) -> str:

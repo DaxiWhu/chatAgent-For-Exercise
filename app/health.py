@@ -119,28 +119,42 @@ def _check_vector_store() -> tuple[bool, str]:
     return (ok, ("vector 扩展可用" if ok else "vector 扩展不可用/连不上") + ident)
 
 
-def _check_checkpointer() -> tuple[bool, str]:
-    """回显**当前生效的检查点后端**，用于核对"持久化到底有没有接上"。
+def _check_run_store() -> tuple[bool, str]:
+    """回显**被打断的运行现场（官方 ``RunState``）存在哪**，用于核对"持久化接上没有"。
 
-    为什么不判失败：内存检查点只是"重启丢状态"，服务本身仍可用；把它判成
-    not-ready 会让实例被摘流量、反而更糟（Windows 本地开发就属于这种情况）。
-    但它必须**可见** —— 否则最典型的翻车是"以为连了 PG，其实静默降级成内存，
-    重启后会话全丢且日志里查不到"。
+    为什么这项取代了原来的 `checkpointer`：编排原语只剩 `Agent` + `Runner`，官方
+    没有任何检查点概念；"跑到一半停下来等人批"的现场由官方 ``RunState`` 序列化后
+    存在 `agent_run_state` 表里（见 `app/runs.py`）。所以要核对的东西没变
+    （状态到底落库了没有），换了承载物。
 
-    返回恒为 (True, 明细)；明细里点名具体类型与是否需要关注。
+    为什么不判失败：内存后端只是"重启丢现场"，服务本身仍可用；判成 not-ready 会让
+    实例被摘流量、反而更糟（Windows 本地开发就属于这种情况）。但它必须**可见** ——
+    否则最典型的翻车是"以为连了 PG，其实静默降级成内存，重启后待审的现场全丢，
+    而日志里查不到"。
     """
     try:
         import app.main as M  # 延迟导入：避免与 main→health 形成循环导入
-        cp = getattr(M.graph, "checkpointer", None)
+        store = getattr(M, "run_store", None)
+        if store is None:
+            return True, "none（无现场仓库）"
+        # ⚠️ 下面三行**直接读属性**（不用 getattr 带默认值）：读取本身也要被这个
+        # except 兜住。否则一个"属性访问会抛"的对象会被 getattr 的默认值吞成
+        # "disabled"，探针就报了一个**假结论**（真因是读失败，不是被关掉）。
+        enabled = store.enabled
+        backend = store.backend
+        dsn = store.dsn
     except Exception as e:  # noqa: BLE001
         return True, f"未知（读取失败：{type(e).__name__}）"
-    if cp is None:
-        return True, "none（无检查点，状态不落库）"
-    name = type(cp).__name__
-    if name in ("InMemorySaver", "MemorySaver"):
-        note = "（内存，重启丢状态！）" if config.DB_URL else "（未配 DB_URL，属预期）"
-        return True, f"{name}{note}"
-    return True, f"{name}（已持久化）"
+    if not enabled:
+        return True, "disabled（运行现场不落库，停机一律不可恢复）"
+    if backend == "postgres":
+        return True, "postgres（已持久化，被打断的运行可跨重启恢复）"
+    if dsn:
+        # 配了 DSN 但表还没建出来：**第一次写入时才建表**，所以在没有运行被打断过
+        # 的实例上这是正常状态，不能据此判失败。
+        return True, "postgres（表尚未建立：首次写入时建）"
+    note = "" if config.DB_URL else "（未配 DB_URL，属预期）"
+    return True, f"memory（进程内存，重启丢现场！）{note}"
 
 
 def _check_pg_pool() -> tuple[bool, str]:
@@ -185,7 +199,7 @@ def readiness() -> tuple[bool, dict]:
         ("llm", _check_llm),
         ("db", _check_db),
         ("vector_store", _check_vector_store),
-        ("checkpointer", _check_checkpointer),
+        ("run_state", _check_run_store),
         ("pg_pool", _check_pg_pool),
     ):
         ok, detail, ms = _timed(fn)

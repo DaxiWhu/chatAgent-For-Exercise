@@ -8,7 +8,7 @@
   1. **文本指纹 ↔ 版本号**：只改模板文字、忘了 bump `PROMPT_VERSION`，
      会直接测红。没有这条，"版本号"就退化为一个人工维护的注释 ——
      它会在第一次赶工的改动里失真，且失真是静默的（版本照旧、行为已变）。
-  2. **提示词不再回流到节点里**：结构性断言 `src/graph.py` 不含模板文本。
+  2. **提示词不再回流到链路代码里**：结构性断言 `src/`（除本模块外）不含模板文本。
      否则下一个人"顺手"内联一句，外置就慢慢瓦解了 —— 而外置一旦不完整，
      "哪一版提示词"这个问题就重新变得无法回答。
   3. **版本真的送到了外面**：响应头与就绪探针都带版本号。存在常量但没人下发，
@@ -32,15 +32,20 @@ ROOT = Path(__file__).resolve().parent.parent
 from src import prompts  # noqa: E402
 
 # 模板指纹（改文本必须同时改版本号并更新本表）。
-# 键是 PROMPT_VERSION；值 = 三个模板用固定哨兵参数渲染后的 sha256。
+# 键是 PROMPT_VERSION；值 = 模板用固定哨兵参数渲染后的 sha256。
 # 更新方法：跑 `python -c "from tests.test_prompts import fingerprint; print(fingerprint())"`
+#
+# ⚠️ 2026-10-20：删掉 `revise_prompt` / `evaluate_prompt` 后**重算过一次**（那两个
+# 模板随旧编排图的节点一起删除，它们从来没有在 agent 链路里被送给模型）。
+# 版本号**没有** bump：指纹表回答的是"线上实际送给模型的文本变了没有"，
+# 而留下来的 `answer_prompt` 一个字符都没动。别把这次当成"忘了 bump"的先例。
 _PROMPT_FINGERPRINTS = {
-    "1.0.0": "7fb7fa4ea678985a991ace209705801b89ca723f43fb688fbeaa0c4cf23d9b25",
+    "1.0.0": "47993a244e2c6aaaedf260d646ef606ea7520111964ceae481cea43d32d64cba",
 }
 
 
 def fingerprint() -> str:
-    """三个模板的合并指纹。
+    """所有模板的合并指纹。
 
     用哨兵参数渲染（而不是读源码）：指纹覆盖的是**模型实际看到的文本**。
     读源码会把注释、变量名、换行风格也算进去 —— 那些不影响行为的改动
@@ -48,8 +53,6 @@ def fingerprint() -> str:
     """
     parts = [
         prompts.answer_prompt("<<CTX>>", "<<QUESTION>>"),
-        prompts.revise_prompt("<<DRAFT>>", "<<FEEDBACK>>", "<<SOURCE>>"),
-        prompts.evaluate_prompt("<<DRAFT2>>"),
     ]
     blob = "\x1f".join(parts)  # \x1f 是单元分隔符：不可能出现在模板文本里
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -91,27 +94,16 @@ def test_answer_prompt_carries_context_and_question():
     assert "资料A" in text and "问题B" in text
 
 
-def test_revise_prompt_demands_a_complete_rewrite():
-    """修订模板必须明确要求**完整新版本**，且带上草稿与意见。
+def test_the_dead_templates_are_really_gone():
+    """旧编排图的两个模板（修订 / 评审）**必须不存在**。
 
-    这不是措辞偏好：下游把返回内容整体当作新草稿（写回 `state["output"]`），
-    模型若只回改动片段，最终回答就是残缺的。
+    为什么值得单钉一条：它们删掉之后没有任何生产调用点，所以"被人顺手加回来"
+    不会有任何运行时症状 —— 只会让 `PROMPT_VERSION` 的指纹表重新变得含糊
+    （表里到底覆盖了哪些模板？），而 agent 链路的评审其实走 evaluator 自己的
+    instructions，两套并存的后果是"改了一处、线上没变"。
     """
-    text = prompts.revise_prompt("旧草稿", "太短了", "评审模型")
-    assert "旧草稿" in text and "太短了" in text and "评审模型" in text
-    assert "完整" in text, "修订要求里丢了『输出完整的新版本』 —— 模型会只回片段"
-
-
-def test_revise_prompt_distinguishes_feedback_source():
-    """人工意见与模型意见措辞要可区分（便于排查"是谁打回的"）。"""
-    ai = prompts.revise_prompt("d", "f", "评审模型")
-    human = prompts.revise_prompt("d", "f", "人工审核")
-    assert "评审模型" in ai and "人工审核" in human and ai != human
-
-
-def test_evaluate_prompt_asks_for_a_score():
-    text = prompts.evaluate_prompt("草稿")
-    assert "草稿" in text and "0-100" in text
+    for name in ("revise_prompt", "evaluate_prompt"):
+        assert not hasattr(prompts, name), f"`{name}` 又被加回来了"
 
 
 def test_templates_do_not_inline_the_context_guard():
@@ -161,24 +153,32 @@ def _inline_string_literals(path: Path) -> list:
     return out
 
 
-def test_prompts_are_not_inlined_back_into_the_graph():
-    """结构性断言：`src/graph.py` 的**代码**里不得再出现模板文本。
+def test_prompts_are_not_inlined_back_into_the_code():
+    """结构性断言：**除 ``src/prompts.py`` 之外**，链路代码里不得出现模板文本。
 
-    外置的价值取决于它**完整**。只要有一句留在节点里，
-    "线上跑的是哪一版提示词"就会重新变得无法回答 ——
-    而那种回归没有任何运行时症状。
+    外置的价值取决于它**完整**。只要有一句留在某个 agent 的 instructions 里，
+    "线上跑的是哪一版提示词"就会重新变得无法回答 —— 而那种回归没有任何运行时
+    症状。
 
-    只扫字符串常量（不含注释与 docstring）：docstring 本来就该说明
-    "这里用的是哪套模板"，把它也算作违规会让文档与断言互相打架。
+    ⚠️ 扫的是整个 ``src/``（而不是某个具体模块）：模板可能被复制到任何一处
+    （specialists / frontline / evaluator / runner），逐个指定文件等于给下一次
+    复制留后门。
+
+    只扫字符串常量（不含注释与 docstring）：docstring 本来就该说明"这里用的是
+    哪套模板"，把它也算作违规会让文档与断言互相打架。
     """
-    literals = _inline_string_literals(ROOT / "src" / "graph.py")
-    for marker in ("参考以下资料作答", "输出【完整的新版本】",
-                   "判断内容是否需要进行评审", "给出的修改意见"):
-        offenders = [s for s in literals if marker in s]
-        assert not offenders, (
-            f"src/graph.py 的代码里又出现了提示词文本 {marker!r}：{offenders[:1]}\n"
-            "请改为调用 src/prompts.py 里的模板函数"
-        )
+    offenders: list[tuple[str, str]] = []
+    for path in (ROOT / "src").rglob("*.py"):
+        if path.name == "prompts.py" or "__pycache__" in path.parts:
+            continue
+        for lit in _inline_string_literals(path):
+            for marker in ("参考以下资料作答",):
+                if marker in lit:
+                    offenders.append((str(path.relative_to(ROOT)), marker))
+
+    assert not offenders, (
+        f"这些文件里又出现了提示词文本（应改为调用 src/prompts.py 的模板）：{offenders[:3]}"
+    )
 
 
 # ---------------- 版本真的下发到了外面 ----------------
@@ -189,24 +189,23 @@ def test_prompt_version_reaches_the_response_header(monkeypatch):
     客户端、网关访问日志、抓包都能记下来，线上答得不对时可直接核对。
     """
     pytest.importorskip("fastapi.testclient", reason="需要 httpx")
-    from types import SimpleNamespace
 
     from fastapi.testclient import TestClient
 
     import app.main as M
     from app.quota import QuotaManager
     from app.ratelimit import RateLimiter
+    from src.agents.runner import TaskOutcome
 
-    class _FakeGraph:
-        async def astream(self, incoming, config, stream_mode):
-            yield SimpleNamespace(content="草稿"), {}
-
-        async def aget_state(self, config):
-            return SimpleNamespace(next=(), values={"citations": []})
+    async def _fake_turn(req, *, context, on_text=None):
+        if on_text is not None:
+            await on_text("草稿", "call-1")
+        return TaskOutcome(answer="草稿", attempts=1, final_agent="frontline_agent",
+                           passed=True, exit_reason="passed")
 
     monkeypatch.setattr(M, "_LIMITER", RateLimiter(per_minute=1000))
     monkeypatch.setattr(M, "_QUOTA", QuotaManager(daily_limit=10 ** 6, request_limit=500))
-    monkeypatch.setattr(M, "graph", _FakeGraph())
+    monkeypatch.setattr(M, "run_turn", _fake_turn)
 
     from tests.auth_util import auth_headers
 

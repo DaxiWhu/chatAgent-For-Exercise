@@ -152,10 +152,17 @@ def decide(context: Any, *, exit_reason: str, answer: str) -> FallbackVerdict:
     if kinds.get("off_track"):
         return FallbackVerdict(MANUAL, "off_track", BUSINESS, unfinished)
 
-    # ③ 评审不过：今天就已经是转人工（`score_hint()` 给 40 分 < HIGH），这里只是把它
-    # 接进同一张表 —— 否则同一条策略会有两处判据，改一处必漏另一处。
-    if exit_reason == "review_failed":
-        return FallbackVerdict(MANUAL, "review_failed", BUSINESS, unfinished)
+    # ③ 评审结论**不进这张表**（2026-10-19 删掉的那一行：``review_failed`` ⇒ 转人工）。
+    #
+    # 为什么删：评审是模型自己调用的工具（``review_draft``，``as_tool``），它的结论
+    # 是**过程内反馈** —— 工具把改进项返回给模型，模型在同一次运行里接着改。它改不改、
+    # 改到什么时候收，由模型自己决定。把"评审没过"接进出口判定，等于模型只要评一次，
+    # 收尾权就被代码接管；而用户明确要求的是「让模型自己决定是否收尾、是否启用评分」。
+    #
+    # ⚠️ ``exit_reason="review_failed"`` 这个值**仍然保留**：它描述"运行结束前最后一次
+    # 评审的结论"，在 ``agent_runs_total{exit_reason}`` 上还能看出"多少比例是评了没过
+    # 还照交的"。但它**不再改变交付方式** —— 有产出就正常交付，没产出才落第⑤行。
+    # 想收紧这一点，正确的位置是模型自己的 instructions，不是这里。
 
     # ④ 护栏拦下的：**业务类** ⇒ 转人工。这里**有意偏离**官方"被拒的输出不落库"的语义 ——
     # 被拦下的那段内容会作为草稿存进审核队列，因为"这是不是误拦"没有原文根本判不了。

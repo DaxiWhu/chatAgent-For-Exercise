@@ -76,6 +76,7 @@ __all__ = [
     "ResumeRequest",
     "approval_enabled",
     "approval_timeout_seconds",
+    "delivery_needs_approval",
     "needs_approval_callback",
     "requests_from",
     "restore",
@@ -119,6 +120,42 @@ async def needs_approval_callback(
     """
     del run_context, tool_parameters, call_id  # 目前只按总开关判定
     return approval_enabled()
+
+
+async def delivery_needs_approval(
+    run_context: Any, tool_parameters: dict, call_id: str
+) -> bool:
+    """交付时要不要停下来等人过目 —— **由模型自己声明**（读工具参数 ``needs_review``）。
+
+    与 ``needs_approval_callback`` 的分工，是两种完全不同的事，别合并：
+
+    * 那边问的是"这个动作危不危险"（落盘、生成图片）—— 由**工具**的属性决定，
+      开关 ``AGENT_TOOL_APPROVAL`` 管的是"要不要启用这道闸"。
+    * 这里问的是"这次产出要不要人先看一眼" —— 由**模型对这一次交付的判断**决定，
+      **刻意不受那个开关约束**。理由：模型没有声明时行为逐字节不变（照常直出），
+      所以不存在"默认改变了行为"这回事；而一旦模型声明了，停下来正是它请求的结果。
+
+    ⚠️ 为什么把判断权交给模型（2026-10-20 用户拍板）
+    --------------------------------------------------
+    原本这道审核挂在图里一个独立节点上，触发条件是运行**结束后**的判定表
+    （跑偏 / 护栏拦下）。换成官方 interruption 之后那个条件用不了了：等判定表
+    出结论时，运行已经结束，没有"可以停下来的地方"可回退。
+    两个时刻对不上，只能把"要不要审"提前到**交付那一刻**由执行者自己说 ——
+    它是整条链路上唯一在那一刻知道"我这次交的是什么、该不该让人先看"的角色。
+
+    代价用户已知并接受：模型漏声明时，该审的那次会直接交付，且没有任何报错。
+    想收紧的话，正确的位置是 ``frontline`` / ``literary_writer`` 的 instructions
+    （告诉它哪几类产出必须声明），**不是**在代码里另加一道事后判据。
+
+    tool_parameters: 官方传的是模型生成的参数（已按工具签名解析）。``needs_review``
+        缺省 False —— 老模型没传这个字段时行为不变。字符串形态一并兜住：模型偶尔
+        会把布尔值写成 ``"true"``，直接 ``bool("false")`` 会得到 True（反向踩坑）。
+    """
+    del run_context, call_id  # 只按模型这一次的声明判定
+    wanted = (tool_parameters or {}).get("needs_review", False)
+    if isinstance(wanted, str):
+        return wanted.strip().lower() in ("1", "true", "yes", "y")
+    return bool(wanted)
 
 
 @dataclass(frozen=True)

@@ -22,8 +22,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+from app import metrics
 from src.rag import citation_check as cc
 
 
@@ -300,50 +303,79 @@ def test_build_citations_carries_source_path():
 
 
 # ===========================================================================
-# 6. graph 接线：每轮产出都要判（首轮 + 修订轮）
+# 6. 接线：交付前那一份草稿**必须**被算过一次校验
 # ===========================================================================
-def _stub_model(monkeypatch, content):
-    from unittest.mock import MagicMock
+# 上面 1~5 节测的都是"零件"（`verify` 判得对不对）。这一节测"零件有没有被装上" ——
+# 没有它，把 `src/agents/runner.py` 里那次 `citation_check.verify(...)` 删掉，
+# 上面全绿、接口层的 `citation_check` 事件变成 `{}`，而"引用被拦"与"没检索到"
+# 从此分不开。
+#
+# ⚠️ 2026-10-20 改写：原先是"graph.generate 的首轮分支 + 修订分支各判一次"。
+# 现在**只有一处**算它（`runner` 收尾时，对最终交付物算一次），所以"修订轮漏判"
+# 这个 bug 类**结构上不可能再发生** —— 这类用例不是被删掉，是失去了存在的前提。
+def _run_with_citations(tmp_path, text: str, citations: list):
+    """跑一次真实的入口 agent 运行，返回 `TaskOutcome`。"""
+    from src.agents.runner import ENTRY_AGENT, run_agent
+    from tests._agents_testkit import ScriptedModel, decide, make_ctx
 
-    from langchain_core.messages import AIMessage
-
-    from src import graph as G
-
-    m = MagicMock()
-    m.invoke.return_value = AIMessage(content=content)
-    monkeypatch.setattr(G, "MODEL", m)
-    return G
-
-
-def test_generate_records_citation_check(monkeypatch):
-    """generate 必须把校验结论写进 state —— 否则接口层拿不到，这条链路等于没接。"""
-    G = _stub_model(monkeypatch, "梧州特产是六堡茶 [1]。")
-    got = G.generate({
-        "messages": [], "iteration": 0, "context": "资料",
-        "citations": [_cite(1)],
-    })
-    assert got["citation_check"]["status"] == "ok"
+    ctx = make_ctx(tmp_path)
+    ctx.citations.extend(citations)          # 假装这一轮真的检索到了这些
+    return asyncio.run(run_agent(ENTRY_AGENT, prompt="梧州有什么特产",
+                                 context=ctx, model=ScriptedModel([decide(text)])))
 
 
-def test_generate_flags_fabricated_ref(monkeypatch):
-    """★ 越界编号必须在**产出当时**就被抓到（模型原文里就带着它）。"""
-    G = _stub_model(monkeypatch, "梧州特产是六堡茶 [7]。")
-    got = G.generate({
-        "messages": [], "iteration": 0, "context": "资料",
-        "citations": [_cite(1)],
-    })
-    assert got["citation_check"]["block_worthy"] is True
+def _output_check_count() -> float:
+    """`agent_output_check_total{status="unsupported"}` 的当前累计值（0 表示还没有）。"""
+    total = 0.0
+    for line in metrics.render().splitlines():
+        if not line.startswith("agent_output_check_total{"):
+            continue
+        if 'status="unsupported"' not in line:
+            continue
+        total += float(line.rsplit(" ", 1)[1])
+    return total
 
 
-def test_generate_checks_the_revised_draft_too(monkeypatch):
-    """★ 修订轮也要判：新草稿可能引入原文里没有的说法（含编造的引用编号）。"""
-    G = _stub_model(monkeypatch, "改完了 [9]。")
-    got = G.generate({
-        "messages": [], "iteration": 1, "context": "资料", "output": "旧草稿",
-        "feedback": "再改改", "feedback_source": "ai",
-        "citations": [_cite(1)],
-    })
-    assert got["citation_check"]["status"] == "unsupported"
+def test_the_delivered_draft_carries_a_citation_verdict(tmp_path):
+    """交付物上必须挂着一份校验结论（`status` 能读出来）。"""
+    out = _run_with_citations(tmp_path, "梧州特产是六堡茶 [1]。", [_cite(1)])
+
+    assert out.citation_check, "交付物上没有校验结论 —— 接口层拿不到，这条链路等于没接"
+    assert out.citation_check["status"] == "ok"
+    assert out.citation_check["block_worthy"] is False
+
+
+def test_a_fabricated_ref_is_blocked_and_counted_by_the_exit_guardrail(tmp_path):
+    """★ 越界编号：整条产出在交付前被拦下，**并且**判据被记进指标。
+
+    这里有个容易误判的地方（写好这版守时踩过）：被护栏拦下之后，
+    `outcome.citation_check` 是 `status="no_answer"`，**不是** `unsupported` ——
+    官方出口护栏一旦 tripwire，`final_output` 就是空串，收尾时已经没有文本可校验。
+    真正的判据在护栏内部算过（`guards.py::citation_traceability_guardrail`），
+    出口是 `agent_output_check_total{status="unsupported"}`。
+
+    ⇒ "引用被拦"要去那条指标里找。只看 `citation_check` 的话，会得出
+    "护栏没生效"的结论，而实际上它生效了 —— 这正是这条用例要钉住的「读法」。
+    """
+    import app.main  # noqa: F401  （安装指标出口；没有它 `observability` 是空转的）
+
+    before = _output_check_count()
+    out = _run_with_citations(tmp_path, "梧州特产是六堡茶 [7]。", [_cite(1)])
+
+    assert out.guardrail == "citation_traceability_guardrail"
+    assert out.answer == ""            # 被拒的输出不成为交付物
+    assert out.exit_reason == "output_guardrail"
+    # 收尾那份结论照实说"没有可校验的文本"，而不是编一个 unsupported
+    assert out.citation_check.get("status") == "no_answer"
+
+    # ⚠️ 必须比**增量**，不能只断言"存在这条序列"：同进程里别的用例
+    # （`test_agents_pipeline` 的编造引用那条）早就把它打过一遍了，
+    # 于是"删掉这次埋点"照样能看见序列 ⇒ 假绿。
+    # 标签按字母序渲染（`agent=...` 在前），所以只按「序列名 + 状态」匹配，
+    # 把整行写死会因为标签顺序变化而假红（实测踩过一次）。
+    assert _output_check_count() > before, (
+        "护栏算出来的 unsupported 没有落到指标上 —— 那「引用为什么被拦」就无从查询了"
+    )
 
 
 # ===========================================================================

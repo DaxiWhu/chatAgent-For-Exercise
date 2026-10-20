@@ -43,8 +43,9 @@ PyJWT[crypto]>=2.8
 # ---- agent 链路（src/agents/，官方 openai-agents SDK）----
 # 官方 Agents SDK：Runner / 跨轮历史会话 / 护栏 / handoff 全靠它。
 # ⚠️ 它**曾经漏在本清单外**（2026-10-03 补上）：容器只按 requirements.txt 安装，
-# 于是镜像里 `import agents` 直接失败 ⇒ `AGENTS_ENABLED=true` 但运行时未就绪 ⇒
-# **整条 agent 链路静默回落到原问答链路**，日志里只有一条 agent_reason，没有 ERROR。
+# 于是镜像里 `import agents` 直接失败。当时还会"静默回落到原问答链路"，所以只表现为
+# 一条 agent_reason 日志；现在没有回落链路了 ⇒ 少了它就是**拒绝启动**
+# （`missing_sdk`），部署流水线当场就能看见。
 # 而跨轮对话历史的后端（官方 SQLAlchemySession）就在这个 SDK 的扩展里 ——
 # 少了它，历史一份也不会有。
 openai-agents>=0.20
@@ -108,3 +109,12 @@ lupa>=2.0
 # 安装示例脚本依赖：pip install chromadb openai
 # chromadb>=0.5            # examples/chroma_save_test.py 向量库
 # openai>=1.30             # examples/chroma_save_test.py embedding 接口
+
+# ---- 可选：Langfuse 链路追踪（不参与生产安装，配了 LANGFUSE_* 才需要）----
+# 装上并配好密钥才会真的上报；没装时启动日志明确写"缺依赖"，tracing 后端回落 none
+# —— 不会出现"日志说接上了、面板里一条都没有"。
+# ⚠️ 这一对要**同批**升级：openinference 的插桩 patch 了 agents 的内部函数
+#    （工具执行那一步、RealtimeSession），跨大版本会静默少采集而不报错。
+#    升级 openai-agents 之前先核它对应的 openinference 版本。
+# langfuse>=3.0
+# openinference-instrumentation-openai-agents>=2.5

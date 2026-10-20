@@ -1,63 +1,55 @@
-"""agent 链路整链测试（拓扑 / 单次运行 / 评审 / 护栏 / 图级接线 / 跨轮历史）。
+"""agent 链路整链测试（拓扑 / 单次运行 / 评审 / 护栏 / 整轮接线 / 跨轮历史）。
 
 需要 ``openai-agents``。协议见文件末尾的"为什么这里自己写假模型"。
 
-⚠️ 2026-10-03：agent 链路从**一个图节点**拆成了**多个**（前台 / 文学），所以本文件
-分成了两层，别再混着写：
+⚠️ 2026-10-20：**拓扑回到官方形态** —— 一次 ``Runner.run`` 跑完整条链，
+前台 → 文学专家走官方 ``handoffs=``。图退役之后本文件的两层分别是：
 
-* **单次运行层**（``run_agent``）：一次只跑一个 agent。凡是"模型看到了什么、评审调了
-  几次、护栏拦没拦下"这类断言都在这一层 —— 它们与图拓扑无关。
-* **图级**（``build_graph`` + ``ainvoke``）：路由、检查点、跨节点不重复落输入、
-  异常冒泡 —— 这些只能在这一层验。
+* **单次运行层**（``run_agent``）：模型看到了什么、评审调了几次、护栏拦没拦下、
+  **交接之后是谁在收尾**。
+* **整轮层**（``run_turn``）：上下文与会话编号有没有真的送到这一次运行、
+  跨轮不重复落输入、失败如实上报 —— 这些只能在这一层验（它也是接口层唯一的入口）。
 
 这一组测试守的是**读代码看不出来**的那类错误，五条最典型的：
 
-1. **提示词里承诺了、拓扑上没接** —— 2026-10-03 起文学专家**没有**回程边，
-   所以它的 instructions 里一句"转回前台"都不能留（那是做不到的承诺）。
-2. **agent 节点内部又出现 handoff** —— SDK 会在同一个节点里把人换完，节点边界
-   （= 续跑边界）随之消失，而症状只是"文学节点永远不被走到"，没有任何报错。
+1. **提示词里承诺了、拓扑上没接** —— 文学专家**没有**回程 handoff，
+   所以它的 instructions 里一句"我转回前台"都不能留（那是做不到的承诺）。
+2. **一把 handoff 加进来却没人计数** —— SDK 的 ``on_handoff`` 钩子是
+   ``agent_handoff_total`` 的唯一来源，漏了就是指标静默归零。
 3. **as_tool 的嵌套 run 不继承 hooks** —— 漏了显式传参，专家的模型调用次数会
    **静默少算**，而它正是成本/能力指标的分母。
 4. **"评审到底发生过没有"必须能从代码侧看见** —— 评审是模型可选的工具
    （``as_tool``，2026-10-02 从代码 ``while`` 改过来），模型可能一次都不调。
    所以 ``exit_reason`` 多一档 ``unreviewed``：**跳过评审 ≠ 评审通过**。
-   2026-10-03 又多了 ``transfer`` 一档：这一步没有交付物，也不该按"漏审"记。
-5. **跨节点该延续的东西没延续** —— 每个节点各建一份上下文，不把 citations / stats
-   从 state 里读回来，接口层的"谁参与了、转移了几次"会静默只剩最后一个节点。
+   ``transfer`` 是另一档：这次运行结束在接手方手上（作品照样要交付）。
+5. **该看的上下文没送到** —— 一次运行只有一份 ``TaskContext``，但它是**每轮新建**
+   的：谁把它缓存成单例、或者忘了把 citations 留在里面，接口层的"谁参与了、
+   引用了几条"就会静默变成空的。
 """
 
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 from pathlib import Path
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
 
 pytest.importorskip(
     "agents", reason="openai-agents 未安装 ⇒ agent 链路会静默降级，本组无从验证"
 )
 
-from src import graph as G  # noqa: E402
 from src.agents import runtime as agruntime  # noqa: E402
-from src.agents.context import (  # noqa: E402
-    CARRY_ACROSS_NODES,
-    RUN_LOCAL,
-    AgentStats,
-)
 from src.agents.frontline import frontline_agent  # noqa: E402
 from src.agents.runner import ENTRY_AGENT, LITERARY_AGENT, run_agent  # noqa: E402
 from src.agents.specialists import literary_agent, researcher_agent  # noqa: E402
-from src.agents.types import FrontlineDecision  # noqa: E402
 from tests._agents_testkit import (  # noqa: E402
-    FakeRetriever,
     FakeSession,
     ScriptedModel,
     call,
     decide,
     feedback,
+    handoff_to,
     make_ctx,
     say,
 )
@@ -134,18 +126,21 @@ async def _run_frontline(prompt, *, ctx, model, session_id="", max_turns=None):
 # 拓扑：谁是 agent、怎么接线
 # --------------------------------------------------------------------------- #
 def test_frontline_topology_is_exactly_what_the_design_claims():
-    """前台的职责边界 = 工具集 + 产出类型 + **没有 handoff**。
+    """前台的职责边界 = 工具集 + **没有 output_type** + handoff 到文学专家。
 
     评审（``review_draft``）**在工具集里** —— 要不要评审由**模型自己决定**
     （2026-10-02 从"runner 的代码循环每轮必跑"改成 ``as_tool``）。
-    它**不该**出现在 ``handoffs`` 里 —— 而且 2026-10-03 起 ``handoffs`` 整个是空的
-    （跨节点转移改由图的条件边做，见 ``types.FrontlineDecision``）。
+    它**不该**出现在 ``handoffs`` 里 —— handoff 是"整段对话换人"，
+    评审是"就这一段给我个意见"，两者混淆会让评审把对话抢走。
+
+    ⚠️ 2026-10-20：``output_type`` 必须**没有**。有它 ⇒ ``final_output`` 是结构化
+    对象 ⇒ 被当成给用户的答复交付出去（用户看到字段名 + 括号）。
     """
     names = {t.name for t in frontline_agent.tools}
     assert names == {"research", "build_slide_deck", "make_illustration",
-                     "review_draft", "save_text_asset"}
-    assert frontline_agent.output_type is FrontlineDecision
-    assert list(frontline_agent.handoffs or []) == []
+                     "review_draft", "save_text_asset", "deliver"}
+    assert frontline_agent.output_type is None
+    assert [h.name for h in frontline_agent.handoffs or []] == ["literary_writer"]
 
 
 def test_literary_agent_can_review_its_own_draft():
@@ -157,22 +152,69 @@ def test_literary_agent_can_review_its_own_draft():
     assert "review_draft" in {t.name for t in literary_agent.tools}
 
 
-def test_no_handoffs_anywhere_and_no_unkeepable_promise():
-    """★ 一处 handoff 都不许有；文学专家的提示词里也不许留"转回前台"。
+def test_delivery_is_available_to_whoever_finishes_the_run():
+    """★ ``deliver`` 必须挂在**每一个可能收尾的 agent** 手上（2026-10-20）。
+
+    交付前的人审从图里的 ``human_review`` 节点搬到了这个工具的审批回调上
+    （见 ``approval.delivery_needs_approval``）。所以"谁收尾"就必须"谁能交付"：
+
+    * 前台直接答复 ⇒ 它在交付；
+    * 文学创作 ⇒ handoff 之后控制权在文学专家，前台那份工具集**不再生效**，
+      它若没有 ``deliver``，作品就只能靠 ``final_output`` 直出 —— 审核永远不触发，
+      而且**没有任何报错**（表现是"文学作品的审核率一直是 0"，看起来像没人用）。
+    """
+    assert "deliver" in {t.name for t in frontline_agent.tools}
+    assert "deliver" in {t.name for t in literary_agent.tools}
+
+
+def test_delivery_stops_only_when_the_model_asks_for_review():
+    """★ 交付要不要停，只看模型这一次的声明；缺省/明确否定都**不停**。
+
+    这条守的是"误停"：如果回调写成"只要调了交付就停"，每一次闲聊答复都要等人批准，
+    线上直接不可用；而症状看起来只是"响应很慢"，没人会想到是审批回调。
+
+    ``"false"`` 那个断言守的是另一类错：模型偶尔把布尔值写成字符串，
+    ``bool("false")`` 是 **True** —— 于是"明确说了不要审"的那次反而停下来。
+    """
+    from src.agents.approval import delivery_needs_approval
+
+    assert asyncio.run(delivery_needs_approval(None, {"needs_review": True}, "c1")) is True
+    assert asyncio.run(delivery_needs_approval(None, {"needs_review": False}, "c1")) is False
+    assert asyncio.run(delivery_needs_approval(None, {}, "c1")) is False
+    assert asyncio.run(delivery_needs_approval(None, {"needs_review": "false"}, "c1")) is False
+
+
+def test_handoff_is_one_way_and_no_unkeepable_promise():
+    """★ 交接只有**去程**（前台 → 文学专家），文学专家不许指回前台。
 
     这条守的是**两类错配**，它们在读代码时都完全看不出来：
 
-    1. **节点里带 handoff** —— SDK 会在同一个图节点内部把人换完再继续跑
-       （``run.py`` 里换人后是 ``continue``），节点边界（= 续跑边界）随之消失。
-       症状只是"文学节点永远不被走到"。
-    2. **提示词承诺了拓扑上不存在的能力** —— 2026-10-03 用户拍板**丢掉**了"文学专家
-       在本轮内转回前台"这条回程边。提示词里若还留着那句话，模型要么尝试调用一个
-       不存在的工具、要么硬撑着不转。
+    1. **回程 handoff** —— 文学专家把对话转回前台，等于给图加一个环：本轮内两个人
+       互相推，而官方 handoff 文档明确指出应避免循环转交。正确做法是"下一轮用户说话
+       自然回到前台"（每次 ``Runner.run`` 的起始 agent 都是前台）。
+    2. **提示词承诺了拓扑上不存在的能力** —— 文学专家的 instructions 里若还留着
+       "我转回前台"，模型要么尝试调用一个不存在的工具、要么硬撑着不转。
     """
-    assert list(frontline_agent.handoffs or []) == []
+    assert [h.name for h in frontline_agent.handoffs or []] == ["literary_writer"]
     assert list(literary_agent.handoffs or []) == []
     assert "frontline_agent" not in literary_agent.instructions, (
-        "文学专家的提示词里还留着「转回前台」—— 而这条边已经在 2026-10-03 丢掉了"
+        "文学专家的提示词里还留着「转回前台」—— 而回程 handoff 刻意没有接"
+    )
+
+
+def test_handoff_description_is_present_because_the_model_reads_it():
+    """★ 文学专家**必须**写 ``handoff_description``。
+
+    官方读它的地方只有一处：``Handoff.default_tool_description``（``handoffs/__init__.py``）
+    把它拼进 handoff 的工具描述。空着的话，前台看到的只是
+    ``"Handoff to the literary_writer agent..."`` —— 一句**没有说它能干什么**的描述。
+    模型只能靠 agent 名字猜，而猜错的表现是"该交的不交 / 不该交的乱交"，
+    读代码完全看不出来（字段在、就是空的）。
+
+    ⚠️ 反过来，三个 ``as_tool`` 专家**不要**写这个字段 —— 那才是"写了没人读"。
+    """
+    assert (literary_agent.handoff_description or "").strip(), (
+        "文学专家没有 handoff_description —— 前台不知道它负责什么"
     )
 
 
@@ -181,7 +223,8 @@ def test_researcher_is_a_bounded_subtask_not_a_conversation_taker():
     tool_names = {t.name for t in frontline_agent.tools}
     assert "research" in tool_names
     # 它不该出现在 handoffs 里 —— 那是"接管用户对话"的位置
-    assert not frontline_agent.handoffs
+    handed_off = {h.name for h in frontline_agent.handoffs or []}
+    assert "researcher" not in handed_off
     assert researcher_agent.output_type is not None   # 结构化 ⇒ 代码可判
 
 
@@ -196,58 +239,47 @@ def test_entry_agent_is_pinned_to_the_frontline():
 
     ⚠️ 这条**必须**是结构断言（入口是哪个常量），不能只断言"跑通"：
     把入口改回读状态**不会报错**，只会让某些轮次静默换了个人接话。
-    图层面的守卫见 ``test_state_agent_does_not_decide_the_entry``。
+    整轮入口就是 ``ENTRY_AGENT``，中间**没有**任何可读的状态能改它 ——
+    所以这条只需断言这个身份关系本身。
     """
     assert ENTRY_AGENT is frontline_agent
     assert LITERARY_AGENT is literary_agent
 
 
-def test_agent_stats_fields_are_all_classified():
-    """★ ``AgentStats`` 的每个字段都必须被明确归类：跨节点延续，还是本次运行独有。
-
-    为什么需要这条：一次请求会跑**多个** agent 节点，而每个节点各建一份
-    ``TaskContext``。忘了把某个字段放进 ``CARRY_ACROSS_NODES`` 的后果是
-    **静默少一半**（接口层只看得见最后一个节点），读代码看不出来，日志也不报错。
-
-    ⇒ 加了字段而两边都没改时，这条立刻红。这是它存在的全部理由。
-    """
-    declared = set(CARRY_ACROSS_NODES) | set(RUN_LOCAL)
-    actual = {f.name for f in dataclasses.fields(AgentStats)}
-    assert declared == actual, (
-        f"AgentStats 的字段没有被完整归类：多出 {actual - declared}，"
-        f"多余声明 {declared - actual}。请把新字段加进 CARRY_ACROSS_NODES 或 RUN_LOCAL。"
-    )
-
-
 # --------------------------------------------------------------------------- #
 # 单次运行：前台一次跑出什么
 # --------------------------------------------------------------------------- #
-def test_transfer_decision_comes_back_as_a_typed_verdict(tmp_path):
-    """★ 前台判定"转交" ⇒ ``exit_reason="transfer"`` + 判定原样带出来。
+def test_handoff_ends_the_run_on_the_literary_agent(tmp_path):
+    """★ 模型请求转交 ⇒ 同一次运行里换人，作品由接手方写出，照样交付。
 
-    这是"跨节点转移的信号"在代码里的落点：图读 ``out.decision["action"]`` 才决定
-    跳文学节点。它必须是**类型化的**，不能靠解析自然语言（见 ``types.FrontlineDecision``）。
+    这是官方 handoff 的形态：SDK 把 ``current_agent`` 换成文学专家后 ``continue``，
+    **不结束运行**。所以这一条要同时钉住三件事：
 
-    ⚠️ 同时钉住：转交这一步**不交付任何东西** —— ``answer`` 为空。
-    ``content`` 里那句"交接说明"是给下一个 agent 的，不是给用户的。
+    * ``exit_reason == "transfer"``（对指标说"这次交给别人了"）；
+    * ``final_agent == "literary_writer"``（谁收的尾 —— 这是一切路由的事实来源）；
+    * ``answer`` 是**作品本身**，不是空的。
+
+    ⚠️ 第三点最容易写错：按旧形态（转交那一步没有交付物）写成"answer 为空"，
+    表现是每一部作品都被丢掉、用户收到一条错误报告，而日志里一切正常。
     """
-    model = ScriptedModel([decide("交给文学作者。", action="transfer")])
+    model = ScriptedModel([handoff_to(), decide("灯塔守望者的第七个冬天。")])
     ctx = make_ctx(tmp_path)
     out = asyncio.run(_run_frontline("写一篇关于灯塔的短篇小说", ctx=ctx, model=model))
     model.assert_complete()
 
     assert out.exit_reason == "transfer"
     assert out.decision["action"] == "transfer"
-    assert out.answer == ""
-    assert out.passed is False
-    assert out.final_agent == "frontline_agent"
+    assert out.final_agent == "literary_writer"
+    assert out.answer == "灯塔守望者的第七个冬天。"
+    assert out.passed is True
 
 
 def test_reply_decision_becomes_the_deliverable(tmp_path):
-    """前台判定"答复" ⇒ 正文就是交付物（不是判定对象的 repr）。
+    """前台直接答复 ⇒ 正文就是交付物。
 
-    ⚠️ 这条盯着一个很容易写错的地方：``result.final_output`` 是 pydantic 对象，
-    天真地 ``str()`` 会拿到"字段名 + 括号"拼出来的 repr，而它会被当成答复交付出去 ——
+    ⚠️ 这条盯着一个很容易写错的地方：给前台加 ``output_type`` 之后
+    ``result.final_output`` 是 pydantic 对象，天真地 ``str()`` 会拿到
+    "字段名 + 括号"拼出来的 repr，而它会被当成答复交付出去 ——
     接口不报错，用户收到一段看不懂的东西。
     """
     model = ScriptedModel([decide("限流采用加权滑动窗口。")])
@@ -261,14 +293,18 @@ def test_reply_decision_becomes_the_deliverable(tmp_path):
 
 
 def test_literary_run_returns_the_work_as_plain_text(tmp_path):
-    """文学节点没有 ``output_type`` ⇒ 产出就是正文本身。"""
+    """文学专家没有 ``output_type`` ⇒ 产出就是正文本身。
+
+    ⚠️ 直接跑文学专家时 ``exit_reason`` **不能**是 ``transfer``：它不是"从别处交过来的"，
+    而是"这次运行本来就是它"。判据里那句"起始 agent 必须是前台"就是为这个。
+    """
     model = ScriptedModel([say("灯塔守望者的第七个冬天。")])
     ctx = make_ctx(tmp_path)
     out = asyncio.run(run_agent(LITERARY_AGENT, prompt="写首诗", context=ctx, model=model))
     model.assert_complete()
 
     assert out.answer == "灯塔守望者的第七个冬天。"
-    assert out.decision == {}                  # 文学节点不产生判定
+    assert out.exit_reason == "unreviewed"     # 没调评审，不是"转交"
     assert out.final_agent == "literary_writer"
 
 
@@ -417,7 +453,10 @@ def test_review_pass_then_deliver(tmp_path):
     assert out.exit_reason == "passed" and out.passed
     assert ctx.stats.review_rounds == 1
     assert ctx.stats.last_score == "pass"
-    assert out.score_hint() == 90
+    assert out.answer == "成稿。"
+    # ★ 2026-10-19：收尾不再经过 0-100 分。`TaskOutcome` 上没有 `score_hint` 了，
+    # 拿到分数这件事本身就是"评分闸"存在的证据。
+    assert not hasattr(out, "score_hint")
 
 
 def test_model_can_review_twice_and_improve_itself(tmp_path):
@@ -446,11 +485,16 @@ def test_model_can_review_twice_and_improve_itself(tmp_path):
     assert "第二段缺环境细节" in fed, "评审反馈没有回到创作方手里"
 
 
-def test_review_failed_still_delivers_to_a_human(tmp_path):
-    """评审不给 pass ⇒ 产出仍返回，但结论是"交人复核"。
+def test_review_failed_still_delivers(tmp_path):
+    """★ 评审查出问题、模型仍决定交付 ⇒ **照交**，不进人工。
 
-    与原来 ``max_attempts`` 同一考虑：有疑点但不确凿 —— 交给人工复核比丢给用户
-    一句空话好。**注意不再有"再来一轮"**：模型要改就自己在同一次 run 里改。
+    这是 2026-10-19 那次改动的核心行为（用户原话：「查出来了就继续执行啊，带着上下文
+    打回去执行」）。评审自己是模型调的工具，``{feedback, score}`` 作为**工具返回值**
+    回到模型手里 —— 它同一次 run 里接着改，或者判断"这条不改也行"。代码只留观测：
+    ``exit_reason="review_failed"`` 能看见，但**不再拦**。
+
+    ⚠️ 与改动前最直观的差别：``out.passed`` 现在是 ``True``，``out.fallback`` 是
+    ``delivered`` 而不是 ``manual``。曾经的"交人复核"只剩护栏 / 跑偏那几条真兜底。
     """
     model = ScriptedModel([
         call("review_draft", {"input": "一稿。"}, "r1"),
@@ -461,10 +505,12 @@ def test_review_failed_still_delivers_to_a_human(tmp_path):
     out = asyncio.run(_run_frontline("写一段文字", ctx=ctx, model=model))
     model.assert_complete()
 
-    assert out.exit_reason == "review_failed" and not out.passed
-    assert out.answer == "一稿。"                # 产出仍交给人工
-    assert out.score_hint() == 40
+    assert out.exit_reason == "review_failed"
+    assert out.passed is True                    # 正常运行收口，评审没过不影响
+    assert out.answer == "一稿。"
     assert ctx.stats.last_score == "needs_improvement"
+    # 兜底结论是"正常交付"，不是"转人工"
+    assert out.fallback is not None and out.fallback.outcome == "delivered"
 
 
 def test_unreviewed_delivery_is_not_counted_as_passed(tmp_path):
@@ -488,12 +534,12 @@ def test_unreviewed_delivery_is_not_counted_as_passed(tmp_path):
 def test_transfer_is_not_filed_under_unreviewed(tmp_path):
     """★ 转交必须自成**一档**，不能记成 ``unreviewed``。
 
-    两者在第 5 条错误的意义上完全不同：``unreviewed`` 是"本该评审而模型跳过了"，
-    转交是"这一步压根没有产出可评审"。混在一起，``agent_runs_total
+    两者在错误信号的意义上完全不同：``unreviewed`` 是"本该评审而模型跳过了"，
+    转交是"这次由别人收的尾"。混在一起，``agent_runs_total
     {exit_reason="unreviewed"}`` 会虚高（转交是常态，不是漏审），而这直接改变
     告警阈值 —— 图上只表现为"跳过评审的变多了"，看不出是口径问题。
     """
-    model = ScriptedModel([decide("交给文学作者。", action="transfer")])
+    model = ScriptedModel([handoff_to(), decide("一稿。")])
     ctx = make_ctx(tmp_path)
     out = asyncio.run(_run_frontline("写一篇短篇小说", ctx=ctx, model=model))
     model.assert_complete()
@@ -521,23 +567,22 @@ def test_fabricated_citation_is_blocked_before_delivery(tmp_path):
     assert model.remaining_steps == 0   # 拦下之后没有多余的模型调用被浪费
 
 
-def test_transfer_note_is_not_judged_as_a_deliverable(tmp_path):
-    """★ 转交那一步的 ``content`` **不**接受出口护栏检查（它不交付给用户）。
+def test_handed_off_work_still_goes_through_the_output_guardrail(tmp_path):
+    """★ 交接之后写出来的作品**照样**过出口护栏。
 
-    这是拆成多节点之后最容易踩的一个坑：出口护栏挂在运行配置上 ⇒ 每一次运行的最终
-    输出都被检查。而"判定为转交"那次运行的最终输出是一个结构化对象，``content``
-    只是交接说明。
-
-    不做区分的话：交接说明里出现形如 ``[9]`` 的字样（或者写得很长）就会**整条拦下**，
-    用户收到一个空答复 —— 而模型什么错都没犯，日志里只有一条"护栏触发"。
+    旧形态（两个图节点）下，转交那一步"没有交付物"，所以护栏特意跳过它；
+    换成官方 handoff 之后，交接在同一次运行内完成，``final_output`` 就是**作品**——
+    没有理由跳过。漏了这一条的后果很具体：文学作品里编造一个引用编号会一路交付给
+    用户，而护栏指标上毫无痕迹（它被当成"没有交付物"静默放行了）。
     """
-    model = ScriptedModel([decide("结论见 [9]，我这就交给文学作者。", action="transfer")])
+    model = ScriptedModel([handoff_to(), decide("他念道：见 [9]。")])
     ctx = make_ctx(tmp_path)
     out = asyncio.run(_run_frontline("写一篇短篇小说", ctx=ctx, model=model))
     model.assert_complete()
 
-    assert out.exit_reason == "transfer"          # 没被护栏拦下
-    assert out.guardrail is None
+    assert out.exit_reason == "output_guardrail"
+    assert out.guardrail == "citation_traceability_guardrail"
+    assert out.answer == ""
 
 
 def test_citation_is_accepted_when_it_was_really_retrieved(tmp_path):
@@ -725,112 +770,78 @@ def test_slide_deck_is_rendered_by_code_not_by_a_model(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# 图级接线（真正"接入生产"的那一段）
+# 接口层接线（真正"接入生产"的那一段）
 # --------------------------------------------------------------------------- #
-def _rag_model() -> object:
-    from unittest.mock import MagicMock
+def _run_turn(prompt, *, ctx, model, thread_id):
+    """跑一整轮。``src.turn.run_turn`` 是接口层**唯一**依赖的执行入口。
 
-    from src.graph import ReviewResult
+    刻意不打桩它、而是真跑（只换模型与检索器）：本组要验的正是"接线"——
+    租户 / 会话编号 / 上下文有没有被真的送到这一次运行里。
+    """
+    from src.turn import TurnRequest, run_turn
 
-    m = MagicMock()
-    m.invoke.return_value = AIMessage(content="（问答链路草稿）")
-    m.with_structured_output.return_value.invoke.return_value = ReviewResult(
-        is_need_evaluate=True, score=90, feedback=""
-    )
-    return m
-
-
-def _graph(tmp_path, monkeypatch, model):
-    """把图装好、模型注入好，返回 ``(graph, cfg_factory)``。"""
-    monkeypatch.setattr(G, "AGENTS_ENABLED", True)
-    monkeypatch.setattr(G, "AGENT_ASSET_DIR", str(tmp_path / "assets"))
-    G._AGENT_MODULES.clear()
     agruntime.set_model(model)
-    return G.build_graph(model=_rag_model(), retriever=FakeRetriever())
+    return asyncio.run(run_turn(TurnRequest(prompt=prompt, thread_id=thread_id),
+                                context=ctx))
 
 
-def test_graph_sends_a_request_through_the_agent_link(monkeypatch, tmp_path, runtime_guard):
-    """★ 请求在图里真的走进 agent 链路，并把结果写回 state。
+def test_turn_runs_the_request_through_the_agent_link(tmp_path):
+    """★ 一整轮真的走进 agent 链路，并把结论原样交回来。
 
-    脚本的**第一跳就是前台自己**：入口只探测可用性、不花模型调用，
-    所以模型见到的第一个请求就来自前台 —— agent 链路从这里开始。
+    ⚠️ 2026-10-20：这一轮**没有** score / is_need_evaluate 可断言了 —— 评分闸随图
+    一起删除，``TaskOutcome`` 上根本没有这两个字段。故意留着一条 `hasattr` 断言：
+    谁把分数写回来（哪怕只为"顺手兼容"），这里立刻变红。
     """
-    g = _graph(tmp_path, monkeypatch, ScriptedModel([decide("灯塔守望者的第七个冬天。")]))
-    cfg = {"configurable": {"thread_id": "t-agent-1", "rag_tenant": ""}}
-    result = asyncio.run(g.ainvoke(
-        {"messages": [HumanMessage(content="写一篇关于灯塔的短篇小说")]}, config=cfg
-    ))
+    ctx = make_ctx(tmp_path)
+    out = _run_turn("写一篇关于灯塔的短篇小说", ctx=ctx,
+                    model=ScriptedModel([decide("灯塔守望者的第七个冬天。")]),
+                    thread_id="t-turn-1")
 
-    assert result["route"] == "agent"
-    assert result["route_reason"] == "ready"
-    assert result["output"] == "灯塔守望者的第七个冬天。"
-    assert result["agent_decision"]["action"] == "reply"
-    stats = result["agent_stats"]
-    assert stats["exit_reason"] == "unreviewed"
-    assert result["score"] >= G.HIGH            # 交付成功 ⇒ 直通收尾
-    assert result["is_need_evaluate"] is True
+    assert out.answer == "灯塔守望者的第七个冬天。"
+    assert out.exit_reason == "unreviewed"
+    assert out.final_agent == "frontline_agent"
+    assert ctx.stats.exit_reason == "unreviewed"
+    assert not hasattr(out, "score")
 
 
-def test_graph_routes_a_transfer_to_the_literary_node(monkeypatch, tmp_path, runtime_guard):
-    """★★ 判定为转交 ⇒ 图跳到文学节点；检查点里"转交给了谁"由**下一跳**表达。
+def test_handoff_happens_inside_a_single_run(tmp_path):
+    """★★ 交接发生在**同一次运行内部**，所以作品只生成一遍。
 
-    这条是拆分方案的核心断言，一次把三件事钉住：
+    这条钉住换回官方 handoff 之后最容易踩的坑：**作品被生成两遍**。
+    如果除了这一次运行之外还有一条"交给文学专家"的路径（旧的两个图节点就是这样），
+    文献会被写两遍，两次内容一起进会话历史 —— 症状是模型费用莫名翻倍，不会报错。
 
-    * 文学节点真的被走到了（产出是作品正文，不是交接说明）；
-    * 检查点某一行的 ``next`` 就是 ``('literary',)`` —— 没有独立的一行叫"转交"，
-      转移就是"上一行的下一跳指向另一个节点"；
-    * 转交这一步**不往 state 里写 output**，也不追加助手消息（它没有交付物）。
+    所以断言分两半：产出与统计对（作品交付了、两个 agent 都参与、交接记了一次）；
+    **模型调用次数恰好等于脚本长度**（多跑一次运行就会对不上）。
     """
-    model = ScriptedModel([
-        decide("交给文学作者。", action="transfer"),
-        say("灯塔守望者的第七个冬天。"),
-    ])
-    g = _graph(tmp_path, monkeypatch, model)
-    cfg = {"configurable": {"thread_id": "t-agent-transfer", "rag_tenant": ""}}
-    result = asyncio.run(g.ainvoke(
-        {"messages": [HumanMessage(content="写一篇关于灯塔的短篇小说")]}, config=cfg
-    ))
+    model = ScriptedModel([handoff_to(), say("灯塔守望者的第七个冬天。")])
+    ctx = make_ctx(tmp_path)
+    out = _run_turn("写一篇关于灯塔的短篇小说", ctx=ctx, model=model,
+                    thread_id="t-turn-transfer")
     model.assert_complete()
 
-    assert result["output"] == "灯塔守望者的第七个冬天。"
-    assert result["current_agent"] == "literary_writer"
-    assert result["agent_decision"]["action"] == "transfer"
-    # 交接说明没有变成给用户的答复
-    assert "交给文学作者" not in result["output"]
-    # messages 里只有用户那句 + 作品，**没有**一条"交给文学作者"的助手消息
-    assert [m.content for m in result["messages"]] == [
-        "写一篇关于灯塔的短篇小说", "灯塔守望者的第七个冬天。",
-    ]
-    # 跨节点该延续的东西：两个 agent 都算参与者，转移记了一次
-    assert result["agent_stats"]["agents"] == ["frontline_agent", "literary_writer"]
-    assert result["agent_stats"]["handoffs"] == [["frontline_agent", "literary_writer"]]
-
-    async def _rows():
-        return [tuple(s.next or ()) for s in
-                [snap async for snap in g.aget_state_history(cfg)]]
-
-    rows = asyncio.run(_rows())
-    assert ("literary",) in rows, f"检查点里没有指向文学节点的那一跳：{rows}"
+    assert out.answer == "灯塔守望者的第七个冬天。"
+    assert out.final_agent == "literary_writer"
+    # 同一次 run 里两个 agent 都参与了，交接由 SDK 的 on_handoff 记了一次
+    assert ctx.stats.agents == ["frontline_agent", "literary_writer"]
+    assert ctx.stats.handoffs == [("frontline_agent", "literary_writer")]
+    assert len(model.calls) == 2, "交接又多跑了一次运行 ⇒ 作品被生成两遍"
 
 
-def test_literary_run_sees_the_citations_the_frontline_collected(
-    monkeypatch, tmp_path, runtime_guard
-):
-    """★★ 跨节点延续：文学那次运行必须看得见**前台登记的引用**。
+def test_literary_run_sees_the_citations_the_frontline_collected(tmp_path):
+    """★★ 交接之后，文学专家必须看得见**前台登记的引用**。
 
-    每个节点各建一份 `TaskContext`（SDK 里没有"跨运行共享上下文"），所以引用必须
-    经 state 带过去。不带的后果**不是报错**，而是文学那次运行的出口护栏把"本轮真的
-    检索到过"的编号判成**编造** ⇒ 整份作品被拦下、用户收到一个空答复 ——
-    而模型什么错都没犯，日志里只有一条"护栏触发"。
-
-    这条与 `test_graph_routes_a_transfer_to_the_literary_node` 的分工：那条看
-    **谁参与了、转移了几次**（统计口径），这条看**引用**（护栏口径）——
-    两者走的是同一段延续代码，但失效后的症状完全不同，所以要各钉一条。
+    这是 handoff 形态下**天然成立**的事（同一次运行、同一个 ``TaskContext``），
+    但仍然要钉住：一旦有人为了"省一次模型调用"把交接改回"结束后再起一次运行"，
+    引用就断了。断了的后果**不是报错**，而是出口护栏把"本轮真的检索到过"的编号判成
+    **编造** ⇒ 整份作品被拦下、用户收到一个空答复 —— 而模型什么错都没犯，
+    日志里只有一条"护栏触发"。
     """
     digest = {
         "question": "限流怎么算",
         "findings": [{"claim": "加权滑动窗口",
-                      "evidence": "判定值 = 上一窗口×剩余比例+当前窗口", "source": "[1]"}],
+                      "evidence": "判定值 = 上一窗口×剩余比例+当前窗口",
+                      "source": "[1]"}],
         "citations": ["[1]"],
         "confidence": "high",
     }
@@ -838,179 +849,81 @@ def test_literary_run_sees_the_citations_the_frontline_collected(
         call("research", {"input": "限流怎么算"}, "t1"),      # 前台取证
         call("kb_search", {"query": "限流"}, "k1"),           # 取证子 agent 检索
         say(json.dumps(digest, ensure_ascii=False)),          # 取证产出 ⇒ 登记引用 [1]
-        decide("依据 [1] 来写。", action="transfer"),          # 前台判定转交
+        handoff_to(),                                          # 前台把对话交给文学作者
         say("灯塔守望者第七个冬天 [1]。"),                     # 文学作者的作品
     ])
-    g = _graph(tmp_path, monkeypatch, model)
-    cfg = {"configurable": {"thread_id": "t-agent-cite", "rag_tenant": ""}}
-    result = asyncio.run(g.ainvoke(
-        {"messages": [HumanMessage(content="写一篇关于灯塔的短篇小说")]}, config=cfg
-    ))
+    ctx = make_ctx(tmp_path)
+    out = _run_turn("写一篇关于灯塔的短篇小说", ctx=ctx, model=model,
+                    thread_id="t-turn-cite")
     model.assert_complete()
 
-    assert len(result["citations"]) == 1, "前台登记的引用没有进 state"
-    assert result["agent_stats"]["retrieval_calls"] == 1
-    # 关键断言：作品带着 [1] **交付出来了**。没延续的话它会以 output_guardrail 收尾、
-    # output 是空串（这正是"文学节点看不见引用"唯一的表现形式）。
-    assert result["output"] == "灯塔守望者第七个冬天 [1]。"
-    assert result["agent_stats"]["exit_reason"] in ("unreviewed", "passed"), (
-        result["agent_stats"]
-    )
+    assert len(ctx.citations) == 1, "前台登记的引用没有留在同一份上下文里"
+    assert ctx.stats.retrieval_calls == 1
+    # 关键断言：作品带着 [1] **交付出来了**。引用没延续的话它会以 output_guardrail
+    # 收尾、answer 是空串（这正是"文学专家看不见引用"唯一的表现形式）。
+    assert out.answer == "灯塔守望者第七个冬天 [1]。"
+    assert out.exit_reason in ("unreviewed", "passed", "transfer"), out.exit_reason
 
 
-def test_graph_does_not_write_the_user_message_into_the_session_twice(
-    monkeypatch, tmp_path, runtime_guard, session_store
+def test_turn_does_not_write_the_user_message_into_the_session_twice(
+    tmp_path, session_store
 ):
-    """★★ 一轮里有**两个** agent 节点，用户那句只能往会话里落**一次**。
+    """★★ 用户那句只能往会话里落**一次**。
 
     传了会话之后 SDK 会把本轮输入**追加**进会话（``save_result_to_session``；它内部
-    的去重只覆盖"同一轮内的重试"，跨"新一轮 run"照写）。所以第二个节点必须传空
-    （``runner._build_input_items`` 的 ``append_prompt``）。
+    的去重只覆盖"同一轮内的重试"，跨"新一轮 run"照写）。
 
     不做区分的后果不是报错，而是**历史里出现重复的用户消息**，下一轮模型读到时
     会以为自己被问了两遍。
     """
-    model = ScriptedModel([
-        decide("交给文学作者。", action="transfer"),
-        say("灯塔守望者的第七个冬天。"),
-    ])
-    g = _graph(tmp_path, monkeypatch, model)
-    cfg = {"configurable": {"thread_id": "t-agent-dup", "rag_tenant": ""}}
-    asyncio.run(g.ainvoke(
-        {"messages": [HumanMessage(content="写一篇关于灯塔的短篇小说")]}, config=cfg
-    ))
+    model = ScriptedModel([handoff_to(), say("灯塔守望者的第七个冬天。")])
+    ctx = make_ctx(tmp_path)
+    _run_turn("写一篇关于灯塔的短篇小说", ctx=ctx, model=model,
+              thread_id="t-turn-dup")
     model.assert_complete()
 
-    items = asyncio.run(session_store["t-agent-dup"].get_items())
+    items = asyncio.run(session_store["t-turn-dup"].get_items())
     users = [it for it in items
              if isinstance(it, dict) and (it.get("role") or "") == "user"]
     assert len(users) == 1, f"用户那句被重复落进会话了：{len(users)} 条"
-    # 反向对照：第二个节点**确实看到了**历史（不是因为它没跑）
+    # 反向对照：接手那一次**确实看到了**历史（不是因为它没跑）
     assert any("灯塔" in json.dumps(it, ensure_ascii=False)
                for it in model.calls[1].input)
 
 
-def test_agent_failure_bubbles_and_leaves_the_turn_resumable(
-    monkeypatch, tmp_path, runtime_guard
-):
-    """★★ agent 运行异常必须**冒到图外**，检查点才会留下待执行节点（= 可续）。
+def test_agent_failure_is_reported_not_disguised(tmp_path):
+    """★★ 运行失败必须如实报出来，不能被伪装成"跑完了"。
 
-    这是拆分的目的能否兑现的前提。运行器那个宽 ``except`` 会把异常兜成
-    ``exit_reason="error"``；节点若照旧写一句"服务出现问题请稍后重试"正常收尾，
-    图会照常走到 END ⇒ ``state.next`` 为空 ⇒ 查询接口报
-    ``status="completed"``/``resumable=false``，**客户端连"继续生成"的按钮都不会弹** ——
-    而这次请求其实什么都没产出。
+    空脚本 ⇒ 第一次模型调用就失败。运行器的宽 ``except`` 会把它收成
+    ``exit_reason="error"``，而**接口层必须据此下发 ``error`` 事件**（见
+    ``_stream_run`` 的 ``raise outcome_box["error"]``）。
 
-    ⚠️ 代价是这类请求在客户端不再表现为友好提示，而是一次失败（SSE 下是脱敏的
-    ``error`` 事件）。这是刻意换的，见 ``graph.AgentRunFailed``。
+    若哪天有人在这里"降级成一句友好话术"（"服务出现问题请稍后重试"）：
+    用户看到的是一次正常回答、指标上的失败率归零、而这次请求其实什么都没产出。
     """
-    g = _graph(tmp_path, monkeypatch, ScriptedModel([]))   # 脚本为空 ⇒ 首次模型调用即失败
-    cfg = {"configurable": {"thread_id": "t-agent-boom", "rag_tenant": ""}}
-    with pytest.raises(G.AgentRunFailed):
-        asyncio.run(g.ainvoke(
-            {"messages": [HumanMessage(content="写一篇短篇小说")]}, config=cfg
-        ))
+    ctx = make_ctx(tmp_path)
+    out = _run_turn("写一篇短篇小说", ctx=ctx, model=ScriptedModel([]),
+                    thread_id="t-turn-boom")
 
-    state = asyncio.run(g.aget_state(cfg))
-    assert tuple(state.next or ()) == ("frontline",), (
-        "异常被吞掉了（或检查点没留下待执行节点）⇒ 这个回合在接口层会显示成"
-        "'已完成、不可续'，而它其实什么都没产出"
-    )
+    assert out.exit_reason == "error"
+    assert out.answer == ""
+    assert out.error, "失败原因没被记下来，运维只能从 traceback 里猜"
 
 
-def test_graph_writes_back_the_agent_the_run_ended_on(monkeypatch, tmp_path, runtime_guard):
-    """★ 每个 agent 节点各写一次 ``state["current_agent"]``，最后一次就是"谁收的尾"。
+def test_a_qa_request_takes_exactly_one_model_call(tmp_path):
+    """★ 问原理类的请求由前台直接作答（不叫任何帮手）。
 
-    转交示例：前台判为转交、文学专家交付 ⇒ 写回 ``literary_writer``。
-
-    ⚠️ 它现在是**纯观测**（入口固定为前台，不会再读它决定谁接话），所以这条守的是
-    "写回的到底是**结局**还是**起点**"——那是 handoff 统计与"这轮谁收的尾"的唯一来源，
-    写错会静默污染指标。
-    """
-    model = ScriptedModel([
-        decide("交给文学作者。", action="transfer"),
-        say("灯塔。"),
-    ])
-    g = _graph(tmp_path, monkeypatch, model)
-    cfg = {"configurable": {"thread_id": "t-agent-ca-1", "rag_tenant": ""}}
-    result = asyncio.run(g.ainvoke(
-        {"messages": [HumanMessage(content="写一篇短篇小说")]}, config=cfg
-    ))
-    model.assert_complete()
-    assert result["current_agent"] == "literary_writer"
-
-
-def test_state_agent_does_not_decide_the_entry(monkeypatch, tmp_path, runtime_guard):
-    """★★ state 里的 ``current_agent`` **不再**决定本轮谁先接话。
-
-    输入 state 预置 ``current_agent = "literary_writer"``（= 上一轮停在文学专家），
-    而本轮前台直接作答（不转交）。
-
-    若入口又变回"读状态"（上一版就是这样），第一个模型调用拿到的 instructions 会是
-    文学专家的，而不是前台的 —— 这条断言就是冲着那个回归去的。
-    它同时也是"入口固定"这条决策**在图层面的**守卫：``runner`` 里那条只管常量本身，
-    管不住"graph 又把状态传回去"。
-
-    顺带钉住写回方向：``current_agent`` 仍是**本轮结局**，只是不再参与路由。
-    """
-    model = ScriptedModel([decide("限流采用加权滑动窗口。")])
-    g = _graph(tmp_path, monkeypatch, model)
-    cfg = {"configurable": {"thread_id": "t-agent-entry-1", "rag_tenant": ""}}
-    result = asyncio.run(g.ainvoke(
-        {"messages": [HumanMessage(content="限流怎么算")],
-         "current_agent": "literary_writer"},
-        config=cfg,
-    ))
-    assert "你是前台" in model.calls[0].system_instructions, (
-        "state 里的 current_agent 又把入口改掉了 —— 入口必须固定为前台"
-    )
-    assert result["current_agent"] == "frontline_agent"
-
-
-def test_graph_sends_a_qa_request_into_the_agent_link_too(monkeypatch, runtime_guard):
-    """★ 问原理类的请求**也**进 agent 链路，由前台直接作答（不叫任何帮手）。
-
-    这是本次改造最直接的行为变化：入口不再把"一段说明"推回原问答链路。
     脚本里前台第一跳就给出最终判定 ⇒ 全程没有任何工具调用 / 转交，
     证明"闲聊式提问"不会平白多花一次检索或一次专家往返。
     """
-    g = _graph_disabled_free(monkeypatch, ScriptedModel([decide("限流采用加权滑动窗口计算。")]))
-    cfg = {"configurable": {"thread_id": "t-qa-1", "rag_tenant": ""}}
-    result = asyncio.run(g.ainvoke(
-        {"messages": [HumanMessage(content="限流是怎么算的")]}, config=cfg
-    ))
-    assert result["route"] == "agent"
-    assert result["route_reason"] == "ready"
-    assert result["output"] == "限流采用加权滑动窗口计算。"
-    # 老链路那个"检索→生成"节点没被走到 ⇒ 不会平白多一次模型调用
-    assert result["agent_stats"]["model_calls"] == 1
+    ctx = make_ctx(tmp_path)
+    out = _run_turn("限流是怎么算的", ctx=ctx,
+                    model=ScriptedModel([decide("限流采用加权滑动窗口计算。")]),
+                    thread_id="t-turn-qa")
 
-
-def _graph_disabled_free(monkeypatch, model):
-    """不碰 tmp 的建图助手（这几个用例不需要资产目录）。"""
-    monkeypatch.setattr(G, "AGENTS_ENABLED", True)
-    G._AGENT_MODULES.clear()
-    agruntime.set_model(model)
-    return G.build_graph(model=_rag_model(), retriever=FakeRetriever())
-
-
-def test_graph_degrades_cleanly_when_the_link_is_disabled(monkeypatch, runtime_guard):
-    """关掉开关 ⇒ **所有**请求都走问答链路，且整图不崩。
-
-    这就是"能力开关默认开、但开着且没配时行为必须与关一致"的落点。
-    """
-    monkeypatch.setattr(G, "AGENTS_ENABLED", False)
-    G._AGENT_MODULES.clear()
-    agruntime.set_model(ScriptedModel([]))
-
-    g = G.build_graph(model=_rag_model(), retriever=FakeRetriever())
-    cfg = {"configurable": {"thread_id": "t-off-1", "rag_tenant": ""}}
-    result = asyncio.run(g.ainvoke(
-        {"messages": [HumanMessage(content="写一篇关于灯塔的短篇小说")]}, config=cfg
-    ))
-    assert result["route"] == "rag"
-    assert result["route_reason"] == "disabled"
-    assert result["output"] == "（问答链路草稿）"
+    assert out.answer == "限流采用加权滑动窗口计算。"
+    assert ctx.stats.model_calls == 1
+    assert ctx.stats.handoffs == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1205,18 +1118,19 @@ def test_run_config_trims_by_tokens_and_omits_reasoning_ids(monkeypatch):
     )
 
 
-def test_graph_thread_id_is_used_as_the_session_id(monkeypatch, tmp_path, runtime_guard):
-    """★ 图把 ``configurable.thread_id`` 当作会话编号交给 agent 链路。
+def test_thread_id_is_used_as_the_session_id(tmp_path):
+    """★ 会话编号就是 ``TurnRequest.thread_id``。
 
     这条守的是"接线"而不是"机制"：会话本身在 ``run_agent`` 那层已经验过了，
-    但如果 agent 节点忘了把 thread_id 传下去（或传了个空串），
-    **每轮都会是全新会话** —— agent 链路照常跑、照常出答案，只是永远记不住上文。
+    但如果执行入口忘了把 thread_id 传下去（或传了个空串），**每轮都会是全新会话**
+    —— 链路照常跑、照常出答案，只是永远记不住上文。
     """
     model = ScriptedModel([decide("第一版：灯塔与守塔人。"), decide("第二版。")])
-    g = _graph(tmp_path, monkeypatch, model)
-    cfg = {"configurable": {"thread_id": "t-agent-hist-1", "rag_tenant": ""}}
-    asyncio.run(g.ainvoke({"messages": [HumanMessage(content="写一篇灯塔小说")]}, config=cfg))
-    asyncio.run(g.ainvoke({"messages": [HumanMessage(content="把结尾改得更压抑")]}, config=cfg))
+    _run_turn("写一篇灯塔小说", ctx=make_ctx(tmp_path), model=model,
+              thread_id="t-turn-hist")
+    # 第二轮用**新的**上下文（真实链路就是每轮新建），只共享 thread_id
+    _run_turn("把结尾改得更压抑", ctx=make_ctx(tmp_path), model=model,
+              thread_id="t-turn-hist")
 
     assert _saw(model.calls[1].input, "灯塔小说"), (
         "第二轮看不到第一轮 —— thread_id 没有传到会话上"
@@ -1227,81 +1141,69 @@ def test_graph_thread_id_is_used_as_the_session_id(monkeypatch, tmp_path, runtim
 # 指标翻译（服务层）
 # --------------------------------------------------------------------------- #
 def test_agent_stats_are_translated_into_metrics():
-    """`agent_stats` → 指标：路由、转移、参与 agent、评审结论、返工、护栏。"""
+    """`agent_stats` → 指标：转移、参与 agent、工具/检索量、护栏。
+
+    ⚠️ 这里**没有** route / review_rounds 两类断言了：前者随"另一条链路"一起删除，
+    后者随分级评审一起删除。留着它们只会让指标永远报 unknown / 0 —— 一个看起来
+    在跑、实际不含任何信息的标签。
+    """
     from app import main as app_main
     from app import metrics
 
     metrics.reset()
     app_main._record_agent_metrics(
         {
-            "route": "agent", "route_reason": "ready",
             "handoffs": [["frontline_agent", "literary_writer"]],
             "agents": ["frontline_agent", "literary_writer"],
-            "review_rounds": 2, "last_score": "pass", "attempts": 1,
+            "last_score": "pass", "attempts": 1,
             "retrieval_calls": 1, "retrieved_chunks": 2, "tool_calls": 3,
             "exit_reason": "passed", "guardrail": "",
         },
         "citation_traceability_guardrail",
     )
-    assert metrics.value("agent_route_total", route="agent",
-                         reason="ready") == 1
     assert metrics.value("agent_handoff_total",
                          src="frontline_agent", dst="literary_writer") == 1
     assert metrics.value("agent_participants_total", agent="literary_writer") == 1
-    assert metrics.value("agent_review_outcome_total", score="pass") == 1
-    # 返工判据：attempts 恒为 1（评审改成 as_tool 后没有代码回灌轮次），
-    # 所以这里由 review_rounds=2（模型自己改了一轮再评）触发。
-    assert metrics.value("agent_rework_total") == 1
+    # attempts 恒为 1（评审改成 as_tool 后没有代码回灌轮次）⇒ 这一轮不算返工
+    assert metrics.value("agent_rework_total") == 0
     assert metrics.value("agent_guardrail_trips_total",
                          guardrail="citation_traceability_guardrail") == 1
-    assert metrics.histogram_count("agent_review_rounds") == 1
-    # 工具调用与模型调用两个量合起来才能区分"模型在想"与"工具在往返"
+    # 工具调用与检索量：合起来才能区分"模型在想"与"工具在往返"
     assert metrics.histogram_count("agent_tool_calls") == 1
     assert metrics.histogram_count("agent_retrieval_calls") == 1
 
 
-def test_agent_metrics_are_not_emitted_when_the_link_was_not_used():
-    """问答请求不带 `agent_stats` ⇒ 一条 agent 指标都不该出现。
+def test_rework_is_counted_from_review_rounds():
+    """返工判据：模型自己改完再评一次（``review_rounds == 2``）必须算一次返工。
 
-    否则"agent 链路用了多少"会被 RAG 请求稀释，比率全部失真。
+    ``attempts`` 恒为 1（评审是模型可调用的工具，代码侧没有回灌循环），
+    所以只按 ``attempts`` 判会让这个指标**永远是 0** —— 而它正是当前形态下
+    "模型在自我返工"的唯一可观测信号。
+    """
+    from app import main as app_main
+    from app import metrics
+
+    metrics.reset()
+    app_main._record_agent_metrics({"attempts": 1, "review_rounds": 2}, "")
+    assert metrics.value("agent_rework_total") == 1
+
+    metrics.reset()
+    app_main._record_agent_metrics({"attempts": 1, "review_rounds": 1}, "")
+    assert metrics.value("agent_rework_total") == 0, "评了一次不算返工"
+
+
+def test_agent_metrics_are_not_emitted_without_stats():
+    """没有 `agent_stats` ⇒ 一条 agent 指标都不该出现。
+
+    否则"agent 链路花了多少"会被别的请求稀释，比率全部失真。
     """
     from app import main as app_main
     from app import metrics
 
     metrics.reset()
     app_main._record_agent_metrics({}, "")
-    assert metrics.value("agent_route_total", route="unknown", reason="unknown") == 0
-
-
-def test_agent_unavailable_is_recorded_except_when_deliberately_disabled():
-    """★ 降级面：**想走 agent 但走不了**必须被记下来（且只记这两种）。
-
-    这条守的是"整条降级路径不可观测"：`module_unavailable`（忘了装
-    openai-agents）与 `runtime_not_ready`（忘了配模型）发生时，**所有请求**都会
-    **静默退回问答链路** —— 服务零报错、探针全绿、答得"像那么回事"。
-    没有这个指标，`AgentLinkDegraded` 告警就永远不会响。
-
-    ⚠️ `disabled` 必须**不**计入：主动关掉开关是运维的意图，把它也报警会让
-    每一次合法的灰度关闭都变成一条 critical。
-
-    ⚠️ 2026-10-02：`classify_failed` 已随**内容分诊**一起删除（入口不再有
-    "判定作品还是说明"那次模型调用）。现在传进来的只可能是三种持续不可用
-    + `ready`，所以这一组只剩"白名单内 / 白名单外"两种走向。
-    """
-    from app import main as app_main
-    from app import metrics
-
-    metrics.reset()
-    app_main._record_agent_route("module_unavailable")
-    app_main._record_agent_route("runtime_not_ready")
-    app_main._record_agent_route("disabled")     # 主动关的 ⇒ 不计
-    app_main._record_agent_route("ready")        # 正常 ⇒ 不计
-    app_main._record_agent_route("")             # 空 ⇒ 不计
-
-    assert metrics.value("agent_unavailable_total", reason="module_unavailable") == 1
-    assert metrics.value("agent_unavailable_total", reason="runtime_not_ready") == 1
-    assert metrics.value("agent_unavailable_total", reason="disabled") == 0
-    assert metrics.value("agent_unavailable_total", reason="ready") == 0
+    assert metrics.value("agent_handoff_total", src="a", dst="b") == 0
+    assert metrics.histogram_count("agent_tool_calls") == 0
 
 
 # --------------------------------------------------------------------------- #

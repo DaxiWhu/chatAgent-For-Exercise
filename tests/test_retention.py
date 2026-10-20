@@ -156,37 +156,19 @@ def test_remove_of_unknown_record_is_false():
 
 # ---------------- DELETE 端点 ----------------
 
-class _FakeGraph:
-    """假图：只记录 `checkpointer.adelete_thread` 是否被调用。
+class _FakeStore:
+    """假运行现场仓库：只记录 `drop(thread_id)` 被调了几次。
 
-    ⚠️ 删除接口挂在 **`graph.checkpointer`** 上，不是图上 —— 这是
-    langgraph 的结构（`graph` 是编译产物，saver 在它的属性里）。
-    第一次写本文件时把方法直接放在图上，于是端点拿不到删除接口、
-    静默返回 `checkpoints: False`，用例因此变红。
+    ⚠️ 删除接口挂在 **`run_store`** 上（`app/runs.py`），不是执行图上。
+    快照里含整段历史，所以"删干净"必须包含它。
     """
 
     def __init__(self):
-        self.deleted: list[str] = []
-        self.checkpointer = self          # 省一层，方法名与真实结构一致
+        self.dropped: list[str] = []
 
-    async def astream(self, incoming, config, stream_mode):   # pragma: no cover
-        yield None, {}
-
-    async def aget_state(self, config):                       # pragma: no cover
-        raise AssertionError("DELETE 不应读会话状态")
-
-    async def adelete_thread(self, thread_id):
-        self.deleted.append(thread_id)
-
-
-class _SyncOnlyCheckpointer:
-    """只有同步 `delete_thread` 的 saver（内存后端就是这样）。"""
-
-    def __init__(self):
-        self.deleted: list[str] = []
-
-    def delete_thread(self, thread_id):
-        self.deleted.append(thread_id)
+    def drop(self, thread_id):
+        self.dropped.append(thread_id)
+        return True
 
 
 @pytest.fixture()
@@ -221,7 +203,7 @@ def test_delete_removes_all_four_kinds_of_data(monkeypatch, open_limits, fake_hi
     之后还完整留着用户说过的每一句与助手产出过的每一段 —— 而接口告诉调用方"已删除"。
     这条用例的意义正是"缺一类都不算删干净"，所以它断的是**完整的四键**而不是只看子集。
     """
-    fake = _FakeGraph()
+    fake = _FakeStore()
     q = ReviewQueue(enabled=True)
     reg = SessionRegistry(enabled=True)
 
@@ -231,7 +213,7 @@ def test_delete_removes_all_four_kinds_of_data(monkeypatch, open_limits, fake_hi
     # 属主判定为假 ⇒ 403（实测踩到：日志里是 `owner=acme/ requester=acme/tester`）。
     reg.claim("del-1", "acme", TEST_USER)
 
-    monkeypatch.setattr(M, "graph", fake)
+    monkeypatch.setattr(M, "run_store", fake)
     monkeypatch.setattr(M, "_REVIEW_QUEUE", q)
     monkeypatch.setattr(M, "_SESSIONS", reg)
 
@@ -241,29 +223,12 @@ def test_delete_removes_all_four_kinds_of_data(monkeypatch, open_limits, fake_hi
     r = client.delete("/v1/sessions/del-1", headers=auth_headers(tenant="acme"))
     assert r.status_code == 200
     body = r.json()
-    assert body["deleted"] == {"checkpoints": True, "agent_history": True,
+    assert body["deleted"] == {"run_state": True, "agent_history": True,
                                "review": True, "ownership": True}
-    assert fake.deleted == ["del-1"]
+    assert fake.dropped == ["del-1"]
     assert fake_history_delete == ["del-1"], "agent 侧的跨轮历史没有被删（或用了别的 id）"
     assert q.record("del-1") is None
     assert reg.owner_of("del-1") is None
-
-
-def test_delete_uses_sync_delete_when_async_is_absent(monkeypatch, open_limits):
-    """同步 saver 只有 `delete_thread` —— 必须走它，不能"什么都不删还报成功"。
-
-    按方法名探测（而不是 `isinstance`）就是为了这个：内存后端与 PG 后端的
-    方法名不同，漏一边的后果是"用户以为删了、数据还在"。
-    """
-    cp = _SyncOnlyCheckpointer()
-    monkeypatch.setattr(M, "graph", type("G", (), {"checkpointer": cp})())
-    monkeypatch.setattr(M, "_REVIEW_QUEUE", ReviewQueue(enabled=True))
-    monkeypatch.setattr(M, "_SESSIONS", SessionRegistry(enabled=False))
-
-    r = client.delete("/v1/sessions/sync-1")
-    assert r.status_code == 200
-    assert r.json()["deleted"]["checkpoints"] is True
-    assert cp.deleted == ["sync-1"]
 
 
 def test_delete_is_forbidden_for_another_tenant(monkeypatch, open_limits):
@@ -275,7 +240,7 @@ def test_delete_is_forbidden_for_another_tenant(monkeypatch, open_limits):
     reg = SessionRegistry(enabled=True)
     reg.claim("other-1", "acme")
     monkeypatch.setattr(M, "_SESSIONS", reg)
-    monkeypatch.setattr(M, "graph", _FakeGraph())
+    monkeypatch.setattr(M, "run_store", _FakeStore())
 
     # 以**另一个租户的身份**发起。⚠️ 必须签一张 globex 的令牌，不能只带
     # `X-Tenant-Id: globex` —— 后者会被"自报与令牌不符"当场 403，于是这条用例
@@ -300,11 +265,11 @@ def test_delete_is_idempotent_in_single_tenant_mode(monkeypatch, open_limits,
     """
     monkeypatch.setattr(M, "_SESSIONS", SessionRegistry(enabled=False))
     monkeypatch.setattr(M, "_REVIEW_QUEUE", ReviewQueue(enabled=True))
-    monkeypatch.setattr(M, "graph", _FakeGraph())
+    monkeypatch.setattr(M, "run_store", _FakeStore())
 
     r = client.delete("/v1/sessions/no-such-session")
     assert r.status_code == 200
-    assert r.json()["deleted"] == {"checkpoints": True, "agent_history": True,
+    assert r.json()["deleted"] == {"run_state": True, "agent_history": True,
                                    "review": False, "ownership": False}
     assert fake_history_delete == ["no-such-session"]
 
@@ -351,8 +316,7 @@ def test_sweep_refuses_without_a_database(sweep, monkeypatch, capsys):
 class _FakeCursor:
     """按 SQL 关键字回应的假游标，用来观察"脚本会执行哪些语句"。"""
 
-    def __init__(self, tables=("session_owners", "review_queue", "checkpoints",
-                               "checkpoint_blobs", "checkpoint_writes"),
+    def __init__(self, tables=("session_owners", "review_queue", "agent_run_state"),
                  has_updated_at=True, counts=7, threads=("t-old",),
                  filter_params=True):
         self.executed: list[tuple[str, object]] = []
@@ -447,15 +411,15 @@ def test_apply_deletes_only_from_the_table_whitelist(sweep, monkeypatch):
     dels = cur.deletes()
     assert dels, "apply 没有执行任何删除"
 
-    allowed = set(sweep.CHECKPOINT_TABLES) | {"review_queue", "session_owners"}
+    allowed = set(sweep.RUN_STATE_TABLES) | {"review_queue", "session_owners"}
     for sql in dels:
         table = sql.split()[2]
         assert table in allowed, f"删除了白名单之外的表：{table}"
-    # 三张检查点表都必须被真正删到（只删 `checkpoints` 会留下一堆孤儿 blob 行）：
-    # langgraph 把状态分散在 checkpoints / checkpoint_blobs / checkpoint_writes 里。
+    # 运行现场那张表必须被真正删到。漏了它的后果不是报错，而是"表只增不减" ——
+    # 每一份现场都含整段历史，容量告警会在几个月后才来，且查不到是谁占的。
     touched = {sql.split()[2] for sql in dels}
-    assert set(sweep.CHECKPOINT_TABLES) <= touched, (
-        f"检查点清理没有覆盖全部三张表，实际碰到：{sorted(touched)}"
+    assert set(sweep.RUN_STATE_TABLES) <= touched, (
+        f"运行现场清理没有真的碰到表，实际碰到：{sorted(touched)}"
     )
 
 
@@ -470,10 +434,10 @@ def test_sweep_stays_inside_the_whitelist_even_if_the_query_over_returns(
     只会**删多**。
 
     （这不是假设：本文件第一版就是这样红的 —— 脚本试图 `DELETE FROM review_queue`
-    并用它去索引 `checkpoints` 计数，直接 KeyError。测试先于真实事故发现了它。）
+    并用它去索引白名单计数，直接 KeyError。测试先于真实事故发现了它。）
     """
     cur = _FakeCursor(
-        tables=("checkpoints", "checkpoint_blobs", "checkpoint_writes",
+        tables=("agent_run_state",
                 "rag_chunks", "session_owners", "review_queue"),   # rag_chunks 是诱饵
         filter_params=False)
     _with_fake_db(sweep, monkeypatch, cur)
@@ -486,7 +450,7 @@ def test_sweep_stays_inside_the_whitelist_even_if_the_query_over_returns(
         "白名单收口失效：脚本删到了一张与保留策略无关的表（这里是向量表）——\n"
         "删表不会报错，只会让检索数据静默消失。"
     )
-    assert touched <= set(sweep.CHECKPOINT_TABLES) | {"review_queue", "session_owners"}
+    assert touched <= set(sweep.RUN_STATE_TABLES) | {"review_queue", "session_owners"}
 
 
 def test_missing_updated_at_column_is_reported_not_silently_skipped(sweep, monkeypatch, capsys):
@@ -517,7 +481,7 @@ AGENT_HISTORY_TABLES = ("agent_sessions", "agent_messages")
 def _cur_with_agent_history(sweep):
     """假游标，表清单里**含** agent 两表 —— 这是它们在真实库里的样子。"""
     return _FakeCursor(tables=("session_owners", "review_queue",
-                               *sweep.CHECKPOINT_TABLES, *AGENT_HISTORY_TABLES))
+                               *sweep.RUN_STATE_TABLES, *AGENT_HISTORY_TABLES))
 
 
 def test_agent_history_is_never_deleted_even_with_an_explicit_window(
@@ -551,10 +515,9 @@ def test_agent_history_is_never_deleted_even_with_an_explicit_window(
 
 def test_agent_history_tables_are_declared_outside_the_cleanup_whitelist(sweep):
     """两份常量必须**互不重叠** —— 叠上就意味着有人把历史塞进了清理名单。"""
-    assert set(sweep.AGENT_HISTORY_TABLES).isdisjoint(sweep.CHECKPOINT_TABLES)
+    assert set(sweep.AGENT_HISTORY_TABLES).isdisjoint(sweep.RUN_STATE_TABLES)
     # `sweep()` 里能被删的表就是这两组 + 归属表 + 审核队列，没有别的来源。
-    assert set(sweep.CHECKPOINT_TABLES) == {"checkpoints", "checkpoint_blobs",
-                                            "checkpoint_writes"}
+    assert set(sweep.RUN_STATE_TABLES) == {"agent_run_state"}
 
 
 def test_agent_history_is_reported_as_untouched(sweep, monkeypatch, capsys):

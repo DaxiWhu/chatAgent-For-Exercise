@@ -15,16 +15,13 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 
 from src import observability
 from src.agents import fallback as F
-from src.agents import runner as R
 from src.agents.context import TaskContext
 from src.agents.steps import ToolStep
-from tests._agents_testkit import ScriptedModel, call, decide, make_ctx
 
 
 class _Sink:
@@ -94,10 +91,16 @@ def test_row2_off_track_is_manual_and_business():
     assert (v.outcome, v.reason, v.category) == (F.MANUAL, "off_track", F.BUSINESS)
 
 
-def test_row3_review_failed_is_manual_and_business():
-    """③ 评审不过 ⇒ 转人工（今天已经是这样，这条把它接进同一张表）。"""
+def test_review_failed_is_not_in_the_table_at_all():
+    """★ 评审结论**不进这张表**（2026-10-19 删掉的那一行）。
+
+    评审是模型自己调的工具，结论是过程内反馈；用户要求「让模型自己决定是否收尾、
+    是否启用评分」，所以"评了没过"不能再变成一次转人工。有产出 ⇒ 正常交付，
+    指标上靠 ``agent_runs_total{exit_reason="review_failed"}`` 看见比例即可。
+    """
     v = _decide(_ctx(), "review_failed", answer="草稿")
-    assert (v.outcome, v.reason, v.category) == (F.MANUAL, "review_failed", F.BUSINESS)
+    assert (v.outcome, v.reason, v.category) == (F.DELIVERED, "none", "")
+    assert v.is_fallback is False
 
 
 @pytest.mark.parametrize("reason", ["input_guardrail", "output_guardrail"])
@@ -236,198 +239,117 @@ def test_a_step_with_an_unexpected_status_still_lands_in_the_list():
 
 
 # --------------------------------------------------------------------------- #
-# 翻译成 state（`src/graph.py::_verdict_state`）
+# 翻译成 SSE 事件（`app.main._stream_run`）
 # --------------------------------------------------------------------------- #
-def _outcome(verdict, *, exit_reason="passed", answer="草稿", draft=""):
-    return SimpleNamespace(
-        fallback=verdict, exit_reason=exit_reason, answer=answer, fallback_draft=draft
+# 判定表本身在 `src/agents/fallback.py`，它只回答"这一轮算哪一档"。**同一份结论
+# 怎么让用户感知到**是接口层的事，且只剩一个出口：SSE 事件。所以这一节直接跑
+# `_stream_run`，断言客户端**真的收到了什么** —— 而不是某个中间对象长什么样。
+def _outcome_for(ctx, *, exit_reason: str, answer: str, review_reason: str = ""):
+    """按运行器的口径造一个结果（verdict 由同一张表算出来，不手抄结论）。"""
+    from src.agents.runner import TaskOutcome
+
+    verdict = F.decide(ctx, exit_reason=exit_reason, answer=answer)
+    return TaskOutcome(
+        answer=answer,
+        attempts=1,
+        final_agent="frontline_agent",
+        passed=verdict.outcome in (F.DELIVERED, F.PARTIAL),
+        exit_reason=exit_reason,
+        fallback=verdict,
+        review_reason=review_reason,
     )
 
 
-def _state_of(verdict, **kw):
-    from src import graph as G
+def _fake_turn(outcome, *, stream=None):
+    """替身运行：`stream` 是"边产边交出去"的那些片段（None = 整段返回）。"""
 
-    return G._verdict_state(_outcome(verdict, **kw), {}, TaskContext())
+    async def _run(req, *, context, on_text=None):
+        if on_text is not None and stream is not None:
+            for chunk in stream:
+                await on_text(chunk, "call-1")
+        return outcome
+
+    return _run
 
 
-def test_delivered_falls_through_to_the_normal_delivery():
-    """`delivered` / `partial` ⇒ 返回 `None`（照常交付），由调用方那段公共块处理。"""
-    assert _state_of(_decide(_ctx(), "passed", "答复")) is None
-    assert _state_of(_decide(_ctx(kinds={"loop": 1}), "passed", "答复")) is None
+def _events(monkeypatch, *, outcome, stream=None, thread_id="fb-1"):
+    import app.main as M
+
+    monkeypatch.setattr(M, "run_turn", _fake_turn(outcome, stream=stream))
+    gen = M._stream_run(M.TurnRequest(prompt="hi", thread_id=thread_id), "chat")
+
+    async def _run():
+        return [ev async for ev in gen]
+
+    return asyncio.run(_run())
 
 
-def test_manual_scores_below_the_threshold_so_the_existing_branch_sends_it_to_human():
-    """★★ 转人工**不改条件边**，靠"分数低于阈值"这一个既有杠杆表达。
+def _names(events) -> list[str]:
+    return [ev["event"] for ev in events]
 
-    这条钉的是"判据只有一处"：一旦有人给 `route_agent_review` 加一个"兜底"分支，
-    同一个"该不该人看"就有了两处判据，改一处必漏另一处。
+
+def test_delivered_emits_no_task_outcome_event(monkeypatch):
+    """正常交付**只发正文**，不带任何兜底字段（客户端少一种分支）。
+
+    这也是"delivered 不是一种结局"的落点：它是"没出问题"，不该在事件里出现。
     """
-    from src.graph import HIGH
+    out = _outcome_for(_ctx(steps=[_ok(1)]), exit_reason="passed", answer="答复")
+    events = _events(monkeypatch, outcome=out, stream=["答复"])
 
-    verdict = _decide(_ctx(kinds={"off_track": 1}), "passed", answer="跑偏的内容")
-    state = _state_of(verdict, answer="跑偏的内容")
-
-    assert state["score"] < HIGH
-    assert state["is_need_evaluate"] is True
-    assert "force_exit" not in state, "转人工不是强制收尾，否则永远到不了 human_review"
-    assert state["output"] == "跑偏的内容", "草稿要带给审核人"
-    assert state["task_outcome"] == F.MANUAL
-    assert state["fallback_reason"] == "off_track"
+    assert _names(events) == ["token", "done"]
+    assert "task_outcome" not in _names(events)
 
 
-def test_manual_feedback_tells_the_reviewer_why_and_what_is_left():
-    """决策 13：原因 + 未完成清单一起带给审核人（走已有的 `feedback`，不加列）。"""
-    ctx = _ctx(steps=[_bad(2)], kinds={"off_track": 1})
-    from src import graph as G
+def test_failed_emits_task_outcome_and_no_body(monkeypatch):
+    """系统类失败 ⇒ 没有正文，但必须给一个**明确的结局**。
 
-    state = G._verdict_state(
-        _outcome(_decide(ctx, "passed", "跑偏的内容")), {}, ctx
-    )
-    assert state["feedback"].startswith("[系统] 兜底转人工：")
-    assert "偏离了用户的要求" in state["feedback"]
-    assert "未完成：第 2 步 kb_search（failed）。" in state["feedback"]
-
-
-def test_manual_keeps_feedback_source_ai():
-    """★★ `feedback_source` 必须是 `ai`。
-
-    写成 `human` 的后果：下一轮 `_agent_context` 会把这段**系统原因**当成
-    "人工打回的意见"送进模型 —— 模型于是收到一句不是人说的话。
+    只发 `done` 的话，用户看到的是"零 token + 结束"，与"模型什么都没说"分不开；
+    `task_outcome` 里的 reason 才是"为什么这一轮没有正文"的答案。
     """
-    state = _state_of(_decide(_ctx(kinds={"off_track": 1}), "passed", "草稿"))
-    assert state["feedback_source"] == "ai"
+    out = _outcome_for(_ctx(), exit_reason="error", answer="")
+    events = _events(monkeypatch, outcome=out)
+
+    assert "token" not in _names(events), "没产出却发了正文"
+    payload = [ev for ev in events if ev["event"] == "task_outcome"][0]["data"]
+    assert '"outcome": "failed"' in payload or '"outcome":"failed"' in payload
+    assert "error" in payload
 
 
-def test_the_draft_for_a_guarded_run_is_the_guarded_content():
-    """护栏那两条**没有产出** ⇒ 草稿要用"被拦下的那段内容"（决策 8 的实现）。"""
-    state = _state_of(
-        _decide(_ctx(), "input_guardrail"), exit_reason="input_guardrail", draft="用户那句请求"
-    )
-    assert state["output"] == "用户那句请求"
+def test_partial_delivers_the_body_and_flags_it(monkeypatch):
+    """轻档：**正文照常交付**，问题信号走结构化事件（不进正文）。
 
-
-def test_failed_keeps_a_visible_ending_and_forces_the_exit():
-    """`failed` ⇒ 不交本次产出（说明里没有它）、但要给用户一个明确结局。
-
-    留空答复的后果写在 `app/main.py` 的注释里：客户端收到"零 token + done"，
-    与"模型什么都没说"分不开。
+    停止 ≠ 不交东西。把已经做出来的那部分扣下不给，用户会以为整轮白跑了；
+    但也不能不说 —— 否则"只做了一半"与"全做完了"在客户端看来一模一样。
     """
-    from src.graph import ERROR_REPORT
+    ctx = _ctx(kinds={"loop": 3})
+    out = _outcome_for(ctx, exit_reason="passed", answer="做完的那部分")
+    events = _events(monkeypatch, outcome=out, stream=["做完的那部分"])
 
-    state = _state_of(_decide(_ctx(), "error"), exit_reason="error")
-    assert state["output"] == ERROR_REPORT
-    assert state["force_exit"] is True
-    assert state["is_need_evaluate"] is False
-
-
-def test_the_partial_notice_goes_into_the_body_only():
-    """轻档：正文多一句提醒；清单走结构化字段（正文不铺开）。"""
-    from src import graph as G
-
-    text = G._with_partial_notice("做完的那部分")
-    assert text.startswith("做完的那部分")
-    assert "部分结果" in text
-    assert len(text.splitlines()) == 3, "只加一句，不铺开清单"
+    assert _names(events)[0] == "token"
+    payload = [ev for ev in events if ev["event"] == "task_outcome"][0]["data"]
+    assert '"partial"' in payload or "partial" in payload
+    assert "loop" in payload
 
 
-def test_delivered_carries_no_fallback_fields():
-    """正常交付不在 state 上留下"有过兜底"的痕迹（否则前端每轮都要多判一次）。"""
-    from src import graph as G
+def test_manual_parks_the_draft_instead_of_showing_it(monkeypatch):
+    """★★ 转人工的内容**不是给用户的**：一个字都不许以 token 发出去。
 
-    assert G._verdict_fields(_decide(_ctx(), "passed", "答复")) == {}
-
-
-# --------------------------------------------------------------------------- #
-# 指标（唯一上报点）
-# --------------------------------------------------------------------------- #
-def test_report_counts_the_outcome_and_carries_the_agent_label(sink):
-    """★ 每次运行都要有 outcome，而且**必须带 agent 标签**（一次请求 = N 次运行）。"""
-    F.report(_decide(_ctx(), "passed", "答复"), exit_reason="passed", agent="frontline_agent")
-
-    assert sink.names("agent_task_outcome_total") == [
-        {"outcome": F.DELIVERED, "agent": "frontline_agent"}
-    ]
-    assert sink.names("agent_fallback_total") == [], "正常交付不是兜底"
-
-
-def test_report_only_counts_a_fallback_when_there_is_one(sink):
-    """兜底才计 `agent_fallback_total`，且 reason 是有限枚举（可做标签）。"""
-    F.report(
-        _decide(_ctx(), "error"), exit_reason="error", agent="frontline_agent"
-    )
-    assert sink.names("agent_fallback_total") == [
-        {"reason": "error", "agent": "frontline_agent"}
-    ]
-
-
-# --------------------------------------------------------------------------- #
-# 真跑一次：接线（不只是纯函数）
-# --------------------------------------------------------------------------- #
-def test_a_real_run_reaches_the_table(tmp_path):
-    """★ 真跑一次 `run_agent`：`fallback` 必须被填上（否则图那两处收尾读不到结论）。"""
-    ctx = make_ctx(tmp_path)
-    out = asyncio.run(
-        R.run_agent(
-            R.ENTRY_AGENT,
-            prompt="限流怎么算？",
-            context=ctx,
-            model=ScriptedModel([decide("答复。")]),
-        )
-    )
-    assert out.fallback is not None
-    assert out.fallback.outcome == F.DELIVERED
-
-
-def test_a_real_run_skips_the_table_for_a_handoff(tmp_path):
-    """转交那一步**不进表**：它没有交付物，进表会让每次正常转交都落进"没产出"。"""
-    ctx = make_ctx(tmp_path)
-    out = asyncio.run(
-        R.run_agent(
-            R.ENTRY_AGENT,
-            prompt="写个开场",
-            context=ctx,
-            model=ScriptedModel([decide("", action="transfer")]),
-        )
-    )
-    assert out.exit_reason == "transfer"
-    assert out.fallback is None
-
-
-def test_the_third_level_stop_becomes_guard_stop_and_is_not_a_crash(tmp_path, monkeypatch):
-    """★★ 第 3 级从注入口抛出 ⇒ `exit_reason="guard_stop"`，**不是** `error`。
-
-    这条同时钉住三件事：
-    ① 异常能穿过 SDK 冒到 `run_agent`（`tmp_probe/probe_guard_stop.py` 的实测）；
-    ② 它被**专用捕获**接住，没被 `except Exception` 吞成"崩溃"（那会让运维去查
-       一个不存在的故障）；
-    ③ 模型**少跑一轮**（抛出即中断，不是"跑完再说"）。
+    顺序在这里就是语义：先判"要不要人审"，再决定补不补正文。反过来的话，
+    待审草稿会先发给用户、然后才收到"待审核" —— "不交半成品"就只写在文档里。
     """
-    real = R.reflection.inject_reflections
-    seen = {"n": 0}
+    import app.main as M
+    from app.review_queue import ReviewQueue
 
-    async def stop_on_second(data, *, context=None):  # noqa: ANN001
-        seen["n"] += 1
-        if seen["n"] == 2:
-            if getattr(context, "reflection", None) is not None:
-                context.reflection.stopped = "capped"
-            raise R.reflection.AgentStoppedByGuard("capped")
-        return await real(data, context=context)
+    q = ReviewQueue(dsn="")
+    monkeypatch.setattr(M, "_REVIEW_QUEUE", q)
 
-    monkeypatch.setattr(R.reflection, "inject_reflections", stop_on_second)
+    out = _outcome_for(_ctx(kinds={"off_track": 1}), exit_reason="passed",
+                       answer="跑偏的内容", review_reason="manual")
+    events = _events(monkeypatch, outcome=out, thread_id="fb-manual")
 
-    ctx = make_ctx(tmp_path)
-    model = ScriptedModel(
-        [
-            call("save_text_asset", {"name": "稿", "content": "第一版。"}, "c1"),
-            decide("答复。"),
-        ]
-    )
-    out = asyncio.run(
-        R.run_agent(R.ENTRY_AGENT, prompt="写个开场", context=ctx, model=model)
-    )
-
-    assert out.exit_reason == "guard_stop"
-    assert out.error == "", "被当成崩溃了（专用捕获没排在 except Exception 之前）"
-    assert len(model.calls) == 1, "抛出没有拦住后续的模型调用"
-    assert out.fallback is not None
-    assert (out.fallback.outcome, out.fallback.reason) == (F.FAILED, "guard_stop")
+    assert "token" not in _names(events), "待审内容被当成正文发出去了"
+    need = [ev for ev in events if ev["event"] == "need_review"]
+    assert need, "没有下发 need_review —— 客户端永远弹不出审核界面"
+    assert "跑偏的内容" in need[0]["data"]
+    # 队列里真的躺着这条（即使此刻没有人在线，内容也不能消失）
+    assert q.record("fb-manual") is not None

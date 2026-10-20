@@ -34,7 +34,7 @@ from src.agents import approval as A
 from src.agents import fallback as F
 from src.agents import runner as R
 from src.agents.context import TaskContext
-from src.agents.tools import save_text_asset
+from src.agents.tools import deliver, save_text_asset
 from tests._agents_testkit import ScriptedModel, call, make_ctx, say
 
 #: 安全探针被真正执行了几次（工具函数内部打点 ＝ 唯一可信证据）。
@@ -297,3 +297,146 @@ def test_a_real_run_reports_the_awaiting_outcome(monkeypatch, tmp_path, sink):
     outcomes = sink.names("agent_task_outcome_total")
     assert outcomes and outcomes[0]["outcome"] == "awaiting"
     assert outcomes[0]["agent"] == "审批测试", "每运行一次类指标必须带 agent 标签"
+
+
+# --------------------------------------------------------------------------- #
+# 第四组：交付审核（2026-10-20 从图里的 ``human_review`` 节点搬过来）
+#
+# 为什么这群断言必须单独存在：触发条件变了 —— 从"运行**结束后**由判定表判
+# （跑偏 / 护栏拦下）"变成"模型在**交付那一刻**自己声明"。旧守卫一条都不会红，
+# 而线上的两种失败都不报错：该审的没审（直接直出）、或者每句话都在等审批。
+# --------------------------------------------------------------------------- #
+def _delivery_agent() -> Agent:
+    """只带交付工具的最小 agent（交付审核与落盘审批是两条独立的路）。"""
+    return Agent(name="交付测试", instructions="交付即可。", tools=[deliver])
+
+
+def test_delivery_without_review_does_not_stop(tmp_path):
+    """★ 模型不要求审 ⇒ 毫不停顿，而且**答复取自交付的正文**。
+
+    后半句守的是 ``runner`` 的取值顺序：模型交完之后通常还会补一句"已交付"，
+    若答复取 ``final_output``，用户收到的就是那三个字，而不是正文。
+    """
+    ctx = make_ctx(tmp_path)
+    model = ScriptedModel(
+        [
+            call("deliver", {"content": "这是正文", "needs_review": False}, "d1"),
+            say("已交付"),
+        ]
+    )
+
+    out = asyncio.run(
+        R.run_agent(_delivery_agent(), prompt="写一段", context=ctx, model=model)
+    )
+
+    assert out.exit_reason != "awaiting_approval"
+    assert out.answer == "这是正文", "答复必须取交付的正文，不是模型之后那句补白"
+
+
+def test_delivery_can_ask_for_review_and_stops(tmp_path):
+    """★ 模型声明要人看 ⇒ 停在**交付那一刻**，现场带回来，正文还没交出去。"""
+    ctx = make_ctx(tmp_path)
+    model = ScriptedModel(
+        [
+            call("deliver", {"content": "敏感正文", "needs_review": True}, "d1"),
+            say("已交付"),
+        ]
+    )
+
+    out = asyncio.run(
+        R.run_agent(_delivery_agent(), prompt="写一段", context=ctx, model=model)
+    )
+
+    assert out.exit_reason == "awaiting_approval"
+    assert [a.tool for a in out.approvals] == ["deliver"]
+    assert out.run_snapshot, "要能接着跑，就必须把现场带回来"
+    assert out.answer == ""
+    assert "delivery" not in ctx.delivered, "被拦下的交付不该已经记进上下文"
+
+
+def test_approving_delivery_delivers_the_reviewed_text(tmp_path):
+    """★ 同意 ⇒ 接着跑 ⇒ 交付真的发生，答复就是人看过的那段正文。"""
+    ctx = make_ctx(tmp_path)
+    first = ScriptedModel(
+        [
+            call("deliver", {"content": "敏感正文", "needs_review": True}, "d1"),
+            say("已交付"),
+        ]
+    )
+    out = asyncio.run(
+        R.run_agent(_delivery_agent(), prompt="写一段", context=ctx, model=first)
+    )
+    assert out.exit_reason == "awaiting_approval"
+
+    resumed = ScriptedModel([say("已交付")])
+    out2 = asyncio.run(
+        R.run_agent(
+            _delivery_agent(),
+            prompt="",
+            context=ctx,
+            model=resumed,
+            resume=A.ResumeRequest(snapshot=out.run_snapshot, approved=True),
+        )
+    )
+
+    assert out2.exit_reason != "awaiting_approval"
+    assert out2.answer == "敏感正文"
+
+
+def test_rejecting_delivery_lets_the_model_rewrite(tmp_path):
+    """★ 打回 ≠ 终止：模型收到意见后改稿，**再交一次**就是新正文。
+
+    这条守的是"打回之后还能不能再触发审核"：如果恢复一次之后审批就失效了，
+    这里第二次 ``needs_review=True`` 会直接交付 —— 用户看到的是一份没人看过的改稿。
+    """
+    ctx = make_ctx(tmp_path)
+    first = ScriptedModel(
+        [
+            call("deliver", {"content": "初稿", "needs_review": True}, "d1"),
+            say("已交付"),
+        ]
+    )
+    out = asyncio.run(
+        R.run_agent(_delivery_agent(), prompt="写一段", context=ctx, model=first)
+    )
+
+    resumed = ScriptedModel(
+        [
+            call("deliver", {"content": "改后", "needs_review": False}, "d2"),
+            say("已交付"),
+        ]
+    )
+    out2 = asyncio.run(
+        R.run_agent(
+            _delivery_agent(),
+            prompt="",
+            context=ctx,
+            model=resumed,
+            resume=A.ResumeRequest(
+                snapshot=out.run_snapshot, approved=False, reason="太生硬"
+            ),
+        )
+    )
+
+    assert out2.exit_reason != "awaiting_approval"
+    assert out2.answer == "改后"
+
+
+def test_delivery_review_ignores_the_write_switch(monkeypatch, tmp_path):
+    """★ 交付审核**不受** ``AGENT_TOOL_APPROVAL`` 约束（刻意如此）。
+
+    那个开关管的是"落盘动作要不要拦"；交付审核是**模型自己请求**的，模型不声明时
+    行为完全不变，所以它没有"默认改变了行为"的问题。若把它也挂到开关上，
+    默认关就等于这个能力在生产上从不存在 —— 而且不会有任何提示。
+    """
+    monkeypatch.setenv("AGENT_TOOL_APPROVAL", "0")
+    ctx = make_ctx(tmp_path)
+    model = ScriptedModel(
+        [call("deliver", {"content": "x", "needs_review": True}, "d1"), say("ok")]
+    )
+
+    out = asyncio.run(
+        R.run_agent(_delivery_agent(), prompt="写一段", context=ctx, model=model)
+    )
+
+    assert out.exit_reason == "awaiting_approval"

@@ -25,7 +25,7 @@ load_dotenv(".env")
 logging.basicConfig(level=logging.INFO, format="   %(levelname)s %(message)s")
 
 import src.rag.retrieval as R  # noqa: E402
-from src.graph import DOCS_DIR  # noqa: E402
+from src.rag.pool import DOCS_DIR  # noqa: E402
 
 
 def db_report(dsn, table):

@@ -24,46 +24,41 @@ from src.rag.resilience import CLOSED, HALF_OPEN, OPEN, CircuitBreaker, CircuitO
 
 
 # ---------------------------------------------------------------------------
-# 驱动 `_stream_graph` 的最小假图（不碰模型、不碰检查点）
+# 驱动 `_stream_run` 的最小假运行（不碰模型、不碰数据库）
 # ---------------------------------------------------------------------------
-class _Msg:
-    def __init__(self, content):
-        self.content = content
+class _FakeTurn:
+    """替身运行：`chunks` 逐段交给 `on_text`；`answer` 是整段返回的正文。
+
+    `chunks=()` 且 `answer` 非空 = **整段返回**（模型一个 token 都没流式发出），
+    这正是 `mode="buffered"` 那一档的判据来源。
+    """
+
+    def __init__(self, chunks=(), answer=""):
+        self.chunks = list(chunks)
+        self.answer = answer
+
+    async def __call__(self, req, *, context, on_text=None):
+        from src.agents.runner import TaskOutcome
+
+        if on_text is not None:
+            for chunk in self.chunks:
+                await on_text(chunk, "call-1")
+        return TaskOutcome(answer=self.answer, attempts=1,
+                           final_agent="frontline_agent", passed=True,
+                           exit_reason="passed")
 
 
-class _FakeStream:
-    def __init__(self, items):
-        self._items = list(items)
-        self.closed = False
+def _run(monkeypatch, turn, *, budget=None, thread_id="m-1"):
+    import app.main as M
 
-    def __aiter__(self):
-        return self
+    monkeypatch.setattr(M, "run_turn", turn)
+    gen = M._stream_run(M.TurnRequest(prompt="hi", thread_id=thread_id), "chat",
+                        budget=budget)
 
-    async def __anext__(self):
-        if not self._items:
-            raise StopAsyncIteration
-        return self._items.pop(0), {}
+    async def _go():
+        return [ev async for ev in gen]
 
-    async def aclose(self):
-        self.closed = True
-
-
-class _FakeState:
-    def __init__(self, values, next_=()):
-        self.values = values
-        self.next = next_
-
-
-class _FakeGraph:
-    def __init__(self, items, values=None, next_=()):
-        self._stream = _FakeStream(items)
-        self._state = _FakeState(values or {}, next_)
-
-    def astream(self, incoming, config=None, stream_mode=None):
-        return self._stream
-
-    async def aget_state(self, config):
-        return self._state
+    return asyncio.run(_go())
 
 
 def _collect(agen):
@@ -104,9 +99,7 @@ def test_first_token_latency_recorded_once_per_stream(monkeypatch):
     "用户等了多久才看见第一个字"这个唯一含义抹掉。
     """
     metrics.reset()
-    monkeypatch.setattr(M, "graph",
-                        _FakeGraph([_Msg("甲"), _Msg("乙"), _Msg("丙")]))
-    _collect(M._stream_graph({}, {}, "chat"))
+    _run(monkeypatch, _FakeTurn(["甲", "乙", "丙"]))
 
     assert metrics.histogram_count(
         "llm_first_token_seconds", kind="chat", mode="stream") == 1
@@ -122,9 +115,7 @@ def test_buffered_chain_is_recorded_under_a_separate_mode(monkeypatch):
     分档。这条断言钉住"分档"这件事，而不只是"记了"。
     """
     metrics.reset()
-    monkeypatch.setattr(M, "graph",
-                        _FakeGraph([], values={"output": "整段产出"}))
-    _collect(M._stream_graph({}, {}, "chat"))
+    _run(monkeypatch, _FakeTurn(answer="整段产出"))
 
     assert metrics.histogram_count(
         "llm_first_token_seconds", kind="chat", mode="buffered") == 1
@@ -139,8 +130,7 @@ def test_no_output_means_no_first_token_sample(monkeypatch):
     把它算成一次"很快的首字节"会系统性压低这个指标 —— 最需要它的场景被抹平。
     """
     metrics.reset()
-    monkeypatch.setattr(M, "graph", _FakeGraph([]))
-    _collect(M._stream_graph({}, {}, "chat"))
+    _run(monkeypatch, _FakeTurn())
 
     # 用跨标签求和的读法：不带标签的 `histogram_count(name)` 恒为 0，
     # 拿它断言等于什么都没验（埋点整个漏掉也是 0）。
@@ -163,48 +153,10 @@ def test_budget_exhaustion_does_not_count_as_first_token(monkeypatch):
             return False
 
     metrics.reset()
-    monkeypatch.setattr(M, "graph", _FakeGraph([_Msg("甲"), _Msg("乙")]))
-    _collect(M._stream_graph({}, {}, "chat", budget=_Rejecting()))
+    _run(monkeypatch, _FakeTurn(["甲", "乙"]), budget=_Rejecting())
 
     assert metrics.value("llm_budget_exceeded_total") == 1
     assert _count_total("llm_first_token_seconds") == 0
-
-
-# ---------------------------------------------------------------------------
-# 2. 模型调用耗时与失败（主链路）
-# ---------------------------------------------------------------------------
-def test_timed_model_call_records_duration_and_reraises():
-    """耗时照记、异常照抛（观测绝不能改写作答行为）。"""
-    from src import graph as G
-
-    metrics.reset()
-    assert G._timed_model_call("answer", lambda: 42) == 42
-    assert metrics.histogram_count(
-        "llm_call_duration_seconds", stage="answer", via="graph") == 1
-    assert metrics.value("llm_call_errors_total", stage="answer", via="graph") == 0
-    # 失败也记耗时：超时型故障的耗时正是要看的那个数。
-    assert metrics.histogram_count(
-        "llm_call_duration_seconds", stage="answer", via="graph") == 1
-
-    def boom():
-        raise RuntimeError("upstream 500")
-
-    with pytest.raises(RuntimeError):
-        G._timed_model_call("revise", boom)
-    assert metrics.value("llm_call_errors_total", stage="revise", via="graph") == 1
-    assert metrics.value("llm_call_errors_total", stage="answer", via="graph") == 0
-
-
-def test_timed_model_call_stages_are_distinct():
-    """三个 stage 必须能分开：默认值（混淆）会让"模型慢"与"评审坏"长得一样。"""
-    from src import graph as G
-
-    metrics.reset()
-    for stage in ("answer", "revise", "evaluate"):
-        G._timed_model_call(stage, lambda: None)
-    for stage in ("answer", "revise", "evaluate"):
-        assert metrics.histogram_count(
-            "llm_call_duration_seconds", stage=stage, via="graph") == 1, stage
 
 
 # ---------------------------------------------------------------------------
@@ -274,63 +226,6 @@ def test_agent_model_wrapper_stream_stays_an_async_iterator(monkeypatch):
     assert asyncio.run(drain()) == ["e1", "e2"]
     assert metrics.histogram_count(
         "llm_call_duration_seconds", stage="step_stream", via="agent") == 1
-
-
-# ---------------------------------------------------------------------------
-# 4. 检查点耗时与失败
-# ---------------------------------------------------------------------------
-def test_checkpointer_timing_keeps_isinstance_and_records_reads():
-    """换类之后仍要满足 langgraph 的 `isinstance(checkpointer, BaseCheckpointSaver)`。
-
-    langgraph 在 `pregel/main.py` 里做了至少 9 处这个判定 —— 过不了就会被当成
-    "没配检查点"而**静默丢掉持久化**，那比不埋指标严重得多。
-    """
-    from langgraph.checkpoint.base import BaseCheckpointSaver
-    from langgraph.checkpoint.memory import InMemorySaver
-
-    cp = M._instrument_checkpointer(InMemorySaver())
-    assert isinstance(cp, BaseCheckpointSaver)
-    assert type(cp).__name__.startswith("Timed")
-
-    metrics.reset()
-    asyncio.run(cp.aget_tuple({"configurable": {"thread_id": "t",
-                                                "checkpoint_ns": ""}}))
-    assert metrics.histogram_count(
-        "checkpoint_duration_seconds", op="get_tuple") == 1
-
-
-def test_checkpointer_timing_counts_failures_and_still_raises():
-    class _Boom:
-        async def aget_tuple(self, config):
-            raise RuntimeError("db down")
-
-        async def aput(self, *a):
-            raise RuntimeError("db down")
-
-        async def aput_writes(self, *a):
-            raise RuntimeError("db down")
-
-    timed = M._instrument_checkpointer(_Boom())
-    metrics.reset()
-    with pytest.raises(RuntimeError):
-        asyncio.run(timed.aget_tuple({}))
-    assert metrics.value("checkpoint_errors_total", op="get_tuple") == 1
-    # 失败也记耗时（否则"卡住"这一类故障就只剩次数、没有量级）。
-    assert metrics.histogram_count(
-        "checkpoint_duration_seconds", op="get_tuple") == 1
-
-
-def test_checkpointer_instrumentation_degrades_instead_of_raising():
-    """接不上指标时必须**原样返回**，而不是把启动带崩。
-
-    这条不是假想：`__class__` 赋值在布局不匹配时就会抛（本项目实测踩到过，
-    当时表现为"服务起来了、检查点指标一条都没有"）。降级是刻意的选择。
-    """
-    class _Sealed:
-        __slots__ = ("x",)
-
-    obj = _Sealed()
-    assert M._instrument_checkpointer(obj) is obj
 
 
 # ---------------------------------------------------------------------------
@@ -641,8 +536,7 @@ def test_online_quality_sampling_is_off_by_default(monkeypatch):
     """默认不采样：它是趋势指标，不需要为它给每个请求加几毫秒。"""
     monkeypatch.setattr(config, "ONLINE_QUALITY_SAMPLE", 0.0)
     metrics.reset()
-    M._maybe_sample_quality({"output": "配置项 `APP_WORKERS` 控制并发",
-                             "context": "`APP_WORKERS` 默认 1"})
+    M._maybe_sample_quality("配置项 `APP_WORKERS` 控制并发", "`APP_WORKERS` 默认 1")
     assert metrics.value("online_answer_judged_total", verdict="pass") == 0
     assert _count_total("online_answer_judged_total") == 0
     assert _count_total("online_answer_hallucinated_total") == 0
@@ -658,19 +552,16 @@ def test_online_quality_sampling_keeps_three_way_verdict(monkeypatch):
     metrics.reset()
 
     # 通过：答案里的标识符在资料里出现过
-    M._maybe_sample_quality({"output": "配置项 `APP_WORKERS` 控制并发",
-                             "context": "`APP_WORKERS` 默认 1"})
+    M._maybe_sample_quality("配置项 `APP_WORKERS` 控制并发", "`APP_WORKERS` 默认 1")
     assert metrics.value("online_answer_judged_total", verdict="pass") == 1
 
     # 失败：标识符在资料里不存在 ⇒ 确凿编造
-    M._maybe_sample_quality({"output": "配置项 `NOPE_KEY` 控制并发",
-                             "context": "`APP_WORKERS` 默认 1"})
+    M._maybe_sample_quality("配置项 `NOPE_KEY` 控制并发", "`APP_WORKERS` 默认 1")
     assert metrics.value("online_answer_judged_total", verdict="fail") == 1
     assert metrics.value("online_answer_hallucinated_total") == 1
 
     # 无从判断：有标识符但**没有资料可核**（检索为空/降级）
-    M._maybe_sample_quality({"output": "配置项 `APP_WORKERS` 控制并发",
-                             "context": ""})
+    M._maybe_sample_quality("配置项 `APP_WORKERS` 控制并发", "")
     assert metrics.value("online_answer_judged_total", verdict="unknown") == 1
     # unknown 不该污染幻觉计数
     assert metrics.value("online_answer_hallucinated_total") == 1
@@ -679,7 +570,7 @@ def test_online_quality_sampling_keeps_three_way_verdict(monkeypatch):
 def test_online_quality_sampling_skips_empty_answer(monkeypatch):
     monkeypatch.setattr(config, "ONLINE_QUALITY_SAMPLE", 1.0)
     metrics.reset()
-    M._maybe_sample_quality({"output": "   ", "context": "x"})
+    M._maybe_sample_quality("   ", "x")
     assert _count_total("online_answer_judged_total") == 0
 
 
@@ -698,7 +589,6 @@ def test_online_quality_sampling_skips_empty_answer(monkeypatch):
 # （所有人都会开始忽略它）。但第二类仍必须**在 alerts.yml 里被提到**：
 # 一个谁都不知道去看的量，和没埋这个点没有区别。
 ALERTED = (
-    "checkpoint_errors_total",
     # 事件循环被同步调用占住 ⇒ 所有并发请求一起停住，而错误率为 0。
     # 这条指标是"卡住了"与"慢"之间唯一的区分手段（见 app/loopwatch.py）。
     "event_loop_lag_seconds",
@@ -721,10 +611,12 @@ ALERTED = (
     # 两者都不影响"任务能不能跑"，所以不会被任何错误率/延迟告警顺带发现。
     "run_control_errors_total",
     "session_message_errors_total",
+    # 该停下来等人审、却没能存下现场 —— 表现是"没审就交付"或"审核台 409"，
+    # 两者都不报错（见 alerts.yml 的 RunStatePersistFailed）。
+    "review_gate_failed_total",
 )
 
 DRILL_ONLY = (
-    "checkpoint_duration_seconds",   # 慢由端到端延迟兜住，这里只用来分诊
     "rag_stage_duration_seconds",    # 整体慢由 rag_retrieval_duration 兜住
     "circuit_opened_total",          # 状态由 circuit_open 兜住，这里是次数
     "circuit_rejected_total",        # 同上：省下了多少次白等
@@ -1020,7 +912,7 @@ def test_new_alert_names_are_registered():
         "RetrievalCircuitOpen",
         "FirstTokenTooSlow",
         "LlmCallErrorsHigh",
-        "CheckpointErrorsHigh",
+        "RunStatePersistFailed",
         "OnlineHallucinationDetected",
         "ReviewWaitTooLong",
         "IdempotencyConflictsHigh",

@@ -1,22 +1,23 @@
-"""生产启动入口 + 事件循环工厂：让异步检查点在 Windows 上也能用。
+"""生产启动入口：参数解析 + 优雅关闭 + 事件循环工厂。
 
-问题是什么
-----------
-`AsyncPostgresSaver`（异步检查点）底层是 psycopg 的**异步**连接，而 psycopg 异步
-**不支持 Windows 的 ProactorEventLoop**，会直接抛：
+⚠️ 事件循环工厂的历史（2026-10-20 更新，别按旧理由改它）
+------------------------------------------------------
+它原本**必须存在**：检查点用的是 `AsyncPostgresSaver`（psycopg 异步），而 psycopg
+异步不支持 Windows 的 ProactorEventLoop —— uvicorn 在 win32 上默认就是 Proactor，
+且 0.36+ 用 `asyncio.run(coro, loop_factory=...)` 直接指定循环、**不再走事件循环
+策略**，所以"导入期 `set_event_loop_policy`"那种常见写法在这里完全无效。
 
-    InterfaceError: Psycopg cannot use the 'ProactorEventLoop' to run in async mode.
+**那个组件已经随编排图一起退役**：现在所有 PG 访问都是同步 psycopg + 工作线程
+（见 `app/pg.py` 的「为什么是同步池」），没有任何 psycopg 异步调用。因此
+`loop_factory` 不再是硬要求，只剩两层作用：
 
-而 uvicorn **在 win32 且不带子进程时，是刻意选 Proactor 的**（见
-`uvicorn.loops.asyncio:asyncio_loop_factory`）；更麻烦的是 uvicorn 0.36+ 改用
-`asyncio.run(coro, loop_factory=...)` 直接指定循环，**不再走事件循环策略** ——
-所以"在导入期 `set_event_loop_policy`"这类常见写法在 uvicorn 下**完全无效**
-（实测：导入时已存在运行中的 loop，且策略切换被 loop_factory 绕过）。
+  1. Linux/macOS 上顺手用上 uvloop（装了就用，性能更好）；
+  2. win32 上仍返回 `SelectorEventLoop` —— 保守选择，避免"某个库在 Proactor 上
+     行为不同"这类不可预测的差异被引进一次启动路径变更里。
 
-怎么解决
---------
-uvicorn 支持自定义工厂：`--loop <模块:函数>`。本模块导出 `loop_factory`，
-win32 一律返回 `SelectorEventLoop`，其它平台保留 uvloop（有则用，性能更好）。
+要不要删掉它、改回裸 `uvicorn app.main:app`：**等有人愿意同步改 Dockerfile、
+compose、CI 与 RUNBOOK 的启动命令时再一起做**，单独删这一个函数只会让文档与
+部署脚本指着一个不存在的入口。
 
 用法
 ----

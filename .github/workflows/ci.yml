@@ -135,8 +135,8 @@ jobs:
   # 为什么用真 PG 而不是 mock：这条的全部价值就是"真的写进去、换个连接读回来"。
   #   把库 mock 掉等于什么都没验 —— 与下面 drill job 必须用真 PG 是同一条理由。
   #
-  # ⚠️ 依赖清单与 test job 保持一致：`tests/conftest.py` 会 import `src.graph`，
-  #   少装一个包会让**收集阶段**就失败（不是跳过，是红）。
+  # ⚠️ 依赖清单与 test job 保持一致：`tests/conftest.py` 与各用例会在**收集阶段**
+  #   导入 `src/`、`app/` 和官方 agents SDK，少装一个包就整批失败（不是跳过，是红）。
   agent-session-pg:
     runs-on: ubuntu-latest
     timeout-minutes: 20

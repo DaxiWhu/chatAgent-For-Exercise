@@ -335,7 +335,14 @@ def test_hostile_ambient_env_cannot_reach_config():
     # 这样这条断言才能同时证明两件事：敌意值没进来，且默认确实是收紧的那个。
     assert got["admins"] == ["admin"]
     assert got["db"] == ""
-    assert got["agnes"] == ""
+    # 模型 Key 与 AUTH_SESSION_SECRET 同一类：测试进程**必须**有一个可用值
+    # （agent 链路是唯一作答路径，没配 Key 时 `app.main` 拒绝启动 ⇒
+    # `tests/conftest.py` 注入了一个假 Key）。所以这里断言的是"敌意值没进来"，
+    # 而不是"是空串" —— 后者在"必须给 Key"之后就不再成立。
+    assert got["agnes"] == CONF._TEST_AUTH_ENV["AGNES_API_KEY"], (
+        "隔离失效：AGNES_API_KEY 落在了敌意值上（应为测试专用值）"
+    )
+    assert got["agnes"] != "sk-attacker"
     # 版本号只要求"非空"：它的默认值会随发布调整，但**绝不能是空串**
     # （FastAPI 的 version 不接受空值，会在建 app 时直接 AssertionError）
     assert got["version"], "APP_VERSION 落到了空串 —— FastAPI 会因此起不来"

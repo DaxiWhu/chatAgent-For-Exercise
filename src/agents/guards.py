@@ -126,35 +126,29 @@ def _as_text(agent_output: Any) -> str:
 def _deliverable(agent_output: Any) -> str | None:
     """取出**要交付给用户的那段正文**；这一步没有交付物时返回 ``None``。
 
-    为什么需要这一层（2026-10-03，agent 链路拆成多个图节点之后）
-    ----------------------------------------------------------
-    出口护栏挂在 ``RunConfig`` 上 ⇒ **每一次 agent 运行**的最终输出都会被它检查。
-    而拆分之后，跑终止于"判定为转交"的那次运行**根本没有交付物**：
-    它的最终输出是一个结构化判定对象，``content`` 字段只是给下一个 agent 的
-    交接说明（用户看不到）。
+    为什么需要这一层
+    ----------------
+    出口护栏挂在 ``RunConfig`` 上 ⇒ **每一次 agent 运行**的最终输出都会被它检查，
+    而最终输出不一定是字符串（结构化产出是 pydantic 模型）。
 
-    不区分的话有两个后果，而且都不会报错：
+    ⚠️ 2026-10-20：此前这个函数还负责"跳过转交那次运行的结构化判定对象"
+    （``FrontlineDecision.action == "transfer"``）。handoff 换回官方形态之后，
+    **不存在**"结构化判定"这种输出 —— 转交就是换人继续跑，``final_output`` 永远是
+    接手方写好的正文。所以那条分支已删：留着它只会让人以为还有第三种输出形态。
 
-    * 拿 ``str(判定对象)`` 去判 —— 判的是一个"字段名 + 括号"拼出来的 repr，
-      判据含义静默改变；
-    * 交接说明里一旦出现形如 ``[9]`` 的字样（而它并没有交付给用户），
-      整条产出会被拦下 —— 用户收到的是一个**空答复**，而模型其实什么都没做错。
+    判据仍然只有一条：**只有"要交给用户看的那段正文"才过护栏**。结构化产出里
+    没有 ``content`` 字段的（例如 ``ResearchDigest``）按整体拍平。
 
-    ⇒ 判据必须是"**这一步有没有交付物**"，而不是"输出是不是一个字符串"。
-    只有"要交给用户看的那段正文"才过护栏，其余一律跳过（**不计数** ——
-    没交付物既不是"检查通过"也不是"检查失败"，它在指标里不该出现）。
+    ⚠️ "空产出"同样算**没有交付物**（返回 ``None``，不计数）：没内容既不是
+    "检查通过"也不是"检查失败"，把它当"通过"记进指标会让通过率虚高。
     """
     if isinstance(agent_output, str):
-        return agent_output
+        return agent_output or None
     content = getattr(agent_output, "content", None)
     if isinstance(content, str):
-        # 结构化判定里的正文。``action == "transfer"`` ⇒ 这一步是"把对话交给下一个
-        # agent"，没有交付物（见 ``types.FrontlineDecision``）。
-        if getattr(agent_output, "action", "") == "transfer":
-            return None
-        return content
+        return content or None
     # 其它结构化产出（例如 ``ResearchDigest``）：没有 content 字段，按整体拍平。
-    return _as_text(agent_output)
+    return _as_text(agent_output) or None
 
 
 @input_guardrail
@@ -225,8 +219,8 @@ def citation_traceability_guardrail(
     注意判据的边界：这里只能证明"编号在本轮检索结果里出现过"，证明不了
     "那句话真被该片段支撑"。后者需要判断力，本文件刻意不覆盖（见模块 docstring）。
 
-    ⚠️ 这一步没有交付物时（``_deliverable`` 返回 None）**直接放行、且不计数** ——
-    详见 ``_deliverable`` 的说明，最容易踩的是"把交接说明当成交付物来判"。
+    ⚠️ 这一步没有交付物时（``_deliverable`` 返回 None，含空产出）**直接放行、且不计数** ——
+    详见 ``_deliverable`` 的说明。
     """
     text = _deliverable(agent_output)
     if text is None:

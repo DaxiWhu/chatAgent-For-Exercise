@@ -40,17 +40,18 @@ def _loose_gates(monkeypatch):
     metrics.reset()
 
 
-def _fake_graph():
-    class _G:
-        async def astream(self, incoming, config, stream_mode):
-            from types import SimpleNamespace
-            yield SimpleNamespace(content="ok"), {}
+def _fake_turn():
+    """替身 `src.turn.run_turn`：只吐一段"ok"，不碰模型。"""
+    class _T:
+        async def __call__(self, req, *, context, on_text=None):
+            from src.agents.runner import TaskOutcome
 
-        async def aget_state(self, config):
-            from types import SimpleNamespace
-            return SimpleNamespace(next=(), values={"citations": []})
+            if on_text is not None:
+                await on_text("ok", "call-1")
+            return TaskOutcome(answer="ok", attempts=1, final_agent="frontline_agent",
+                               passed=True, exit_reason="passed")
 
-    return _G()
+    return _T()
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +251,7 @@ def test_middleware_nesting_order_is_pinned():
 def test_message_too_long_returns_422_naming_the_field(monkeypatch):
     """注意这是 422 而**不是** 413：体积远小于 1 MiB 字节闸门，
     应由字段闸门给出精确原因（两层各司其职）。"""
-    monkeypatch.setattr(M, "graph", _fake_graph())
+    monkeypatch.setattr(M, "run_turn", _fake_turn())
     r = client.post("/v1/chat", json={"thread_id": "lim-1",
                                       "message": "x" * (M.config.MAX_MESSAGE_CHARS + 1)})
     assert r.status_code == 422
@@ -281,7 +282,7 @@ def test_resume_thread_id_too_long_returns_422():
 
 def test_normal_sized_request_is_unaffected(monkeypatch):
     """常规请求不受影响（默认阈值必须对真实用法无感）。"""
-    monkeypatch.setattr(M, "graph", _fake_graph())
+    monkeypatch.setattr(M, "run_turn", _fake_turn())
     r = client.post("/v1/chat", json={"thread_id": "lim-ok", "message": "梧州有什么特产？"})
     assert r.status_code == 200
 

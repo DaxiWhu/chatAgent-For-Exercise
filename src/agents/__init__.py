@@ -1,30 +1,34 @@
 """生产版 agent 链路（严格按 OpenAI Agents SDK 官方原语装配）。
 
-    graph.dispatch ──[agent 链路可用]──> graph.frontline ──[转交判定]──> graph.literary
-                                              │                              │
-      ┌───────────────────────────────────────┘                              │
-      ├── frontline_agent（**每轮入口固定是它**；唯一面向用户）               │
-      │     ├── tools        : researcher / slides_maker / visual_artist （as_tool）
-      │     │                  + review_draft                           （as_tool，评审）
-      │     └── output_type  : FrontlineDecision（这一步是答复还是转交）—— 不再是 handoff
-    ├── literary_writer（图里**独立的一个节点**，由上面那个判定路由过去；同样挂 review_draft）
-    ├── session（跨轮历史，官方 Session 抽象 + 官方 SQLAlchemySession 后端，落 PostgreSQL）
-      ├── run_config 上的出口护栏：citation_traceability + length
-      │     （入口护栏 prompt_injection 挂在 frontline_agent 上，见 runner.build_run_config）
-      └── 一次请求 = 每个节点各跑**一次** agent（转交那一轮两次）
+    Runner.run(frontline_agent, ..., session=...)   ← 一次运行，一个主循环
+        │
+        ├── frontline_agent（**每次运行的起始 agent**；唯一面向用户）
+        │     ├── tools    : researcher / slides_maker / visual_artist （as_tool）
+        │     │              + review_draft                       （as_tool，评审）
+        │     └── handoffs : literary_writer  ← 官方 handoff，同一次运行内换人
+        ├── literary_writer（接手后写完作品；同样挂 review_draft）
+        ├── session（跨轮历史，官方 Session 抽象 + 官方 SQLAlchemySession 后端，落 PostgreSQL）
+        └── run_config 上的出口护栏：citation_traceability + length
+              （入口护栏 prompt_injection 挂在 frontline_agent 上，见 runner.build_run_config）
+
+⚠️ 2026-10-20：不再有 LangGraph 节点。此前前台与文学专家是两个图节点、靠结构化
+判定连边；现在整条链路就是**一次** ``Runner.run``，交接走官方 handoff，
+``result.last_agent`` 回答"这次运行结束在谁手上"。理由见 ``frontline.py`` 的
+模块 docstring。
 
 ⚠️ **本包在导入期会 import ``agents``（openai-agents SDK）。**
 
 因此：
 
-* ``src/graph.py`` **不在模块级** import 本包的任何子模块 —— 它走
-  ``_agent_module()`` 惰性取，取不到就降级走原问答链路。
-* 本文件也**不做任何 eager import** —— 上面那些公开名字是**惰性**的（PEP 562）。
-  否则 ``from .agents import router`` 会顺带把 SDK 拉进来，SDK 一没装，
-  ``src/graph.py`` 整个模块就导入失败，服务直接起不来。
+* 本文件**不做任何 eager import** —— 上面那些公开名字是**惰性**的（PEP 562）。
+  这不是为了省导入耗时，而是为了让"缺 SDK"这件事**由一个地方报清楚**：
+  `app.main._assert_agents_ready` 会在启动期调 `src.agents.runtime.configure()`，
+  由它给出 `missing_sdk` / `missing_api_key` / `build_failed` 三档之一并**拒绝启动**。
+  若这里 eager import，缺 SDK 时最先炸的会是 ``import src.agents`` 本身，
+  报一个 ModuleNotFoundError 堆栈 —— 看不出"该装什么"。
 
-这是"能力开关默认开、但**开着且没配**时行为必须与关一致"那条原则的落地方式：
-没装 SDK ⇒ 全部请求走原问答链路，行为与改造前逐字节一致，无需运维额外配开关。
+⚠️ 2026-10-20 起这条链路是**唯一**的作答路径，**没有**"没装 SDK 就走原问答链路"
+这种降级：SDK 缺失 = 进程起不来（守卫 `tests/test_startup_guard.py`）。
 """
 
 from __future__ import annotations
@@ -36,7 +40,6 @@ __all__ = [
     "AGENT_HOOKS",
     "AgentStats",
     "EvaluationFeedback",
-    "FrontlineDecision",
     "ImageBrief",
     "ResearchDigest",
     "SlideDeck",
@@ -63,7 +66,6 @@ _LAZY: dict[str, tuple[str, str]] = {
     "TaskOutcome": ("runner", "TaskOutcome"),
     "frontline_agent": ("frontline", "frontline_agent"),
     "EvaluationFeedback": ("types", "EvaluationFeedback"),
-    "FrontlineDecision": ("types", "FrontlineDecision"),
     "ImageBrief": ("types", "ImageBrief"),
     "ResearchDigest": ("types", "ResearchDigest"),
     "SlideDeck": ("types", "SlideDeck"),

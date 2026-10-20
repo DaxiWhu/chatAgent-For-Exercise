@@ -2,41 +2,32 @@
 
 要解决什么
 ----------
-``messages`` 这个字段在本项目里同时被当成**两样东西**用：跨轮对话本身，以及
-**图状态里的一个普通字段**。而图状态**每走完一个节点就整份落一次盘**，会话历史
-又是**全量追加**（``session.py`` 的模块 docstring 写了为什么刻意不设条数上限）。
+会话历史是**全量追加**的（``session.py`` 的模块 docstring 写了为什么刻意不设条数
+上限），而每一轮都要把**整份历史**送进模型。两者叠加的结果是**平方**：第 N 轮要
+为前面每一轮的对话各付一次输入 token，聊得越久单位对话越贵。
 
-两者叠加的结果是**平方**：实测（每轮 5 个节点、等价于本项目一轮的形状）
+| 轮数 | 对话条目 | 每轮输入条目（累计） |
+|---|---|---|
+| 3 | 6 | 6 + 4 + 2 = 12 |
+| 12 | 24 | 24 + 22 + … + 2 = 156 |
+| 24 | 48 | 48 + 46 + … + 2 = 600 |
 
-| 轮数 | 真实对话条目 | 快照份数 | ``messages`` 落盘次数 | 放大倍数 |
-|---|---|---|---|---|
-| 3 | 6 | 21 | 189 | 31.5× |
-| 6 | 12 | 42 | 756 | 63.0× |
-| 12 | 24 | 84 | 3024 | 126.0× |
-| 24 | 48 | 168 | 12096 | 252.0× |
-
-**轮数每翻一倍，总量正好翻四倍**，而且放大倍数本身跟着轮数一起涨（聊得越久，
-单位对话越贵）。成因是三条同时成立，缺一不可：``messages`` 用累加器语义（只增
-不减）、每轮真的都在往里加、检查点每个 super-step 整份落盘 ⇒ 官方那套"值没变就
-复用"的去重机制对它完全用不上。
-
-压缩切断的就是这条链：把"**前 N 轮之前**"的老历史换成一段摘要，此后每一轮的快照
-里都只带「摘要 + 最近 N 轮」，增量从"整段历史"变成"常数" ⇒ **增长阶从平方降到
-线性**。实测（4 轮，用官方的消息移除原语做过"清空 + 写摘要"）：各份快照里的消息
-条数落在 0~3 条，而同样 4 轮不做压缩时是 0~8 条，**且不需要删掉任何旧快照**
-（回溯能力不丢）。
+压缩切断的就是这条链：把"**前 N 轮之前**"的老历史换成一段摘要，此后每轮送进
+模型的都只带「摘要 + 最近 N 轮」，增量从"整段历史"变成"常数" ⇒ **增长阶从平方
+降到线性**。
 
 两个固定入口（共用 §"压缩内核"）
 ------------------------------
 ======================  ==============================  ==================  ==========
 入口                    触发                            压哪一份            写回
 ======================  ==============================  ==================  ==========
-**历史压缩**            老历史超过"保留轮数"            会话表 / 图状态      **是**
+**历史压缩**            老历史超过"保留轮数"            会话表（库里那份）  **是**
 **窗口压缩**            送进模型的输入 > 预算的 85%     本次调用的那一份     否
 ======================  ==============================  ==================  ==========
 
-* **历史压缩**每轮各判一次（会话侧在请求开头、图状态侧是图里的一个节点），压的是
-  **库里那份**：老的那段换成摘要，之后每轮读到的都是压过的。
+* **历史压缩**每轮各判一次（请求开头的后台任务），压的是**库里那份**：老的那段
+  换成摘要，之后每轮读到的都是压过的。它**晚一轮生效** —— 本轮读到的是压缩前的
+  历史，行为与不压完全一致。
 * **窗口压缩**判的是**将要送进模型的那一份输入**——它本来就含"本轮新增 + 上一次
   返回的内容"，所以是**提前**判而不是事后发现。它**只改这一次调用**：库里那份由
   历史压缩负责（那条路每轮都在跑，库里天然封顶在"保留轮数 + 一条摘要"），
@@ -91,7 +82,7 @@ SDK 里**有一个现成的压缩会话**（``agents/memory/openai_responses_com
 
 ⚠️ 本模块导入 ``agents`` 吗？—— **不**。它只做"按轮切分 + 写摘要 + 替换"，替换
 动作对会话侧是鸭子类型（官方靠 ``getattr(session, "run_compaction")`` 识别，不看
-类型），对图状态侧是官方的消息移除原语。所以它**不**受 ``session.py`` 里那条
+类型）。所以它**不**受 ``session.py`` 里那条
 "只能被惰性加载的模块引用"的约束，``session.py`` 可以在模块级导入它。
 """
 
@@ -110,7 +101,6 @@ from .history_budget import count_tokens, history_token_limit
 
 __all__ = [
     "CompactingSession",
-    "compact_graph_messages",
     "compact_session_history",
     "compact_for_window",
     "history_compact_enabled",
@@ -193,7 +183,8 @@ def _is_user_item(item: Any) -> bool:
     * **SDK 会话 / 模型输入**：dict，``role == "user"`` —— 与官方
       ``select_compaction_candidate_items`` 里那个 ``_is_user_message`` 同一判据
       （那里还额外认 ``type == "message"``，两种写法都有，这里统一看 ``role``）。
-    * **图状态**：LangChain 的 ``HumanMessage``。用 ``.type == "human"`` 判而不是
+    * **消息对象**（官方 Session 里存的是 dict，部分调用点传的是 LangChain 的
+      ``HumanMessage``）：用 ``.type == "human"`` 判而不是
       ``isinstance``：``BaseMessage.type`` 是稳定的公开属性，这样 ``src/agents/``
       不必硬依赖 langchain（本模块的导入面因此保持干净，见模块 docstring 末节）。
     """
@@ -397,7 +388,7 @@ def summarize_items(segment: list[Any]) -> str:
         return ""
     model, _, _ = _model_config()
     # 计时段**只包住模型调用**，不包 `_segment_body` 的拼装与 `_replace_items` 的
-    # 会话替换 —— 后者走检查点，耗时已经在 `checkpoint_duration_seconds{op}` 里。
+    # 会话替换 —— 后者只是一次数据库写（`session_for` 换掉整段历史），不在这里归因。
     # 只有"摘要这一次出站调用"是新增在首 token 延迟上、却完全没有归因出口的那一段。
     started = time.perf_counter()
     try:
@@ -587,7 +578,7 @@ class CompactingSession:
 async def compact_session_history(session_id: str, *, session: Any = None) -> int:
     """**入口一（会话侧）**：压一次某个会话的历史。返回被压掉的条目数（0 = 没压）。
 
-    调用点：``app/main.py`` 的 ``_stream_graph`` 开头 ``asyncio.create_task`` ——
+    调用点：``app/main.py`` 的 ``_stream_run`` 开头 ``asyncio.create_task`` ——
     **后台跑，不挡本轮**。所以：
 
     * 本轮读到的仍是**压缩前**的历史，本轮行为与今天完全一样；
@@ -709,68 +700,6 @@ class _lock_or_none:
 
 
 # ---------------------------------------------------------------------------
-# 图状态那一侧
-# ---------------------------------------------------------------------------
-def _graph_messages_replacement(summary: str, tail: list[Any]) -> list[Any]:
-    """图状态里的新内容：**先清空全部消息，再给摘要 + 保留段**。
-
-    用的是官方的消息移除原语（``RemoveMessage(id=REMOVE_ALL_MESSAGES)``）——
-    它由 ``add_messages`` 这个 reducer 消费，效果是"丢掉这之前的一切，只留我给的"。
-    实测可用（``REMOVE_ALL_MESSAGES == "__remove_all__"``）。
-
-    惰性 import 的真实理由：``langgraph`` / ``langchain_core`` 是本项目的硬依赖
-    （``src/graph.py`` 在模块级就导入了），所以这里其实可以直接导 —— 放在函数里是
-    为了让本模块的**导入面**保持"只有 stdlib"，``session.py`` 才能安全地在模块级
-    导入它（那个模块的一条硬约束是"不把 SDK/框架拉进导入链"）。
-    """
-    from langchain_core.messages import SystemMessage
-    from langgraph.graph.message import REMOVE_ALL_MESSAGES, RemoveMessage
-
-    return [
-        RemoveMessage(id=REMOVE_ALL_MESSAGES),
-        SystemMessage(content=summary),
-        *tail,
-    ]
-
-
-async def compact_graph_messages(messages: list[Any]) -> list[Any] | None:
-    """**入口一（图状态侧）**：返回**替换用**的完整消息列表；``None`` = 不需要压。
-
-    与"会话侧那份"共用同一套切分与摘要（同一个 ``keep_rounds``），差别只有两点：
-
-    * 压的是图状态里的 ``messages``（问答兜底链路的历史就住在这里）；
-    * 触发点在**图里**，所以本轮就生效（会话侧是下一轮才生效）。
-
-    为什么它**不能**也做成后台任务：图状态必须影响本轮接下来的节点（``retrieve``
-    拿最后一条当检索词、``generate`` 把它送进模型），而且检查点同时是**图自己的
-    账本**（"图跑到哪了"就记在里面）—— 后台任务去改它，等于同一条会话出现两个
-    写者，``parent_checkpoint_id`` 那条链还会被改断。
-
-    ⚠️ 它**只动 ``messages``**，别的字段一个不碰：那些不是"对话"，压不得。
-    """
-    if not history_compact_enabled():
-        return None
-    msgs = list(messages or [])
-    keep_from = _plan_keep_from(msgs, keep=keep_rounds())
-    if keep_from is None:
-        return None
-    summary = await _summarize_async(msgs[:keep_from])
-    if not summary:
-        return None
-    tail = msgs[keep_from:]
-    try:
-        replacement = _graph_messages_replacement(summary, tail)
-    except Exception as e:  # noqa: BLE001  框架装不上（不该发生，降级即可）
-        _note_failure(e, stage="graph_build")
-        return None
-    observability.counter("agent_history_compacted_total", scope="graph")
-    observability.histogram("agent_history_compacted_items", keep_from)
-    logging.info("历史压缩完成（graph）：%d 条 → 1 条摘要 + %d 条（保留最近 %d 轮）",
-                 keep_from, len(tail), keep_rounds())
-    return replacement
-
-
-# ---------------------------------------------------------------------------
 # 窗口压缩（入口二）
 # ---------------------------------------------------------------------------
 def _items_tokens_over(instructions: str, items: list[Any], trigger: int) -> bool:
@@ -830,42 +759,6 @@ async def compact_for_window(items: list[Any], *, instructions: str = "") -> lis
     observability.counter("agent_history_compacted_total", scope="window")
     observability.histogram("agent_history_compacted_items", keep_from)
     logging.info("窗口压缩完成：%d 条 → 1 条摘要 + %d 条（触发线 %d token）",
-                 keep_from, len(tail), trigger)
-    return replacement
-
-
-def compact_for_window_sync(items: list[Any], *, instructions: str = "") -> list[Any] | None:
-    """``compact_for_window`` 的**同步**版本（给跑在线程里的图节点用）。
-
-    为什么需要：``src/graph.py`` 的 ``generate`` 是同步节点（langgraph 把它丢进
-    线程池执行），那里没有正在运行的事件循环 —— 在那里 ``asyncio.run`` 会另建一个
-    loop，而摘要用的是**同步** client，本来就不需要 loop。两条路共用同一套判定与
-    同一个摘要实现，只有"要不要 await"这一点不同。
-    """
-    if not history_compact_enabled():
-        return None
-    trigger = window_compact_trigger()
-    if trigger is None:
-        return None
-    payload = list(items or [])
-    if not payload:
-        return None
-    if not _items_tokens_over(instructions, payload, trigger):
-        return None
-    keep = _rounds_that_fit(payload, budget=trigger, cap=keep_rounds())
-    if keep is None:
-        return None
-    keep_from = _plan_keep_from(payload, keep=keep)
-    if keep_from is None:
-        return None
-    summary = summarize_items(payload[:keep_from])
-    if not summary:
-        return None
-    tail = payload[keep_from:]
-    replacement = _session_replacement(summary, tail)
-    observability.counter("agent_history_compacted_total", scope="window")
-    observability.histogram("agent_history_compacted_items", keep_from)
-    logging.info("窗口压缩完成（同步路径）：%d 条 → 1 条摘要 + %d 条（触发线 %d token）",
                  keep_from, len(tail), trigger)
     return replacement
 

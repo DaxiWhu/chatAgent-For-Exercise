@@ -51,12 +51,14 @@
 application already manages"）。
 
 ⚠️ 本模块导入 ``agents``（SDK）。因此只能被 ``src/agents/*`` 里同样是惰性加载的模块
-引用（``runner``），**不能**出现在 ``src/graph.py`` 的模块级 import 里 —— 否则没装 SDK
-的环境连图都建不起来（见 ``src/agents/__init__.py`` 的说明）。
+引用（``runner``），**不要**在包入口 eager import 它 —— 否则"缺 SDK"的报错会变成
+import 期的堆栈，而不是启动守卫那句点名该装什么的 ``missing_sdk``
+（见 ``src/agents/__init__.py`` 的说明）。
 
 ⚠️ **不在导入期连库**：``create_async_engine`` 只构造对象、不建连（真正的连接推迟到
 第一条命令）。所以"地址写错 / PG 没起"要到用时才暴露 —— 这正是
-``ping_session_backend()`` 存在的理由，与 ``app/main.py`` 里检查点那条自检同源。
+``ping_session_backend()`` 存在的理由（启动期那次自检会打一行"跨轮对话历史就绪 /
+不可用"的结论）。
 """
 
 from __future__ import annotations
@@ -277,6 +279,30 @@ def session_for(session_id: str) -> Any:
     while len(_sessions) > _CACHE_MAX:
         _sessions.popitem(last=False)
     return built
+
+
+async def load_items(session_id: str) -> list[Any]:
+    """读某个会话的历史条目（官方 ``Session.get_items``）；失败返回空列表。
+
+    为什么需要它：``GET /v1/sessions/{id}`` 要回答"这条会话说过什么"。这份历史
+    现在**只有官方会话存着** —— 图退役之后没有第二份了。不读它，断流重连时
+    客户端就只能拿到自己本地缓存的那半段。
+
+    降级口径与 ``session_for`` 一致：没有后端 / 读失败都返回空列表，不上抛。
+    "拿不到历史"不该让一个只读端点变成 500。
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return []
+    session = session_for(sid)
+    if session is None:
+        return []
+    try:
+        items = await session.get_items()
+    except Exception as e:  # noqa: BLE001  后端不可用 ⇒ 按"没有历史"处理
+        _note_failure(e)
+        return []
+    return list(items or [])
 
 
 async def clear_session(session_id: str) -> bool:

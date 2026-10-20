@@ -2,20 +2,23 @@
 
 为什么需要这一层
 ----------------
-`src/graph.py` 要在**模块导入期**就能判断"agent 链路能不能用"，而
+`app/main.py` 要在**模块导入期**就能判断"agent 链路能不能用"，而
 `src/agents/` 里的模块（tools / specialists / runner）全部在导入期就
 ``from agents import ...`` —— 只要 `openai-agents` 没装，导入就炸。
 
 所以本模块**不允许在模块级 import ``agents``**：它只是一组开关与一个模型槽位。
 真正的 SDK 导入发生在 ``configure()`` 里（进程启动、只调一次）。
 
-降级语义（与 app/config.py 里那条原则一致："能力开关默认开，但开着且没配时行为
-必须与关闭时一致"）：
+⚠️ 没有"降级"这回事
+-----------------
+图退役之后本服务**只有这一条**作答路径，所以 ``configure()`` 返回 False 意味着
+"这个进程答不了任何请求"。调用方（`app/main.py` 的 `_assert_agents_ready`）
+据此**拒绝启动**，不再有任何"回落到另一条链路"的分支。
 
-* 没装 `openai-agents` ⇒ ``configure()`` 抛 ImportError → 调用方记 warning →
-  ``is_ready()`` 恒为 False ⇒ ``graph.dispatch`` 全部走原问答链路 **行为与改造前
-  逐字节一致**，不需要运维额外配一个开关。
-* 装了但没配 API Key ⇒ 同样不 ready（模型调不动，路由过去只会失败）。
+``configure()`` 本身仍然**不抛异常**（它把失败原因写进 ``_reason`` 再返回 False）：
+判断要不要退出是调用方的事，装配层只负责把原因说清楚 —— ``missing_sdk`` 与
+``missing_api_key`` 的处置方式不同（前者是镜像问题、后者是配置问题），
+让调用方拿到原因才能给出可执行的报错。
 """
 
 from __future__ import annotations
@@ -52,8 +55,8 @@ def configure(
 
     timeout: 单次模型调用超时（秒）。
 
-    返回是否就绪。**不抛异常**：装配失败一律降级（记 warning + 返回 False），
-    服务该照常起 —— "能起来"优先于"新链路可用"。
+    返回是否就绪。**不抛异常**（原因写进 ``ready_reason()``）：
+    判"要不要拒绝启动"是调用方的事，见模块 docstring。
     """
     global _ready, _reason, _model
     if not api_key:
@@ -89,12 +92,12 @@ def get_model() -> Any | None:
 
 
 def is_ready() -> bool:
-    """agent 链路是否可用。``graph.dispatch`` 的判据。"""
+    """agent 链路是否可用（诊断用：启动期由 `app.main` 硬校验，运行期不再分叉）。"""
     return _ready and _model is not None
 
 
 def ready_reason() -> str:
-    """未就绪的原因（进启动日志，便于区分"没装 SDK"与"没配 Key"）。"""
+    """未就绪的原因（进启动报错，便于区分"没装 SDK"与"没配 Key"）。"""
     return _reason
 
 

@@ -1,12 +1,10 @@
 import os
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
-from langchain_core.messages import AIMessage
 
-# 把项目根目录加入 sys.path，使 `from src.graph import ...` 可用
+# 把项目根目录加入 sys.path，使 `from src.xxx import ...` 可用
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -60,11 +58,10 @@ from tests import _envscan  # noqa: E402
 #: `test_eval_answer.py` 的门禁结论从"达标"变成"来源覆盖 0.795 < 0.87"——
 #: 评测集的达标与否**取决于开发机配置**，这是同一类问题的第二次出现。
 #: ⚠️ 采集面**必须覆盖每一个会读环境变量的文件**（2026-10-06 扩）。
-#: 原值只有 `("app/config.py", "src/rag/*.py")`，于是 `src/graph.py` 与
-#: `src/agents/*` 读的那一批（`DOCS_DIR` / `AGENTS_ENABLED` / `AGENT_MAX_TURNS` /
-#: `AGENT_MAX_ANSWER_CHARS` / `AGENT_KB_TOP_K` / `AGENT_SESSION_CACHE_MAX` /
-#: `RAG_TENANT_CACHE_MAX`）**从不被清理** —— 而"清不掉"正是本文件开头那段说的
-#: 三类恶性后果（本地红 CI 绿 / 有人放宽断言 / 前置条件被悄悄改掉）。
+#: 原值只有 `("app/config.py", "src/rag/*.py")`，于是 `src/agents/*` 读的那一批
+#: （`AGENT_MAX_TURNS` / `AGENT_MAX_ANSWER_CHARS` / `AGENT_KB_TOP_K` /
+#: `AGENT_SESSION_CACHE_MAX` / `RAG_TENANT_CACHE_MAX`）**从不被清理** —— 而"清不掉"
+#: 正是本文件开头那段说的三类恶性后果（本地红 CI 绿 / 有人放宽断言 / 前置条件被悄悄改掉）。
 #: 判据不是"这批变量眼下有没有出现在 `.env` 里"，而是"它们会不会改变服务行为"：
 #: `DOCS_DIR` 眼下就写着 `./data`（代码默认是 `data/kb`），也就是说同一个测试
 #: 在开发机与 CI 上跑的是**不同的语料目录**。
@@ -178,6 +175,11 @@ _TEST_AUTH_ENV = {
     # （那会表现为"后半段用例随机 401"这种与代码无关的诡异失败）。
     "AUTH_ACCESS_TTL": "86400",
     "AUTH_REFRESH_TTL": "86400",
+    # 模型 Key。**必须给**：agent 链路是唯一的作答路径，没配 Key 时 `app.main`
+    # 会**拒绝启动**（`_assert_agents_ready`）—— 也就是说"裸环境"在这一点上不再
+    # 可导入。"拒绝启动"本身由 `tests/test_startup_guard.py` 用**子进程**验证
+    # （那才测得到真正的导入期行为，而不是 monkeypatch 出来的替身）。
+    "AGNES_API_KEY": "sk-test-not-a-real-key",
 }
 
 
@@ -279,9 +281,6 @@ def _restore_observability_sink_each_test():
     observability.set_sink(saved)
 
 
-from src.graph import ReviewResult, build_graph  # noqa: E402
-
-
 class FakeRetriever:
     """假检索器：可指定返回值，避免测试真的去读语料 / 跑 TF-IDF。"""
 
@@ -296,20 +295,3 @@ class FakeRetriever:
 def fake_retriever():
     """默认不召回任何片段（等价于未配置知识库的降级路径）。"""
     return FakeRetriever()
-
-
-@pytest.fixture
-def mock_model():
-    """用 MagicMock 模拟 ChatOpenAI：generate 返回草稿，evaluate 返回合法评分。"""
-    m = MagicMock()
-    m.invoke.return_value = AIMessage(content="这是草稿内容。")
-    struct = m.with_structured_output.return_value
-    struct.invoke.return_value = ReviewResult(
-        is_need_evaluate=True, score=50, feedback="建议修改"
-    )
-    return m
-
-
-@pytest.fixture
-def graph(mock_model, fake_retriever):
-    return build_graph(model=mock_model, retriever=fake_retriever)

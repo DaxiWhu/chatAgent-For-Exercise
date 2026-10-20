@@ -3,8 +3,8 @@
 为什么需要这一层（这是本文件存在的理由）
 ------------------------------------
 改造前唯一的超时是 LLM client 的 `timeout=30`，它只约束**单次 HTTP 调用**。
-而 `/v1/chat` 的图是「检索 → 生成 → 自评审 → （不满意）再审 → 再生成」，
-每轮都是一次独立的 30s 调用 ⇒ **一次合法请求的总时长没有任何上界**。
+而一次请求里会有**多次**模型调用（模型调工具、再调模型、转交之后再调），
+每一次都是独立的 30s 调用 ⇒ **一次合法请求的总时长没有任何上界**。
 
 最需要总时限的场景恰恰是"主循环一次都不转"的那个：上游限流重试 / 排队 /
 连接挂死时，`async for` 停在 await 上，循环体不执行 —— 所以"在循环里比对时间"
@@ -13,7 +13,7 @@
 
 测试策略
 -------
-- 单元层直接驱动 `_stream_graph`（假图 + 真 asyncio，必须真睡，否则测不到超时）；
+- 单元层直接驱动 `_stream_run`（假运行 + 真 asyncio，必须真睡，否则测不到超时）；
 - 有一条例外必须走 **HTTP 层**：`timeout` 事件的 data 是结构化载荷，
   而序列化发生在 sse_starlette 里 —— 只断言进程内的 dict 是典型的假绿
   （见 `test_api_v1.py` 里对 JSONServerSentEvent 的那段说明）。
@@ -43,63 +43,47 @@ client = TestClient(M.app, headers=auth_headers())
 # ---------------------------------------------------------------------------
 # 假图 / 假流
 # ---------------------------------------------------------------------------
-class _HangingStream:
-    """永远不吐字的流：`__anext__` 一直挂住（上游卡死的抽象）。"""
+class _FakeTurn:
+    """替身运行：按需吐片段 / 挂住 / 慢吐。
 
-    def __init__(self):
+    替换的是 ``app.main.run_turn`` —— 接口层现在唯一依赖的执行入口。刻意保留
+    "回调式交正文"的形状（`on_text`），因为总时限要约束的正是**每一次等待**，
+    而等待发生在"上游什么时候交出下一段"上。
+    """
+
+    def __init__(self, total=0, *, delay=0.0, hang=False, hang_hold=False):
+        self.total = total
+        self.delay = delay
+        self.hang = hang
+        #: 吐完正文、**收尾**才挂住（模拟"落待审队列时库端卡死"）。
+        self.hang_hold = hang_hold
         self.closed = False
+        self.cancelled = False
 
-    def __aiter__(self):
-        return self
+    async def __call__(self, req, *, context, on_text=None):
+        from src.agents.runner import TaskOutcome
 
-    async def __anext__(self):
-        await asyncio.sleep(3600)
-
-    async def aclose(self):
-        self.closed = True
-
-
-class _SlowStream:
-    """慢速吐字：每片先睡 `delay` 再返回（测"总时限对持续产出的流也生效"）。"""
-
-    def __init__(self, total, delay):
-        self._left = total
-        self._delay = delay
-        self.closed = False
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        if self._left <= 0:
-            raise StopAsyncIteration
-        self._left -= 1
-        await asyncio.sleep(self._delay)
-        from types import SimpleNamespace
-        return SimpleNamespace(content="片段"), {}
-
-    async def aclose(self):
-        self.closed = True
-
-
-class _FakeGraph:
-    """可组合的假图：astream 用给定的流；aget_state 可挂住、并记录调用次数。"""
-
-    def __init__(self, stream, pending=(), hang_state=False):
-        self.stream = stream
-        self.pending = tuple(pending)
-        self.hang_state = hang_state
-        self.state_calls = 0
-
-    def astream(self, incoming, config, stream_mode):
-        return self.stream
-
-    async def aget_state(self, config):
-        self.state_calls += 1
-        if self.hang_state:
-            await asyncio.sleep(3600)
-        from types import SimpleNamespace
-        return SimpleNamespace(next=self.pending, values={"citations": []})
+        try:
+            if self.hang:
+                await asyncio.sleep(3600)
+            for _ in range(self.total):
+                if self.delay:
+                    await asyncio.sleep(self.delay)
+                if on_text is not None:
+                    await on_text("片段", "call-1")
+            if self.hang_hold:
+                await asyncio.sleep(3600)
+            return TaskOutcome(
+                answer="", attempts=1, final_agent="frontline_agent",
+                passed=True, exit_reason="passed",
+                # 这一档会触发"落库"这一步（收尾 IO），用于钉住它也在时限内。
+                review_reason="manual" if self.hang_hold else "",
+            )
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        finally:
+            self.closed = True
 
 
 def _collect(gen, timeout=10):
@@ -221,10 +205,10 @@ def test_hanging_upstream_is_cut_off(loose_gates, monkeypatch):
     这条用例专治"只检测时间、不取消等待"的实现：那种写法下
     `await anext()` 会一直挂住，循环体永远不执行 ⇒ 本用例超时失败。
     """
-    g = _FakeGraph(_HangingStream())
-    monkeypatch.setattr(M, "graph", g)
+    turn = _FakeTurn(hang=True)
+    monkeypatch.setattr(M, "run_turn", turn)
 
-    events = _collect(M._stream_graph({}, {}, "chat", timeout=0.05))
+    events = _collect(M._stream_run(M.TurnRequest(prompt="hi", thread_id="to-1"), "chat", timeout=0.05))
     names = [e["event"] for e in events]
 
     assert names == ["timeout"], f"事件序列应为单个终止性事件，实际 {names}"
@@ -233,8 +217,8 @@ def test_hanging_upstream_is_cut_off(loose_gates, monkeypatch):
     assert payload["produced_chars"] == 0
     # 超时是**终止性**的：不查状态（紧接着的 aget_state 也是网络调用，继续等
     # 等于没有时限），也不补 done。
-    assert g.state_calls == 0, "超时后仍去查了状态"
-    assert g.stream.closed is True, "上游流未被关闭（取消没传导下去）"
+    assert turn.cancelled is True, "超时后上游没被取消（模型会继续跑到自然结束，照付 token）"
+    assert turn.closed is True, "上游运行未被关闭（取消没传导下去）"
     assert metrics.value("request_timeout_total", kind="chat") == 1
 
 
@@ -244,10 +228,9 @@ def test_partial_output_is_still_delivered(loose_gates, monkeypatch):
     为什么不能把整次回答作废：用户已经看到的那半句话一旦被收回、又没有任何
     正文，客户端只能重问一遍，等于**再花一次**已经花掉的 token。
     """
-    g = _FakeGraph(_SlowStream(total=100, delay=0.02))
-    monkeypatch.setattr(M, "graph", g)
+    monkeypatch.setattr(M, "run_turn", _FakeTurn(total=100, delay=0.02))
 
-    events = _collect(M._stream_graph({}, {}, "chat", timeout=0.1))
+    events = _collect(M._stream_run(M.TurnRequest(prompt="hi", thread_id="to-2"), "chat", timeout=0.1))
     toks = [e["data"] for e in events if e["event"] == "token"]
     tail = next(e for e in events if e["event"] == "timeout")
 
@@ -262,10 +245,9 @@ def test_epilogue_state_read_is_also_bounded(loose_gates, monkeypatch):
     只给"消费流"加时限是不够的：收尾那几次 `aget_state` 也是网络/DB 调用，
     它挂住时同样没有上界（而这时用户已经拿到正文，只会觉得"怎么还没结束"）。
     """
-    g = _FakeGraph(_SlowStream(total=1, delay=0), hang_state=True)
-    monkeypatch.setattr(M, "graph", g)
+    monkeypatch.setattr(M, "run_turn", _FakeTurn(total=1, hang_hold=True))
 
-    events = _collect(M._stream_graph({}, {}, "chat", timeout=0.05))
+    events = _collect(M._stream_run(M.TurnRequest(prompt="hi", thread_id="to-3"), "chat", timeout=0.05))
     names = [e["event"] for e in events]
 
     assert names[0] == "token"
@@ -282,10 +264,9 @@ def test_no_timeout_means_no_timeout(loose_gates, monkeypatch):
     这条是"默认值不改变既有行为"的守门人：少了它，把默认实现成"悄悄给个 30s"
     永远不会被发现 —— 而那正是最难排查的故障（内容少一半、日志无异常）。
     """
-    g = _FakeGraph(_SlowStream(total=3, delay=0.03))
-    monkeypatch.setattr(M, "graph", g)
+    monkeypatch.setattr(M, "run_turn", _FakeTurn(total=3, delay=0.03))
 
-    events = _collect(M._stream_graph({}, {}, "chat", timeout=0))
+    events = _collect(M._stream_run(M.TurnRequest(prompt="hi", thread_id="to-4"), "chat", timeout=0))
     names = [e["event"] for e in events]
 
     assert names == ["token", "token", "token", "done"], f"事件序列：{names}"
@@ -294,10 +275,9 @@ def test_no_timeout_means_no_timeout(loose_gates, monkeypatch):
 
 def test_fast_stream_is_unaffected_by_a_large_timeout(loose_gates, monkeypatch):
     """有总时限但流跑得完 ⇒ 正常收尾，不产生 timeout 事件。"""
-    g = _FakeGraph(_SlowStream(total=2, delay=0))
-    monkeypatch.setattr(M, "graph", g)
+    monkeypatch.setattr(M, "run_turn", _FakeTurn(total=2))
 
-    events = _collect(M._stream_graph({}, {}, "chat", timeout=60))
+    events = _collect(M._stream_run(M.TurnRequest(prompt="hi", thread_id="to-5"), "chat", timeout=60))
     names = [e["event"] for e in events]
 
     assert names == ["token", "token", "done"], f"事件序列：{names}"
@@ -331,12 +311,12 @@ def _parse_sse(body: str):
 def test_timeout_payload_is_json_on_the_wire(loose_gates, monkeypatch):
     """`timeout` 事件的 data 必须能被 `json.loads` 解析（走 Python repr 会红）。
 
-    必须走 HTTP：`_stream_graph` 产出的是 dict，序列化在 sse_starlette 里完成。
+    必须走 HTTP：`_stream_run` 产出的是 dict，序列化在 sse_starlette 里完成。
     只断言进程内的 dict 是假绿 —— 那正是 2026-09-28 citations 事件线上是
     Python repr 却没被测出来的原因。
     """
     monkeypatch.setattr(M.config, "REQUEST_TIMEOUT_SECONDS", 0.05)
-    monkeypatch.setattr(M, "graph", _FakeGraph(_HangingStream()))
+    monkeypatch.setattr(M, "run_turn", _FakeTurn(hang=True))
 
     r = client.post("/v1/chat", json={"thread_id": "to-wire", "message": "hi"})
     assert r.status_code == 200
@@ -355,8 +335,14 @@ def test_review_endpoint_is_bounded_too(loose_gates, monkeypatch):
     照抄旧写法。指标标签应为 kind="review"。
     """
     monkeypatch.setattr(M.config, "REQUEST_TIMEOUT_SECONDS", 0.05)
-    monkeypatch.setattr(M, "graph",
-                        _FakeGraph(_HangingStream(), pending=("human_review",)))
+    monkeypatch.setattr(M, "run_turn", _FakeTurn(hang=True))
+    # 前提：队列里真躺着一条待审记录（否则先返回 409 —— 用例照样"绿"，
+    # 但测的根本不是总时限）。
+    from app.review_queue import ReviewQueue
+
+    q = ReviewQueue(dsn="")
+    q.add(thread_id="to-review", draft="草稿", feedback="", tenant="")
+    monkeypatch.setattr(M, "_REVIEW_QUEUE", q)
 
     r = client.post("/v1/review", json={"thread_id": "to-review", "action": "accept",
                                         "feedback": ""})

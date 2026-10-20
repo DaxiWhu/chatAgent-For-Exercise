@@ -408,73 +408,6 @@ def test_the_entry_uses_the_official_duck_typing_contract():
 
 
 # --------------------------------------------------------------------------- #
-# ④ 图状态侧：节点位置、只动 messages、打回轮的原话还在
-# --------------------------------------------------------------------------- #
-def test_graph_node_sits_between_init_and_dispatch():
-    """新节点必须**确实**在 ``init`` 与 ``dispatch`` 之间（两条链路都经过它）。
-
-    位置错了的后果：夹在 ``dispatch`` 之后 ⇒ **rag 链路（历史全在 messages 里的那一条）
-    永远压不到**；并进 ``dispatch`` ⇒ 那个节点不 await 任何东西、写摘要却是异步的。
-    """
-    from src.graph import build_graph
-
-    g = build_graph(model=object(), retriever=None)
-    edges = {(e.source, e.target) for e in g.get_graph().edges}
-    assert ("init", "compact_history") in edges
-    assert ("compact_history", "dispatch") in edges
-    assert ("init", "dispatch") not in edges, "旧的直连边必须已经断开"
-
-
-def test_graph_compaction_keeps_the_current_turn_user_message(on, fake_summary):
-    """压缩后 ``_last_user_content`` 仍要取得到**本轮**那句原话。
-
-    这条盯的是"最新一轮无条件保留"：agent 节点靠 ``_last_user_content(state["messages"])``
-    取本轮输入，把最新那一轮压进摘要 ⇒ 模型拿到的"用户刚说的话"变成一段背景描述，
-    而它**不报错**（接口层照常 200）。
-    """
-    from src.graph import _last_user_content, compact_history
-
-    state = {"messages": _messages(4, prefix=True)}
-
-    async def _go():
-        return await compact_history(state)
-
-    out = asyncio.run(_go())
-    assert set(out) == {"messages"}, "压缩节点只该动 messages"
-    replacement = out["messages"]
-    assert _last_user_content(replacement) == "u3"
-    assert [type(m).__name__ for m in replacement][:2] == ["RemoveMessage", "SystemMessage"]
-    # 旧摘要落在被压缩的那一段里 ⇒ 被折进新摘要，不会越积越多
-    assert "旧摘要" in replacement[1].content
-    assert sum(isinstance(m, SystemMessage) for m in replacement) == 1
-
-
-def test_graph_compaction_does_nothing_when_there_is_nothing_to_compress(on, fake_summary):
-    """轮数没攒够 ⇒ 返回 ``{}``（**不产生任何 state 写入**，检查点不会多一份快照）。"""
-    from src.graph import compact_history
-
-    async def _go():
-        return await compact_history({"messages": _messages(2)})  # 保留轮数 = 2
-
-    assert asyncio.run(_go()) == {}
-
-
-def test_graph_compaction_ignores_failures(on, monkeypatch):
-    """摘要抛异常 ⇒ 按原样继续（**绝不**带崩整轮）。"""
-
-    def _boom(segment):
-        raise RuntimeError("摘要服务挂了")
-
-    monkeypatch.setattr(C, "summarize_items", _boom)
-    from src.graph import compact_history
-
-    async def _go():
-        return await compact_history({"messages": _messages(4)})
-
-    assert asyncio.run(_go()) == {}
-
-
-# --------------------------------------------------------------------------- #
 # ⑤ 窗口压缩：触发线、提前判、最新一轮无条件保留、压了没用就不压
 # --------------------------------------------------------------------------- #
 @pytest.fixture
@@ -540,16 +473,6 @@ def test_window_compaction_is_a_noop_when_everything_already_fits(tiny_budget, m
     assert asyncio.run(_go()) is None
 
 
-def test_window_compaction_sync_matches_the_async_one(tiny_budget):
-    """同步版本（图节点用）与异步版本判据一致 —— 两条路不能各有一套口径。"""
-    items = _rounds(4)
-
-    async def _go():
-        return await C.compact_for_window(items)
-
-    assert C.compact_for_window_sync(items) == asyncio.run(_go())
-
-
 # --------------------------------------------------------------------------- #
 # ⑥ 关掉时：两个入口都必须"一次都不动"
 # --------------------------------------------------------------------------- #
@@ -564,16 +487,11 @@ def test_both_entries_are_noops_when_disabled(monkeypatch, fake_summary):
     async def _session():
         return await C.compact_session_history("s-1", session=wrapped)
 
-    async def _graph():
-        return await C.compact_graph_messages(_messages(6))
-
     async def _window():
         return await C.compact_for_window(items)
 
     assert asyncio.run(_session()) == 0
-    assert asyncio.run(_graph()) is None
     assert asyncio.run(_window()) is None
-    assert C.compact_for_window_sync(items) is None
     assert fake.items == items
     assert fake.calls == [], "关着的时候连读都不该发生"
 

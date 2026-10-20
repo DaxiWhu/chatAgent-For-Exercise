@@ -8,16 +8,16 @@
 本文件是第二种。三件**本项目自己拿主意**的事（官方两个多轮示例都不是这么写的，
 取舍理由写在下面 —— 不是"看起来更合理"，而是有明确代价对比）：
 
-一、**一次运行只跑一个 agent**（2026-10-03 定，此前是"一次跑完整条链"）
----------------------------------------------------------------------
-agent 链路拆成了**图里的多个节点**（见 ``src/graph.py``）：前台一个节点、
-文学专家一个节点，"该转给谁"由前台的结构化判定（``types.FrontlineDecision``）
-经条件边决定。所以本文件不再拥有整条链，只负责**把指定的那一个 agent 跑完一次**。
+一、**一次运行跑完整条链**（2026-10-20 定，回到官方形态）
+--------------------------------------------------------
+``Runner.run(ENTRY_AGENT, ...)`` 一次跑到底：模型调工具、handoff 换人、
+接手方接着写，全在同一次运行的 ``while`` 里完成（官方 ``run.py`` 的
+``NextStepRunAgain`` / ``NextStepHandoff`` 两个分支都是 ``continue``）。
+"这次结束在谁手上"由 ``result.last_agent`` 回答 —— 是既成事实，不是模型的自述。
 
-为什么不能让 SDK 自己换人（``handoffs=``）必须在节点里消失：SDK 的 handoff 是
-"同一个节点内部把人换完再继续跑"（``run.py`` 里换人后是 ``continue`` 而不是
-``return``）—— 节点里一旦带 handoff，节点边界就不存在了，而**节点边界正是续跑边界**。
-拆了等于没拆。取舍与实测见 ``DESIGN_agent_architecture.md``。
+⚠️ 2026-10-03 ～ 2026-10-20 之间本文件是"一次只跑一个 agent"，因为 agent 链路
+当时被拆成了多个 LangGraph 节点（节点边界就是续跑边界，而 SDK 的 handoff 会在
+节点内部把整条链跑完 ⇒ 拆了等于没拆）。图去掉之后那个前提消失，于是回到官方形态。
 
 二、**入口固定为前台**（2026-10-02 定）
 --------------------------------------
@@ -62,9 +62,22 @@ docstring。本文件负责"把它接上"：``run_agent(session_id=...)`` 取会
 用户要求改为**由模型决定要不要评审**，于是评审变成挂在产出方身上的 ``as_tool``
 （见 ``evaluator.py``）。现在这里只跑**一次** ``Runner.run``。
 
-由此多出一档 ``exit_reason="unreviewed"``（模型一次都没调评审）。**不要**把它当成
-``passed``：代码不能替模型宣布"这份产出被审过了"，指标上也要能看出跳过的比例。
-2026-10-03 又多了 ``transfer`` 一档（这一步把对话交给了下一个 agent，没有交付物）。
+⚠️ 2026-10-19 再改一步：**评审结论不再决定交付方式（评分闸已删）**
+------------------------------------------------------------------
+上一次改动只把"跑不跑评审"交给了模型，但出口仍然拿评审结论办事：
+``review_failed`` 被映射成 40 分，图那边按 ``>= HIGH`` 判"交人"——
+等于模型评了一次，收尾权就被代码接管。用户要的是「让模型自己决定是否收尾、
+是否启用评分机制，而不是在最后硬加一道评分闸」。所以：
+
+* ``score_hint()`` **已删除**（agent 链路不产 0-100 分）；
+* ``exit_reason="review_failed"`` **保留**，但语义降级为**纯观测**：
+  它回答"运行结束时最后一次评审的结论是什么"，不再改变交付；
+* ``passed`` 的判据随之扩大 —— 评了没过也是**正常运行收口**（有产出就交）。
+
+由此 ``exit_reason`` 仍是四档，但**没有一档叫"没通过所以不给用户"**：
+``passed``（评过且过）/ ``unreviewed``（模型选择不评）/ ``review_failed``（评了没过，
+由模型自己决定是否接受）/ ``transfer``（交给下一个 agent，没有交付物）。
+前三者都算正常收口。**评审是过程内反馈，不是出口判定**。
 
 另外，**渲染 PPT / 落盘资产是确定性步骤，放在这里（代码）而不是做成工具**：
 没有任何模型需要"决定要不要渲染"。
@@ -77,6 +90,9 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from agents.stream_events import RawResponsesStreamEvent
+from openai.types.responses import ResponseTextDeltaEvent
+
 from agents import (
     Agent,
     InputGuardrailTripwireTriggered,
@@ -88,6 +104,7 @@ from agents import (
 
 from .. import observability
 from ..envutil import env_int
+from ..rag import citation_check
 from . import approval, fallback, reflection, runtime, supplements
 from .context import TaskContext
 from .frontline import frontline_agent
@@ -100,7 +117,6 @@ from .hooks import AGENT_HOOKS
 from .session import session_for
 from .specialists import literary_agent
 from .tools import render_slide_deck
-from .types import FrontlineDecision
 
 __all__ = [
     "ENTRY_AGENT",
@@ -177,14 +193,13 @@ class TaskOutcome:
     """
 
     decision: dict[str, Any] = field(default_factory=dict)
-    """结构化判定（``{"action": ..., "content": ...}``）。
+    """**已废弃**（2026-10-20）：此前装的是前台的 ``FrontlineDecision``，供图的条件边路由。
 
-    只有跑**带 ``output_type`` 的 agent**（当前就是前台）时才有值，其余是空 dict。
-    调用方（``src/graph.py`` 的前台节点）读它的 ``action`` 决定下一条边 ——
-    这就是"跨节点转移的信号来源"（handoff 已经不在节点里了，见模块 docstring）。
-
-    ⚠️ 空 dict 与 ``{"action": "reply"}`` 是**两回事**：前者是"这次运行没给出判定"
-    （跑文学节点 / 没跑到底），后者是"给出了判定：直接答复"。
+    换成官方 handoff 之后，"这一步是谁收的尾"由 ``final_agent`` 表达、有没有换人由
+    ``handoffs`` 表达，不再需要任何结构化判定。``app/main.py`` 与 ``src/graph.py``
+    的读者都已随图删掉；现在只剩 ``scripts/agent_capability_probe.py`` 与
+    ``tests/test_agents_pipeline.py`` 按"本轮是 reply 还是 transfer"读它。
+    新代码不要再读 —— 要判"有没有转交"请看 ``exit_reason`` / ``final_agent``。
     """
 
     approvals: list[approval.ApprovalRequest] = field(default_factory=list)
@@ -192,6 +207,26 @@ class TaskOutcome:
 
     ⚠️ 它**不是**"这次运行产出了什么"，而是"这次运行**停在哪**"：那些动作**还没执行**。
     别把它并进 ``delivered`` / ``assets`` —— 那两样是"已经做成了的事"。
+    """
+
+    citations: list[Any] = field(default_factory=list)
+    """本轮检索命中的**结构化来源**（页码、章节路径、保真原文、表格网格…）。
+
+    为什么跟着结果一起返回：接口层要把它发给客户端做"这句话出自哪一页"的回溯。
+    此前这份数据只活在 LangGraph 的 state 里，于是 runner 无法单独把一轮的结果
+    说完整 —— 依赖图的那一层一删，它就跟着丢了。
+    """
+
+    citation_check: dict[str, Any] = field(default_factory=dict)
+    """引用校验结论。``citations`` 非空只说明"检索命中了东西"，推不出"答案用了它"，
+    两者必须分开报（见 ``src/rag/citation_check.py``）。"""
+
+    review_reason: str = ""
+    """需要人看的原因（有限枚举）。空串 = 这一轮不需要人看。
+
+    取值：``manual``（兜底判定要求人工介入）/ ``needs_review``（模型在交付时
+    自己声明的）。前者是代码判的、后者是模型判的 —— 混成一个值会让"到底是谁
+    认为要审"这个问题失去答案，而这两种情形的处置并不相同。
     """
 
     run_snapshot: str = ""
@@ -202,28 +237,9 @@ class TaskOutcome:
     只恢复一次"这条必须由调用方保证（服务层用待审记录的"已办理"来挡）。
     """
 
-    def score_hint(self) -> int:
-        """把"是否可交付"映射成主链路沿用的 0-100 分。
-
-        为什么要有这个映射：``src/graph.py`` 的 ``route_review`` 是按分数做决策的
-        （>=HIGH 直通 / 中间重生成 / 低分转人工）。把 agent 链路的结论接到同一套
-        阈值上，两条链路对"要不要转人工"的口径才一致 —— 否则同一个服务里
-        两个标准，运维无法解释。
-        """
-        if self.passed:
-            return 90
-        if self.exit_reason == "transfer":
-            # 转交这一步本身是**成功**的（模型按约定给出判定，图据此跳文学节点），
-            # 只是它没有产出可交付物（所以 `passed` 为假）。给 90 是安全的：
-            # 目前没有任何调用方会在转交分支上读分数（`route_frontline` 直接跳节点），
-            # 而万一有人读了，把一次成功的步进报成"需要人工介入"会制造假告警。
-            return 90
-        if self.exit_reason in ("input_guardrail", "output_guardrail"):
-            return 30          # 确定性拦截：确凿的坏产出，交人
-        # review_failed / max_turns / error：链路没跑完或没过审 → 交人
-        # awaiting_approval 也落在这里 —— 它不是"内容有问题"，但确实**不能当成交付**
-        # （那个动作还没做）。落 40 让图把它交给人工通道，与"等一个人来处理"同一个落点。
-        return 40
+    #: ⚠️ 这里曾有 ``score_hint()``（把运行状态映射成 0-100 分，给图的评分闸用）。
+    #: 2026-10-19 **已删除**：agent 链路不产分、也不该为了触发一个分支去编一个量纲。
+    #: 收尾判据现在只有一处 —— ``fallback.decide`` 的结论（见模块 docstring）。
 
 
 def _rejected_output(exc: BaseException) -> str:
@@ -406,10 +422,13 @@ def _verdict_of(context: TaskContext) -> str:
 
     评审是模型**可选择**的工具（``as_tool``），所以三种情形必须分开：
 
-    * 一次都没调 ⇒ ``unreviewed``。**不等于通过** —— 代码不能替模型宣布"这份被
-      审过了"；指标上要能看出跳过的比例（这是选择"模型自主"必须付的透明度成本）。
+    * 一次都没调 ⇒ ``unreviewed``。**不等于"审过了"** —— 代码不能替模型宣布
+      "这份被审过了"；指标上要能看出跳过的比例（这是选择"模型自主"必须付的透明度成本）。
     * 评审且 ``pass`` ⇒ ``passed``
-    * 评审但没 ``pass`` ⇒ ``review_failed`` ⇒ 交付结论交人复核。
+    * 评审但没 ``pass`` ⇒ ``review_failed``。⚠️ 它**只是观测**：2026-10-19 起
+      这类运行照样正常交付（评审结论是过程内反馈，模型自己决定接不接受，见模块
+      docstring）。保留这个取值是为了让"多少交付是在评审未通过的情况下给出的"
+      能在 ``agent_runs_total{exit_reason}`` 上被看见。
 
     ⚠️ 判据是"**本次运行**"而不是"本轮的累积"：``run_agent`` 在每次运行开始时
     清空 ``context.delivered``（理由见那里），所以这里的 ``recall`` 天然只看得见
@@ -452,6 +471,7 @@ def _report_run_metrics(stats, exit_reason: str, *, agent: str = "") -> None:
     observability.histogram("agent_model_calls", stats.model_calls, agent=agent)
     observability.histogram("agent_tool_calls", stats.tool_calls, agent=agent)
     if stats.review_rounds:
+        # 0 不是"评审很快"，是"没评审" —— 两者在分位数上完全不是一回事。
         observability.histogram("agent_review_rounds", stats.review_rounds, agent=agent)
 
 
@@ -502,6 +522,62 @@ def _build_input_items(
     return items
 
 
+async def _run_streamed(
+    agent: Agent[TaskContext],
+    run_input: Any,
+    *,
+    context: TaskContext,
+    run_config: RunConfig | None,
+    max_turns: int,
+    session: Any,
+    on_text: Any,
+) -> Any:
+    """按官方流式接口跑一次，把正文增量边产边交给 ``on_text``。
+
+    为什么不再用 ``Runner.run`` + 事后切段
+    --------------------------------------
+    ``Runner.run`` 是**整段返回**：它跑完才拿到 ``final_output``。此前服务层虽然
+    一路是 SSE，但主链路（agent）拿到的是一整段文本，只能一次性发出去 ——
+    用户看到的是"等完整段生成时间，然后所有字同时出现"，而
+    ``llm_first_token_seconds{mode="buffered"}`` 那条指标记录的正是这件事本身。
+    换成 ``run_streamed`` 之后，token 真正逐段到达。
+
+    事件怎么取
+    ----------
+    官方把流分成三类：``RawResponsesStreamEvent``（模型原始事件）、
+    ``RunItemStreamEvent``（语义事件：工具调用、消息落库）、
+    ``AgentUpdatedStreamEvent``（换人）。正文增量在**第一类**的 data 上：
+    只有 ``ResponseTextDeltaEvent`` 才带 ``.delta``，其余原始事件一律跳过。
+
+    ``item_id`` 作为"这一次模型调用"的标记传给回调：服务层用它区分
+    "同一段生成的连续 chunk"与"换了一次调用（中间隔了工具执行）"，
+    TTFT 与 chunk 间隔两条指标都依赖这个区分。
+
+    ⚠️ **异常在迭代时抛出**，不在 ``run_streamed(...)`` 调用那一刻。所以调用方
+    的 ``try`` 必须包住整个迭代（见 ``run_agent``），否则护栏与限流会绕过所有
+    收尾逻辑，表现为"运行炸了但调用方以为它成功了"。
+    """
+    streamed = Runner.run_streamed(
+        agent,
+        run_input,
+        context=context,
+        run_config=run_config,
+        max_turns=max_turns,
+        hooks=AGENT_HOOKS,
+        session=session,
+    )
+    async for event in streamed.stream_events():
+        if not isinstance(event, RawResponsesStreamEvent):
+            continue
+        data = event.data
+        if not isinstance(data, ResponseTextDeltaEvent):
+            continue
+        delta = getattr(data, "delta", "") or ""
+        if delta:
+            await on_text(delta, getattr(data, "item_id", "") or "")
+    return streamed
+
+
 async def run_agent(
     agent: Agent[TaskContext],
     *,
@@ -512,11 +588,13 @@ async def run_agent(
     max_turns: int = MAX_TURNS,
     append_prompt: bool = True,
     resume: approval.ResumeRequest | None = None,
+    on_text: Any | None = None,
 ) -> TaskOutcome:
     """跑**一个** agent 一次，返回这次运行的结果。
 
-    agent: 本次运行用哪个 agent。图里的每个 agent 节点传各自的那一个
-        （``ENTRY_AGENT`` / ``LITERARY_AGENT``，见 ``src/graph.py``）。
+    agent: 本次运行的**起点** agent。正常一轮固定是 ``ENTRY_AGENT``（前台）；
+        换人由它自己的 ``handoffs`` 在运行内部完成，所以这里不需要按"第几个节点"
+        分别传参（原来那套 `ENTRY_AGENT` / `LITERARY_AGENT` 双入口是给图的两个节点用的）。
     prompt: **本轮新增的用户输入**。正常轮就是用户这句话；人工打回那一轮传原话
         （实际送进去的是意见，见 ``_build_input_items``）。
     context: 共享上下文（租户、检索器工厂、资产目录、统计对象）。
@@ -533,6 +611,11 @@ async def run_agent(
 
         "接着跑"为什么成立（而不是"重跑一轮"）、两条路各自的代价，
         见 ``approval`` 模块的模块 docstring —— 那里有实测证据，不是推断。
+
+    on_text: 正文增量回调 ``async (text, call_id) -> None``。给了就走官方
+        ``Runner.run_streamed``（见 ``_run_streamed``），不给就走 ``Runner.run``
+        （整段返回）。两条分支产出的 ``TaskOutcome`` 完全一致 —— 差别只在
+        "什么时候把字交出去"，不在"跑成什么样"。
 
     ⚠️ 只跑**一次** ``Runner.run``：评审已改成模型可调用的 ``as_tool``，
     这里没有"评审不通过就回灌重来"的循环（见模块 docstring）。
@@ -590,18 +673,31 @@ async def run_agent(
     decision: dict[str, Any] = {}
 
     try:
-        result = await Runner.run(
-            agent,
-            run_input,
-            context=context,
-            run_config=run_config,
-            max_turns=max_turns,
-            hooks=AGENT_HOOKS,
-            # 会话负责"取历史 + 与本轮合并 + 写回"；没有它时模型只看得到 input_items。
-            # ⚠️ 它是**这一个** run 的历史口，不是"本轮用什么模型/护栏"那类配置 ——
-            # 后者在 run_config 里（会话对象的构造期参数也在那儿配，见 build_run_config）。
-            session=session,
-        )
+        if on_text is None:
+            result = await Runner.run(
+                agent,
+                run_input,
+                context=context,
+                run_config=run_config,
+                max_turns=max_turns,
+                hooks=AGENT_HOOKS,
+                # 会话负责"取历史 + 与本轮合并 + 写回"；没有它时模型只看得到 input_items。
+                # ⚠️ 它是**这一个** run 的历史口，不是"本轮用什么模型/护栏"那类配置 ——
+                # 后者在 run_config 里（会话对象的构造期参数也在那儿配，见 build_run_config）。
+                session=session,
+            )
+        else:
+            # 流式：正文边产边交给回调。异常在迭代里抛（见 _run_streamed），
+            # 所以下面的 except 分支同样覆盖它 —— 两种形态的收尾口径必须一致。
+            result = await _run_streamed(
+                agent,
+                run_input,
+                context=context,
+                run_config=run_config,
+                max_turns=max_turns,
+                session=session,
+                on_text=on_text,
+            )
     except OutputGuardrailTripwireTriggered as exc:
         # 出口护栏拦下的输出**不会**成为交付物 —— 官方语义：被拒的候选输出不落库。
         # ⚠️ 但那段产出要"救回来存档"：转人工时它作为草稿带给审核人（见 fallback_draft）。
@@ -646,27 +742,49 @@ async def run_agent(
             )
 
     if result is not None and not approvals:
-        final = result.final_output
-        if isinstance(final, FrontlineDecision):
-            # 带结构化判定的 agent（前台）：**产出就是判定**，正文在 content 字段里。
-            # ⚠️ 不能走下面的 `str(final)` —— 那会拿到 pydantic 的 repr（字段名 + 括号），
-            # 而它会被当成"给用户的答复"一路交付出去。
-            decision = {"action": final.action, "content": final.content}
-            if final.action != "transfer":
-                answer = final.content or ""
-        else:
-            answer = str(final or "")
+        # 交付物**优先取 ``deliver`` 交出来的正文**（2026-10-20）：模型可能在交完之后
+        # 又补一句"已交付"，那句不是给用户的内容（提示词也要求它别重复正文）。
+        # 没调 deliver 时回落 ``final_output`` —— 闲聊与追问走的就是这条路，
+        # 与改造前逐字节一致。
+        delivered = str(context.delivered.get("delivery") or "")
+        answer = delivered or str(result.final_output or "")
         # 观测"这轮谁收的尾"。⚠️ 它**不**再决定下一轮的入口（入口固定为前台），
         # 所以这里不需要 on_handoff 参与、也不会因为漏了回调而把谁永久拉走 ——
         # 取的是"本次 run 结束在哪个 agent"这个唯一的事实来源。
         ended_on = getattr(result.last_agent, "name", "") or ""
+        # ★ "转交"的判据是**运行结束在谁手上**，不是模型自己报的一个字段
+        # （2026-10-20 起用官方 handoff：SDK 换掉 ``current_agent`` 后接着跑，
+        # ``last_agent`` 就是换人的结果）。模型说的不算，跑的算。
+        #
+        # ⚠️ 必须同时要求"起始 agent 是前台"：直接跑文学专家（例如旧的 ``literary``
+        # 图节点、或者测试里单跑它）时 ``last_agent`` 也不是前台，但那不是一次转交 ——
+        # 它是"这次运行本来就是它"。漏掉前半句，文学的每一次正常产出都会被记成
+        # ``exit_reason="transfer"``，而 transfer 在判据里另有含义。
+        transfer = (
+            getattr(agent, "name", "") == ENTRY_AGENT.name
+            and bool(ended_on)
+            and ended_on != ENTRY_AGENT.name
+        )
+        # ``decision`` 保留给图/接口层的旧读取方，但它是**从上面的既成事实推出来的**，
+        # 不再是模型产出的结构化对象 —— 图删掉之后这个字段应当一起消失。
+        decision = {"action": "transfer" if transfer else "reply", "content": answer}
         # 渲染大纲、收资产：确定性步骤，放在代码里而不是做成工具。
         _flush_deterministic_steps(context)
-        # 转交：这一步没有交付物，所以不走评审口径 —— 用"没评审"给它定档会让
-        # `agent_runs_total{exit_reason="unreviewed"}` 虚高（转交是常态，不是漏审）。
-        exit_reason = "transfer" if decision.get("action") == "transfer" else _verdict_of(context)
+        # 转交：这次运行没有"前台给用户的答复"，产出是接手方写的东西。
+        # 用"没评审"给它定档会让 `agent_runs_total{exit_reason="unreviewed"}` 虚高
+        # （转交是常态，不是漏审）。
+        exit_reason = "transfer" if transfer else _verdict_of(context)
 
-    passed = exit_reason in ("passed", "unreviewed")
+    # 2026-10-19：评审结论**不再决定能不能收口**。``review_failed``（模型评了、但结论
+    # 不是 pass）也是**正常收口** —— 它改不改、接不接受这个结论是模型自己的事
+    # （见模块 docstring）。所以 ``passed`` 的判据从"评过且过 / 没评"扩到含它。
+    #
+    # ⚠️ 2026-10-20：``transfer`` 也并进来了。此前它不算，理由是"那一步没有交付物"——
+    # 那是**图节点**形态下的结论（前台把对话交给下一个节点，自己什么都没写）。
+    # 换成官方 handoff 之后，交接在**同一次运行内**完成：接手方写完作品，``last_agent``
+    # 是它，``answer`` 就是作品本身 ⇒ 这一次运行**有**可交付内容。不并进来会怎么样：
+    # 文学请求的作品被判成"没有答复"，兜底表走第⑤行 ⇒ 用户收到一条错误报告。
+    passed = exit_reason in ("passed", "unreviewed", "review_failed", "transfer")
     duration = time.perf_counter() - started
     stats.attempts = 1
     stats.exit_reason = exit_reason
@@ -690,10 +808,11 @@ async def run_agent(
         agent=getattr(agent, "name", ""),
     )
 
-    # 交付物：没过审时**仍返回产出**：与 max_turns 同一考虑 —— 有疑点但不确凿，
-    # 交给人工复核比丢给用户一句空话好。被护栏拦下的则不给（那是确凿的坏产出）；
-    # 转交的也不给（那一段内容压根不是给用户看的）。
-    deliverable = answer if passed or exit_reason in ("review_failed", "max_turns") else ""
+    # 交付物：``passed`` 已经含 ``review_failed``（评审没过照样交，见上），
+    # 这里额外放行的只剩 ``max_turns`` —— 它可能已经写出了完整答复，只是没收敛；
+    # 有疑点但不确凿，交给人工复核比丢给用户一句空话好。
+    # 被护栏拦下的不给（那是确凿的坏产出）；转交的也不给（那一段内容压根不是给用户看的）。
+    deliverable = answer if passed or exit_reason == "max_turns" else ""
 
     # 兜底判定（第 5 步）：**转交**那一步不进表 —— 它没有交付物，拿它进表会让每一次
     # 正常转交都落进"没有可交付的答复"那一行（转交是常态，不是出问题）。
@@ -703,6 +822,38 @@ async def run_agent(
         fallback.report(
             verdict, exit_reason=exit_reason, agent=getattr(agent, "name", "")
         )
+
+    # 引用校验：**只算，不拦**。接口层按 `citation_check` 决定要不要下发引用，
+    # 拦截逻辑不在算的这一层（在这里改写文案会让"模型到底产出了什么"不可复现）。
+    #
+    # ⚠️ 被出口护栏拦下的那一轮，这里的结论是 `status="no_answer"`（而不是
+    # `unsupported`）：官方出口护栏一旦 tripwire，`final_output` 就是空串，
+    # 到这一步已经**没有文本可校验**了。真正的判据在护栏里算过（`guards.py` 的
+    # `citation_traceability_guardrail`），并以
+    # `agent_output_check_total{status="unsupported"}` 计数、以 `output_info` 回给 SDK。
+    # 所以"引用被拦"要看那条指标，**不要**从 `citation_check` 里找 —— 它答的是
+    # "交付出去的那份文本的引用可信吗"。
+    check: dict[str, Any] = {}
+    if context.citations:
+        try:
+            check = citation_check.verify(
+                deliverable, list(context.citations), docs_dir=context.docs_dir
+            )
+        except Exception as e:  # noqa: BLE001  观测失败不能影响作答
+            observability.counter("citation_check_errors_total")
+            logging.warning("引用校验失败（不影响作答）：%s", e)
+
+    # 要不要人看：**两件不同的事**，别合并成一个布尔。
+    #   ``needs_review`` —— 模型在交付那一刻自己声明的（deliver 工具挂审批回调，
+    #       于是运行停在这里，现场在 ``run_snapshot`` 里，可以接着跑）；
+    #   ``manual``       —— 代码在运行**结束后**判出来的（跑偏 / 护栏拦下 / 没产出）。
+    # 后者没有可挂起的地方（运行已经结束），它的处置是"进待审队列、打回时新起一轮"。
+    review_reason = ""
+    if exit_reason == "awaiting_approval":
+        if any(a.tool == "deliver" for a in approvals):
+            review_reason = "needs_review"
+    elif verdict is not None and verdict.outcome == "manual":
+        review_reason = "manual"
 
     return TaskOutcome(
         answer=deliverable,
@@ -719,4 +870,7 @@ async def run_agent(
         decision=decision,
         approvals=list(approvals),
         run_snapshot=run_snapshot,
+        citations=list(context.citations),
+        citation_check=check,
+        review_reason=review_reason,
     )

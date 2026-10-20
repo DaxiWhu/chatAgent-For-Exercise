@@ -19,7 +19,6 @@ import os
 import subprocess
 import sys
 import time
-from types import SimpleNamespace
 
 import pytest
 
@@ -40,91 +39,72 @@ client = TestClient(M.app, headers=auth_headers())
 # ---------------------------------------------------------------------------
 # 辅助：假对象
 # ---------------------------------------------------------------------------
-class _FakeStream:
-    """模拟 langgraph 的 astream 生成器：可异步迭代、可 aclose、记录是否被关闭。
+class _FakeTurn:
+    """替身运行：`chunks` 逐段交给 `on_text`，可加延迟 / 卡住 / 直接抛错。
 
-    delay: 每个 chunk 之间的间隔（秒）。用来模拟"模型在慢慢吐字"，
-        让"断连后停止产出"这件事在测试里可观测（否则纯 CPU 循环瞬间跑完，
-        断连检测根本没机会赢）。
+    替换的是 ``app.main.run_turn``。`closed` 记录"上游那次运行有没有被收掉"——
+    它在 `finally` 里置位，所以"取消真的传导下去了"这件事才可断言。
     """
 
-    def __init__(self, chunks, delay=0.0):
-        self._chunks = list(chunks)
-        self._delay = delay
-        self._i = 0
+    def __init__(self, chunks=(), delay=0.0, *, stall=False, boom=None):
+        self.chunks = list(chunks)
+        self.delay = delay
+        self.stall = stall
+        self.boom = boom
         self.closed = False
+        self.cancelled = False
 
-    def __aiter__(self):
-        return self
+    async def __call__(self, req, *, context, on_text=None):
+        from src.agents.runner import TaskOutcome
 
-    async def __anext__(self):
-        if self._delay:
-            await asyncio.sleep(self._delay)
-        if self._i >= len(self._chunks):
-            raise StopAsyncIteration
-        item = self._chunks[self._i], {}
-        self._i += 1
-        return item
+        try:
+            if self.boom is not None:
+                raise self.boom
+            if self.stall:
+                # 上游卡住：一直等，直到被取消（真实场景是限流重试 / 排队）。
+                await asyncio.sleep(3600)
+            for chunk in self.chunks:
+                if self.delay:
+                    await asyncio.sleep(self.delay)
+                if on_text is not None:
+                    await on_text(getattr(chunk, "content", chunk), "call-1")
+            return TaskOutcome(answer="", attempts=1, final_agent="frontline_agent",
+                               passed=True, exit_reason="passed")
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        finally:
+            self.closed = True
 
-    async def aclose(self):
-        self.closed = True
 
+class _TurnRaisesOnShutdown(_FakeTurn):
+    """取消时在 `finally` 里抛异常 —— 模拟"上游运行在收尾期报错"。
 
-class _StallingStream:
-    """永不产出 chunk 的流：模拟上游卡住/长时间重试（实测踩过的场景）。
+    真实形态：底层 HTTP 流被 cancel 时，传输层先在收尾里抛一句
+    "connection closed"，然后才轮到取消本身。它**不该**污染这一轮的结论
+    （正文已经发出去、配额已经该结算），也不该冒出一个 error 事件。
 
-    **关键**：`aclose()` 必须真的让挂起的 `__anext__` 结束 —— 这才是真实
-    async generator 的语义（aclose 向挂起点抛 GeneratorExit，迭代方随即收到
-    StopAsyncIteration）。如果 aclose 只设个标志而不唤醒等待者，就测不出
-    "取消能不能传导下去"，而会让用例卡在超时上。
+    分段产出（而不是只产一段就睡）：断连判定发生在**每次迭代的开头**，
+    上游若只产一段就卡住，主循环会停在"等下一段"上，断连根本没机会生效。
     """
 
-    def __init__(self):
-        self.closed = False
-        self._released = asyncio.Event()
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        if self.closed:
-            raise StopAsyncIteration
-        await self._released.wait()         # 一直挂起，直到被关闭
-        raise StopAsyncIteration
-
-    async def aclose(self):
-        self.closed = True
-        self._released.set()                # 唤醒挂起的迭代方
+    async def __call__(self, req, *, context, on_text=None):
+        try:
+            for i in range(50):
+                await asyncio.sleep(0.02)
+                await on_text(f"段{i}", "call-1")
+        finally:
+            self.closed = True
+            raise RuntimeError("shutdown boom")
 
 
-class _FakeGraph:
-    """假图：astream 返回给定 chunk 序列，aget_state 记录是否被访问。"""
-
-    def __init__(self, chunks, delay=0.0):
-        self.stream = _FakeStream(chunks, delay=delay)
-        self.state_queried = False
-
-    def astream(self, incoming, config, stream_mode):
-        return self.stream
-
-    async def aget_state(self, config):
-        self.state_queried = True
-        return SimpleNamespace(next=(), values={"citations": []})
-
-
-class _StallGraph:
-    """假图：上游永远不产出（用于验证"上游卡住时断连仍能被检测"）。"""
-
-    def __init__(self):
-        self.stream = _StallingStream()
-        self.state_queried = False
-
-    def astream(self, incoming, config, stream_mode):
-        return self.stream
-
-    async def aget_state(self, config):
-        self.state_queried = True
-        return SimpleNamespace(next=(), values={"citations": []})
+def _stream(turn, monkeypatch, *, tenant="t1", thread_id="t-1", disconnect=None,
+            timeout=0):
+    """构造一次 `_stream_run`：把替身运行装上，返回它的 SSE 事件生成器。"""
+    monkeypatch.setattr(M, "run_turn", turn)
+    return M._stream_run(M.TurnRequest(prompt="hi", thread_id=thread_id),
+                         "chat", tenant=tenant, thread_id=thread_id,
+                         disconnect=disconnect, timeout=timeout)
 
 
 class _FakeHTTPRequest:
@@ -606,27 +586,19 @@ def test_client_error_includes_request_id_in_production(monkeypatch):
 
 
 def test_stream_error_event_is_sanitized_in_production(monkeypatch):
-    """**接线测试**：`_stream_graph` 下发的 error 事件必须用脱敏文案。
+    """**接线测试**：`_stream_run` 下发的 error 事件必须用脱敏文案。
 
     上面三条只调 `_client_error()` —— 它们测的是"零件"，不是"零件有没有被装上"。
-    实测教训：把 `_stream_graph` 里的 `_client_error(e)` 改回 `str(e)` 时，
+    实测教训：把 `_stream_run` 里的 `_client_error(e)` 改回 `str(e)` 时，
     那三条**照样全绿**（断言根本没走到调用点）。所以必须有一条从异常源头
     走到 SSE 事件的用例，否则这层保护可以被静默摘掉。
     """
-    class _BoomGraph:
-        async def astream(self, incoming, config, stream_mode):
-            raise RuntimeError(
-                'connection to server at "db.internal" (10.0.0.5), port 5432 failed'
-            )
-            yield  # pragma: no cover  （让它成为异步生成器）
-
-        async def aget_state(self, config):  # pragma: no cover
-            raise AssertionError("异常路径不该查状态")
-
+    boom = RuntimeError(
+        'connection to server at "db.internal" (10.0.0.5), port 5432 failed')
     monkeypatch.setattr(M.config, "IS_PRODUCTION", True)
-    monkeypatch.setattr(M, "graph", _BoomGraph())
+    monkeypatch.setattr(M, "run_turn", _FakeTurn(boom=boom))
 
-    events = _collect(M._stream_graph({}, {}, "chat", tenant="t1"))
+    events = _collect(M._stream_run(M.TurnRequest(prompt="hi", thread_id="t1"), "chat", tenant="t1"))
     assert [e["event"] for e in events] == ["error"], events
     payload = events[0]["data"]
     assert "db.internal" not in payload and "10.0.0.5" not in payload
@@ -740,69 +712,93 @@ def test_production_env_turns_docs_off_by_default():
 # ---------------------------------------------------------------------------
 # 断连止损：客户端走了就别再烧 token
 # ---------------------------------------------------------------------------
+# 断连止损：客户端走了就别再烧 token
+# ---------------------------------------------------------------------------
 def test_client_disconnect_stops_generation(monkeypatch):
-    """断开后必须：① 停止产出；② 不再下发 done；③ 不再查状态（也就不入队）。
+    """断开后必须：① 停止产出；② 不再下发 done；③ 取消真的传导到上游运行。
 
-    破坏 `_watch_disconnect` 或 `_DisconnectSignal` 时这条会红。
+    破坏 `_watch_disconnect` 与 `_DisconnectSignal` 之间的接线时这条会红。
     """
     from app import metrics
 
     metrics.reset()
-    chunks = [SimpleNamespace(content=f"段{i}") for i in range(40)]
-    g = _FakeGraph(chunks, delay=0.02)          # 每 chunk 20ms，模拟慢速生成
-    monkeypatch.setattr(M, "graph", g)
+    chunks = [f"段{i}" for i in range(40)]
+    g = _FakeTurn(chunks, delay=0.02)          # 每段 20ms，模拟慢速生成
 
     events = _collect_with_disconnect(
-        lambda sig: M._stream_graph({}, {}, "chat", tenant="t1", disconnect=sig),
-        trip_after=0.05)                        # 约 2~3 个 chunk 后断开
+        lambda sig: _stream(g, monkeypatch, disconnect=sig),
+        trip_after=0.05)                        # 约 2~3 段后断开
     names = [e["event"] for e in events]
 
-    assert names.count("token") < len(chunks), f"断开后仍把全部 chunk 产出了：{names}"
+    assert names.count("token") < len(chunks), f"断开后仍把全部内容产出了：{names}"
     assert "done" not in names, f"已断开不该下发收尾事件：{names}"
-    assert g.state_queried is False, "已断开却仍去查状态（会白白入队）"
+    assert g.cancelled is True, "取消没有传导到上游运行，它会在后台跑到底（边断边计费）"
     # 指标是"止损真的发生了"的唯一线上证据；修复前它是死代码（恒为 0）
     assert metrics.value("client_disconnected_total", kind="chat") == 1
 
 
-def test_client_disconnect_closes_upstream_stream(monkeypatch):
-    """必须显式 aclose 上游流：不关的话底层 LLM 调用会一直跑到 GC 为止。
+def test_client_disconnect_settles_the_upstream_run(monkeypatch):
+    """断开后上游那次运行必须**收尾结束**，不能留一个没人取结果的协程。
 
-    去掉 `await stream.aclose()` 时这条红。
+    只断言"少发了几个 token"是不够的：那可以靠"不再 yield"伪造出来，而上游
+    仍在后台跑（=仍在付钱）。`closed` 在替身运行的 `finally` 里置位，
+    所以它只在上游**真的**退出时才为 True。
     """
-    g = _FakeGraph([SimpleNamespace(content=f"段{i}") for i in range(10)], delay=0.02)
-    monkeypatch.setattr(M, "graph", g)
+    g = _FakeTurn([f"段{i}" for i in range(10)], delay=0.02)
 
     _collect_with_disconnect(
-        lambda sig: M._stream_graph({}, {}, "chat", tenant="t1", disconnect=sig),
+        lambda sig: _stream(g, monkeypatch, disconnect=sig),
         trip_after=0.05)
-    assert g.stream.closed is True, "上游生成器未被关闭，取消没有传导下去"
+    assert g.closed is True, "上游运行没有收尾，取消没有传导下去"
 
 
-def test_disconnect_detected_even_when_upstream_stalls(monkeypatch):
-    """**回归测试**：上游长时间不产出 chunk 时，断连仍必须被检测到。
+def test_a_stalled_upstream_is_bounded_by_the_deadline(monkeypatch):
+    """**回归测试**：上游长时间不产出内容时，不能无限等 —— 兜底是**总时限**。
 
-    原实现把检测写在 `async for` 循环体内 ⇒ 只在"上游产出 chunk"时才转一圈。
-    2026-09-28 实测中上游 429 重试了 36 秒，主循环一次都没转，客户端早走了
-    服务端还在等，token 照付。改成独立 watcher 任务后才能覆盖这个场景。
+    为什么这条不再声称"watcher 能救卡住的上游"
+    ----------------------------------------
+    watcher 置位后会去 `aclose()` 上游流，而此刻生成器正卡在"等下一段"里
+    （`ag_running` 为真），asyncio 会以 "asynchronous generator is already
+    running" 拒绝它 —— 这是 `_DisconnectSignal` 文档里写死的三条约束之一，
+    以前那条用例只是没走到这里。
 
-    本用例还额外钉住一件事：**是 watcher 的 aclose 把卡住的流解开的**
-    （卡住的 `__anext__` 只有被 aclose 唤醒才会结束），所以它同时也验证了
-    "关闭能真正传导到上游"。
-    退回"循环体内检测"的实现时，本用例会超时失败。
+    生产链路上卡住的上游是被 sse_starlette 的 `cancel_scope.cancel()` 收掉的
+    （断连即取消整个 task group，见 `tests/test_disconnect.py` 的真实 ASGI 栈）；
+    单元级没有那层取消，所以这里钉住的是**最后一道兜底**：有总时限时必须按时收流
+    并取消上游，而不是挂在那里。原来那条"断连能救卡住的上游"是假前提 ——
+    它靠 15 秒超时失败，而不是靠任何真实机制。
+
+    2026-09-28 的事故背景仍然成立：上游 429 重试了 36 秒，主循环一次都没转，
+    客户端早走了服务端还在等、token 照付。当时的修法是"独立 watcher"，
+    但真正把等待打断的是这里的 `deadline`（以及库的取消）。
     """
-    g = _StallGraph()
-    monkeypatch.setattr(M, "graph", g)
+    g = _FakeTurn(stall=True)
 
     started = time.time()
-    events = _collect_with_disconnect(
-        lambda sig: M._stream_graph({}, {}, "chat", tenant="t1", disconnect=sig),
-        trip_after=0.05, timeout=15)
+    events = _collect(_stream(g, monkeypatch, timeout=0.5))
     elapsed = time.time() - started
 
-    assert elapsed < 5, f"上游卡住时断连未能及时中止（耗时 {elapsed:.1f}s）"
-    assert events == [], f"卡住场景不该产出任何事件：{events}"
-    assert g.stream.closed is True, "上游未被关闭，取消没有传导下去"
-    assert g.state_queried is False
+    assert elapsed < 5, f"上游卡住时没有按时收流（耗时 {elapsed:.1f}s）"
+    assert [e["event"] for e in events] == ["timeout"], events
+    assert g.cancelled is True, "卡住的上游没有被取消，它会一直等到自己结束"
+
+
+def test_disconnect_takes_effect_at_the_next_wait_boundary(monkeypatch):
+    """断连在下一次迭代开头生效：不再继续产完，也绝不补一个没人收的 done。
+
+    能漏出去的只有**断连那一刻正在途中的那一段**（上游已经把它交出来了）。
+    剩下的必须停：删掉主循环开头那道 `disconnect.closed` 判定时，这条会看到
+    上游把内容全产完再发 done —— 客户端早就走了，token 照付。
+    """
+    g = _FakeTurn([f"段{i}" for i in range(10)], delay=0.3)   # 每段 300ms
+
+    events = _collect_with_disconnect(
+        lambda sig: _stream(g, monkeypatch, disconnect=sig),
+        trip_after=0.05)                        # 断连时第一段还在路上
+    names = [e["event"] for e in events]
+
+    assert names == ["token"], f"已断开却继续下发事件：{names}"
+    assert g.cancelled is True
 
 
 def test_disconnect_still_settles_quota(monkeypatch):
@@ -818,45 +814,41 @@ def test_disconnect_still_settles_quota(monkeypatch):
     q = Q.QuotaManager(daily_limit=10 ** 6, request_limit=1000)
     monkeypatch.setattr(M, "_QUOTA", q)
 
-    g = _FakeGraph([SimpleNamespace(content="已经产出的内容")] * 20, delay=0.02)
-    monkeypatch.setattr(M, "graph", g)
+    g = _FakeTurn(["已经产出的内容"] * 20, delay=0.02)
 
     _collect_with_disconnect(
-        lambda sig: M._stream_graph({}, {}, "chat", tenant="tenant-x", disconnect=sig),
-        trip_after=0.1)                         # 已产出若干 chunk 后才断
+        lambda sig: _stream(g, monkeypatch, tenant="tenant-x", disconnect=sig),
+        trip_after=0.1)                         # 已产出若干段后才断
     assert q.store.get(Q._tenant_bucket("tenant-x", Q._today()), Q._today()) > 0
 
 
 def test_normal_run_without_disconnect_is_unchanged(monkeypatch):
     """不传 disconnect 时保持旧行为（CLI/历史调用方）—— 必须有 done 收尾。"""
-    chunks = [SimpleNamespace(content="正常回答")]
-    g = _FakeGraph(chunks)
-    monkeypatch.setattr(M, "graph", g)
+    g = _FakeTurn(["正常回答"])
 
-    events = _collect(M._stream_graph({}, {}, "chat", tenant="t1"))
+    events = _collect(_stream(g, monkeypatch))
     names = [e["event"] for e in events]
     assert names == ["token", "done"]
-    assert g.stream.closed is True     # 正常结束也要关闭，避免连接泄漏
+    assert g.closed is True and g.cancelled is False   # 正常结束也要收尾，且不是被取消的
 
 
-def test_close_error_does_not_break_accounting(monkeypatch):
-    """关闭上游时抛异常，不该覆盖真实结果，也不该吞掉计费。"""
+def test_upstream_shutdown_error_does_not_break_accounting(monkeypatch):
+    """上游在收尾期抛异常，不该污染这一轮的结论，也不该吞掉计费。
+
+    真实形态：底层 HTTP 流被 cancel 时，传输层的收尾先抛一句 "connection closed"。
+    它既不是"流故障"（不该冒 error 事件），也不该让 `finally` 里的结算被跳过。
+    """
     from app import quota as Q
-
-    class _BadClose(_FakeStream):
-        async def aclose(self):
-            raise RuntimeError("close boom")
-
-    class _BadGraph(_FakeGraph):
-        def __init__(self, chunks):
-            super().__init__(chunks)
-            self.stream = _BadClose(chunks)
 
     q = Q.QuotaManager(daily_limit=10 ** 6, request_limit=1000)
     monkeypatch.setattr(M, "_QUOTA", q)
-    g = _BadGraph([SimpleNamespace(content="内容")])
-    monkeypatch.setattr(M, "graph", g)
+    g = _TurnRaisesOnShutdown()
 
-    events = _collect(M._stream_graph({}, {}, "chat", tenant="t-bad"))
-    assert [e["event"] for e in events] == ["token", "done"]
+    events = _collect_with_disconnect(
+        lambda sig: _stream(g, monkeypatch, tenant="t-bad", disconnect=sig),
+        trip_after=0.05)
+
+    names = [e["event"] for e in events]
+    # 只允许 token，且既没有 done（没收尾成功）、也没有 error（关闭期异常被当故障）
+    assert names and set(names) == {"token"}, events
     assert q.store.get(Q._tenant_bucket("t-bad", Q._today()), Q._today()) > 0

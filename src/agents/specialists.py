@@ -40,11 +40,12 @@ hooks（SDK 源码里这是两个独立形参）。漏掉的表现是"专家的�
 （``handoffs/__init__.py``：``f"Handoff to the {agent.name} agent... {agent.handoff_description or ''}"``）；
 ``as_tool`` 用的是 ``tool_description``，**不回退**到这个字段
 （``agent.py``：``tool_description_resolved = tool_description or ""``）。
-⇒ 2026-10-03 起本项目**一处 handoff 都不剩**，所以这个字段**全部删净**：
-留着它就是"写了没人读"的死配置。三个 ``as_tool`` 专家的职责说明写在
-``frontline.py`` 的 ``as_tool(..., description=...)`` 里，那才是模型真正看得到的那句；
-``literary_agent`` 的职责说明写在**结构化判定**的字段描述里
-（``types.FrontlineDecision``），那也是模型真正看得到的那句。
+⇒ 判据是"这个 agent 是 ``as_tool`` 还是 ``handoffs``"：
+* 三个 ``as_tool`` 专家**不写**这个字段（写了没人读，是死配置），职责说明写在
+  ``frontline.py`` 的 ``as_tool(..., description=...)`` 里 —— 那才是模型看得到的那句；
+* ``literary_agent`` 走 **handoff**（2026-10-20 起，见 ``frontline.py`` 的模块
+  docstring），所以它**必须写** ``handoff_description``：前台是靠这句决定要不要
+  把对话交出去的，空着等于让模型猜"这个 agent 是干嘛的"。
 """
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ from agents import Agent, RunResult, RunResultStreaming
 
 from .context import TaskContext
 from .evaluator import evaluate_draft_tool
-from .tools import generate_image, kb_search
+from .tools import deliver, generate_image, kb_search
 from .types import ImageBrief, ResearchDigest, SlideDeck
 
 __all__ = [
@@ -169,7 +170,7 @@ async def extract_illustration(result: RunResult | RunResultStreaming) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 帮手 C：文学（图里的一个独立节点，由前台的结构化判定路由过去）
+# 帮手 C：文学（通过官方 handoff 接管对话，不是图节点）
 # --------------------------------------------------------------------------- #
 literary_agent = Agent[TaskContext](
     name="literary_writer",
@@ -179,17 +180,28 @@ literary_agent = Agent[TaskContext](
         "# Routine\n"
         "1. 先确认题材、篇幅、基调；信息够了就直接写，不要反复追问。\n"
         "2. 一次给出完整作品，再根据用户意见修改。\n"
-        "3. 交给用户之前调用 review_draft 自查一次，按它给出的改进项改完再交付。\n"
+        "3. 要不要自查由**你**判断：想确认质量就调用 review_draft；一旦调用，"
+        "按它给出的改进项改完再交付。它**不是**必须通过的关卡，只是你自己的第二意见。\n"
+        "4. 交付：作品写完后调用 deliver，把**作品全文**放进 content。\n"
+        "   - 题材敏感、或你自己拿不准时把 needs_review 设为 true —— "
+        "整个运行会停下来等人工过目，人打回时你会收到他写的意见，改完再交一次。\n"
+        "   - 普通创作保持 needs_review: false。\n"
         "\n"
         "# 边界\n"
-        "- 你只做文学创作。用户要的是别的（查资料 / 做 PPT / 插图）时如实说明，"
-        "不要硬做 —— 下一轮由前台接手。\n"
+        "- 你只做文学创作。用户中途要的是别的（查资料 / 做 PPT / 插图）时如实说明"
+        "自己不做这个，让用户下一轮回前台提 —— **不要硬做**。\n"
         "- 不写技术文档、不做资料检索（那是 researcher 的活）。\n"
         "- 不输出 Markdown 表格、不输出 JSON —— 你交付的是作品本身。"
     ),
     # 作品是交付物 ⇒ 它同样要能自查（评审挂"产出交付物的一方"）。
-    tools=[evaluate_draft_tool],
-    # 刻意**不写** handoff_description：2026-10-03 起本项目一处 handoff 都不剩，
-    # 而这个字段唯一的读取方就是 Handoff.default_tool_description（见模块 docstring）。
-    # 模型看到的职责说明来自 types.FrontlineDecision 的字段描述（前台据此决定转不转）。
+    # ``deliver`` 也必须在它手上：handoff 之后控制权在这里，交付动作只能由它发起
+    # （``frontline`` 那份工具集在换人之后不再生效）。
+    tools=[evaluate_draft_tool, deliver],
+    # ★ 前台靠这一句决定"要不要把整段对话交出去"（官方唯一读取方：
+    # ``Handoff.default_tool_description``）。写成"能力清单 + 时机"，
+    # 不写"我是一个 agent"这类模型已经知道的信息。
+    handoff_description=(
+        "把对话交给文学作者。用于小说、散文、诗歌、剧本这类创作请求 —— "
+        "需要整篇作品，而不是一段说明或一份大纲。交接前把题材、篇幅、基调讲清楚。"
+    ),
 )

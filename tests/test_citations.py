@@ -5,9 +5,6 @@
 所以测试的重点不是"有没有 citations 字段"，而是**保真数据有没有被加工品顶掉**。
 """
 
-from langchain_core.messages import AIMessage
-
-from src.graph import retrieve
 from src.rag.retrieval import build_citations, context_block
 
 # 一个"像真产物一样"的命中：保真 content 与加工过的 text 明显不同
@@ -162,9 +159,11 @@ def test_context_block_always_carries_the_source_label():
 
 
 # ---------------------------------------------------------------------------
-# 接进图：retrieve 节点必须把引用放进 state
+# 接进工具：kb_search 必须把引用累积到上下文
 # ---------------------------------------------------------------------------
 class _FakeRetriever:
+    """只回放固定命中的检索器（不碰向量库，也不校验查询词）。"""
+
     def __init__(self, hits):
         self.hits = hits
 
@@ -172,30 +171,57 @@ class _FakeRetriever:
         return self.hits
 
 
-def _state(text="华东区销售额是多少"):
-    from src.graph import OverAllState
-    return OverAllState(messages=[AIMessage(content=text)])
+def _tool_context(context, arguments='{"query": "华东区销售额"}', name="kb_search"):
+    """造一个工具执行时收到的上下文（``on_invoke_tool`` 的第一个参数）。
+
+    ⚠️ 必须走 ``on_invoke_tool`` 而不是直接调底层函数：``@function_tool`` 之后
+    ``kb_search`` 已经不是普通函数了，而且在真链路上模型也正是从这条口子进来的。
+    """
+    from agents.tool_context import ToolContext
+    from agents.usage import Usage
+
+    return ToolContext(context=context, usage=Usage(), tool_name=name,
+                       tool_call_id="c1", tool_arguments=arguments)
 
 
-def test_retrieve_puts_citations_into_state(monkeypatch):
-    import src.graph as g
+def test_kb_search_accumulates_citations_into_context():
+    """引用必须累积到上下文 —— 出口护栏与 SSE 的 citations 事件都读它。
 
-    monkeypatch.setattr(g, "_RETRIEVER", _FakeRetriever([(_TABLE_HIT, 0.9)]))
-    out = retrieve(_state())
-    assert out["citations"] and out["citations"][0]["source"] == "年报.pdf"
-    assert out["citations"][0]["page"] == 3
+    只把引用拼进返回文本、不写上下文的话，用户看到的正文里有 ``[1]``，
+    但事件里一条引用都没有：角标成了死链，而且是**静默**的。
+    """
+    import asyncio
+
+    from src.agents.context import TaskContext
+    from src.agents.tools import kb_search
+
+    context = TaskContext(tenant="acme",
+                          retriever_factory=lambda: _FakeRetriever([(_TABLE_HIT, 0.9)]))
+    text = asyncio.run(kb_search.on_invoke_tool(_tool_context(context),
+                                               '{"query": "华东区销售额"}'))
+
+    assert [c["source"] for c in context.citations] == ["年报.pdf"]
+    assert context.citations[0]["page"] == 3
     # 送给模型的上下文用保真内容（网格），而不是文字化结果
-    assert "| 地区 | 销售额 |" in out["context"]
+    assert "| 地区 | 销售额 |" in text
+    assert "地区=华东" not in text
 
 
-def test_retrieve_citations_empty_on_failure(monkeypatch):
-    """检索失败时引用也要清空 —— 残留上一轮的引用比没有引用更危险。"""
-    import src.graph as g
+def test_kb_search_leaves_citations_untouched_on_failure():
+    """检索失败时引用**一条都不能留** —— 残留上一轮的引用比没有引用更危险：
+    正文里的角标会指向一段与本次结论无关的原文。"""
+    import asyncio
+
+    from src.agents.context import TaskContext
+    from src.agents.tools import kb_search
 
     class _Boom:
         def search(self, query, top_k=3):
             raise RuntimeError("index broken")
 
-    monkeypatch.setattr(g, "_RETRIEVER", _Boom())
-    out = retrieve(_state())
-    assert out["context"] == "" and out["citations"] == []
+    context = TaskContext(tenant="acme", retriever_factory=lambda: _Boom())
+    text = asyncio.run(kb_search.on_invoke_tool(_tool_context(context),
+                                               '{"query": "华东区销售额"}'))
+
+    assert context.citations == []
+    assert "检索失败" in text, "失败必须如实说，不能当成「检索不到」糊过去"

@@ -54,22 +54,27 @@ def test_review_revise_without_feedback_returns_400():
 # ---------------------------------------------------------------------------
 # 引用事件（citations）：答案之后必须下发"依据了什么"，否则用户无法回溯
 # ---------------------------------------------------------------------------
-class _FakeGraph:
-    """替身图：只验证 **SSE 事件编排**，不触发真实检索与模型调用。"""
+def _fake_turn(answer="华东区 1200。", *, citations=None, review_reason=""):
+    """替身运行：只验证 **SSE 事件编排**，不触发真实检索与模型调用。
 
-    def __init__(self, citations, next_nodes=()):
-        self._citations = citations
-        self._next = next_nodes
+    替换的是 ``app.main.run_turn`` —— 接口层现在唯一依赖的执行入口。
+    """
+    from src.agents.runner import TaskOutcome
 
-    async def astream(self, incoming, config, stream_mode):
-        from types import SimpleNamespace
-        yield SimpleNamespace(content="华东区 1200。"), {}
+    async def _run(req, *, context, on_text=None):
+        if on_text is not None and answer:
+            await on_text(answer, "call-1")
+        return TaskOutcome(
+            answer=answer,
+            attempts=1,
+            final_agent="frontline",
+            passed=True,
+            exit_reason="passed",
+            citations=list(citations or []),
+            review_reason=review_reason,
+        )
 
-    async def aget_state(self, config):
-        from types import SimpleNamespace
-        return SimpleNamespace(next=self._next,
-                               values={"citations": self._citations,
-                                       "output": "草稿", "score": 50, "feedback": "x"})
+    return _run
 
 
 def _collect(gen):
@@ -86,8 +91,9 @@ def test_stream_emits_citations_between_tokens_and_done(monkeypatch):
     import app.main as M
 
     cites = [{"n": 1, "source": "年报.pdf", "page": 3, "snippet": "| 华东 | 1200 |"}]
-    monkeypatch.setattr(M, "graph", _FakeGraph(cites))
-    events = _collect(M._stream_graph({}, {}, "chat"))
+    monkeypatch.setattr(M, "run_turn", _fake_turn(citations=cites))
+    events = _collect(M._stream_run(
+        M.TurnRequest(prompt="hi", thread_id="api-cite"), "chat"))
     assert [e["event"] for e in events] == ["token", "citations", "done"]
     # data 必须是**已序列化的 JSON 字符串**，不能是 list 本身：
     # sse_starlette 的 encode 对 data 走 `str(...)`，直接给 list 会发出 Python repr
@@ -101,15 +107,25 @@ def test_stream_skips_citations_event_when_nothing_recalled(monkeypatch):
     """没有召回就**不要**发空引用事件：前端收到空数组会显示一个空引用区。"""
     import app.main as M
 
-    monkeypatch.setattr(M, "graph", _FakeGraph([]))
-    events = _collect(M._stream_graph({}, {}, "chat"))
+    monkeypatch.setattr(M, "run_turn", _fake_turn())
+    events = _collect(M._stream_run(
+        M.TurnRequest(prompt="hi", thread_id="api-nocite"), "chat"))
     assert [e["event"] for e in events] == ["token", "done"]
 
 
 def test_stream_still_signals_need_review_with_citations(monkeypatch):
+    """要人审的那一轮：引用照常下发，最后以 need_review 收尾（而不是 done）。
+
+    ⚠️ 注意 token 仍然在这条流里，而且这是**有意的**：审核判定发生在运行结束之后，
+    此时正文早已流给用户了 —— "已经发出去的收不回来"。真正"不交半成品"只对
+    **模型在交付那一刻自己声明**的那条路（`deliver(needs_review=True)`）成立：
+    那一轮运行停在工具审批上，正文**没有**变成 token。
+    """
     import app.main as M
 
-    monkeypatch.setattr(M, "graph", _FakeGraph([{"n": 1, "source": "a.pdf"}],
-                                               next_nodes=("human_review",)))
-    events = _collect(M._stream_graph({}, {}, "chat"))
+    monkeypatch.setattr(M, "run_turn",
+                        _fake_turn(citations=[{"n": 1, "source": "a.pdf"}],
+                                   review_reason="manual"))
+    events = _collect(M._stream_run(
+        M.TurnRequest(prompt="hi", thread_id="api-nr"), "chat"))
     assert [e["event"] for e in events] == ["token", "citations", "need_review"]

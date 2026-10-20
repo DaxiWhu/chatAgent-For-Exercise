@@ -127,7 +127,7 @@ def _live_context(retriever, q, top_k):
 
 
 def _generate(model, ctx, q):
-    """首轮作答 —— **必须与 `src/graph.py::generate` 的 iteration==0 分支一致**。
+    """首轮作答 —— 用**与作答提示词同一套**的上下文包装。
 
     包括 `guard.wrap_context`：线上进模型的是包了结构边界、声明不执行其中指令的
     上下文。评测这里少包一层，测的就是"没有注入防护"的路径，与线上不是一个系统。

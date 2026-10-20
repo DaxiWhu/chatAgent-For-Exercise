@@ -16,16 +16,19 @@
 
     current_agent = result.last_agent
 
-赋值来源是**本次 run 的结果**，不经过任何 ``on_handoff`` 回调。本项目为了跨副本/重启，
-把它落进 LangGraph state 的 ``current_agent`` 字段（见 ``src/graph.py`` 的 ``frontline``
-与 ``literary`` 两个节点，每个节点各写一次），但**仍由 result.last_agent 驱动**。
+赋值来源是**本次 run 的结果**，不经过任何 ``on_handoff`` 回调。本项目**不再**把它
+持久化到任何地方（原先落进 LangGraph state 的 ``current_agent`` 字段，随图一起删了）：
+一轮 = 一次 ``Runner.run``，每轮入口固定是 ``frontline_agent``，所以"上一轮结束在谁手上"
+对下一轮没有意义 —— 它只在**本次运行内部**有意义，而本次运行内部官方已经有
+``result.last_agent``。
 
 ⚠️ 曾经这里有过一个 ``channel`` 字段，由 ``on_handoff`` 回调写入。它只覆盖了"去程"，
 回程没有对等的写入 ⇒ 一旦走过文学 handoff，之后每轮都会被拉回文学专家，回程边等于白接。
 **不要再把跨轮状态放回上下文 / 回调** —— 状态只有一个来源：本次 run 结束在哪个 agent。
 
-（2026-10-03 起本项目**一处 handoff 都没有了** —— 跨节点转移改由图的条件边做，
-见 ``src/agents/types.FrontlineDecision``。那条教训仍然成立：跨轮状态不进上下文。）
+（2026-10-20：前台 → 文学专家重新走官方 ``handoffs=``，所以这条教训**现在更要紧**：
+交接发生在一次运行内部，任何"把当前是谁记进上下文"的做法都会在换人后与
+``result.last_agent`` 打架。跨轮状态只有一个来源：本次运行结束在哪个 agent。）
 
 与示例版的差别（生产化必须的）
 ------------------------------
@@ -48,7 +51,7 @@ from typing import Any
 from .reflection import ReflectionState
 from .steps import StepLog
 
-__all__ = ["AgentStats", "CARRY_ACROSS_NODES", "TaskContext", "RUN_LOCAL", "stats_from_dict"]
+__all__ = ["AgentStats", "TaskContext"]
 
 
 @dataclass
@@ -56,19 +59,19 @@ class AgentStats:
     """一次 agent run 的**可上报统计**。
 
     为什么单独一个对象、而不是随手打日志：这些量就是"评估 agent 能力"的指标源
-    （路由降级原因、评审轮次与结论、返工率、护栏拦截、检索命中率）。日志只能事后
-    grep 单条请求，做不出比率。
+    （评审结论、返工率、护栏拦截、检索命中率）。日志只能事后 grep 单条请求，
+    做不出比率。
 
-    ⚠️ 它**不进 LangGraph 的 state** —— state 会被 checkpointer 序列化，
-    dataclass 不是 msgpack 可序列化类型。`src/graph.py` 里写进 state 的是
-    ``as_dict()`` 的**普通 dict**。
+    ⚠️ 这里**不再有** ``route`` / ``route_reason`` 两个字段：它们是"降级到另一条
+    链路"的标签，而兜底链路已经随图一起删除（链路不可用时进程直接拒绝启动）。
+    留着它们的后果是**指标永远报 unknown** —— 一个看起来在跑、实际不含任何信息的
+    标签。
+
+    ⚠️ ``review_rounds`` **保留**，但它数的**不是**图时代的分级评审轮次：它数的是
+    "本轮评审工具被模型叫了几次"（见 ``evaluator.extract_evaluation``）。
+    删掉它会让 ``agent_rework_total`` 永远为 0 —— 而"模型自己改了一轮再评"
+    是唯一能反映自我返工的信号（``attempts`` 恒为 1，判不出返工）。
     """
-
-    # -- 路由 --
-    route: str = ""
-    """最终走的链路：``agent`` / ``rag``。"""
-    route_reason: str = ""
-    """降级原因（指标标签，取值有限）；没降级时是 ``ready``。"""
 
     # -- 运行 --
     model_calls: int = 0
@@ -77,8 +80,17 @@ class AgentStats:
     """参与过本轮调用的 agent 名（按首次出现顺序）。"""
     handoffs: list[tuple[str, str]] = field(default_factory=list)
     """(from, to) —— 每次 handoff 一条。"""
-    review_rounds: int = 0
     last_score: str = ""
+    """上一轮评审给出的结论档（``pass`` / ``revise`` / …）；没评审时是空串。"""
+
+    review_rounds: int = 0
+    """本轮**评审工具被模型叫了几次**。
+
+    ⚠️ 不是"代码循环跑了几轮"（那个循环已经随评审改成 ``as_tool`` 一起删掉）。
+    它现在的用途只有一个：``review_rounds > 1`` 说明模型改完又评了一次，
+    这才是"自我返工"的唯一可观测信号 —— ``attempts`` 恒为 1，判不出来。
+    """
+
     attempts: int = 0
     exit_reason: str = ""
     guardrail: str = ""
@@ -93,16 +105,14 @@ class AgentStats:
     assets: int = 0
 
     def as_dict(self) -> dict:
-        """转成**普通 dict**（可进 state / 可 JSON 序列化）。"""
+        """转成**普通 dict**（可 JSON 序列化、可写日志）。"""
         return {
-            "route": self.route,
-            "route_reason": self.route_reason,
             "model_calls": self.model_calls,
             "tool_calls": self.tool_calls,
             "agents": list(self.agents),
             "handoffs": [list(p) for p in self.handoffs],
-            "review_rounds": self.review_rounds,
             "last_score": self.last_score,
+            "review_rounds": self.review_rounds,
             "attempts": self.attempts,
             "exit_reason": self.exit_reason,
             "guardrail": self.guardrail,
@@ -112,72 +122,6 @@ class AgentStats:
             "empty_retrievals": self.empty_retrievals,
             "assets": self.assets,
         }
-
-
-#: 跨 agent 节点要**延续**的统计字段。
-#:
-#: 2026-10-03 起一次请求可能跑**多个** agent 节点（前台 + 文学），而每个节点各建一份
-#: ``TaskContext``（它们不是同一次 run，SDK 里没有共享上下文的办法）。而这些量是
-#: **整轮**口径的 —— 模型调用了几次、哪些 agent 参与过、发生过哪些转移、检索了几次。
-#: 不延续的表现是**静默少一半**：接口层的 ``agent_participants_total`` 只看见最后那个
-#: agent，转交次数永远是 0，而日志里什么都看不出来。
-CARRY_ACROSS_NODES = (
-    "model_calls",
-    "tool_calls",
-    "agents",
-    "handoffs",
-    "review_rounds",
-    "retrieval_calls",
-    "retrieved_chunks",
-    "empty_retrievals",
-    "assets",
-    "duration_seconds",
-)
-
-#: **只属于最近一次运行**的统计字段 —— 由当前节点覆盖写，刻意不延续。
-#:
-#: 延续它们的具体后果：前台那次运行判为转交（``exit_reason="transfer"``），文学节点
-#: 如果延续了这个值，一次正常交付会被报成"转交"；``last_score`` 同理（上一段的评审
-#: 结论会冒充这一段的）。
-RUN_LOCAL = (
-    "route",
-    "route_reason",
-    "last_score",
-    "attempts",
-    "exit_reason",
-    "guardrail",
-)
-
-
-def stats_from_dict(raw: dict) -> AgentStats:
-    """把 state 里的 ``agent_stats``（普通 dict）还原成 ``AgentStats``。
-
-    只还原 ``CARRY_ACROSS_NODES`` 里那些 —— 其余字段留给当前节点自己覆盖写
-    （理由见 ``RUN_LOCAL``）。
-
-    ⚠️ 这两个常量合起来必须**恰好覆盖** ``AgentStats`` 的全部字段：
-    ``tests/test_agents_pipeline.py`` 有一条断言专门钉它。将来给 ``AgentStats``
-    加字段时，如果两边都没加，那条断言会红 —— 这正是它存在的理由（漏掉的后果是
-    "某个量在第二个节点之后静默归零"，读代码看不出来）。
-    """
-    stats = AgentStats()
-    for name in CARRY_ACROSS_NODES:
-        if name not in raw:
-            continue
-        value = raw[name]
-        if name == "agents":
-            stats.agents = [str(x) for x in (value or [])]
-        elif name == "handoffs":
-            stats.handoffs = [
-                (str(p[0]), str(p[1]))
-                for p in (value or [])
-                if isinstance(p, (list, tuple)) and len(p) == 2
-            ]
-        elif name == "duration_seconds":
-            stats.duration_seconds = float(value or 0.0)
-        else:
-            setattr(stats, name, int(value or 0))
-    return stats
 
 
 @dataclass

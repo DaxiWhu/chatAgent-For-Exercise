@@ -77,8 +77,9 @@
 这里算出"没超"不等于服务端认为没超。
 
 ⚠️ 本模块导入 ``agents``（SDK）。因此与 ``session.py`` 同一条约束：只能被
-``src/agents/*`` 里同样是惰性加载的模块引用，**不能**出现在 ``src/graph.py`` 的
-模块级 import 里。
+``src/agents/*`` 里同样是惰性加载的模块引用 —— **不要**在 ``src/agents/__init__.py``
+里 eager import 它，否则"缺 SDK"的报错会变成 import 期的堆栈，而启动守卫给出的
+``missing_sdk`` 提示就永远看不到了。
 """
 
 from __future__ import annotations

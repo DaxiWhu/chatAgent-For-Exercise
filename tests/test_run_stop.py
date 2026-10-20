@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from types import SimpleNamespace
 
 import pytest
 
@@ -138,20 +137,26 @@ def test_stop_endpoint_requires_auth():
 # --------------------------------------------------------------------------- #
 # 三、真的收流
 # --------------------------------------------------------------------------- #
-class _EndlessGraph:
-    """每 50ms 吐一个字，直到被关闭。用来复现"正在跑的时候被停"。"""
+class _EndlessTurn:
+    """每 50ms 吐一个字，直到被取消。用来复现"正在跑的时候被停"。"""
 
     def __init__(self, total: int = 200):
         self.total = total
+        self.cancelled = False
 
-    async def astream(self, *_a, **_kw):
-        for i in range(self.total):
-            await asyncio.sleep(0.05)
-            msg = SimpleNamespace(content=f"字{i}", id="c1")
-            yield msg, {"langgraph_node": "probe"}
+    async def __call__(self, req, *, context, on_text=None):
+        from src.agents.runner import TaskOutcome
 
-    async def aget_state(self, _cfg):  # pragma: no cover - 停止路径不会走到
-        return SimpleNamespace(values={}, next=())
+        try:
+            for i in range(self.total):
+                await asyncio.sleep(0.05)
+                if on_text is not None:
+                    await on_text(f"字{i}", "c1")
+            return TaskOutcome(answer="", attempts=1, final_agent="frontline_agent",
+                               passed=True, exit_reason="passed")
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
 
 def test_stream_emits_stopped_and_stops_consuming(monkeypatch):
@@ -162,12 +167,13 @@ def test_stream_emits_stopped_and_stops_consuming(monkeypatch):
     """
     import app.main as M
 
-    monkeypatch.setattr(M, "graph", _EndlessGraph())
+    turn = _EndlessTurn()
+    monkeypatch.setattr(M, "run_turn", turn)
     monkeypatch.setattr(M, "_RUNS", RunControl(dsn=""))
 
     async def _scenario():
-        gen = M._stream_graph(
-            {"messages": []}, {"configurable": {"thread_id": "T-stream"}},
+        gen = M._stream_run(
+            M.TurnRequest(prompt="hi", thread_id="T-stream"),
             "chat", tenant="", thread_id="T-stream", run_id="r-stream")
         events = []
         async for ev in gen:
@@ -184,18 +190,19 @@ def test_stream_emits_stopped_and_stops_consuming(monkeypatch):
     assert events[-1]["event"] == "stopped", events[-3:]
     # 停下来要**快**：那一刻上游还有近两百个字没吐（约 10 秒的量）
     assert elapsed < 5, f"停止没有及时生效（{elapsed:.1f}s）"
+    assert turn.cancelled is True, "停了却没有取消上游运行（它会继续跑到底、继续计费）"
 
 
 def test_stream_without_run_id_cannot_be_stopped(monkeypatch):
     """没有 run_id（测试/CLI/未登记）时行为与改造前完全一致：跑到底，不发 stopped。"""
     import app.main as M
 
-    monkeypatch.setattr(M, "graph", _EndlessGraph(total=4))
+    monkeypatch.setattr(M, "run_turn", _EndlessTurn(total=4))
     monkeypatch.setattr(M, "_RUNS", RunControl(dsn=""))
 
     async def _scenario():
-        gen = M._stream_graph(
-            {"messages": []}, {"configurable": {"thread_id": "T-nostop"}},
+        gen = M._stream_run(
+            M.TurnRequest(prompt="hi", thread_id="T-nostop"),
             "chat", tenant="", thread_id="T-nostop")
         return [ev async for ev in gen]
 

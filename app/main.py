@@ -1,13 +1,19 @@
 """FastAPI 服务化入口：流式对话 + 人工审核 resume + 生产化横切能力。
 
 运行（在项目根目录执行）：
-    uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
-（开发热重载加 --reload）
+    python -m app.serve              # ⚠️ **必须**是这个入口，不要裸 uvicorn
+（开发热重载：`python -m app.serve --reload`）
+
+⚠️ 为什么不能裸 `uvicorn app.main:app`
+------------------------------------
+本进程在 **win32** 上需要自适应的事件循环工厂（psycopg 的异步连接对 loop 有要求），
+而那个工厂是在 `app/serve.py` 里装的。裸 uvicorn 会绕开它 —— 现象是"端点一连库就
+报 loop 相关的错"，而启动日志一切正常。
 
 端点
 ----
     POST /v1/chat              SSE 流式对话（低分时下发 need_review）
-    POST /v1/chat/resume       续跑中途断掉的会话（SSE；从检查点继续）
+    POST /v1/chat/resume       续跑被打断的会话（SSE；从运行现场继续）
     POST /v1/review            人工审核 resume（accept / revise）
     GET  /v1/reviews           待审队列（分页列举，含草稿摘要与评分）
     GET  /v1/sessions/{id}     会话状态快照（断点续传的基础；纯读、幂等）
@@ -21,12 +27,12 @@
 本文件原名 serve.py，按目录归类迁入 app/。
 """
 import asyncio
+import contextlib
 import ipaddress
 import json
 import logging
 import os
 import random
-import sys
 import threading
 import time
 import uuid
@@ -53,14 +59,13 @@ from typing import NamedTuple
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
-from langchain_core.messages import HumanMessage
-from langgraph.types import Command
 from pydantic import BaseModel, field_validator
 from sse_starlette.sse import EventSourceResponse
 
 from src import observability
-from src.graph import build_graph
+from src.agents.approval import ResumeRequest
 from src.prompts import PROMPT_VERSION
+from src.turn import TurnRequest, build_context, run_turn
 
 from . import auth as userauth
 from . import config, health, loopwatch, metrics, middleware, tracing
@@ -77,6 +82,7 @@ from .quota import RequestBudget, build_quota_manager, estimate_tokens
 from .ratelimit import build_rate_limiter
 from .review_queue import build_review_queue
 from .run_control import build_run_control
+from .runs import build_run_store
 from .sessions import SessionError, build_session_registry
 
 # ---------------------------------------------------------------------------
@@ -109,24 +115,70 @@ _AUTH = userauth.build_auth_service(accounts=_ACCOUNTS)
 _TRACING_BACKEND = tracing.init_tracing()
 
 
-if not AGNES_API_KEY:
-    logging.warning("AGNES_API_KEY 未设置，运行时模型调用会失败")
+# ---------------------------------------------------------------------------
+# agent 链路装配（**唯一**的作答路径；实现见 src/agents/）
+# ---------------------------------------------------------------------------
+# **模型用主链路同一份配置**（同一个 base_url / api_key / model 名）。
+# 刻意不引入第二套模型变量：同一个服务里两个模型配置是运维事故的常见来源
+# （改了 A 没改 B，现象是"某类请求的答案风格突然变了"）。
+#
+# ⚠️ 装配失败 = **拒绝启动**，不降级、不兜底。
+# ---------------------------------------------------
+# 图退役之后本服务只剩这一条作答路径（官方 `Agent` + `Runner`）。没有第二套
+# "不依赖 SDK 也能答"的实现，所以"没装 SDK / 没配 Key 也照常起"这件事本身就是
+# 一个谎：进程起来了，但每个请求都必然失败，而且失败点分散在每次模型调用里
+# （客户端只看到"答不出来"，运维在指标里只看到 error 率上升）。
+#
+# 宁可起不来 —— 起不来有明确的启动日志与退出码，部署流水线当场就知道镜像/配置
+# 不对；起来了却答不了，只会在线上变成一个需要反查的现象。
+#
+# ⚠️ 这段必须排在构造 `ChatOpenAI` **之前**：`openai>=2.5x` 起 `api_key=""` 会在
+# 构造期直接抛 `OpenAIError`，那条报错读起来跟"没配 Key"毫无关系（现象是
+# "服务起不来，但日志里没有一句提到 Key"）。先判就会给出上面那段明确的原因。
+_AGENT_NOT_READY = """\
+agent 链路不可用（{reason}）⇒ 拒绝启动。
+
+本服务只有这一条作答路径（官方 openai-agents 的 Agent + Runner），没有备用实现：
+
+  · `missing_sdk`  ⇒ 镜像里没装 `openai-agents`（装：`pip install openai-agents`）；
+  · `missing_api_key` ⇒ 没配 `AGNES_API_KEY`；
+  · `build_failed` / 其它 ⇒ 见上面那条 warning 的具体异常。
+
+"能起来但每个请求都答不出来"不是一个可接受的部署状态，所以这里直接退出。
+"""
+
+
+def _assert_agents_ready():
+    """装配官方 Model 并**硬校验**就绪；未就绪抛 RuntimeError（进程起不来）。
+
+    返回 runtime 模块，供启动日志回显用。
+    """
+    from src.agents import runtime as _agent_runtime
+
+    ok = _agent_runtime.configure(
+        model_name=config.MODEL_NAME,
+        api_key=config.API_KEY,
+        base_url=config.API_BASE,
+        timeout=config.AGENT_TIMEOUT_SECONDS,
+    )
+    if not ok:
+        raise RuntimeError(_AGENT_NOT_READY.format(reason=_agent_runtime.ready_reason()))
+    return _agent_runtime
+
+
+_agent_runtime = _assert_agents_ready()
+logging.info(
+    "agent 链路就绪：请求走 src/agents（入口 agent 自己决定叫哪个帮手，"
+    "模型与主链路同配置）"
+)
+
 
 from langchain_openai import ChatOpenAI  # noqa: E402
 
-# 空 Key 的占位值。
-# ----------------
-# `openai>=2.5x` 起，`AsyncOpenAI/OpenAI(api_key="")` 会**直接抛 OpenAIError**
-# （旧版 2.26 容忍空串，只在请求期失败）。而本模块的既定行为是上面刚写的那条
-# ——"没配 Key 只告警、服务照常起、请求期才失败"。不处理的话，一个**没配 Key 的
-# 环境会在 import 期就崩**，与日志里那句"运行时模型调用会失败"完全相反，而且现象
-# 是"服务起不来"，排查方向会完全跑偏（跟 Key 没关系似的）。
-#
-# 传一个占位值把这条路径保住：请求打到上游会以鉴权错误失败，与改造前一致。
-_CHAT_KEY_PLACEHOLDER = "not-configured"
-
+# 这里不再有空 Key 的占位值：`_assert_agents_ready()` 已经保证 Key 非空，
+# 走不到这一行时 `AGNES_API_KEY` 必然有值。
 _MODEL = ChatOpenAI(
-    model=AGNES_MODEL, api_key=AGNES_API_KEY or _CHAT_KEY_PLACEHOLDER,
+    model=AGNES_MODEL, api_key=AGNES_API_KEY,
     base_url=AGNES_API_BASE, timeout=30, max_retries=3,
 )
 
@@ -161,57 +213,11 @@ observability.set_sink(_MetricsSink())
 
 
 # ---------------------------------------------------------------------------
-# agent 链路装配（请求默认全部走这里；实现见 src/agents/）
+# 优雅关闭：在途请求由 **uvicorn** 放完，不是 lifespan
 # ---------------------------------------------------------------------------
-# **模型用主链路同一份配置**（同一个 base_url / api_key / model 名）。
-# 刻意不引入第二套模型变量：同一个服务里两个模型配置是运维事故的常见来源
-# （改了 A 没改 B，现象是"某类请求的答案风格突然变了"）。
-#
-# ⚠️ 这里**不做失败即中止**：没装 `openai-agents` 或没配 Key 时只是不 ready，
-# 服务照常起、全部请求回落原问答链路 —— 这就是"能力开关默认开、但开着且没配时
-# 行为必须与关一致"。所以调用方只需看 `_AGENTS_READY`，不需要 try 整个启动流程。
-_AGENTS_READY = False
-_AGENTS_REASON = "disabled"
-if config.AGENTS_ENABLED:
-    try:
-        from src.agents import runtime as _agent_runtime
-
-        _AGENTS_READY = _agent_runtime.configure(
-            model_name=config.MODEL_NAME,
-            api_key=config.API_KEY,
-            base_url=config.API_BASE,
-            timeout=config.AGENT_TIMEOUT_SECONDS,
-        )
-        _AGENTS_REASON = _agent_runtime.ready_reason()
-    except Exception as e:  # noqa: BLE001  装配失败不该拦住启动
-        _AGENTS_REASON = f"setup_failed: {e}"
-    if _AGENTS_READY:
-        logging.info(
-            "agent 链路就绪：请求将走 src/agents（入口 agent 自己决定叫哪个帮手，"
-            "模型与主链路同配置）"
-        )
-    else:
-        logging.warning(
-            "agent 链路未就绪（%s）⇒ 请求将走问答链路兜底，行为与未启用时一致。"
-            "需要该能力请安装 openai-agents 并配置 AGNES_API_KEY。", _AGENTS_REASON
-        )
-
-
-# ---------------------------------------------------------------------------
-# 检查点持久化：**必须用异步 saver**，在 lifespan 里装配
-# ---------------------------------------------------------------------------
-# 为什么不能用同步 PostgresSaver
-# -----------------------------
-# 本服务的每个端点都走 `await graph.astream(...)` / `await graph.aget_state(...)`
-# （asyncio 事件循环）。langgraph 的**同步** `PostgresSaver` 没有实现
-# `aget_tuple`，异步调用会直接 `NotImplementedError` —— 而且它是在流的中间炸的，
-# 表现成"SSE 连上了、一个 token 都没吐就被 error 事件收尾"，极难往检查点上想。
-#
-# 所以持久化必须用 `AsyncPostgresSaver` + `AsyncConnectionPool`，而建池要 await，
-# 不能在模块导入时做 ⇒ 放进 lifespan。这也顺带给了我们**优雅关闭**：
-# 进程收到 SIGTERM 时 lifespan 收尾会释放连接池，不再掐断在途请求。
-#
-# ⚠️ 但"不掐断在途请求"这件事**不是 lifespan 做的**，别把功劳记错（2026-09-29 实测）
+# 本模块已不装配状态持久化（图退役了；"被打断的运行现场"见 `app/runs.py`）。
+# 这段只澄清一个容易记错功劳的地方 —— 它决定 lifespan 收尾时究竟还有什么要善后：
+# "不掐断在途请求"**不是 lifespan 做的**（2026-09-29 实测）。
 # ---------------------------------------------------------------------------
 # 真正保证在途请求跑完的是 **uvicorn**：`Server.shutdown()` 先 `server.close()`
 # 停止接受新连接，再对每个连接调 `connection.shutdown()` —— 而对**响应尚未结束**
@@ -227,105 +233,6 @@ if config.AGENTS_ENABLED:
 #   ⇒ 所以命令在 `app/serve.py` 里显式设了排空上界，`docker-compose.yml` 里把
 #      `stop_grace_period` 设得**大于**它。两处必须一起改，只改一处等于没改。
 # ---------------------------------------------------------------------------
-def _timed_cp_method(op, fn):
-    """把 `fn(self, *args)` 包成"计时 + 计失败"的异步方法。
-
-    op 只取三个有限值，它们就是检查点在请求热路径上的三种操作：
-      get_tuple   读检查点（每次图执行都会走）；
-      put         写检查点；
-      put_writes  写本次的中间写入（每个节点执行后都会走）。
-    """
-    async def wrapper(self, *args):
-        t0 = time.perf_counter()
-        try:
-            return await fn(self, *args)
-        except Exception:
-            metrics.inc("checkpoint_errors_total", op=op)
-            raise
-        finally:
-            # 失败也记耗时：连接卡住时耗时正压着超时上限 —— 那是最能说明
-            # "卡在哪一层"的样本。
-            metrics.observe("checkpoint_duration_seconds",
-                            time.perf_counter() - t0, op=op)
-
-    wrapper.__name__ = op
-    wrapper.__qualname__ = f"TimedCheckpointer.{op}"
-    return wrapper
-
-
-def _instrument_checkpointer(cp):
-    """给 saver 的类插一层"计时 + 计失败"；**失败则原样返回**。
-
-    为什么值得花这个力气
-    ------------------
-    检查点是**图在运行时隐式调用**的 —— 没有任何显式调用点可供埋点，而它又是
-    `AsyncPostgresSaver` + 网络。一旦变慢或失败，现象只有"请求卡住""零 token"，
-    日志里顶多一条泛泛的异常；而 `/health/ready` 里的 checkpointer 检查是**启动
-    探针**，答不了"此刻每次读写多久"。
-
-    为什么是"改 `__class__`"而不是包一层代理
-    -------------------------------------
-    langgraph 在 `langgraph/pregel/main.py` 里对 checkpointer 做了**至少 9 处**
-    `isinstance(checkpointer, BaseCheckpointSaver)` 判定 —— 代理对象过不了这层
-    判定，会被当成"没配检查点"而**静默丢掉持久化**（比不埋指标严重得多）。让
-    `isinstance` 继续成立是硬要求。
-    （2026-10-02 实测：`__getattr__` 转发的代理对 `InMemorySaver` 与
-    `BaseCheckpointSaver` 的 `isinstance` **都是 False** —— 不是"可能不行"，
-    是确定不行。）
-
-    为什么新类**只继承 saver 自己**（而不是 `(Mixin, Saver)`）
-    -----------------------------------------------------
-    2026-10-02 实测：`type("T", (Mixin, InMemorySaver), {...})` 之后
-    `cp.__class__ = T` 抛 `TypeError: '__class__' assignment: 'T' object layout
-    differs from 'InMemorySaver'`。原因不在 MRO（实测 MRO 里 `InMemorySaver`
-    仍在），而在 CPython 的 `compatible_for_assignment`：加入第二个"实体基类"
-    后布局与赋值目标不再一致。
-    ⚠️ 这个失败**会被下面的降级分支咽掉**，表现成"服务起来了、检查点指标一条
-    都没有" —— 所以它必须由测试钉住，不能靠"看起来能跑"。
-    单继承 + 把方法塞进类字典则完全绕开这个约束；代价是不能再用零参 `super()`，
-    所以包装时**显式捕获了 `base.<method>`**。
-
-    `__slots__ = ()` 是**防御性**写法，不是赋值的必要条件（2026-10-02 更正）
-    ---------------------------------------------------------------------
-    原先这里写的是"`InMemorySaver` 声明了 `__slots__ = ()`，子类不声明就会新增
-    一个 `__dict__` 槽 ⇒ basicsize 变化 ⇒ 同样赋值失败"。**实测不成立**：
-    `BaseCheckpointSaver` 自己就带 `__dict__`（`__basicsize__` = 16，去掉
-    `__slots__` 的子类同样 16），赋值照样成功 —— 变异验证里"删掉 `__slots__`"
-    这条**故意没红**，正是它把这个错误结论暴露出来的。
-    留着它只是为了将来撞上"整条继承链都用了 `__slots__`"的 saver 时不必再想一遍。
-
-    `alist` / `adelete_thread` **刻意不包**：两者都不在请求热路径上（列举供
-    运维与审核队列用，删除只在显式调用时发生），包进来只是多出的标签与代码面积。
-
-    失败即降级为"原样返回"：少一组指标是小事，起不来服务或持久化被换掉是大事。
-    """
-    try:
-        base = type(cp)
-        timed = type(f"Timed{base.__name__}", (base,), {
-            "__slots__": (),
-            "aget_tuple": _timed_cp_method("get_tuple", base.aget_tuple),
-            "aput": _timed_cp_method("put", base.aput),
-            "aput_writes": _timed_cp_method("put_writes", base.aput_writes),
-        })
-        cp.__class__ = timed
-        logging.info("检查点读写计时已接入（%s）", base.__name__)
-        return cp
-    except Exception as e:  # noqa: BLE001
-        logging.warning("检查点计时未能接入（不影响持久化）：%s", e)
-        return cp
-
-
-@asynccontextmanager
-async def _async_checkpointer(dsn):
-    """按 DSN 装配异步 checkpointer（异步上下文管理器）。
-
-    dsn: 连接串。**不要**在这里做异常处理，交给调用方决定降级策略。
-    """
-    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
-    async with AsyncPostgresSaver.from_conn_string(dsn) as cp:
-        await cp.setup()          # 建表（幂等）
-        yield _instrument_checkpointer(cp)
 
 
 def _report_index_identity():
@@ -361,14 +268,16 @@ def _report_index_identity():
 
 @asynccontextmanager
 async def lifespan(_app):
-    """应用生命周期：启动时装异步检查点，关闭时释放资源。
+    """应用生命周期：启动时做各项自检，关闭时释放资源。
 
-    装配失败一律**降级为内存 checkpointer 并记 warning**，不阻止服务启动 ——
-    "能起来"优先于"状态持久化"。但降级后重启会丢会话状态，所以日志必须点名原因。
+    这里**不再装配状态持久化**：编排原语只剩 `Agent` + `Runner`（官方没有任何
+    图/节点/检查点概念），"被打断的运行现场"由 `app/runs.py` 存官方 ``RunState``。
+    所以启动期只剩一堆自检与回显 —— 它们回答的都是"这次部署到底接上了什么"，
+    接不上时一律**只记日志、不阻止启动**（"能起来"优先），但结论必须留在日志里。
     """
-    global graph
+    global run_store
     stack = AsyncExitStack()
-    # 向量索引身份自检放在最前：它与检查点无关，且无论 DB 通不通都要在启动日志里
+    # 向量索引身份自检放在最前：它不依赖 DB，且无论 DB 通不通都要在启动日志里
     # 留下一条明确结论（"没检出问题"与"根本没检查"必须能区分开）。
     _report_index_identity()
     # 跨轮历史同理，只是它要**异步连一次**才能下结论（懒连接意味着构造期不报错）。
@@ -376,7 +285,7 @@ async def lifespan(_app):
     # 账号表：确保三张表存在，并在**库为空**时用 `AUTH_USERS` 建出第一个管理员。
     # 为什么放在启动期而不是等第一个管理接口调用：种子必须**早于**任何登录尝试生效，
     # 否则"服务起来了但没人能登录"这段时间里唯一的补救手段是重启。
-    # 连不上库时只记 warning 不阻止启动（与检查点的取舍一致：能起来优先），
+    # 连不上库时只记 warning 不阻止启动（与运行现场的取舍一致：能起来优先），
     # 但结论必须留在日志里 —— 它决定"这次部署到底有没有人能登录"。
     if _ACCOUNTS.dsn:
         try:
@@ -395,24 +304,15 @@ async def lifespan(_app):
             logging.warning(
                 "账号数据落在**进程内存**（无 DB_URL）：已放入 %d 个种子账号。"
                 "重启即丢，多副本下各进程互不可见 —— 仅限本地开发。", created)
+    # 被打断的运行现场（官方 ``RunState``）存在哪：配了 DB_URL 就进 PG，
+    # 否则进进程内存（单实例、重启丢）。这份数据**只有**"运行中产生了
+    # interruption"的轮次才有 —— 正常跑完的轮次没有现场，也不需要。
     dsn = os.getenv("DB_URL", DB_URL)
+    run_store = build_run_store()
     if not dsn:
-        logging.info("未设置 DB_URL，使用内存 checkpointer（重启丢状态）")
+        logging.info("未设置 DB_URL：运行现场（RunState）落在进程内存，重启即丢")
     else:
-        try:
-            cp = await stack.enter_async_context(_async_checkpointer(dsn))
-            graph = build_graph(model=_MODEL, checkpointer=cp)
-            logging.info("AsyncPostgresSaver 就绪：检查点异步持久化（astream/aget_state 可用）")
-        except Exception as e:  # noqa: BLE001
-            await stack.aclose()
-            stack = AsyncExitStack()
-            logging.warning("异步检查点装配失败，回退内存 checkpointer（重启丢状态）：%s", e)
-            if sys.platform == "win32":
-                logging.warning(
-                    "提示：Windows 上 psycopg 的异步模式**不支持 ProactorEventLoop**，"
-                    "而 uvicorn 默认就用它。请用 `python -m app.serve` 启动（会先切到 "
-                    "SelectorEventLoop），或改用 Linux/Docker 部署（那边默认就是 Selector）。"
-                )
+        logging.info("运行现场（RunState）落 PostgreSQL：被打断的运行可跨重启恢复")
     # 事件循环阻塞探针。**压进 stack**：关闭时由 `stack.aclose()` 一并取消，
     # 不在关闭路径上再写一遍取消逻辑（漏写的代价是每次滚动发布留一个悬挂任务）。
     # 放在这里而不是更早，是因为上面那个 except 分支会 `aclose()` 并**重建** stack ——
@@ -457,7 +357,7 @@ async def lifespan(_app):
             await _off(_REVIEW_QUEUE.close, 5.0)
         except Exception as e:  # noqa: BLE001
             logging.warning("审核通知队列排空失败（不影响关闭）：%s", e)
-        logging.info("服务关闭：检查点与跨轮历史连接池已释放")
+        logging.info("服务关闭：跨轮历史与 PG 连接池已释放")
 
 
 # API 文档按环境开关：生产默认关闭（`/docs`、`/redoc`、`/openapi.json` 全部 404）。
@@ -559,11 +459,6 @@ logging.info("服务启动配置：%s", config.as_dict(runtime={
     # 会话白名单落在 redis 还是进程内存：会话校验是**无条件**的，所以内存后端
     # 只在单进程成立；多副本下会表现为"刚登录成功、隔几次请求又要重新登录"的随机 401
     "auth_session_backend": _AUTH.store.backend_name,
-    # agent 链路：`enabled`（配置想开）与 `ready`（真的能用）必须分开回显 ——
-    # 没装 openai-agents / 没配 Key 都会静默降级为"全部走问答链路"，
-    # 只看 enabled=true 会得出"请求已走 agent 链路"这个错误结论。
-    "agents_ready": _AGENTS_READY,
-    "agents_reason": _AGENTS_REASON,
     # 幂等键的**实际**后端。不传这一项时 `config.as_dict` 只能按 `bool(REDIS_URL)` 猜，
     # 而 `IdempotencyStore` 在共享后端不可用时会**静默退回进程内存**（只打一条 warning）
     # ⇒ 启动日志会谎报 redis，运维据此以为"多副本下的重复执行保护已生效"。
@@ -575,10 +470,10 @@ logging.info("tracing 后端：%s", _TRACING_BACKEND)
 # 第一件要核对的事就是"跑的是哪一版提示词"。
 logging.info("提示词版本：%s", PROMPT_VERSION)
 
-# 模块级先用内存 checkpointer 起图，lifespan 启动时再换成异步持久化版本。
+# 被打断运行的现场仓库：内存起步，lifespan 启动时按 DB_URL 换成 PG 版。
 # 刻意不在导入期连库：那会在 import 时就开一个永不释放的连接，且测试导入本模块
 # 会平白打一次真实 PG。
-graph = build_graph(model=_MODEL, checkpointer=None)
+run_store = build_run_store()
 
 
 
@@ -1031,12 +926,10 @@ def _assert_agent_history_backend_policy() -> None:
     只能反问"改什么的结尾？"。而所有指标都正常（那一轮确实正常跑完了），
     日志里一行错误都没有。用户侧看起来像模型能力不稳。
 
-    2026-10-03 起只有一个后端（PG，与检查点同库）：配了 `DB_URL` 就天然多副本共享，
+    2026-10-03 起只有一个后端（PG，与运行现场同库）：配了 `DB_URL` 就天然多副本共享，
     不再有"配了 Redis 但某个副本没配"那类部署形态问题。所以这里只需要拦一种情况 ——
-    **根本没配 `DB_URL`**，那时连检查点也是内存的，跨轮历史整个不存在。
+    **根本没配 `DB_URL`**，那时连运行现场也是内存的，跨轮历史整个不存在。
     """
-    if not config.AGENTS_ENABLED:
-        return
     if config.DB_URL:
         # 配了也可能连不上（PG 没起 / 库不存在），但那个要异步连一次才知道 ——
         # 结论由 lifespan 的 `_report_agent_history_backend()` 给，不在这里猜。
@@ -1044,7 +937,7 @@ def _assert_agent_history_backend_policy() -> None:
     logging.warning(
         "未配置 DB_URL ⇒ 跨轮对话历史**不可用**（没有后端）：模型每一轮只看得到用户"
         "当轮说的那一句，上一轮说过什么一概不知道（用户会看到「接着改上一轮的东西」时"
-        "模型不知道在指什么，而所有指标都正常）。同时检查点也是内存的，重启即丢状态。"
+        "模型不知道在指什么，而所有指标都正常）。同时运行现场也是内存的，重启即丢。"
         "要接上历史，请配 DB_URL 并执行 `python -m app.migrations apply` 建表。"
     )
 
@@ -1063,8 +956,6 @@ async def _report_agent_history_backend() -> None:
     （失败详情由 `src.agents.session` 打一条 ERROR；这里只负责给出**结论行**，
     让"这次部署的历史到底接上了没有"有一个可以直接 grep 的答案。）
     """
-    if not config.AGENTS_ENABLED:
-        return
     try:
         from src.agents import session as agent_session
     except Exception as e:  # noqa: BLE001  自检失败不该拦住启动
@@ -1232,7 +1123,7 @@ def _retrieval_tenant(ident: "Identity") -> str:
 #      async 对它们只是装饰性的，唯一实际效果是把阻塞直接压在循环上。
 #
 #   2. **真异步的调用点 → `await _off(...)`**。只剩 SSE 那几个端点（必须 async
-#      才能流式产出）与 `_stream_graph` 的收尾，靠 `def` 解决不了，只能显式挪走。
+#      才能流式产出）与 `_stream_run` 的收尾，靠 `def` 解决不了，只能显式挪走。
 #
 # ⚠️ 为什么用 `asyncio.to_thread` 而不是换成 async 客户端：本项目的 Redis / PG
 # 客户端是**跨调用共享的模块级单例**，换成 async 客户端要连带重写整个存储层
@@ -1311,13 +1202,13 @@ def _quota_gate(tenant: str, subject: str = "") -> int:
 
     为什么在这里"预占"而不是只"检查"
     -------------------------------
-    旧实现是"这里 check、`_stream_graph` 的 finally 里 add"。判定与记账分在请求
+    旧实现是"这里 check、`_stream_run` 的 finally 里 add"。判定与记账分在请求
     两端、中间隔着整次生成，并发的 N 个请求就会各自读到同一个"还没超"的旧值
     然后一起放行，最后各自 add —— 日额度被超掉 N 份。这不是理论竞态：它只在
     额度快用完时发生，而那正是额度最该被守住的时候。
 
     现在换成 `QuotaManager.claim`（先占后判，一次原子操作）。返回的预占量必须
-    **原样**交给 `_stream_graph` 去 `settle`，否则预占永远不退、额度会被逐次吃光。
+    **原样**交给 `_stream_run` 去 `settle`，否则预占永远不退、额度会被逐次吃光。
 
     拒绝时的 `scope` 会带进日志与指标：额度可能是被租户级拦下的，也可能是被
     每人级拦下的 —— 两种情况的处置完全不同（前者要提租户额度，后者要么放宽
@@ -1337,7 +1228,7 @@ def _quota_gate(tenant: str, subject: str = "") -> int:
 def _reserve_quota(tenant: str, subject: str, idem_key: str) -> int:
     """预占配额；若预占失败，**先退还已抢占的幂等键**再抛出。
 
-    tenant / subject: 来自鉴权，可信；两者都要原样传给 `_stream_graph` 的结算。
+    tenant / subject: 来自鉴权，可信；两者都要原样传给 `_stream_run` 的结算。
     idem_key: 本次请求已抢占的幂等键（可能为空 = 客户端没带 `Idempotency-Key`）。
         退还必须带上同一个 `subject`（见 `IdempotencyStore._key`）—— 少了它就会
         去撤销另一个命名空间里的键，原键留在"在途"直到 TTL 到期。
@@ -1345,7 +1236,7 @@ def _reserve_quota(tenant: str, subject: str, idem_key: str) -> int:
     为什么"退还"必须和预占绑在一起
     -----------------------------
     `_IDEMPOTENCY.begin()` 是**先占后判**的原子抢占（见 `_IdemGate` 的说明）：
-    键此刻已经是"在途"状态。而归还只发生在 `_stream_graph` 的 finally ——
+    键此刻已经是"在途"状态。而归还只发生在 `_stream_run` 的 finally ——
     配额 429 会在这里抛出，生成器根本没被创建，那个 finally 永远不执行。
 
     后果很隐蔽：客户端拿到 429、等额度恢复后拿**同一个键**重试，却收到
@@ -1418,11 +1309,12 @@ def _preflight(request: Request, session: str, tenant: str, user: str = "") -> N
     可能走数据库，所以放后面。
 
     ⚠️ **归属校验必须排在业务校验之前**：`/review`、`/resume` 在通过闸门后还要读
-    检查点状态（不在审核态 → 409 / 无未完成生成 → 409）。如果先做状态校验，攻击者
-    就能用别人的 thread_id 区分"存在且在审核态"与"不存在"，把 404/409 变成枚举探针。
+    待审记录 / 运行现场（不在审核态 → 409 / 没有现场 → 409）。如果先做状态校验，
+    攻击者就能用别人的 thread_id 区分"存在且在审核态"与"不存在"，把 404/409 变成
+    枚举探针。
 
     ⚠️ 这里**刻意不做配额预占**：那几个 409 会让请求在进入生成前就结束，而预占的
-    额度只有 `_stream_graph` 的 finally 会退还 —— 放在这里必然泄漏额度。配额预占
+    额度只有 `_stream_run` 的 finally 会退还 —— 放在这里必然泄漏额度。配额预占
     因此移到 `_sse`，与结算成对（理由见 `_sse` 的说明）。
     """
     _rate_limit(request, session, subject=user, subject_verified=bool(user))
@@ -1434,22 +1326,24 @@ def _preflight(request: Request, session: str, tenant: str, user: str = "") -> N
 # ---------------------------------------------------------------------------
 # 为什么需要它
 # ----------
-# 好消息是：**状态早就在检查点里了**。`init → retrieve → generate → evaluate →
-# human_review` 每个节点边界都会落一次检查点，`aget_state()` 随时能取回完整对话、
-# 最新草稿、评分与引用。坏消息是：**没有任何端点把它暴露出去** ——
-# 于是 SSE 一断（弱网、切后台、代理超时），客户端手里只剩下"已经打到屏幕上的那半句"，
-# 除了从头重问一遍别无选择，而重问会**再花一次 token**（生成 + 评审都可能重跑）。
+# SSE 一断（弱网、切后台、代理超时），客户端手里只剩下"已经打到屏幕上的那半句"，
+# 除了从头重问一遍别无选择，而重问会**再花一次 token**。所以这一节只做一件事：
+# 把"这条会话现在进行到哪了"按客户端能用的形态暴露出来。
 #
-# 所以这一节只做一件事：把检查点里已经存在的事实，按客户端能用的形态暴露出来。
+# 状态由**三份数据**拼出来，各回答一半，缺一份就会给出错误结论
+# ------------------------------------------------------------
+#   · **官方会话**（``session.load_items``）—— 这条会话说过什么。图退役之后它是
+#     **唯一**的对话历史来源，没有第二份；
+#   · **运行现场**（``run_store``，官方 ``RunState``）—— 有没有"跑到一半停下来等
+#     审批"的那一轮。只有它才谈得上"接着跑"；
+#   · **待审队列**（``_REVIEW_QUEUE``）—— ``manual`` 那类（跑偏 / 护栏拦下 /
+#     没产出）运行**已经结束**，只有这条记录，没有现场。
 #
-# 那个 `next` 元组是全部关键
-# ------------------------
-# `state.next` 是"还没执行完的节点"，它同时回答了"能不能续"和"该用哪个接口续"：
-#   - 含 human_review      → 在等人审，必须走 POST /v1/review（要人的决定，不是续跑）；
-#   - 非空但不含 human_review → 中途断了，可 POST /v1/chat/resume 续跑；
-#   - 空                    → 本轮已收尾（或从未开始）。
-# 这不是推测：实测过"流中途取消"后 `next == ('generate',)` —— **未完成的节点仍留在
-# 里面**，所以续跑会重新执行它（重放该节点的产出，而不是接着上次的半个 token 拼）。
+# ⚠️ 官方**只**在"运行中产生了 interruption"时提供可恢复的现场。客户端断流导致的
+# "跑了一半"没有现场（崩溃恢复官方刻意不管，``human_in_the_loop.md`` 明确要求生产
+# 应用自己做）。所以 ``status`` 里没有 "incomplete" 这一档，``/v1/chat/resume``
+# 对这种情况如实回 409 —— 假装能续的做法是**再跑一轮**，会把已经发出去的 token
+# 重发一遍、把已经落盘的资产再做一遍。
 _ROLE_MAP = {"human": "user", "ai": "assistant", "system": "system", "tool": "tool"}
 
 
@@ -1476,74 +1370,61 @@ def _serialize_messages(messages) -> list:
     return out
 
 
-def _interrupt_payload(state):
-    """从 StateSnapshot.tasks 里取出 interrupt 的原始载荷（人审界面要用）。
+def _session_view(thread_id: str, *, held=None, record=None,
+                  messages=None) -> dict:
+    """把"这条会话现在是什么状态"拍成对外的视图（纯 JSON 可序列化）。
 
-    返回 dict 或 None。`human_review` 节点传给 `interrupt()` 的是
-    `{"draft", "score", "feedback", "error"}`，正是审核工作台需要的全部信息。
+    held: ``run_store.load()`` 的返回值 —— 运行**中途**停下来等审批的现场
+        （官方 ``RunState``）。有它才谈得上"接着跑"。
+    record: ``_REVIEW_QUEUE.record()`` 的返回值 —— 待审队列里的那条记录。
+        ``manual`` 那类（跑偏 / 护栏拦下 / 没产出）运行已经结束，只有队列、没有现场。
+    messages: 官方会话的历史条目（``session.load_items``）。这是**唯一**的对话历史
+        来源 —— 图退役之后没有第二份了。
+
+    为什么状态只有这三种
+    ------------------
+    * ``awaiting_review``：有现场或有待审记录 ⇒ 要人做决定，走 ``/v1/review``；
+    * ``completed``：有历史 ⇒ 这一轮已经收尾（或从未需要干预）；
+    * ``unknown``：什么都没有 ⇒ 从未开始，或已被清理。
     """
-    for task in (getattr(state, "tasks", None) or ()):
-        for it in (getattr(task, "interrupts", None) or ()):
-            value = getattr(it, "value", None)
-            if isinstance(value, dict):
-                return value
-    return None
-
-
-def _session_view(state, thread_id: str) -> dict:
-    """把 StateSnapshot 拍成对外的会话视图（纯 JSON 可序列化）。
-
-    state: `graph.aget_state(cfg)` 的返回值。
-    thread_id: 会话 id（回显，便于客户端确认自己请求的是哪条）。
-
-    ⚠️ agent 链路拆成多个节点之后（2026-10-03）**这里不需要改**，值得记一笔以免
-    后来者按"一行 = 一轮"的直觉去改它：本函数读的是 ``state.values`` 与 ``state.next``，
-    而 ``values`` 是**合并后的状态**（不是某一行检查点）。一次请求在图里落几行、
-    经过几个节点，``values`` 里都只有一个最终值；``next`` 也照样回答"还有没有
-    待执行的节点"。所以"多行拼回一条链"这件事在**这个视图里**本来就不存在。
-    真正需要按行读的场合是排查检查点表本身，那属于运维，不在接口职责内。
-    """
-    values = getattr(state, "values", None) or {}
-    pending = tuple(getattr(state, "next", None) or ())
-
-    if not values and not pending:
-        status = "unknown"            # 从未开始（或已被清理）
-    elif "human_review" in pending:
-        status = "awaiting_review"    # 等人审 → 走 /v1/review
-    elif pending:
-        status = "incomplete"         # 中途断了 → 走 /v1/chat/resume
-    else:
+    awaiting = bool(held) or bool(record and record.get("status") == "pending")
+    history = _serialize_messages(messages)
+    if awaiting:
+        status = "awaiting_review"
+    elif history:
         status = "completed"
+    else:
+        status = "unknown"
 
+    draft = (held or {}).get("draft") or (record or {}).get("draft") or ""
     review = None
-    if status == "awaiting_review":
-        # 优先用图里真正的 interrupt 载荷；取不到时用 state 字段兜底
-        # （两条路径的信息量相同，只是来源不同）。
-        review = _interrupt_payload(state) or {
-            "draft": values.get("output"),
-            "score": values.get("score"),
-            "feedback": values.get("feedback"),
+    if awaiting:
+        review = {
+            "draft": draft,
+            # 这条链路不产 0-100 分 ⇒ ``None``。**不能给 0**：审核台上 0 分是
+            # "AI 判了 0 分"，而真相是"没有人评过"。
+            "score": None,
+            "feedback": (record or {}).get("feedback") or "",
             "error": None,
         }
 
     return {
         "thread_id": thread_id,
         "status": status,
-        # 客户端可直接据此决定要不要提示"继续生成"按钮
-        "resumable": status == "incomplete",
-        "iteration": values.get("iteration", 0),
-        "score": values.get("score"),
-        "feedback": values.get("feedback") or "",
-        "draft": values.get("output") or "",
-        # 兜底结局（第 5 步）：与最新一轮 state 同源，**不落进对话历史**。
-        # 没有兜底时是空串/空表（`init` 每轮都会清，见 `src/graph.py`）。
-        "task_outcome": values.get("task_outcome") or "",
-        "fallback_reason": values.get("fallback_reason") or "",
-        "unfinished_steps": values.get("unfinished_steps") or [],
-        "citations": values.get("citations") or [],
-        # 引用校验结论（`citations` 非空 ≠ 有依据，两者必须分开报）
-        "citation_check": values.get("citation_check") or {},
-        "messages": _serialize_messages(values.get("messages")),
+        # 只有"有现场"才谈得上接着跑；其余情况"续"就等于新起一轮。
+        "resumable": bool(held),
+        "iteration": 0,
+        "score": None,
+        "feedback": (record or {}).get("feedback") or "",
+        "draft": draft,
+        # 兜底结局属于"上一轮的过程结论"，现在不落在任何持久化状态里
+        # （它随 SSE 的 `task_outcome` 事件一次性交付）。字段保留是为了不改契约。
+        "task_outcome": "",
+        "fallback_reason": "",
+        "unfinished_steps": [],
+        "citations": [],
+        "citation_check": {},
+        "messages": history,
         "pending_review": review,
     }
 
@@ -1557,7 +1438,7 @@ def _assert_session_readable(thread_id: str, tenant: str, user: str = "") -> Non
 
     多租户模式下**查不到属主一律 404（fail-closed）**：正常情况下每条会话都先
     经过 /chat 的 `_preflight` 认领过，查不到属主就意味着"这个 id 不存在"。
-    若不这样处理，返回内容（或 403/404 的差异）会变成一个"检查点是否存在"的
+    若不这样处理，返回内容（或 403/404 的差异）会变成一个"这条会话是否存在"的
     可枚举探针。单租户下所有请求同属主，没有区分能力，直接放行。
 
     ⚠️ "查不到属主"（404）与"**查不出来**"（503）必须分开：前者是结论，后者是
@@ -1586,14 +1467,15 @@ def _assert_session_readable(thread_id: str, tenant: str, user: str = "") -> Non
 async def _delete_agent_session(thread_id: str) -> bool:
     """删除该会话在 **SDK 侧**的跨轮历史（``agent_sessions`` / ``agent_messages``）。
 
-    为什么必须单独删：这份历史与检查点是**两份数据** —— 一份给图（检查点），
-    一份给下一轮的模型（官方会话）。删除端点此前只动检查点那几张表，于是
-    "删除请求"之后还完整留着用户说过的每一句与助手产出过的每一段。
-    接口 docstring 里写着"缺一类都算不上删干净"，而它漏的正是这一类。
+    为什么必须单独删：这份历史与运行现场、待审记录是**三份数据** ——
+    一份是"下一轮的模型会读到的对话"（官方 Session），一份是"被打断的那次运行"，
+    一份是"等奖人看的草稿"。删除端点此前只动后两份，于是"删除请求"之后还完整
+    留着用户说过的每一句与助手产出过的每一段。接口 docstring 里写着"缺一类都
+    算不上删干净"，而它漏的正是这一类。
 
     ⚠️ 惰性 import：``src/agents/session.py`` 本身不依赖 SDK（官方会话后端是在函数
     内部才 import 的），但这里保持与本文件其它 agent 相关代码同一姿势 ——
-    没装 SDK 的环境只是取不到模块，而不是让服务起不来。
+    万一将来有人把它改成模块级 import，症状会是"整条服务链接不起来"。
 
     返回是否真的清了。**取不到模块 / 后端不可用都只是 False**：删除是幂等的，
     明细里如实告诉调用方每一项到底删掉没有，比让整个请求失败更有用。
@@ -1607,29 +1489,20 @@ async def _delete_agent_session(thread_id: str) -> bool:
 
 
 async def _delete_thread_state(thread_id: str) -> bool:
-    """删除该会话的检查点（完整消息历史 / 草稿 / 评分 / 引用）。
+    """删除该会话的**运行现场**（官方 ``RunState`` 快照）。
 
-    两个后端的方法名不同，这里按能力探测而不是按类型判断：
-      - PG 的 `AsyncPostgresSaver` 是**异步** saver，只有 `adelete_thread`；
-      - 内存 `MemorySaver` 是同步 saver，只有 `delete_thread`。
-    用 `isinstance` 分支会在 langgraph 换类名时静默失效（退化成"什么都没删、
-    却告诉用户已删除"），按方法名探测则至少会落到 `False` 上被看见。
+    这份数据现在只装一件事：某个待审批的运行停在哪。它含整段历史（快照是
+    完整现场），所以删除请求必须把它一起清掉 —— 只删会话历史的话，一份"已被
+    要求删除"的对话原文仍留在快照里，而接口 docstring 承诺的是删干净。
 
-    返回是否真的执行了删除（无 saver / 无对应方法时为 False）。
+    返回是否真的删掉了一条。存储异常不上抛：删除是幂等的，如实告诉调用方
+    每一项到底删掉没有，比让整个请求失败更有用。
     """
-    cp = getattr(graph, "checkpointer", None)
-    if cp is None:
+    try:
+        return await _off(run_store.drop, thread_id)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("运行现场删除失败（thread=%s）：%s", thread_id, e)
         return False
-    adelete = getattr(cp, "adelete_thread", None)
-    if adelete is not None:
-        await adelete(thread_id)
-        return True
-    delete = getattr(cp, "delete_thread", None)
-    if delete is not None:
-        delete(thread_id)
-        return True
-    logging.warning("checkpointer 没有删除接口，会话状态未被清除：%s", type(cp).__name__)
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1652,14 +1525,14 @@ def _thread_id(value: str) -> str:
     """`thread_id` 的校验：**去空白后不得为空**，再判长度上限。
 
     ⚠️ "非空"这条是 2026-10-05 补的缺口。此前只拦长度上限，空串是**合法输入**；
-    而检查点按 thread_id 落库、会话归属表也按它登记，于是所有提交空 id 的客户端
+    而会话历史、运行现场、归属表全部按 thread_id 落库，于是所有提交空 id 的客户端
     **共用同一个空 key 的会话空间** —— 彼此的上下文互相可见；更糟的是归属校验对
     空 id 是"直接短路放行"，所以这条隔离在最需要它的时候（多客户端共用空 id）
     恰好不起作用。这是典型的"**合法输入导致隔离失效**"，必须在入口挡掉，
     不能只靠存储层兜（`SessionRegistry.claim` 里还有一道，那是纵深防御）。
 
     ⚠️ 返回的是**去空白后**的值，不是原值。此前不去空白、而存储层内部去空白，
-    导致 `"a"` 与 `"a "` 在归属表里是同一行、在检查点里却是两个不同 key ——
+    导致 `"a"` 与 `"a "` 在归属表里是同一行、在历史表里却是两个不同 key ——
     同一个会话在两个子系统里落到不同的键上。在入口统一规范化，两边就一致了。
     """
     v = (value or "").strip()
@@ -1733,7 +1606,7 @@ class ReviewReq(BaseModel):
 
 
 class ResumeReq(BaseModel):
-    """续跑请求体：只有 thread_id —— 要跑的内容早已在检查点里。"""
+    """续跑请求体：只有 thread_id —— 要跑的内容早就存在运行现场里了。"""
 
     thread_id: str
 
@@ -1951,35 +1824,6 @@ def _citation_blocked() -> bool:
             and (config.CITATION_CHECK_ACTION or "").strip().lower() == "block")
 
 
-#: "想走 agent 链路、但走不了"的理由。**刻意不含 `disabled`** ——
-#: 主动关掉开关是运维的意图，不该告警；这两个都是**配置缺失**（没装 SDK /
-#: 没配模型），必须可见。
-#:
-#: ⚠️ 2026-10-02：入口不再做内容分诊（见 `src/graph.dispatch`），所以
-#: `classify_failed` 这一档连同 `agent_classify_errors_total` 一起**已删除** ——
-#: 不再存在"判定要作品还是要说明"那次可能失败的模型调用。
-#: 若在别处再看到这两个名字，那是过期引用。
-_AGENT_UNAVAILABLE_REASONS = ("module_unavailable", "runtime_not_ready")
-
-
-def _record_agent_route(route_reason: str) -> None:
-    """上报 agent 路由的**降级面**：想走但走不了。
-
-    抽成纯函数是为了可测 —— 它的失效方式是"静默少一个指标"，而少这一个指标的
-    后果是**整条降级路径不可观测**（请求退回问答链路，服务零报错）。
-    这类缺陷不会自己暴露，只能靠断言。
-
-    ⚠️ 与 `_record_agent_metrics` 是**两件事**：那个回答"agent 跑得怎么样"，
-    这个回答"agent 到底有没有跑起来"。后者只在**走不了**时才计，
-    且**刻意排除 `disabled`**（主动关闭不是故障，不该把值班的人叫起来）。
-
-    2026-10-02 起传进来的只可能是 `disabled` / `module_unavailable` /
-    `runtime_not_ready` / `ready` —— 入口不再做内容分诊，`classify_failed` 已删。
-    """
-    if route_reason in _AGENT_UNAVAILABLE_REASONS:
-        metrics.inc("agent_unavailable_total", reason=route_reason)
-
-
 def _record_agent_metrics(stats: dict, has_guardrail: str = "") -> None:
     """把 agent 链路的运行统计翻译成指标。
 
@@ -1989,26 +1833,19 @@ def _record_agent_metrics(stats: dict, has_guardrail: str = "") -> None:
     ② 标签的**基数与命名**是运维契约（告警规则、Grafana 面板都按这些名字与标签写），
        集中在服务层改一处就够，不会出现"链路加了标签、告警没跟上"。
 
-    标签一律取**有限取值**：路由降级原因、退出原因、agent 名、护栏名。
+    标签一律取**有限取值**：退出原因、agent 名、护栏名。
     **绝不**放 thread_id / 用户输入这类高基数值 —— 标签进 key，会把内存打爆。
 
-    stats: ``src/graph`` 的 agent 节点写进 state 的 ``agent_stats``（普通 dict）。
+    stats: ``TaskContext.stats.as_dict()``（普通 dict）。
     has_guardrail: 被哪条出口护栏拦下（空 = 没被拦）。
 
-    ⚠️ 一次请求可能跑多个 agent 节点（转交那一轮：前台 + 文学），而这里读的是
-    **累积统计**，所以 ``agents`` / ``handoffs`` / ``tool_calls`` 等天然是"整轮"的
-    口径 —— 这正是运维要的（"这一轮花了多少"）。**单次运行**的口径在
-    ``runner._report_run_metrics`` 的直方图里，那里带 ``agent`` 标签。
-    两处不能混：把整轮数字塞进单次运行的直方图，会让分位数失去含义。
+    ⚠️ 这里报的是**整轮**口径（``agents`` / ``handoffs`` / ``tool_calls``）——
+    一次请求里可能有多次 handoff，这正是运维要的"这一轮花了多少"。
+    **单次运行**的口径在 ``runner._report_run_metrics`` 的直方图里，那里带
+    ``agent`` 标签。两处不能混：把整轮数字塞进单次运行的直方图，分位数会失去含义。
     """
     if not stats:
         return
-    route = str(stats.get("route") or "unknown")
-    reason = str(stats.get("route_reason") or "unknown")
-    # `route` 现在只有两个取值：`agent`（正常）与 `rag`（链路不可用时的兜底）。
-    # 它是"这条链路到底有没有被用上"的唯一证据 —— 没有它，一条永远走不到的分支
-    # 会安静地存在几个月。
-    metrics.inc("agent_route_total", route=route, reason=reason)
 
     for pair in stats.get("handoffs") or []:
         if isinstance(pair, (list, tuple)) and len(pair) == 2:
@@ -2016,23 +1853,18 @@ def _record_agent_metrics(stats: dict, has_guardrail: str = "") -> None:
     for name in stats.get("agents") or []:
         metrics.inc("agent_participants_total", agent=str(name))
 
-    review_rounds = int(stats.get("review_rounds") or 0)
-    if review_rounds:
-        metrics.observe("agent_review_rounds", review_rounds)
-        score = str(stats.get("last_score") or "unknown")
-        metrics.inc("agent_review_outcome_total", score=score)
-
     attempts = int(stats.get("attempts") or 0)
     review_rounds = int(stats.get("review_rounds") or 0)
     if attempts > 1 or review_rounds > 1:
-        # 返工率 = agent_rework_total / agent_route_total{route="agent"}。
+        # 返工率 = agent_rework_total / 请求总数。
         # 它是"能力"最直接的一个代理指标：一次通过说明规划与执行到位，
-        # 反复返工说明 prompt 或拓扑有问题 —— 而这个量只能靠埋点拿到。
+        # 反复返工说明 prompt 或产出质量有问题 —— 而这个量只能靠埋点拿到。
         #
-        # ⚠️ 2026-10-02：评审改成模型可调用的 `as_tool` 之后 **`attempts` 恒为 1**
-        # （不再有"代码回灌、再来一轮"的轮次）。返工的判据随之换成
-        # "评审被调了不止一次"—— 那对应"模型自己改了一轮再评"。只留 `attempts > 1`
-        # 会让这个指标永远为 0，而它恰是唯一能反映"模型在自我返工"的信号。
+        # ⚠️ 判据必须是这两条**合起来**：
+        #   · `attempts > 1` —— 代码侧回灌重来的轮次（评审改成 `as_tool` 后恒为 1，
+        #     但留着这条是因为"哪天有人加回循环"时它必须继续生效）；
+        #   · `review_rounds > 1` —— 模型**自己**改了一轮再评。这是当前形态下唯一
+        #     能反映自我返工的信号，只留 `attempts` 会让这个指标永远为 0。
         metrics.inc("agent_rework_total")
 
     retrieved = int(stats.get("retrieved_chunks") or 0)
@@ -2053,8 +1885,12 @@ def _record_agent_metrics(stats: dict, has_guardrail: str = "") -> None:
         metrics.inc("agent_guardrail_trips_total", guardrail=str(has_guardrail))
 
 
-def _maybe_sample_quality(values: dict) -> None:
+def _maybe_sample_quality(text: str, context: str) -> None:
     """按采样率对**本轮产出**跑一遍离线判据，把线上幻觉率变成指标。
+
+    参数是**内容本身**而不是某个状态对象：这条链路此前签名是 `values: dict`，
+    因为产出与资料都长在 LangGraph 的 state 里。图去掉之后没有 state 了 ——
+    继续要求调用方拼一个假 dict 只会让"这两个字段从哪来"更难追。
 
     为什么可以直接在请求里跑
     ----------------------
@@ -2076,14 +1912,13 @@ def _maybe_sample_quality(values: dict) -> None:
     rate = config.ONLINE_QUALITY_SAMPLE
     if rate <= 0 or random.random() >= rate:
         return
-    text = values.get("output") or ""
-    if not text.strip():
+    if not (text or "").strip():
         return
     try:
         from src.rag import answer_quality as AQ
-        # context 取**线上同款**拼装结果（state 里的 `context`），不是原始 chunk
-        # 列表 —— 口径与线上不一致的评测最隐蔽（测了一个不存在的链路）。
-        got = AQ.score_answer(text, values.get("context") or "")
+        # context 取**线上同款**拼装结果（运行上下文里累积的检索资料），不是原始
+        # chunk 列表 —— 口径与线上不一致的评测最隐蔽（测了一个不存在的链路）。
+        got = AQ.score_answer(text, context or "")
     except Exception as e:  # noqa: BLE001  观测失败绝不能影响作答
         metrics.inc("online_quality_sampling_errors_total")
         logging.debug("在线质量采样失败（已忽略）：%s", e)
@@ -2202,7 +2037,7 @@ class _DisconnectSignal:
 
     @property
     def closed(self) -> bool:
-        """是否已断开。`_stream_graph` 主循环每轮读它，用来跳过收尾事件。"""
+        """是否已断开。`_stream_run` 主循环每轮读它，用来跳过收尾事件。"""
         return self._closed
 
 
@@ -2223,8 +2058,8 @@ class _RequestDeadline:
 
     与 `budget_exceeded` 的区别：预算管的是"产出多少"，本类管的是"花多久"。
     两者都**不把已产出的正文作废**，但超时是**终止性**的（`timeout` 事件之后
-    直接收流，不再有 `done`）—— 因为紧接着要做的事（`aget_state`）本身也是
-    网络调用，继续等下去等于没有时限。
+    直接收流，不再有 `done`）—— 收尾那几步（落待审队列、结算配额）也是 IO，
+    继续等下去等于没有时限。
     """
 
     __slots__ = ("seconds", "_at")
@@ -2249,8 +2084,8 @@ class _RequestDeadline:
     async def run(self, factory):
         """在剩余时限内执行 `factory()` 返回的**新**协程；超时抛 `asyncio.TimeoutError`。
 
-        factory: 无参可调用对象，**每次调用都要返回一个新协程**（如
-            `stream.__anext__`、`lambda: graph.aget_state(cfg)`）。
+        factory: 无参可调用对象，**每次调用都要返回一个新协程**（本项目里唯一
+            的用法是 `stream.__anext__` —— 也就是"等下一段正文"）。
 
         为什么传工厂而不是协程对象
         ------------------------
@@ -2329,12 +2164,15 @@ def _stopped_event(req_kind: str, produced) -> dict:
     """
     chars = sum(len(x) for x in produced)
     metrics.inc("run_stopped_total", kind=req_kind)
-    logging.warning("%s 被用户停止（已产出 %d 字）；检查点保留，可 /v1/chat/resume 续跑",
+    logging.warning("%s 被用户停止（已产出 %d 字）；已产出的正文保留，本轮不再补 done",
                     req_kind, chars)
     return _sse_json("stopped", {
         "produced_chars": chars,
-        # 检查点在节点边界，所以"停"不等于"作废"：客户端想接着跑可以 resume。
-        "resumable": True,
+        # ⚠️ 恒为 False：停止之后**没有**可恢复的现场（官方只在"运行中产生了
+        # interruption"时才给 `RunState`，而被停下的一轮是运行被取消，不是工具在
+        # 等审批）。所以 `/v1/chat/resume` 对这条会话只会回 409。
+        # 以前这里写 True 是因为检查点停在节点边界上——那个前提已经不存在了。
+        "resumable": False,
     })
 
 
@@ -2400,7 +2238,7 @@ def _on_compact_done(task) -> None:
 def _spawn_history_compaction(thread_id: str) -> None:
     """请求开头起一个**后台**压缩任务（入口一·会话侧，见 ``src/agents/compaction.py``）。
 
-    为什么在 ``_stream_graph`` 里、而不是端点函数里
+    为什么在 ``_stream_run`` 里、而不是端点函数里
     ----------------------------------------------
     * 端点 ``chat_v1`` 是**同步** ``def``，FastAPI 把它丢进线程池 —— 那里没有正在
       运行的事件循环，``asyncio.create_task`` 直接抛 ``RuntimeError``。
@@ -2438,25 +2276,138 @@ def _spawn_history_compaction(thread_id: str) -> None:
     task.add_done_callback(_on_compact_done)
 
 
-async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
-                        subject: str = "", thread_id: str = "", budget=None,
-                        disconnect=None, reserved: int = 0, timeout: float = 0,
-                        idem_key: str = "", idem_fp: str = "", run_id: str = ""):
-    """把图的流式输出转成 SSE 事件。
+async def _turn_events(turn, context, out: dict):
+    """跑一轮官方 agent 运行，把正文增量当成"流"逐段吐出。
 
-    incoming: 送进图的输入。三种形态：
-        - 首轮对话：`{"messages": [HumanMessage(...)]}`；
-        - 人工审核 resume：`Command(resume={...})`；
-        - **断点续传**：`None` —— langgraph 的"从最近一次检查点继续"约定，
-          会重新执行 `state.next` 里那个未完成的节点（实测确认）。
-    run_config: langgraph 运行配置，形如 `{"configurable": {"thread_id": ...}}`。
-        **必须带 thread_id**：它决定 checkpoint 落哪条会话，/review 正是靠它
-        找回被打断的那次运行。tracing 的 metadata/callbacks 也由调用方并进这里。
-        ⚠️ 它**刻意不叫 `config`**（2026-10-03 改名）：原名会**遮蔽模块级的
-        `app.config`** —— 于是函数体里任何 `config.XXX` 都变成"在运行配置字典上
-        取属性"，报 `AttributeError: 'dict' object has no attribute ...`。
-        这不是洁癖：加幂等重放上限时实测踩到，且报错发生在**流已经开始之后**
-        （生成器里），表现为"回答到一半变成 error 事件"，而不是导入期报错。
+    为什么用队列桥接
+    --------------
+    ``Runner.run_streamed`` 是**回调式**的（边跑边把 token 交出来），而调用方需要
+    一个"可以逐次 ``await`` 的流" —— 只有那样才能把每一次等待都交给总时限、
+    断连、预算这三道闸门。队列是这两种形态之间最薄的一层桥，没有第三套编排。
+
+    结果怎么带回来
+    -----------
+    异步生成器没法 ``return`` 值，所以结果写进 ``out["outcome"]``；异常写进
+    ``out["error"]``，由调用方在流结束后重新抛出 —— 让它和"流读到一半失败"
+    走同一条错误路径（否则错误处理会分成两套，而其中一套必然少测）。
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    sentinel = object()
+
+    async def _push(text: str, call_id: str) -> None:
+        await queue.put((text, call_id))
+
+    async def _drive() -> None:
+        try:
+            out["outcome"] = await run_turn(turn, context=context, on_text=_push)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001  统一交给调用方
+            out["error"] = e
+        finally:
+            queue.put_nowait(sentinel)
+
+    task = asyncio.create_task(_drive())
+    try:
+        while True:
+            item = await queue.get()
+            if item is sentinel:
+                return
+            yield item
+    finally:
+        # 客户端断开 / 超时 / 停止：把上游真正取消掉再走，否则模型调用会在
+        # 后台继续跑到底 —— 那正是"断了还在计费"的成因。
+        if not task.done():
+            task.cancel()
+        # ⚠️ 必须连 `BaseException` 一起吃掉，不能只 suppress Exception。
+        # `task.cancel()` 之后 `await task` 抛的 `CancelledError` 是**我们自己刚
+        # 发出去的那次取消的回执**，不是"调用方被取消"。它一旦冒出去，就会从
+        # `aclose()` 穿回 `_stream_run` 的 finally —— 那里只 catch Exception，
+        # 于是整个生成器以 CancelledError 结束：断连（客户端已经走了、这一轮
+        # 该结算）被表现成"请求被取消"，收尾的配额结算与幂等键都无法正常走完。
+        # 实测：断连那一刻主循环正在等下一段（生成器在运行中），watcher 的
+        # aclose 会命中 asyncio 的 "already running" 保护而失效，唯一真正关掉
+        # 上游的就是这条 finally ⇒ 每次断连都会走到这里。
+        with contextlib.suppress(BaseException):  # noqa: BLE001
+            await task
+
+
+def _review_draft(outcome) -> str:
+    """审核台要看的草稿。
+
+    两处来源，按"答复本身优先"取：
+      * 正常产出 / 兜底转人工 ⇒ ``outcome.answer``（兜底那类还可能只有
+        ``fallback_draft``，那是被护栏拦下的原文）；
+      * 模型声明要人审 ⇒ 运行停在 ``deliver`` 工具上，正文还没变成答复，
+        它在待批项的参数里。
+    """
+    if outcome.answer:
+        return outcome.answer
+    for item in outcome.approvals or ():
+        if getattr(item, "tool", "") != "deliver":
+            continue
+        try:
+            payload = json.loads(getattr(item, "arguments", "") or "{}")
+        except (TypeError, ValueError):
+            continue
+        text = payload.get("content") if isinstance(payload, dict) else None
+        if isinstance(text, str) and text.strip():
+            return text
+    return outcome.fallback_draft or ""
+
+
+async def _hold_for_review(session_id: str, outcome, tenant: str, *, reason: str) -> bool:
+    """把这一轮押进"等人看"，返回是否真的停住了。
+
+    两类触发，处置**不同**（这是这套流程里最容易做错的一处）：
+
+    * ``needs_review`` —— 模型在交付那一刻声明要人看，运行停在工具的审批中断上。
+      现场（官方 ``RunState`` 的 JSON）存进 run_store，``/v1/review`` 用它接着跑。
+    * ``manual`` —— 代码在运行**结束后**判的（跑偏 / 护栏拦下 / 没产出）。
+      它**没有现场可存**：运行已经结束，没有任何"可以停下来的地方"可回退。
+      处置是入队；``accept`` 直接交付草稿、``revise`` 新起一轮。
+
+    ⚠️ 失败时返回 False 而**不抛错**：产出已经在手里，吞掉比交出去更糟 ——
+    用户拿不到东西，审核人也拿不到（队列里没记录）。但必须可观测，
+    否则这条降级路径等于静默失效。
+    """
+    if reason != "needs_review":
+        return True
+    if not outcome.run_snapshot:
+        logging.error("声明了要人审，但运行没有产生现场（thread=%s）—— 无法恢复", session_id)
+        metrics.inc("review_gate_failed_total")
+        return False
+    try:
+        ok = await _off(
+            run_store.save, session_id,
+            snapshot=outcome.run_snapshot,
+            draft=_review_draft(outcome),
+            reason=reason,
+            tenant=tenant or "",
+        )
+    except Exception as e:  # noqa: BLE001
+        logging.error("存运行现场失败（本轮按正常交付处理）：%s", e)
+        metrics.inc("review_gate_failed_total")
+        return False
+    if not ok:
+        logging.warning("运行现场没有落库（thread=%s）—— 按正常交付处理", session_id)
+        metrics.inc("review_gate_failed_total")
+    return bool(ok)
+
+
+async def _stream_run(turn, req_kind: str, tenant: str = "",
+                      subject: str = "", thread_id: str = "", budget=None,
+                      disconnect=None, reserved: int = 0, timeout: float = 0,
+                      idem_key: str = "", idem_fp: str = "", run_id: str = ""):
+    """跑一轮官方 agent 运行，把它的输出转成 SSE 事件。
+
+    turn: 这一轮的输入（``src.turn.TurnRequest``）：用户原话、会话编号、租户、
+        人工打回意见、以及"接着跑一次被打断的运行"的现场。**没有**"图输入"这
+        种东西了 —— 官方主循环只接受"用户输入"或"RunState"，两者都装在这里。
+        ⚠️ 这里**不再收一个"运行配置"字典**（2026-10-20 删）：那是 LangGraph 的
+        `configurable` 形状，官方 `Runner.run` 根本不读它，唯一的读者是下面那句
+        "兜底取 thread_id" —— 而 `TurnRequest.thread_id` 本来就是必填字段。
+        删掉它同时删掉了 tracing 那条"看起来接上了"的假通路（见 `app/tracing.py`）。
     req_kind: 仅用于日志文案（"chat" / "review"），标明是哪个端点触发的流。
     tenant: 租户 id。用于**把本次消耗计入配额**，并写进审核队列。
     subject: 请求主体（用户名）。同时是两件事的桶键，必须与调用方一致：
@@ -2485,8 +2436,8 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
     reserved: `_preflight` 里预占的配额量。请求结束时由 `settle` 把它换成实际消耗；
         不传（0）时退化成"只加实际值"，即预占不会被退。
     timeout: **请求级总时限**（秒），0 = 不限（默认，行为与改造前一致）。
-        约束的是"消费上游流"与收尾的 `aget_state` —— 也就是会随上游变慢而失控的
-        那部分。超时后下发 `timeout` 事件并**收流**（已产出的正文照常交付）。
+        约束的是"等下一段正文"这一步 —— 也就是会随上游变慢而失控的那部分。
+        超时后下发 `timeout` 事件并**收流**（已产出的正文照常交付）。
     run_id: 这次运行的登记编号。非空 ⇒ 可以被 `POST /v1/sessions/{id}/stop` 停下，
         停的时候下发 `stopped` 事件并收流；空串（测试/CLI/未登记）⇒ 完全不可停，
         行为与改造前一致。**必须由调用方生成并在 `_RUNS.begin` 里登记过** ——
@@ -2516,9 +2467,16 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
     # 放这里还顺带保证了"登记成功 ⇒ 确实开始跑了"。
     if run_id:
         await _off(_RUNS.begin, run_id, thread_id, tenant)
+    # 这一轮的运行上下文（租户、语料目录、检索器工厂）。一次请求一份 ——
+    # 不再像图那样"每个节点各建一份、再互相串引用"，因为一次请求**就是**一次运行。
+    context = build_context(tenant=turn.tenant)
     budget = budget if budget is not None else RequestBudget(0)
     deadline = _RequestDeadline(timeout)
     produced: list[str] = []
+    #: 预算是否被耗尽。耗尽时**不再补发整段产出** —— 那会把刚被判定为"超预算、
+    #: 停止生成"的正文原样发出去，等于预算闸只在流式路径上生效、在整段返回的
+    #: 路径上失效。
+    starved = False
     # chunk 间延迟（TPOT）的游标：上一个**已交付** chunk 的到达时刻，以及它属于
     # 哪一次模型调用。判据必须是"同一次调用"而不能只是"同一个节点" —— 同一个
     # agent 节点里完全可能调用两次模型，中间隔着一次工具执行（几百毫秒到几十秒），
@@ -2545,6 +2503,9 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
     # 本次请求是否**成功完成**。它决定幂等键的收尾方式（标记完成 / 撤销），
     # 而这件事只在收尾那一刻才知道 —— 所以必须在 try 之外可见。
     succeeded = False
+    #: 这一轮的结果与异常。由 `_turn_events` 在流结束时写入 —— 异步生成器没法
+    #: 返回值，所以用这个字典把 `TaskOutcome` 带回主循环。
+    outcome_box: dict = {}
     # ---- 幂等重放的登记表 ----
     # 只在下发**之前**登记每个事件，且只在带了键时登记（不带键的请求零开销）。
     # 为什么登记"事件"而不是"最终答案"：见 `_replay_from_idem_payload`。
@@ -2579,7 +2540,7 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
         if stop is not None:
             stop_watcher = asyncio.create_task(
                 _watch_stop(run_id, stop, produced, state))
-        stream = graph.astream(incoming, config=run_config, stream_mode="messages")
+        stream = _turn_events(turn, context, outcome_box)
         state["stream"] = stream
         # 手工迭代（而不是 `async for`）：只有显式拿到 `__anext__`，才能把**每一次
         # 等待**都交给 `deadline.run` —— 而"上游一直不返回"正是唯一需要总时限的
@@ -2594,19 +2555,18 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
             if stop is not None and stop.is_set():
                 break
             try:
-                msg, meta = await deadline.run(anext)
+                text, call_id = await deadline.run(anext)
             except StopAsyncIteration:
                 break
             except TimeoutError:
-                # 总时限耗尽：**终止性**返回（不查状态、不补 done）—— 紧接着的
-                # `aget_state` 本身也是网络调用，继续等下去等于没有时限。
+                # 总时限耗尽：**终止性**返回（不查状态、不补 done）—— 收尾那几步
+                # 同样是 IO（写待审队列、结算配额），继续等下去等于没有时限。
                 yield _record(_timeout_event(req_kind, deadline, produced))
                 return
             # 到达时刻在**任何处理之前**取：后面还要判预算、拼事件，那些开销
             # 会随实现变化，而 TTFT / TPOT 量的都该是"用户等了多久"。
             arrived = time.perf_counter()
-            if msg.content:
-                text = msg.content
+            if text:
                 if not budget.add(text):
                     # 预算耗尽：立刻停止继续生成（而不是等模型自己收尾）
                     metrics.inc("llm_budget_exceeded_total")
@@ -2614,11 +2574,12 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
                                     budget.used, budget.limit)
                     yield _record(_sse_json("budget_exceeded",
                                             {"used": budget.used, "limit": budget.limit}))
+                    starved = True
                     break
-                # "这一次模型调用"的标记：节点名 + 消息 id。
-                # `id` 由 langgraph 按 run 生成（实测形如 `lc_run--<uuid>`），
-                # 同一次调用内恒定、换一次调用就变；节点名在 `id` 缺失时兜底。
-                call = (meta or {}).get("langgraph_node"), getattr(msg, "id", None)
+                # "这一次模型调用"的标记：官方 `ResponseTextDeltaEvent.item_id`。
+                # 同一个 output item 内的各 delta 共享它，换一次模型调用就变
+                # （中间那次工具执行的时间**不是**解码耗时，要能剔除）。
+                call = call_id
                 if not produced:
                     # 首个 token = TTFT。放在预算判定**之后**：预算被顶掉时
                     # 用户一个字的正文都没看到，把它算成一次首字节会系统性
@@ -2648,34 +2609,66 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
         if stop is not None and stop.is_set():
             # 用户主动停下：**终止性**返回。不查状态、不入队、不补 done ——
             # 那三件事都属于"这一轮要正常收尾"，而停止的含义正好是不收尾。
-            # 检查点已经停在某个节点边界上，所以客户端想接着跑可以 resume。
+            # ⚠️ 这里**没有**可恢复的现场：运行是被取消的，官方不会为取消产出
+            # `RunState`（只对 interruption 产）。所以 `stopped` 事件里
+            # `resumable` 恒为 False，客户端不该把它当成"稍后能接着跑"。
             yield _record(_stopped_event(req_kind, produced))
             return
 
-        try:
-            state_snap = await deadline.run(lambda: graph.aget_state(run_config))
-        except TimeoutError:
-            # 生成已经跑完、卡在收尾的检查点读取上：同样按总时限收流。
-            yield _record(_timeout_event(req_kind, deadline, produced))
-            return
-        values = state_snap.values
+        # ---- 这一轮的结论 ----
+        # `_turn_events` 已经把结果（或异常）放进来了：流结束 ⇒ 那次运行也结束了。
+        if "error" in outcome_box:
+            # 运行本身失败：交给外层 except 统一处理（记指标 + 下发脱敏错误）。
+            # ⚠️ 不能在这里"降级成一句友好话术" —— 那会把"没跑成"伪装成"跑成了"，
+            # 观测面与客户端重试逻辑一起失真。
+            raise outcome_box["error"]
+        outcome = outcome_box.get("outcome")
+        if outcome is None:
+            raise RuntimeError("运行结束但没有结果")
 
-        # ---- 本轮是不是停在人工审核？----
-        # ⚠️ 必须在**补齐产出之前**判（第 5 步）。转人工的内容**不是给用户的** ——
-        # 顺序反了的话，待审草稿会先以 token 事件发给用户、然后才收到"待审核"，
-        # 于是"不交半成品"只写在文档里、实际照样漏出去。
-        awaiting_review = bool(state_snap.next and "human_review" in state_snap.next)
+        # 会话编号：按"离调用方最近"的顺序兜底。
+        # ⚠️ 参数优先、`turn.thread_id` 兜底：前者是给"流式收尾也要知道是哪条会话"
+        # 的调用方另外传的，后者是这一轮**必然**带着的那个 id。只看参数的话，一旦
+        # 有调用方忘了传，待审记录会落到空串上 —— 所有会话挤进同一条记录（互相
+        # 覆盖），而且交付前那一步会因为 `session_id` 为空**直接跳过**，表现成
+        # "该转人工的轮次悄悄变成了正常交付"。两种症状都不报错。
+        #
+        # ⚠️ 2026-10-20：这里原来还有一级"从运行配置的 `configurable.thread_id`
+        # 兜底"，随 LangGraph 的 config 形状一起删掉了 —— 官方 `Runner.run` 不认
+        # 那个键，而它上面的两级已经覆盖全部调用方。
+        session_id = thread_id or getattr(turn, "thread_id", "") or ""
+
+        # ---- 本轮要不要人审？----
+        # ⚠️ 必须在**补齐产出之前**判。要审的内容**不是给用户的** —— 顺序反了的话，
+        # 待审草稿会先以 token 事件发给用户、然后才收到"待审核"，于是"不交半成品"
+        # 只写在文档里、实际照样漏出去。
+        review_requested = bool(outcome.review_reason)
+        awaiting_review = False
+        if review_requested and session_id:
+            # ⚠️ 这一步同样要在总时限之内：它是一次**落库**（`run_store` 写 PG /
+            # `_REVIEW_QUEUE.add` 写表），库端卡住时会无限等 —— 而用户已经拿到正文，
+            # 只会觉得"怎么还没结束"。收尾的 IO 不比正文的等待更能超时。
+            try:
+                awaiting_review = await deadline.run(
+                    lambda: _hold_for_review(
+                        session_id, outcome, tenant, reason=outcome.review_reason))
+            except TimeoutError:
+                yield _record(_timeout_event(req_kind, deadline, produced))
+                return
+        # 审核台要看的草稿：正常产出时就是答复本身；`needs_review` 那一轮运行停在
+        # 交付工具上（答复还没产生），正文在待批项的参数里。
+        draft = _review_draft(outcome)
 
         # ---- 非流式链路的产出补齐 ----
         # agent 链路用 `Runner.run` 整段返回，**不产生 token 事件**。
         # 不补这一步，客户端会收到"零 token + done" —— 表现得像服务没回答，
         # 而服务日志里一切正常（最容易误判成前端 bug 的一种）。
         # 放在这里而不是各链路各写一遍：判据统一是"本轮一个 token 都没流过"。
-        if not produced and not awaiting_review and (values.get("output") or ""):
-            text = values["output"]
-            # 非流式链路（agent 链路）整段返回：它的"首字节"就是**整段
-            # 生成耗时**，与流式差一个数量级。两者混进同一个分布会让 P95 变成
-            # 一个没有含义的中间值，所以用 mode 标签分开看、分开告警。
+        if not produced and not awaiting_review and not starved and outcome.answer:
+            text = outcome.answer
+            # 整段返回（`on_text` 为 None 的路径 / 模型一个 token 都没流式发出）：
+            # 它的"首字节"就是**整段生成耗时**，与流式差一个数量级。两者混进同一个
+            # 分布会让 P95 变成一个没有含义的中间值，所以用 mode 标签分开看。
             metrics.observe("llm_first_token_seconds",
                             time.perf_counter() - started,
                             kind=req_kind, mode="buffered")
@@ -2683,26 +2676,17 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
             yield _record({"event": "token", "data": text})
 
         # ---- agent 链路的运行指标 ----
-        agent_stats = values.get("agent_stats") or {}
-        guardrail = values.get("agent_guardrail") or ""
+        agent_stats = context.stats.as_dict()
+        guardrail = outcome.guardrail or ""
         if agent_stats or guardrail:
             _record_agent_metrics(agent_stats, guardrail)
 
         # ---- 在线答案质量采样（默认关，见 config.ONLINE_QUALITY_SAMPLE）----
-        # 放在这里而不是各链路各写一遍：判据统一是"本轮最终产出是什么"，
-        # 两条链路（流式问答 / agent 整段返回）的产出都落在 `values["output"]`。
-        _maybe_sample_quality(values)
+        # 判据统一是"本轮最终产出是什么"与"本轮真实检索到了什么"。
+        _maybe_sample_quality(outcome.answer, context.citations_text)
 
-        # ---- agent 路由的「降级面」：想走但走不了 ----
-        # 与上面那组是**两件事**：那组回答"agent 跑得怎么样"，这条回答
-        # "agent 到底有没有跑起来"。少了它，`module_unavailable`（忘了装
-        # openai-agents）与 `runtime_not_ready`（忘了配模型）**完全不可观测** ——
-        # 请求会静默退回问答链路，答得"像那么回事"，而所有指标都正常。
-        # 这正是能力开关最危险的一种失效形态（开着、但等于没开）。
-        _record_agent_route(str(values.get("route_reason") or ""))
-
-        cites = values.get("citations") or []
-        check = values.get("citation_check") or {}
+        cites = outcome.citations or []
+        check = outcome.citation_check or {}
         blocked = False
         if check:
             # status 是**有限取值**（ok/weak/degraded/unsupported/no_citations/no_answer），
@@ -2726,7 +2710,7 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
         # agent 链路的产出是整段返回的（不流式），所以护栏能在交付前把它拦掉 ——
         # 被拒的输出 `output` 留空。此时若只发 done，用户看到的是"空回答"，
         # 与"模型什么都没说"分不开；这里补一条可见的解释。
-        if guardrail and not (values.get("output") or ""):
+        if guardrail and not outcome.answer:
             logging.warning("agent 出口护栏拦下本次交付：%s", guardrail)
             yield _record(_sse_json("guardrail_blocked", {
                 "guardrail": guardrail,
@@ -2737,22 +2721,27 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
             }))
 
         # ---- 兜底结局（第 5 步）：结构化字段，**不进答复正文、也不进对话历史** ----
-        # 轻档的正文里只有一句提醒，完整清单在这里给前端；failed / manual 也报一次 ——
-        # 否则"这一轮为什么没有正文"只能靠翻日志回答。
-        outcome_kind = values.get("task_outcome") or ""
+        # 正文原样交付（有产出就交，不加任何"部分结果"的措辞），完整清单在这里给前端；
+        # failed / manual 也报一次 —— 否则"这一轮为什么没有正文"只能靠翻日志回答。
+        # ⚠️ delivered **不发**：它是"没出问题"，发了会让客户端多一种永远不该出现的分支。
+        verdict = outcome.fallback
+        outcome_kind = (verdict.outcome if verdict is not None else "") or ""
         if outcome_kind and outcome_kind != "delivered":
             yield _record(_sse_json("task_outcome", {
                 "outcome": outcome_kind,
-                "reason": values.get("fallback_reason") or "",
-                "unfinished": values.get("unfinished_steps") or [],
+                "reason": (verdict.reason if verdict is not None else "") or "",
+                "unfinished": list(verdict.unfinished) if verdict is not None else [],
             }))
 
         if awaiting_review:
             item = {
-                "thread_id": thread_id or (run_config.get("configurable", {}) or {}).get("thread_id", ""),
-                "draft": values.get("output") or "",
-                "score": values.get("score"),
-                "feedback": values.get("feedback") or "",
+                "thread_id": session_id,
+                "draft": draft,
+                # agent 链路不产 0-100 分 ⇒ None。**不能给 0**：审核台上 0 分是
+                # "AI 判了 0 分"，而真相是"这条链路根本不产分"。
+                "score": None,
+                # 评审结论不再进这个字段（它属于"对内容的建议"，现在只交给模型自己看）。
+                "feedback": "",
                 "tenant": tenant or "",
             }
             # 落队列 + 异步通知：即使此刻没有客户端在线，待审内容也不会"消失"。
@@ -2762,9 +2751,9 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
             await _off(_REVIEW_QUEUE.add, **item)
             metrics.inc("review_needed_total")
             yield _record(_sse_json("need_review", {
-                "draft": values.get("output"),
-                "score": values.get("score"),
-                "feedback": values.get("feedback"),
+                "draft": draft,
+                "score": None,
+                "feedback": "",
             }))
         else:
             yield _record({"event": "done"})
@@ -2878,13 +2867,13 @@ async def _stream_graph(incoming, run_config, req_kind: str, tenant: str = "",
 # 于是"客户端重试"被自己的 409 挡住，而它什么都没做错。
 # 所以顺序固定为：**业务 4xx 全部判完 → 抢键 → 配额 → 开流**。
 #
-# 抢到的键由谁收尾：`_stream_graph` 的 finally（成功→finish，失败→forget）。
+# 抢到的键由谁收尾：`_stream_run` 的 finally（成功→finish，失败→forget）。
 # 唯一"抢了却进不了生成器"的缺口是配额 429 —— 那一步在 `_sse` 里显式退还。
 class _IdemGate(NamedTuple):
     """闸门结论：`response` 非空表示"就此返回"，否则用 `key`/`fp` 开流。
 
     `subject` 是**抢键时的那个主体**（用户名），必须一路带到收尾（`_release_idem_gate`
-    与 `_stream_graph`）—— 幂等键的命名空间是 (tenant, subject, key)，
+    与 `_stream_run`）—— 幂等键的命名空间是 (tenant, subject, key)，
     收尾时漏掉 subject 就会去改另一个空间里的键，原键永远收不了尾。
     收在闸门里而不是让调用方各自再传一遍：调用方已经拿到了 gate，
     多一个"记得也把 subject 传下去"的手工约定，就多一个静默漏传的机会。
@@ -3065,7 +3054,7 @@ def _release_idem_gate(gate: _IdemGate, tenant: str) -> None:
 # SSE 响应构造：所有"生命周期必须成对"的东西都收在这里
 # （断连信号、配额预占→结算）
 # ---------------------------------------------------------------------------
-def _sse(graph_input, run_cfg, req_kind: str, *, tenant: str, subject: str = "",
+def _sse(turn, req_kind: str, *, tenant: str, subject: str = "",
          thread_id: str, budget=None, idem_key: str = "", idem_fp: str = "",
          reserved=None, run_id: str = "") -> EventSourceResponse:
     """构造 SSE 响应：断连信号成对接线 + 配额预占（结算交给生成器）。
@@ -3075,7 +3064,7 @@ def _sse(graph_input, run_cfg, req_kind: str, *, tenant: str, subject: str = "",
     断连信号有两端，缺一不可：
       - **写端**在 sse_starlette 里 —— 只有 `client_close_handler_callable` 能拿到
         真正的 `http.disconnect`（库自己常驻消费 `receive()`，外部读不到）；
-      - **读端**在 `_stream_graph` 里 —— 生成器与 watcher 据此收手。
+      - **读端**在 `_stream_run` 里 —— 生成器与 watcher 据此收手。
     分散在三个端点里手工接线，就要在 6 处保持一致；而漏接任一端**不会报错**，
     只表现为"线上断了却既不计数、也不减损"（这正是修复前线上发生的事）。
     收进一个函数后，接错只可能错一次。
@@ -3084,7 +3073,7 @@ def _sse(graph_input, run_cfg, req_kind: str, *, tenant: str, subject: str = "",
     ----------------------
     **预占与结算必须落在同一条"一定会走到 finally"的路径上**。预占若放在
     `_preflight`（各端点业务校验之前），`/review` 与 `/resume` 的 409 会让请求
-    在进入生成前就返回，而退还只发生在 `_stream_graph` 的 finally ⇒ **额度永久
+    在进入生成前就返回，而退还只发生在 `_stream_run` 的 finally ⇒ **额度永久
     泄漏**（表现成"配额莫名少了一截"，且没有任何报错）。
 
     调换顺序的代价是配额排在业务校验之后，但换来两个好处：① 不会为注定 409 的
@@ -3094,27 +3083,27 @@ def _sse(graph_input, run_cfg, req_kind: str, *, tenant: str, subject: str = "",
 
     ⚠️ 传给库的回调必须是 async 且不阻塞 —— 理由见 `_DisconnectSignal` 的文档。
 
-    graph_input: 送进图的输入（首轮 dict / resume 的 Command / 续跑的 None）。
-    run_cfg: langgraph 运行配置。
+    turn: 这一轮的输入（``src.turn.TurnRequest``）：用户原话、会话编号、租户、
+        打回意见、以及"接着跑一次被打断的运行"的现场。
     req_kind: "chat" / "review" / "resume"，用于日志与指标标签。
     tenant / subject: 配额计量的两级"算在谁头上"，同时是幂等键命名空间的一部分
         （见 `IdempotencyStore._key`）。**subject 必须跟着 `reserved` 一起传**：
         `reserved` 是 `_reserve_quota(tenant, subject, ...)` 算出来的，settle
         用另一个 subject 就会把结算记到别的桶上（额度偏松或偏紧，且无任何报错）。
         默认空串只对"调用方自己已经预占过"的场景安全 —— 那时 `reserved` 由外部传入。
-    thread_id / budget: 透传给 `_stream_graph`（入队、预算止血）。
-    idem_key / idem_fp: 已抢占的幂等键与其请求指纹，透传给 `_stream_graph` 收尾。
+    thread_id / budget: 透传给 `_stream_run`（入队、预算止血）。
+    idem_key / idem_fp: 已抢占的幂等键与其请求指纹，透传给 `_stream_run` 收尾。
     run_id: 已在 `_RUNS.begin` 登记过的运行编号。空串 = 这次运行不可被主动停止。
 
     请求级总时限**在这里读配置**（而不是在各端点）：三个端点都要它，而 `_sse`
     已经是它们共同经过的唯一一处。调用时读（而非模块级常量）才能被测试
     monkeypatch —— 与字段闸门同一个理由（见 `_bounded`）。
     """
-    # 配额预占必须**紧贴**生成器创建：成功之后，结算就由 `_stream_graph` 的
+    # 配额预占必须**紧贴**生成器创建：成功之后，结算就由 `_stream_run` 的
     # finally 保证；失败（429）则当场抛出、不留残值。
     #
     # ⚠️ 幂等键必须先**退还**再抛：调用方已经抢到了键（状态 = 在途），而退还只
-    # 发生在 `_stream_graph` 的 finally —— 429 一抛，生成器根本没被创建，
+    # 发生在 `_stream_run` 的 finally —— 429 一抛，生成器根本没被创建，
     # 那个键会一直停在"在途"直到 TTL 到期。表现为：客户端拿到 429、等额度
     # 恢复后拿**同一个键**重试，却收到 409"正在处理中" —— 它什么都没做错。
     #
@@ -3127,12 +3116,12 @@ def _sse(graph_input, run_cfg, req_kind: str, *, tenant: str, subject: str = "",
         reserved = _reserve_quota(tenant, subject, idem_key)
     signal = _DisconnectSignal(req_kind)
     return EventSourceResponse(
-        _stream_graph(graph_input, run_cfg, req_kind, tenant=tenant,
-                      subject=subject,
-                      thread_id=thread_id, budget=budget, disconnect=signal,
-                      reserved=reserved,
-                      timeout=config.REQUEST_TIMEOUT_SECONDS,
-                      idem_key=idem_key, idem_fp=idem_fp, run_id=run_id),
+        _stream_run(turn, req_kind, tenant=tenant,
+                    subject=subject,
+                    thread_id=thread_id, budget=budget, disconnect=signal,
+                    reserved=reserved,
+                    timeout=config.REQUEST_TIMEOUT_SECONDS,
+                    idem_key=idem_key, idem_fp=idem_fp, run_id=run_id),
         client_close_handler_callable=signal.mark_closed,
         # 提示词版本随响应头下发（**不改 SSE 事件载荷** —— 那是对外契约）。
         # 颗粒度正好是需要的那个：一条回答 = 一个响应 = 一个版本号，
@@ -3865,8 +3854,11 @@ def chat_v1(req: ChatReq, request: Request,
     idempotency_key: 可选的 `Idempotency-Key`。带上它，客户端超时重试就不会
         重跑一整轮（规范见 `deploy/IDEMPOTENCY.md`）。
 
-    内部把 message 包成 HumanMessage 作为图输入；若图停在 human_review，
-    流里会下发 need_review 事件（草稿 + 评分 + 意见），由前端调 /review 续跑。
+    内部把 message 作为这一轮的输入交给 `run_turn`（一次 `Runner.run`）；若模型
+    在交付时自己声明需要人看（`needs_review`），流里会下发 need_review 事件
+    （草稿 + 评分 + 意见），同时把这条产出登记进审核队列等审，由前端调 /review
+    再审。⚠️ 审核之后**不能"续跑"**：拒绝/通过都是对已产出的那份文本的处置，
+    没有可恢复的执行现场（见 `deploy/RUNBOOK.md` 的三态判据）。
     请求处理前会过"限流 → 配额 → 会话归属"三道闸门。
 
     幂等闸门排在**所有业务 4xx 之后、配额之前**（理由见 `_IdemGate` 的说明）。
@@ -3878,13 +3870,19 @@ def chat_v1(req: ChatReq, request: Request,
                              ident.user)
     if gate.response is not None:
         return gate.response
-    run_cfg = tracing.build_run_config(
-        {"configurable": {"thread_id": req.thread_id}},
-        thread_id=req.thread_id, tenant=tenant,
-        rag_tenant=_retrieval_tenant(ident))
-    incoming = {"messages": [HumanMessage(content=req.message)]}
+    incoming = TurnRequest(
+        prompt=req.message,
+        thread_id=req.thread_id,
+        # ⚠️ 这里传**归一后**的检索租户，不是 `ident.tenant`：
+        # `TurnRequest.tenant` 的唯一去向是检索层（`build_context` → `get_retriever`），
+        # 而"给他看哪些库"的判据只写在 `_retrieval_tenant` 里（无租户⇒公共租户⇒
+        # 哨兵，绝不返回空串）。传 `ident.tenant` 的话，空串会从这条路走进检索层的
+        # 进程级默认值，而 `_retrieval_tenant` 那套 fail-closed 就只剩文档上的。
+        # 与之相对，配额分桶 / 审核归属 / 会话属主仍然用 `tenant`（空串是如实记录）。
+        tenant=_retrieval_tenant(ident),
+    )
     budget = RequestBudget(_QUOTA.request_limit)
-    return _sse(incoming, run_cfg, "chat", tenant=tenant, subject=ident.user,
+    return _sse(incoming, "chat", tenant=tenant, subject=ident.user,
                 thread_id=req.thread_id, budget=budget,
                 idem_key=gate.key, idem_fp=gate.fp,
                 # 每次运行一个编号：`/stop` 靠它精确命中"正在跑的这一次"，
@@ -3897,18 +3895,25 @@ async def review_v1(req: ReviewReq, request: Request,
                     x_tenant_id: str = Header(default=""),
                     authorization: str = Header(default=""),
                     idempotency_key: str = Header(default="", alias="Idempotency-Key")):
-    """POST /v1/review：人工审核 resume，续跑被 interrupt 挂起的图。
+    """POST /v1/review：人工审核的入口 —— 把审核人的决定送回停机容器。
 
     req: 请求体 ReviewReq。thread_id 用于定位会话；action 只允许 accept / revise；
         feedback 在 revise 时必填（accept 时可留空）。
     x_tenant_id: 同 /v1/chat。
     idempotency_key: 同 /v1/chat。它同时挡住了"审核 POST 被重试"这类事故。
 
-    三道前置校验，任一条不过都不进入图：
+    三道前置校验，任一条不过都不动容器：
       - action 非 accept/revise → 400；
       - revise 但 feedback 全空白 → 400；
-      - 该 thread 当前并不停在 human_review（如已完成、或从未触发）→ 409。
+      - 该 thread 当前并没有停在审核（如已完成、或从未触发）→ 409。
     通过后把队列里的记录标记为已处理（accepted / revised）。
+
+    两个动作走**完全不同的路**（2026-10-20 起）：
+      - accept → 把现场/队列里的草稿直接**作为答复流出去**，不再跑模型：
+        正文早就产出了（有现场时在 ``RunState`` 里，没现场时在队列里），
+        再跑一遍就是重复计费、重复落盘。
+      - revise → 容器里写回决定，然后**新起一轮运行**，审核意见作为
+        `configurable.human_feedback` 交给生成方（不进 state、不进对话历史）。
 
     ⚠️ 幂等闸门必须排在 `_REVIEW_QUEUE.resolve` **之前**：那条 resolve 是
     **写操作**（出队 + 留痕"谁批的"）。若一条重试先改了状态、再被幂等判成
@@ -3916,7 +3921,7 @@ async def review_v1(req: ReviewReq, request: Request,
     """
     ident = await _off(_authenticate, x_tenant_id, authorization)
     tenant = ident.tenant
-    # 授权检查排在业务校验（action 合法性、会话是否停在 human_review）**之前**：
+    # 授权检查排在业务校验（action 合法性、会话是否停在审核）**之前**：
     # 先确认"你配不配做这件事"，再看"这件事能不能做"。反过来的话，
     # 一个无权限的调用方能靠 400/409 的差异去探测会话状态。
     _assert_review_role(ident)
@@ -3929,10 +3934,9 @@ async def review_v1(req: ReviewReq, request: Request,
 
     # ⚠️ 幂等闸门必须排在**状态检查之前**（2026-10-05 修正顺序）
     # ------------------------------------------------------
-    # 此前是"先 `aget_state` 判是否停在 human_review，再走幂等闸门"。那个顺序让
-    # **重放永远走不到**：第一次 /review 成功后图会 resume，`state.next` 不再含
-    # `human_review`，于是客户端拿同一个 Idempotency-Key 重试时，第 3351 行那句
-    # 状态检查先命中、直接 409 —— 而"重放上一次已完成的结果"正是幂等模块
+    # 此前是"先查状态（还在不在等审），再走幂等闸门"。那个顺序让**重放永远走不到**：
+    # 第一次 /review 成功后那条待审记录就结案了，于是客户端拿同一个 Idempotency-Key
+    # 重试时，状态检查先命中、直接 409 —— 而"重放上一次已完成的结果"正是幂等模块
     # docstring 承诺的标准 2.6 行为。承诺与实现对不上，且**没有任何测试覆盖**。
     #
     # 更糟的是它的下游影响：客户端会以为"这次审批没成功"，于是换个新键再点一次 ——
@@ -3946,9 +3950,16 @@ async def review_v1(req: ReviewReq, request: Request,
     if gate.response is not None:
         return gate.response
 
-    cfg = {"configurable": {"thread_id": req.thread_id}}
-    state = await graph.aget_state(cfg)
-    if not (state.next and "human_review" in state.next):
+    # 409 的判据：这条会话**当前**有没有一条待审记录。
+    # 两个来源，因为两类拦截存的东西不同：
+    #   · `needs_review`（模型在交付那一刻声明）⇒ 运行现场在 run_store 里；
+    #   · `manual`（跑偏 / 护栏拦下 / 没产出）⇒ 只有待审队列，没有现场
+    #     （运行已经结束，没有任何"可以停下来的地方"可回退）。
+    # 判据必须是"事实存在"而不是"曾经想审"：入队成功但存现场失败时，
+    # 信意图会让端点去恢复一条不存在的运行。
+    record = await _off(_REVIEW_QUEUE.record, req.thread_id)
+    held = await _off(run_store.load, req.thread_id)
+    if not (held or (record and record.get("status") == "pending")):
         await _off(_release_idem_gate, gate, tenant)
         raise HTTPException(status_code=409, detail="该会话当前不在人工审核状态")
 
@@ -3970,7 +3981,7 @@ async def review_v1(req: ReviewReq, request: Request,
         # "审批推进了、队列里那条却永远停在 pending、也没留下是谁批的"，
         # 而且**没有任何信号** —— 恰恰违背这个模块存在的全部理由（审计归因）。
         #
-        # 为什么不在这里抛错阻断审批：审批的**业务**正确性由图的 checkpoint 决定，
+        # 为什么不在这里抛错阻断审批：审批的**业务**正确性由运行现场（`RunState`）决定，
         # 审核队列只是"待办清单 + 留痕"。为一个可降级的留痕问题去打断已经成立的
         # 审批，等于把内部故障升级成用户可见的失败。
         #
@@ -3984,13 +3995,51 @@ async def review_v1(req: ReviewReq, request: Request,
             "请检查审核队列后端（PG 抖动 / 记录被清理 / 队列开关与写入路径不一致）。",
             req.thread_id, ident.user or tenant)
 
-    run_cfg = tracing.build_run_config(cfg, thread_id=req.thread_id, tenant=tenant,
-                                       rag_tenant=_retrieval_tenant(ident))
-    incoming = Command(resume={"action": req.action,
-                               "feedback": req.feedback or None})
-    return _sse(incoming, run_cfg, "review", tenant=tenant, subject=ident.user,
+    # ---- 配额预占必须排在**恢复运行之前** ----
+    # 反过来的话：预占失败（429）时运行已经被恢复，审批等于"执行了"——
+    # 但用户一个字的答复都没拿到，而客户端重试会撞 409（现场已被消费）。
+    # 预占在前，429 时现场仍停着，重试完全安全。
+    reserved = await _off(_reserve_quota, tenant, ident.user, gate.key)
+
+    # ---- 把决定变成**一轮运行** ----
+    # 三种形态，全部落在官方原语上，没有第四套机制：
+    #   · 有现场 + accept ⇒ `Runner.run(agent, state)` 接着跑（state 里这个待批项
+    #     被批准，交付工具随即执行，答复就产生了）；
+    #   · 有现场 + revise ⇒ 同一个入口，只是一次 `reject(意见)`：模型收到拒绝理由，
+    #     改完再交一次；
+    #   · 没有现场（`manual` 那类，运行早已结束）⇒ accept 直接交付草稿、
+    #     revise 新起一轮并把意见作为 `human_feedback` 带进去。
+    if held:
+        turn = TurnRequest(
+            prompt="", thread_id=req.thread_id, tenant=_retrieval_tenant(ident),
+            resume=ResumeRequest(
+                snapshot=held["snapshot"],
+                approved=(req.action == "accept"),
+                reason=req.feedback or "",
+            ),
+        )
+        # ⚠️ 现场只能用一次：官方消费掉批准结果之后就作废了。不删的话，
+        # 同一个待批项能被恢复两次 ⇒ 同一个动作执行两遍，而且不报错。
+        await _off(run_store.drop, req.thread_id)
+    elif req.action == "accept":
+        draft = (record or {}).get("draft") or ""
+        if not draft.strip():
+            # 没有正文可交：把已经占住的两样东西还回去，别让客户端重试撞假死。
+            await _off(_release_idem_gate, gate, tenant)
+            await _off(_QUOTA.settle, tenant, reserved, 0, subject=ident.user)
+            raise HTTPException(status_code=409, detail="没有可交付的待审正文")
+        turn = TurnRequest(prompt="", thread_id=req.thread_id,
+                           tenant=_retrieval_tenant(ident), deliver_text=draft)
+    else:
+        # `prompt` 给空串是有意的：原话已经在官方会话里，打回只需要意见
+        # （见 `runner._build_input_items` 对打回轮的判据）。
+        turn = TurnRequest(prompt="", thread_id=req.thread_id,
+                           tenant=_retrieval_tenant(ident),
+                           human_feedback=req.feedback or "")
+
+    return _sse(turn, "review", tenant=tenant, subject=ident.user,
                 thread_id=req.thread_id, budget=RequestBudget(_QUOTA.request_limit),
-                reserved=await _off(_reserve_quota, tenant, ident.user, gate.key),
+                reserved=reserved,
                 idem_key=gate.key, idem_fp=gate.fp,
                 run_id=uuid.uuid4().hex)
 
@@ -4001,7 +4050,7 @@ def list_reviews(request: Request, limit: int = 50,
                  authorization: str = Header(default="")):
     """GET /v1/reviews：列出待人工审核的会话（默认 50 条，按时间倒序）。
 
-    给"审核工作台"用：没有它，待审内容只存在于 checkpoint 里，无人知晓。
+    给"审核工作台"用：没有它，待审内容只能靠人记得去某条会话里翻，无人知晓。
 
     ⚠️ 2026-10-05 修了两处（此前是个可被低权限账号利用的跨租户泄露口）：
     1. **补了资源级授权**。此前只做 `_authenticate`，不查角色 —— 任何登录账号
@@ -4048,9 +4097,16 @@ async def session_state_v1(thread_id: str, request: Request,
     await _off(_rate_limit, request, thread_id)
     await _off(_assert_session_readable, thread_id, ident.tenant, ident.user)
 
-    cfg = {"configurable": {"thread_id": thread_id}}
-    state = await graph.aget_state(cfg)
-    view = _session_view(state, thread_id)
+    # 状态有三个来源，各回答一半，缺一半都会给出错误结论：
+    #   · 运行现场（RunState）—— 有没有"跑到一半停下来等审批"的那一轮；
+    #   · 待审队列 —— `manual` 那类（运行已结束）只有这份记录；
+    #   · 官方会话 —— 这条会话说过什么（对话历史的唯一来源）。
+    from src.agents import session as agent_session
+
+    held = await _off(run_store.load, thread_id)
+    record = await _off(_REVIEW_QUEUE.record, thread_id)
+    history = await agent_session.load_items(thread_id)
+    view = _session_view(thread_id, held=held, record=record, messages=history)
     if view["status"] == "unknown":
         raise HTTPException(status_code=404, detail="会话不存在")
     return view
@@ -4196,7 +4252,9 @@ async def session_stop_v1(thread_id: str, request: Request,
       · **已经产出的正文照常保留**（不是作废）；
       · SSE 收到一个 **`stopped`** 事件，它是**终止性**的（其后没有 `done`）——
         客户端必须能区分"被停了"与"网络断了"，因为前者不该自动重试；
-      · **检查点保留**：停在哪个节点边界就在哪儿，`POST /v1/chat/resume` 能接着跑；
+      · **没有可恢复的现场**：运行是被取消的，而官方只对"工具在等审批"这种
+        interruption 产出 `RunState`。所以 `stopped` 事件里 `resumable` 恒为
+        False，`POST /v1/chat/resume` 对这条会话只会回 409（它要求重发消息）；
       · 计费按已产出结算（与断连同一条路径）。
 
     为什么不能只靠"客户端断开"
@@ -4238,13 +4296,14 @@ async def session_delete_v1(thread_id: str, request: Request,
 
     删四类数据，缺一类都算不上"删干净"：
 
-      1. **检查点** —— 完整对话历史、所有中间草稿、评分与引用。数据主体；
+      1. **运行现场** —— 被打断那次运行的 ``RunState`` 快照（里面含整段历史与
+         未交付的正文）。数据主体；
       2. **agent 侧跨轮历史** —— ``agent_sessions`` / ``agent_messages`` 两张表，
-         存的是"下一轮的模型会读到的对话"（官方 Session 后端）。⚠️ 它与检查点是
+         存的是"下一轮的模型会读到的对话"（官方 Session 后端）。⚠️ 它与运行现场是
          **两份独立的数据**：只删 1 会留下一整段用户消息与助手产出，而接口却告诉
          调用方"已删除"；
       3. **审核队列记录** —— 待审/已审的草稿正文与审核意见。它独立存表，
-         只删检查点会留下一份"幽灵草稿"；
+         只删运行现场会留下一份"幽灵草稿"；
       4. **归属登记行** —— 不删会让同一个 thread_id 永久挂在旧租户名下：
          归属表只增不减，且该 id 之后谁也再用不了（新租户来会被判 403）。
 
@@ -4271,7 +4330,7 @@ async def session_delete_v1(thread_id: str, request: Request,
     await _off(_assert_session_readable, thread_id, ident.tenant, ident.user)
 
     deleted = {
-        "checkpoints": await _delete_thread_state(thread_id),
+        "run_state": await _delete_thread_state(thread_id),
         # agent 侧那份跨轮历史（另一份数据，见 _delete_agent_session）。
         "agent_history": await _delete_agent_session(thread_id),
         "review": await _off(_REVIEW_QUEUE.remove, thread_id),
@@ -4293,21 +4352,26 @@ async def chat_resume_v1(req: ResumeReq, request: Request,
                          x_tenant_id: str = Header(default=""),
                          authorization: str = Header(default=""),
                          idempotency_key: str = Header(default="", alias="Idempotency-Key")):
-    """POST /v1/chat/resume：续跑一条**中途断掉**的会话（SSE，事件与 /v1/chat 相同）。
+    """POST /v1/chat/resume：续跑一条**被打断**的会话（SSE，事件与 /v1/chat 相同）。
 
-    req: 请求体 ResumeReq，只有 thread_id —— 要跑的内容早就在检查点里了。
+    req: 请求体 ResumeReq，只有 thread_id —— 要跑的内容早就存在运行现场里了。
     x_tenant_id: 同 /v1/chat。
     idempotency_key: 同 /v1/chat（续跑同样是一次真实生成，重试代价一样大）。
 
-    语义（实测确认，不是推测）：检查点停在**当前未完成的那个节点之前**，
-    所以续跑是**重新执行该节点**，而不是"接上上次的半个 token"。
-    对客户端而言是"从头把这次回答重新流一遍"，拿到的是完整、自洽的正文。
-    对账时注意：这会**再花一次**该节点的 token（但省掉了前面已完成的检索与迭代）。
+    语义：现场（官方 ``RunState``）记的是"某个工具在等审批"那一刻，所以续跑是
+    **从那一步接着走**，不是"接上上次的半个 token"。对客户端而言是"把这次回答
+    继续流完"，拿到的是完整、自洽的正文。
 
-    三种状态各自该走哪条路：
-        next 含 human_review  → 409，提示调 POST /v1/review（需要人的决定，不是续跑）；
-        next 空               → 409，本轮已收尾，没有可续的内容；
-        其余（next 非空）      → 200 + SSE，用 `astream(None, ...)` 从检查点继续。
+    两种状态各自该走哪条路：
+        有现场（等人审）→ 409，提示调 POST /v1/review（要人的决定，不是续跑）；
+        没有现场        → 409，说明断流后请重发消息。
+
+    ⚠️ 第二条**不是**"本轮已收尾"的同义词，这是最容易被误读的一处：官方只在
+    运行中产生 interruption 时才给现场，**客户端断流 / 请求超时都不产生现场**。
+    那类崩溃恢复官方刻意不管（``human_in_the_loop.md`` 明确要求生产应用自己提供
+    恢复与副作用对账）。所以这里如实回 409 并指路"重发消息"，而不是假装能续 ——
+    假装能续的做法是**再跑一轮**，会把已经发出去的 token 重发一遍、把已经落盘的
+    资产再做一遍。
 
     ⚠️ 为什么不做成"自动判断后用一条接口搞定一切"：把"要人的决定"和"机器能自己跑完"
     混在一个接口里，客户端就无法区分"我需要弹审核界面"和"我可以直接继续" ——
@@ -4318,33 +4382,31 @@ async def chat_resume_v1(req: ResumeReq, request: Request,
     await _off(_preflight, request, session=req.thread_id, tenant=tenant, user=ident.user)
 
     # ⚠️ 幂等闸门排在状态检查之前 —— 与 `/review` 同一个修正（理由见那里的长注释）：
-    # 续跑成功后 `state.next` 会变空，于是"同一个键重试"拿到的会是 409
-    # "没有未完成的生成"，而不是上一次结果的**重放**。
+    # 续跑成功后现场就被消费掉了，于是"同一个键重试"拿到的会是 409
+    # "没有可续跑的运行现场"，而不是上一次结果的**重放**。
     gate = await _off(_idempotency_gate, tenant, "resume", idempotency_key,
                       req.model_dump(), ident.user)
     if gate.response is not None:
         return gate.response
 
-    cfg = {"configurable": {"thread_id": req.thread_id}}
-    state = await graph.aget_state(cfg)
-    pending = tuple(getattr(state, "next", None) or ())
-    if "human_review" in pending:
+    # 先判"是不是在等人审"，再判"有没有现场" —— 顺序反了会把"等人审"报成
+    # "没有可续跑的运行"。
+    held = await _off(run_store.load, req.thread_id)
+    if held:
         await _off(_release_idem_gate, gate, tenant)
         raise HTTPException(status_code=409,
-                            detail="该会话正在等待人工审核，请调用 POST /v1/review 续跑")
-    if not pending:
-        await _off(_release_idem_gate, gate, tenant)
-        raise HTTPException(status_code=409,
-                            detail="该会话没有未完成的生成（可能已完成，或从未开始）")
+                            detail="该会话正在等待人工审核，请调用 POST /v1/review")
 
-    run_cfg = tracing.build_run_config(cfg, thread_id=req.thread_id, tenant=tenant,
-                                       rag_tenant=_retrieval_tenant(ident))
-    # incoming=None 是 langgraph 的"从最近一次检查点继续"约定。
-    return _sse(None, run_cfg, "resume", tenant=tenant, subject=ident.user,
-                thread_id=req.thread_id, budget=RequestBudget(_QUOTA.request_limit),
-                reserved=await _off(_reserve_quota, tenant, ident.user, gate.key),
-                idem_key=gate.key, idem_fp=gate.fp,
-                run_id=uuid.uuid4().hex)
+    # ⚠️ 官方**只**在"运行中产生了 interruption"时提供可恢复的现场（``RunState``）。
+    # 客户端断流 / 请求超时导致的"跑到一半"没有现场 —— 那类崩溃恢复官方刻意不管，
+    # 明确写明"生产应用必须自己提供恢复与副作用对账"（``human_in_the_loop.md``）。
+    # 所以这里如实回 409，而不是假装能续：假装能续的做法是**再跑一轮**，
+    # 那会把已经发出去的 token 重发一遍、把已经落盘的资产再做一遍。
+    await _off(_release_idem_gate, gate, tenant)
+    raise HTTPException(
+        status_code=409,
+        detail="该会话没有可续跑的运行现场（断流后请重发消息；带同一个 "
+               "Idempotency-Key 会重放上次的结果）")
 
 
 app.include_router(v1)

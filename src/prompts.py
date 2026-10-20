@@ -2,8 +2,8 @@
 
 为什么要单独一个模块
 --------------------
-提示词原先散落在 `src/graph.py` 各节点里的 f-string 中。这种写法的代价不是"不好看"，
-而是三个具体的能力缺失：
+提示词原先散落在旧编排层（`src/graph.py`，2026-10-20 已删）各节点的 f-string 里。
+这种写法的代价不是"不好看"，而是三个具体的能力缺失：
 
   1. **无法回答"线上跑的是哪一版"**。提示词是模型行为的一部分，但改动它不留任何
      版本痕迹 —— 线上答得不好时，无法判断是不是提示词被改过，也无法把质量变化
@@ -25,8 +25,14 @@
 
 为什么不在这里放 system 角色消息
 --------------------------------
-本项目的提示词都是"单条 user 消息"形态（首轮问答 / 修订指令 / 评审指令），
-模型侧没有 system 角色。模板保持与调用点同构，避免引入一层与调用方不对应的抽象。
+本项目的提示词都是"单条 user 消息"形态（首轮问答 / 对照评测）。agent 链路的
+instructions 不在这里 —— 那是 `Agent` 原语自带的字段，见 `src/agents/*.py`。
+模板保持与调用点同构，避免引入一层与调用方不对应的抽象。
+
+⚠️ 2026-10-20 删掉了 `revise_prompt` / `evaluate_prompt`：它们只服务旧的
+修订节点与评分节点，两个节点随图一起删了，删完这两个模板**没有任何生产调用点**
+（只有测试在调）。agent 链路的评审走 `src/agents/evaluator.py` 自己的 instructions，
+不走这里。
 """
 
 from __future__ import annotations
@@ -47,32 +53,3 @@ def answer_prompt(context: str, question: str) -> str:
     职责，写在模板里会让"关掉 guard"这个动作失效。
     """
     return f"参考以下资料作答：\n{context}\n\n用户需求：{question}"
-
-
-def revise_prompt(previous_draft: str, feedback: str, source: str) -> str:
-    """修订模板：把评审/人工意见转成一次完整的重写请求。
-
-    previous_draft: 上一版草稿全文。
-    feedback: 修改意见。
-    source: 意见来源标签 —— "评审模型" 或 "人工审核"，只影响措辞，不影响要求。
-
-    关键要求是"输出【完整的新版本】"：模型天然倾向于只回改动片段或 diff，
-    而下游把返回内容**整体当作新草稿**使用（写回 state["output"]），
-    一旦只回片段，最终回答就会残缺。这句不是客套话，是接口契约。
-    """
-    return (
-        f"以下是{source}给出的修改意见，请据此修订你之前的草稿{previous_draft}，"
-        f"输出【完整的新版本】，不要只给片段或 diff：\n\n"
-        f"{feedback}"
-    )
-
-
-def evaluate_prompt(draft: str) -> str:
-    """评审模板：要求结构化输出（是否需评审 / 0-100 分 / 建议）。
-
-    draft: 待评审的草稿。
-
-    分数口径由 `src/graph.py` 的 `LOW`/`HIGH` 阈值消费，改这里的措辞会改变
-    分数分布 —— 因此它同样受 `PROMPT_VERSION` 覆盖。
-    """
-    return f"判断内容是否需要进行评审，如果需要对内容打分(0-100)并且给建议：\n{draft}"

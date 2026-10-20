@@ -5,44 +5,48 @@
 装配上的三处关键差别（测试会逐条钉住）：
 
 * ``tools=[...]`` 里放 **``as_tool()`` 出来的专家** —— 有界子任务，不接管对话；
-* ``output_type=FrontlineDecision`` —— 每一步都要给出"答复还是转交"的判定，
-  由 ``src/graph.py`` 的条件边消费（见下）；
+* ``handoffs=[literary_agent]`` —— 文学创作这类**整段对话都该换人**的请求，
+  用官方 handoff 把控制权交出去（见下）；
 * ``review_draft``（评审）**也在 ``tools`` 里** —— 要不要评审由**模型自己决定**。
   2026-10-02 按用户要求从"代码 ``while`` 每轮必跑"改成 ``as_tool``；口径变化见
   ``evaluator.py`` 的模块 docstring（尤其是"代码不能假设评审一定发生过"）。
+  ⚠️ 2026-10-19 再补一刀：评审结论**也不参与收尾判定**了（不打分、不转人工，
+  结论只回给模型自己）。
 
-⚠️ 2026-10-03：``handoffs`` 已删，改成 ``output_type``
-----------------------------------------------------
-"移交文学作者"这件事从 **SDK 的 handoff** 改成了 **图节点之间的一条边**：
+⚠️ 2026-10-20：``handoffs`` 回来了，``output_type=FrontlineDecision`` 删了
+-----------------------------------------------------------------------
+这是对 2026-10-03 那次改动的**回退**，原因不是当时判断错了，而是**前提没了**：
 
-    前台节点 --(读 FrontlineDecision.action)--> 文学节点
+当时（2026-10-03）agent 链路被拆成多个 LangGraph 节点，"移交文学作者"只能做成
+图的一条边 —— 因为 SDK 的 handoff 是"在同一个节点内部换人后 ``continue``"，
+节点里带 handoff 会让节点边界消失。于是它被换成了
+``output_type=FrontlineDecision``：模型每步产出一个 ``{action, content}``，
+由 ``route_frontline`` 读 ``action`` 决定跳哪条边。
 
-为什么必须换：agent 链路拆成多个图节点之后，**节点边界就是续跑边界**；而 SDK 的
-handoff 是在同一个节点内部把人换完再继续跑（``run.py`` 里换人后是 ``continue``），
-节点里一旦带 handoff，节点边界就形同不存在 —— 拆了等于没拆。
+现在图被去掉了（用户要求整条链路按 OpenAI SDK 来），"节点边界"这个前提不存在了，
+那条理由自然失效。于是回到官方形态：
 
-由此得到的硬约束：**本文件不能再出现 ``handoffs=``**。加回来就会让 SDK 在这一个
-节点里把人都换完、一路跑到终点，而图只会看到"一个节点执行了一次" ——
-症状是"文学节点永远不被走到"，且没有任何报错。守卫见
-``tests/test_agents_pipeline.py`` 的接线断言。
+* **移交** = ``handoffs=[literary_agent]``，SDK 换掉当前 agent 后继续跑，
+  ``result.last_agent`` 就是"这次运行结束在谁手上"这个唯一事实来源；
+* **答复** = 普通文本输出（模型不再需要额外产出一个 JSON，交付内容就是最终答复）；
+* **不再有 ``agent_decision``** —— 那是给图的代码看的字段，图没了就没有读取方。
 
-⚠️ 入口护栏从 ``RunConfig`` 移到了这里（2026-10-03）
---------------------------------------------------
-此前它挂在运行配置上，理由是本 agent "会 handoff 出去 ⇒ 不一定是链上第一个"，
-于是"第一份输入必被扫"的不变式不能绑在任何一个 agent 身上。
+由此得到的硬约束换成反过来的那条：**不要再给本 agent 加 ``output_type``**。
+一旦加了，``result.final_output`` 就变成结构化对象，而它会被当成"给用户的答复"
+一路交付出去（pydantic 的 repr：字段名 + 括号）—— 用户在聊天框里看到的是
+``action='reply' content='...'``。守卫见 ``tests/test_agents_pipeline.py``。
 
-拆成图节点之后这条理由**不成立了**：每轮的第一个 agent 节点**固定**是前台
-（图里 ``init → dispatch → frontline`` 是写死的边），前台不再 handoff 出去。
-不变式现在是**结构保证**的，挂在 agent 级才是它的正确位置。
+⚠️ 入口护栏挂在 agent 级（不是 ``RunConfig``）
+--------------------------------------------
+官方那两个池子是**相加**（``starting_agent.input_guardrails + run_config.input_guardrails``），
+两处都挂会让每次运行跑两遍（指标翻倍 + 重复扫描）。挂在 agent 上还顺带得到一个
+正确语义：handoff 之后 SDK **不会**再跑输入护栏（它只扫起始 agent 的输入），
+所以同一句用户输入在文学专家那一程不会被重扫一遍 —— 这正是想要的。
 
-⚠️ 同时必须从 ``RunConfig.input_guardrails`` 里**删掉**：官方那两个池子是**相加**
-（``starting_agent.input_guardrails + run_config.input_guardrails``），两处都挂会让
-每次运行跑两遍（指标翻倍 + 重复扫描）。也正因为改了位置，文学节点那次运行不会再
-把同一句用户输入重扫一遍。
-
-回程边（曾经的 ``literary_agent.handoffs.append(...)``）已随 handoff 一起去掉 ——
-**不要加回来**：入口已固定为前台，下一轮用户说话自然回到前台，不需要文学专家在
-本轮内自己判断"这不是我的活"（多一次模型调用，且失败方式是硬撑不转）。
+⚠️ 没有回程边：**不要加** ``literary_agent.handoffs`` 指回前台。
+下一轮用户说话自然回到前台（每次 ``Runner.run`` 的起始 agent 都是前台）。
+加回程边会让文学专家在本轮内自己判断"这不是我的活"（多一次模型调用，
+失败方式是硬撑不转），而且官方 handoff 文档明确指出应避免循环转交。
 """
 
 from __future__ import annotations
@@ -57,13 +61,13 @@ from .specialists import (
     extract_illustration,
     extract_research,
     extract_slide_deck,
+    literary_agent,
     researcher_agent,
     slides_agent,
     visual_agent,
 )
 from .steps import tool_error_handler
-from .tools import save_text_asset
-from .types import FrontlineDecision
+from .tools import deliver, save_text_asset
 
 __all__ = ["frontline_agent"]
 
@@ -78,21 +82,30 @@ _INSTRUCTIONS = (
     "2. 需要多个交付物时逐个调用对应工具。\n"
     "3. 回答里引用取证结论时**保留出处编号**（形如 [1]），不要改写成自己的话，"
     "也不要编造没有出现过的编号。\n"
-    "4. 交付**正式产出**（说明文 / 大纲 / 作品）之前，调用 review_draft 自查一次，"
-    "按它给出的改进项改完再交付。闲聊与追问不必自查。\n"
+    "4. 要不要自查由**你**判断：交付正式产出（说明文 / 大纲 / 作品）时，"
+    "想确认质量就调用 review_draft；闲聊与追问不必。"
+    "⚠️ 一旦调用，就按它给出的改进项改完再交付 —— 它指出问题而你决定不改时，"
+    "要么说明理由，要么先改。它**不是**一道必须通过的关卡，只是一份给你自己的第二意见。\n"
+    "5. 交付：正式产出（说明文 / 大纲 / 作品，或任何你要作为最终答复的正文）"
+    "调用 deliver，把给用户看的正文放进 content。\n"
+    "   - 题材敏感、结论影响面大、或你自己拿不准质量时，把 needs_review 设为 true —— "
+    "整个运行会**停在这里**等人工过目；人打回时你会收到他写的修改意见，改完再交一次。\n"
+    "   - 普通产出保持 needs_review: false。**不要**为了保险一律设为 true："
+    "每一次 true 都要有人真的去看，否则这条对话就一直停着，用户等不到答复。\n"
     "\n"
-    "# 输出（每一步都要给一个判定）\n"
-    "你的产出是一个结构化对象，两个字段：\n"
-    "- action：reply = 这一步由你答复用户；transfer = 把对话交给文学创作专家。\n"
-    "- content：给用户看的正文。action=reply 时必须是**完整答复**；"
-    "action=transfer 时写一句交接说明（这一句用户看不到）。\n"
+    "# 输出（不要包 JSON）\n"
+    "调了 deliver：以它交出去的正文为准，之后的输出只写一句简短说明（例如「已交付」），"
+    "**不要**把正文再重复一遍。\n"
+    "没调 deliver 的闲聊与追问：把给用户看的正文本身作为答复输出。\n"
+    "动手前心里过一遍上面这几条（该取证取证、该转交转交），但**不要**把这份清单"
+    "或你的判断过程写进答复里，也不要写成 ``action=... content=...`` 这种字段形式。\n"
     "\n"
     "# 边界（这几条是职责的另一半）\n"
     "- 不自己编事实：凡是要给的数字、配置项、接口路径，必须来自 research 的返回。\n"
     "  包括**本服务自身**的规则（限流怎么算、某个开关在哪）—— 一样去 research 查，"
     "不凭印象回答。\n"
-    "- 文学创作（小说/散文/诗歌）**不要自己做**：把 action 定为 transfer，"
-    "不要用 content 直接把作品写出来。\n"
+    "- 文学创作（小说/散文/诗歌）**不要自己做**：交给 literary_writer。"
+    "你只负责把这次要写什么讲清楚（题材、篇幅、基调、已有约束）。\n"
     "- 不做校验、不做评审的具体规则：那是 review_draft 与出口护栏的事，不由你重写。\n"
     "- 工具返回「检索不到」时，如实说明检索不到，不要用常识补齐。"
 )
@@ -137,9 +150,17 @@ frontline_agent = Agent[TaskContext](
         evaluate_draft_tool,
         # -- 确定性步骤：普通函数工具，不是 agent --
         save_text_asset,
+        # -- 交付：把正文交出去（顺带承载"要不要人先过目"这个声明）--
+        # ⚠️ 它是"按内容决定要不要人审"的**唯一入口**（图只剩一个打标记的
+        # ``request_review`` 节点，跑偏/护栏/低分那几档才走它）：
+        # 只有这次调用带上 ``needs_review=True`` 时运行才会停下来等人，
+        # 判定与代价见 ``approval.delivery_needs_approval``。
+        deliver,
     ],
-    # 每一步的判定。图读它的 action 决定下一条边（见模块 docstring）。
-    output_type=FrontlineDecision,
+    # 整段对话都该换人的请求（文学创作）⇒ 官方 handoff，控制权交给对方。
+    # ⚠️ 刻意**不写** ``output_type``：加了它 ``result.final_output`` 就变成结构化
+    # 对象，而它会被当成给用户的答复一路交付出去（见模块 docstring 的硬约束）。
+    handoffs=[literary_agent],
     # 入口护栏挂在**这里**：本 agent 是每轮的第一个 agent 节点（结构保证），
     # 不是"碰巧第一个"。理由见模块 docstring 的"入口护栏"一节。
     input_guardrails=[prompt_injection_guardrail],

@@ -20,6 +20,40 @@ from tests.auth_util import TEST_USER, auth_headers  # noqa: E402
 client = TestClient(M.app, headers=auth_headers())
 
 
+def _park_review(thread_id: str, *, draft="草稿", score=None, feedback="意见"):
+    """在**待审队列**里造一条"停在审核"的记录，并返回那个队列。
+
+    ⚠️ 2026-10-20 起 `POST /v1/review` 的 409 判据是"有没有待审记录或运行现场"
+    （见端点里的 `record` / `held`）。伪造执行图的 `next` 已经骗不过它了 ——
+    图本身已经不存在。``manual`` 那类（跑偏 / 护栏）没有运行现场，队列就是它的
+    全部状态，所以这里造队列记录就能覆盖端点的全部分支。
+    """
+    from app.review_queue import ReviewQueue
+
+    q = ReviewQueue(dsn="")
+    q.add(thread_id, draft=draft, score=score, feedback=feedback, tenant="")
+    return q
+
+
+def _fake_turn(answer="改好的草稿", *, review_reason=""):
+    """替身运行：`/v1/review` 的每个分支最后都会跑一轮，这里只需吐一段正文。"""
+    from src.agents.runner import TaskOutcome
+
+    async def _run(req, *, context, on_text=None):
+        if on_text is not None and answer:
+            await on_text(answer, "call-1")
+        return TaskOutcome(
+            answer=answer,
+            attempts=1,
+            final_agent="frontline",
+            passed=True,
+            exit_reason="passed",
+            review_reason=review_reason,
+        )
+
+    return _run
+
+
 # ---------------- 版本化路由 ----------------
 def test_v1_review_validates_action():
     r = client.post("/v1/review", json={"thread_id": "t", "action": "nope"})
@@ -119,20 +153,14 @@ def test_quota_exhausted_returns_429(monkeypatch):
     `_sse` 的说明），所以不造这个前提，先返回的是 409 —— 用例照样"绿"，但测的
     根本不是配额。
     """
-    from types import SimpleNamespace
 
     from app.quota import QuotaManager
 
-    class _InReview:
-        async def astream(self, incoming, config, stream_mode):
-            yield SimpleNamespace(content="草稿"), {}
-
-        async def aget_state(self, config):
-            return SimpleNamespace(next=("human_review",), values={"citations": []})
-
     monkeypatch.setattr(M, "_LIMITER", RateLimiter(per_minute=1000))
     monkeypatch.setattr(M, "_QUOTA", QuotaManager(daily_limit=1))
-    monkeypatch.setattr(M, "graph", _InReview())
+    monkeypatch.setattr(M, "run_turn", _fake_turn())
+    # 前提：队列里真躺着一条待审记录（否则先返回的是 409，测的就不是配额了）。
+    monkeypatch.setattr(M, "_REVIEW_QUEUE", _park_review("q-thread"))
     M._QUOTA.add(M.config.DEFAULT_TENANT, 5)     # 把默认租户额度用光
 
     r = client.post("/v1/review", json={"thread_id": "q-thread", "action": "accept"})
@@ -143,7 +171,7 @@ def test_review_409_does_not_leak_quota(monkeypatch):
     """409（不在审核态）这条路径**不能**留下配额预占。
 
     预占若放在业务校验之前，这条路径会带着一份预占直接返回；而退还在
-    `_stream_graph` 的 finally 里 —— 那个 finally 永远不会执行。表现是"配额莫名
+    `_stream_run` 的 finally 里 —— 那个 finally 永远不会执行。表现是"配额莫名
     少了一截"，没有任何异常、也没有日志可查，只能靠对账发现。
     """
     from app.quota import QuotaManager
@@ -163,22 +191,14 @@ def test_chat_settles_quota_with_actual_tokens(monkeypatch):
     token，而不是 request_limit。留成 request_limit 就是预占泄漏 —— 每次请求都多算
     一份预占，额度会以远快于真实消耗的速度耗尽。
     """
-    from types import SimpleNamespace
 
     from app.quota import QuotaManager, estimate_tokens
 
     draft = "六堡茶是梧州特产。"
 
-    class _FakeGraph:
-        async def astream(self, incoming, config, stream_mode):
-            yield SimpleNamespace(content=draft), {}
-
-        async def aget_state(self, config):
-            return SimpleNamespace(next=(), values={"citations": []})
-
     monkeypatch.setattr(M, "_LIMITER", RateLimiter(per_minute=1000))
     monkeypatch.setattr(M, "_QUOTA", QuotaManager(daily_limit=10 ** 6, request_limit=500))
-    monkeypatch.setattr(M, "graph", _FakeGraph())
+    monkeypatch.setattr(M, "run_turn", _fake_turn(answer=draft))
 
     r = client.post("/v1/chat", json={"thread_id": "settle-1", "message": "hi"})
     assert r.status_code == 200
@@ -199,37 +219,13 @@ def test_review_action_records_who_did_it(monkeypatch):
     `_REVIEW_QUEUE.resolve(... actor=..., note=...)` 这串关键字参数真的从端点传下去了
     （漏传时 `resolve` 照样成功返回 True，队列照样出队，只有审计字段是空的）。
     """
-    from types import SimpleNamespace
 
     from app.review_queue import ReviewQueue
 
-    class _FakeGraph:
-        """假图：**第一次** `aget_state` 停在 human_review（端点据此放行），之后收尾。
-
-        ⚠️ 两次 `aget_state` 必须给不同答案：端点先用它判"是否在审核态"，`_stream_graph`
-        收尾时再用它判"要不要重新入队"。若第二次仍返回 human_review，收尾会把刚被
-        resolve 掉的记录**重新写成 pending** —— 审计字段照写、日志照打，只有状态回退，
-        极难发现（本用例第一次就是这么红的）。
-        """
-
-        def __init__(self):
-            self.state_calls = 0
-
-        async def astream(self, incoming, config, stream_mode):
-            yield SimpleNamespace(content="改好的草稿"), {}
-
-        async def aget_state(self, config):
-            self.state_calls += 1
-            if self.state_calls == 1:
-                return SimpleNamespace(next=("human_review",),
-                                       values={"citations": [], "output": "草稿",
-                                               "score": 40, "feedback": "太短"})
-            return SimpleNamespace(next=(), values={"citations": []})
-
     q = ReviewQueue(dsn="")
-    q.add("audit-1", draft="草稿", score=40, feedback="太短", tenant="acme")
+    q.add("audit-1", draft="草稿", score=None, feedback="太短", tenant="acme")
     monkeypatch.setattr(M, "_REVIEW_QUEUE", q)
-    monkeypatch.setattr(M, "graph", _FakeGraph())
+    monkeypatch.setattr(M, "run_turn", _fake_turn())
     monkeypatch.setattr(M, "_LIMITER", RateLimiter(per_minute=1000))
 
     r = client.post("/v1/review", json={"thread_id": "audit-1", "action": "revise",
@@ -339,17 +335,10 @@ def test_budget_exceeded_event_emitted_when_limit_hit(monkeypatch):
     """单请求预算耗尽 → 下发 budget_exceeded 并停止继续生成。"""
     from app.quota import RequestBudget
 
-    class _FakeGraph:
-        async def astream(self, incoming, config, stream_mode):
-            from types import SimpleNamespace
-            yield SimpleNamespace(content="很长的回答" * 20), {}
-
-        async def aget_state(self, config):
-            from types import SimpleNamespace
-            return SimpleNamespace(next=(), values={"citations": []})
-
-    monkeypatch.setattr(M, "graph", _FakeGraph())
-    events = _collect(M._stream_graph({}, {}, "chat", budget=RequestBudget(1)))
+    monkeypatch.setattr(M, "run_turn", _fake_turn(answer="很长的回答" * 20))
+    events = _collect(M._stream_run(
+        M.TurnRequest(prompt="hi", thread_id="budget-1"),
+        "chat", budget=RequestBudget(1)))
     names = [e["event"] for e in events]
     # 超预算 → 下发 budget_exceeded（此时不再产出 token），随后照常收尾 done，
     # 让 SSE 客户端能正常结束流（而不是悬着等不到结束标记）
@@ -382,7 +371,7 @@ def _collect(gen):
 #   客户端一律失败。而前端按 JSON.parse 处理是标准做法，静默失败的表现是
 #   "引用区永远空白"，服务端日志毫无异常（契约错了，但不报错）。
 #
-# 为什么必须**走 HTTP 层**断言：`_stream_graph` 产出的是 dict，序列化发生在
+# 为什么必须**走 HTTP 层**断言：`_stream_run` 产出的是 dict，序列化发生在
 # sse_starlette 里。旧测试只断言 dict（进程内、序列化之前），所以这种 bug
 # 无论怎么改都测不出来 —— 这正是"假绿"的典型形态。
 # ---------------------------------------------------------------------------
@@ -407,8 +396,8 @@ def _parse_sse(body: str):
     return frames
 
 
-class _CitedGraph:
-    """假图：产出一段正文 + 一组**带真实类型**的引用。"""
+class _CitedTurn:
+    """替身运行：产出一段正文 + 一组**带真实类型**的引用。"""
 
     TOKEN = '梧州位于广西东部，特产有"六堡茶"。'
     CITES = [{"n": 1, "source": "intro.txt", "score": 0.6213,
@@ -416,13 +405,15 @@ class _CitedGraph:
               "section": "概览", "snippet": "梧州市……\n特产：六堡茶",
               "truncated": False, "table_md": None}]
 
-    async def astream(self, incoming, config, stream_mode):
-        from types import SimpleNamespace
-        yield SimpleNamespace(content=self.TOKEN), {}
+    async def __call__(self, req, *, context, on_text=None):
+        from src.agents.runner import TaskOutcome
 
-    async def aget_state(self, config):
-        from types import SimpleNamespace
-        return SimpleNamespace(next=(), values={"citations": self.CITES})
+        if on_text is not None:
+            await on_text(self.TOKEN, "call-1")
+        return TaskOutcome(
+            answer=self.TOKEN, attempts=1, final_agent="frontline",
+            passed=True, exit_reason="passed", citations=self.CITES,
+        )
 
 
 def test_citations_payload_is_json_on_the_wire(monkeypatch):
@@ -430,7 +421,7 @@ def test_citations_payload_is_json_on_the_wire(monkeypatch):
     import json
 
     monkeypatch.setattr(M, "_LIMITER", RateLimiter(per_minute=1000))
-    monkeypatch.setattr(M, "graph", _CitedGraph())
+    monkeypatch.setattr(M, "run_turn", _CitedTurn())
 
     r = client.post("/v1/chat", json={"thread_id": "wire-1", "message": "hi"})
     assert r.status_code == 200
@@ -453,12 +444,12 @@ def test_token_payload_stays_raw_text(monkeypatch):
     正文里的引号还会被转义，展示出来就是错的。
     """
     monkeypatch.setattr(M, "_LIMITER", RateLimiter(per_minute=1000))
-    monkeypatch.setattr(M, "graph", _CitedGraph())
+    monkeypatch.setattr(M, "run_turn", _CitedTurn())
 
     r = client.post("/v1/chat", json={"thread_id": "wire-2", "message": "hi"})
     frames = dict(_parse_sse(r.text))
 
-    assert frames.get("token") == _CitedGraph.TOKEN, \
+    assert frames.get("token") == _CitedTurn.TOKEN, \
         f"token 被加工过了：{frames.get('token')!r}"
 
 
@@ -466,29 +457,20 @@ def test_need_review_payload_is_json_on_the_wire(monkeypatch):
     """need_review 同样是结构化载荷，必须走 JSON。"""
     import json
 
-    class _ReviewGraph:
-        async def astream(self, incoming, config, stream_mode):
-            from types import SimpleNamespace
-            yield SimpleNamespace(content="生成的草稿"), {}
-
-        async def aget_state(self, config):
-            from types import SimpleNamespace
-            return SimpleNamespace(
-                next=("human_review",),
-                values={"citations": [], "output": "草稿内容", "score": 42,
-                        "feedback": "请补充来源"},
-            )
-
     monkeypatch.setattr(M, "_LIMITER", RateLimiter(per_minute=1000))
-    monkeypatch.setattr(M, "graph", _ReviewGraph())
+    monkeypatch.setattr(M, "run_turn",
+                        _fake_turn(answer="草稿内容", review_reason="manual"))
 
     r = client.post("/v1/chat", json={"thread_id": "wire-3", "message": "hi"})
     frames = dict(_parse_sse(r.text))
 
     assert "need_review" in frames, f"没收到 need_review：{frames.keys()}"
     parsed = json.loads(frames["need_review"])
-    assert parsed["score"] == 42                    # 整数
-    assert parsed["feedback"] == "请补充来源"        # 中文不转义也不乱码
+    # ⚠️ 这两个字段**刻意**是 None / 空串：agent 链路不产 0-100 分，
+    # 评审意见也不再作为"交给审核人的建议"落库。给 0 会让审核台显示"AI 判了 0 分"，
+    # 而真相是"没有人评过"。
+    assert parsed["score"] is None
+    assert parsed["feedback"] == ""
     assert parsed["draft"] == "草稿内容"
 
 
@@ -503,18 +485,9 @@ def test_budget_exceeded_payload_is_json_on_the_wire(monkeypatch):
 
     from app.quota import QuotaManager
 
-    class _FakeGraph:
-        async def astream(self, incoming, config, stream_mode):
-            from types import SimpleNamespace
-            yield SimpleNamespace(content="很长的回答" * 20), {}
-
-        async def aget_state(self, config):
-            from types import SimpleNamespace
-            return SimpleNamespace(next=(), values={"citations": []})
-
     monkeypatch.setattr(M, "_LIMITER", RateLimiter(per_minute=1000))
     monkeypatch.setattr(M, "_QUOTA", QuotaManager(daily_limit=0, request_limit=1))
-    monkeypatch.setattr(M, "graph", _FakeGraph())
+    monkeypatch.setattr(M, "run_turn", _fake_turn(answer="很长的回答" * 20))
 
     r = client.post("/v1/chat", json={"thread_id": "wire-4", "message": "hi"})
     frames = dict(_parse_sse(r.text))
