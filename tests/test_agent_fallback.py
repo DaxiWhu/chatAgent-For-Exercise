@@ -119,6 +119,8 @@ def test_row4_guardrails_are_manual_and_business(reason):
         # 一个该调预算/查为什么这么费，一个该调 AGENT_MAX_TURNS —— 混成 max_turns
         # 会让人去调轮数上限，而真正的问题是这一轮烧了太多 token。
         ("token_budget", "", "token_budget"),
+        # 墙钟到点同理：该查"为什么这么慢"（工具慢 / 圈数多），不是查预算也不是查轮数。
+        ("run_timeout", "", "run_timeout"),
         ("passed", "", "no_output"),
     ],
 )
@@ -138,6 +140,7 @@ def test_row5_no_answer_is_failed_and_keeps_the_real_reason(exit_reason, stopped
         ("passed", {"stuck": 2}, "", "stuck"),
         ("max_turns", {}, "", "max_turns"),
         ("token_budget", {}, "", "token_budget"),
+        ("run_timeout", {}, "", "run_timeout"),
         ("guard_stop", {}, "capped", "guard_stop"),
     ],
 )

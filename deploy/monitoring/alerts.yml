@@ -1191,6 +1191,22 @@ groups:
           description: "提醒与撤回都没能让模型跳出问题，机制主动中断了这次运行。用户侧表现是「这次答不出来」或只拿到半段内容。`problem` 是最近一次判出来的问题类型；**停因**（capped / not_found / not_fixed / side_effect）只在日志里，它回答的是「为什么退不了」。"
           runbook: "1) 日志搜「多步防护第 3 级：停止重试」，那条 warning 带停因；2) 停因 capped ⇒ 撤回额度用完了（`AGENT_REFLECT_MAX_LEVEL2`），先确认是不是同一个问题反复触发，再决定调额度而不是无脑加大；3) not_found ⇒ 那一步已经被 token 裁剪或历史压缩吃掉，撤回无处下手 ⇒ 查 `AGENT_HISTORY_TOKEN_LIMIT` 是否偏小、或压缩是否把步骤结构压没了；4) not_fixed ⇒ 撤了同类问题又出现 ⇒ 改 prompts/instructions，这是内容层的问题；5) side_effect ⇒ 出问题的动作是落盘类（不可撤）⇒ 看该工具是否该拆成「准备 + 提交」两步；6) 同时看 `agent_task_outcome_total{outcome=\"failed\"}` 确认用户侧影响面。"
 
+      - alert: AgentRunTimeoutFrequent
+        # ★ 一次运行撞到**墙钟上限**（2026-10-21 新增）。
+        #   判据是"有发生"：它是终止性事件 —— 这一轮在注入口被停掉 ⇒ 没有答复正文，
+        #   用户只拿到流式里已经推出去的半段。一次就值得看一眼。
+        #   ⚠️ 它和 AgentGuardStopFrequent 是两码事：那个是"机制放弃让模型自己改"
+        #   （提示词/策略问题），这个是"跑太久了"（配置太紧、或某一步真的慢）。
+        expr: increase(agent_run_deadline_stop_total[30m]) > 0
+        for: 1m
+        labels:
+          category: agent
+          severity: warning
+        annotations:
+          summary: "agent 运行撞到墙钟上限（近 30 分钟 {{ $value }} 次）"
+          description: "这些运行被 `AGENT_RUN_TIMEOUT_SECONDS` 停下，没有形成答复正文（非流式下客户端什么都没收到；流式下只有已推出去的增量，且不进会话历史）。要么上限配得比真实任务紧，要么这一类任务确实慢。"
+          runbook: "1) 日志搜「超过上限」，那条 warning 带「已跑 X 秒 / 上限 Y 秒」；2) 先看 `agent_tool_duration_seconds` 的 p95 按 `tool` 拆 —— 单个工具慢就打 `AGENT_TOOL_TIMEOUT_SECONDS` 的主意，全都慢就是上游/检索的问题；3) 看 `agent_model_calls_per_run` 是否接近 `AGENT_MAX_TURNS` ⇒ 圈数多导致总时长超，先治打转（`agent_action_repeats_total` / `agent_action_oscillation_total`）；4) 确认是正常长任务之后才调大 `AGENT_RUN_TIMEOUT_SECONDS`，别用它掩盖慢。"
+
       - alert: AgentToolStepTimeoutFrequent
         # ★ 又一条"不报错的坏"：工具单步超时（`AGENT_TOOL_TIMEOUT_SECONDS`，默认 20s）。
         #   超时**不会**让这一轮失败 —— 它被转成一句给模型的话（"换做法/缩小范围，

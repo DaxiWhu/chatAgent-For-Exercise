@@ -1239,6 +1239,40 @@ curl -s --noproxy '*' localhost:8000/metrics | grep 'agent_task_outcome_total'
 - 先看 `problem` 标签再动手：它回答"退的是什么问题"，停因回答"为什么退不了"，
   两个维度缺一个就会改错地方。
 
+#### `AgentRunTimeoutFrequent`（warning，30m 内 > 0 次）
+
+一次运行撞到了**墙钟上限**（`AGENT_RUN_TIMEOUT_SECONDS`）。它是终止性事件：这一轮
+在注入口被停掉 ⇒ **没有答复正文**。非流式下客户端什么都没收到；流式下只有已经推出去
+的那半段（不进会话历史）。
+
+为什么单独一条，不和 `AgentGuardStopFrequent` 合并：那个是"机制放弃让模型自己改"
+（提示词/策略问题），这个是"跑太久了"（配置太紧，或某一步真的慢）。改的地方完全不同。
+
+```bash
+# 停了几次
+curl -s --noproxy '*' localhost:8000/metrics | grep 'agent_run_deadline_stop_total'
+# 用户侧影响面（这些运行最终落成 failed + run_timeout）
+curl -s --noproxy '*' localhost:8000/metrics | grep 'agent_fallback_total'
+# 日志里那条带「已跑 X 秒 / 上限 Y 秒」
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --since 40m app-stable | grep '超过上限'
+```
+
+按这个顺序看，别一上来就调大上限：
+
+1. **单个工具慢**：`agent_tool_duration_seconds` 的 p95 按 `tool` 拆。某一个贴着
+   `AGENT_TOOL_TIMEOUT_SECONDS` ⇒ 是它的问题（检索数据量、落盘 IO）。
+2. **全都慢**：上游/网关的问题，看 `llm_first_token_seconds`。
+3. **圈数多**：`agent_model_calls_per_run` 接近 `AGENT_MAX_TURNS` ⇒ 总时长是被
+   圈数堆出来的，先治打转（`agent_action_repeats_total` /
+   `agent_action_oscillation_total`），别用上限掩盖它。
+4. **确认是正常长任务**之后才调 `AGENT_RUN_TIMEOUT_SECONDS`。它默认 `0`（不限），
+   所以这条告警只在**配了**上限的部署里可能触发 —— 触发本身就说明配的这个值
+   与真实任务不匹配。
+
+> ⚠️ 这两条（`token_budget` / `run_timeout`）被停下时，**已落盘的资产还在**
+> `AGENT_ASSET_DIR` 里。用户说"刚才生成到一半的那份"时，先去那儿找，不要以为
+> 全丢了。
+
 #### `AgentRunFailureRateHigh`（warning，10m）
 异常收尾比例 > 20%（`exit_reason` ∈ `error` / `evaluator_error` / `max_turns`）。
 

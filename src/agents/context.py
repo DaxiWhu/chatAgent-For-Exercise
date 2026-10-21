@@ -98,9 +98,43 @@ class AgentStats:
 
     # -- 成本（2026-10-21）--
     input_tokens: int = 0
-    """本次运行累计的**输入** token（所有模型调用相加）。"""
+    """本次运行**主链路**累计的输入 token（``Runner`` 那几次模型调用相加）。"""
     output_tokens: int = 0
-    """本次运行累计的**输出** token。"""
+    """本次运行**主链路**累计的输出 token。"""
+
+    bypass_tokens: dict[str, dict[str, int]] = field(default_factory=dict)
+    """**旁路**模型调用的 token，按来源分开：``{"reflection": {"input":…, "output":…}}``。
+
+    为什么必须单独记、不能直接累进上面两个字段
+    ----------------------------------------
+    上面两个字段的口径是"``Runner`` 循环里那几次模型调用"，它是 ``agent_run_tokens_total``
+    的来源、也是"这个 agent 一圈多贵"的唯一答案。把旁路混进去，那条曲线就不再回答
+    原先那个问题，而且**没有任何地方会显示它被污染了**。
+
+    但"钱"这个口径必须含旁路 —— 反思闸门（``reflection._reflect_sync``）与窗口压缩
+    （``compaction.summarize_items``）各自 bypass 建 client，账单上是实打实的。
+    所以拆成两个口径、两处上报：
+
+    * ``agent_run_tokens_total{kind}``       —— 主链路（口径不变）；
+    * ``agent_bypass_tokens_total{kind,source}`` —— 旁路，按来源拆；
+    * ``budget.used_of``                    —— **两者之和**（预算是钱，钱不分主次）。
+
+    ⚠️ 按来源存而不是只存一个总数：压缩是长任务里最贵的一笔（它要把老历史整段读一遍），
+    反思只是一小段证据。合成一个数就没法回答"钱到底花在哪一侧"。
+    ⚠️ 后台反思可能在本轮**收尾之后**才回来（``_run`` 活得比主线久）⇒ 那一笔会写进
+    这个字典，但已经没有地方读它了。属可接受损失（与"迟到 = 白跑"同一条），不要
+    因此把它改成同步等待。
+    """
+
+    @property
+    def bypass_input_tokens(self) -> int:
+        """所有旁路调用的输入 token 合计。"""
+        return sum(int(v.get("input", 0) or 0) for v in self.bypass_tokens.values())
+
+    @property
+    def bypass_output_tokens(self) -> int:
+        """所有旁路调用的输出 token 合计。"""
+        return sum(int(v.get("output", 0) or 0) for v in self.bypass_tokens.values())
 
     # -- 检索（agent 链路上的检索由 researcher 工具发起）--
     retrieval_calls: int = 0
@@ -125,6 +159,7 @@ class AgentStats:
             "duration_seconds": round(self.duration_seconds, 6),
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "bypass_tokens": {k: dict(v) for k, v in self.bypass_tokens.items()},
             "retrieval_calls": self.retrieval_calls,
             "retrieved_chunks": self.retrieved_chunks,
             "empty_retrievals": self.empty_retrievals,
@@ -208,6 +243,19 @@ class TaskContext:
     """
 
     stats: AgentStats = field(default_factory=AgentStats)
+
+    started_at: float = 0.0
+    """本次运行的**起点**（``time.monotonic()``；``0`` = 还没开始）。
+
+    ``runner.run_agent`` 在 ``Runner.run`` 之前写一次，墙钟闸门
+    （``deadline.check``）在注入口读它算"这次跑了多久"。
+
+    ⚠️ 为什么不用 ``time.time()``：它是墙上时钟，NTP 校时或用户改系统时间会让它
+    **倒退**，而"倒退"在闸门里的表现是"跑了两小时却判成还没到线" —— 一个静默失效。
+    单调时钟只回答"过了多久"，正是这里唯一需要的语义。
+    ⚠️ 恢复运行（等用户授权之后接着跑）会**重写**它：闸门的语义是"这一次运行最多
+    多久"，不是"这个任务从提出到交付最多多久"（后者会把用户思考的时间也算进去）。
+    """
 
     steps: StepLog = field(default_factory=StepLog)
     """本次运行的动作清单（工具名 / 参数指纹 / 成败 / 耗时）。

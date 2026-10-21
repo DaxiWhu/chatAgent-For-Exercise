@@ -111,7 +111,7 @@ def fake_summary(monkeypatch):
     "切分切错了"看起来一切正常（摘要总是一样的）。
     """
 
-    def _stub(segment):
+    def _stub(segment, **kw):
         return "【摘要】" + "|".join(str(_text(x)) for x in segment)
 
     monkeypatch.setattr(C, "summarize_items", _stub)
@@ -230,7 +230,7 @@ def test_empty_summary_means_no_replacement(on, monkeypatch):
     这是整套机制里最危险的一条分支：摘要为空却照做替换，等于**把老历史删掉**
     （比不压严重得多，而且不可恢复）。所以判据是"库里原样"，不是"函数返回了 0"。
     """
-    monkeypatch.setattr(C, "summarize_items", lambda segment: "")
+    monkeypatch.setattr(C, "summarize_items", lambda segment, **kw: "")
     items = _rounds(4)
     fake = FakeSession(items)
     wrapped = C.CompactingSession(fake)
@@ -266,7 +266,7 @@ def test_summarizing_does_not_hold_the_lock(on, monkeypatch):
     entered = asyncio.Event()
     release = {"done": False}
 
-    def _slow(segment):
+    def _slow(segment, **kw):
         loop = _LOOP["loop"]
         loop.call_soon_threadsafe(entered.set)
         while not release["done"]:
@@ -307,7 +307,7 @@ def test_concurrent_write_during_summary_aborts_this_round(on, monkeypatch):
     """
     entered = asyncio.Event()
 
-    def _slow(segment):
+    def _slow(segment, **kw):
         _LOOP["loop"].call_soon_threadsafe(entered.set)
         time.sleep(0.3)
         return "摘要"
@@ -418,7 +418,7 @@ def tiny_budget(monkeypatch):
     monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "20")
     monkeypatch.setenv("AGENT_HISTORY_COMPACT_RATIO", "1.0")
     monkeypatch.setattr(hb, "_item_tokens", lambda item: 10)
-    monkeypatch.setattr(C, "summarize_items", lambda segment: "摘要")
+    monkeypatch.setattr(C, "summarize_items", lambda segment, **kw: "摘要")
     C.reset_compaction_state()
     yield
     C.reset_compaction_state()

@@ -97,7 +97,7 @@ from typing import Any
 from .. import observability
 from ..envutil import env_float, env_int
 from . import history_budget
-from .history_budget import count_tokens, history_token_limit
+from .history_budget import count_tokens, history_token_limit, is_user_item
 
 __all__ = [
     "CompactingSession",
@@ -175,22 +175,12 @@ def _max_segment_chars() -> int:
 # ---------------------------------------------------------------------------
 # 按轮切分
 # ---------------------------------------------------------------------------
-def _is_user_item(item: Any) -> bool:
-    """这个条目是不是**一轮的起点**（用户说的话）。
+_is_user_item = is_user_item
+"""判"这是不是一轮的起点"的**唯一实现**在 ``history_budget``（本模块导入的方向是
+"高层引用低层"，反过来会成环 —— 见 ``history_budget.is_user_item`` 的说明）。
 
-    两种形态都要认：
-
-    * **SDK 会话 / 模型输入**：dict，``role == "user"`` —— 与官方
-      ``select_compaction_candidate_items`` 里那个 ``_is_user_message`` 同一判据
-      （那里还额外认 ``type == "message"``，两种写法都有，这里统一看 ``role``）。
-    * **消息对象**（官方 Session 里存的是 dict，部分调用点传的是 LangChain 的
-      ``HumanMessage``）：用 ``.type == "human"`` 判而不是
-      ``isinstance``：``BaseMessage.type`` 是稳定的公开属性，这样 ``src/agents/``
-      不必硬依赖 langchain（本模块的导入面因此保持干净，见模块 docstring 末节）。
-    """
-    if isinstance(item, dict):
-        return (item.get("role") or "") == "user"
-    return getattr(item, "type", "") == "human"
+这里保留旧名字只是为了让本模块内部的调用点与既有测试不用改：语义一个字都没变。
+"""
 
 
 def _content_text(content: Any) -> str:
@@ -394,12 +384,20 @@ def _segment_body(segment: list[Any]) -> str:
     return body
 
 
-def summarize_items(segment: list[Any]) -> str:
+def summarize_items(segment: list[Any], *, on_usage: Any = None) -> str:
     """把一段历史压成摘要（**同步**；没有模型能力时返回空串）。
 
     返回空串有明确含义：**这次压不了**（没配 Key / 建不起 client / 调用失败 /
     模型返回空）。调用方据此原样返回、不做任何替换 —— 摘要为空却照做替换，等于
     把老历史**删掉**，那正好是这套机制最不能出的错。
+
+    on_usage: 拿到这一次的 ``usage`` 时回调一次。**只有窗口压缩那条路会传**
+    （它属于某一次运行，成本要进那一次运行的账）；会话写回那条路是后台任务、
+    不属于任何一次运行，传 None。
+
+    ⚠️ 为什么这件事必须做：压缩是**长任务里最贵的一笔**——它要把被压掉的那一整段
+    历史（可能几十万 token）重新读一遍。不记账的话，token 预算就是"只管主链路"，
+    而真实账单里有相当一部分完全不在这张表上（见 ``budget.note_bypass``）。
     """
     client = _client_or_none()
     if client is None:
@@ -430,6 +428,12 @@ def summarize_items(segment: list[Any]) -> str:
         return ""
     observability.histogram("agent_history_compaction_seconds",
                             time.perf_counter() - started, result="ok")
+    # 记在成功返回之后：这次出站调用已经花掉了，不管后面摘要能不能用
+    # （返回空内容也算花过钱，下面那条"空摘要不替换"的分支照样该记账）。
+    if on_usage is not None:
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            on_usage(usage)
     text = text.strip()
     if not text:
         logging.warning("摘要模型返回了空内容 ⇒ 这一轮不压（不拿空摘要替换历史）")
@@ -438,13 +442,13 @@ def summarize_items(segment: list[Any]) -> str:
     return text
 
 
-async def _summarize_async(segment: list[Any]) -> str:
+async def _summarize_async(segment: list[Any], *, on_usage: Any = None) -> str:
     """协程侧的摘要入口：真正的活在**线程**里干。
 
     与 ``history_budget.trim_model_input`` 同一手法 —— 一次同步 HTTP 往返跑在协程里
     会把本进程所有并发请求（含正在推的 SSE 流）一起停住。
     """
-    return await asyncio.to_thread(summarize_items, segment)
+    return await asyncio.to_thread(summarize_items, segment, on_usage=on_usage)
 
 
 # ---------------------------------------------------------------------------
@@ -740,10 +744,15 @@ def _items_tokens_over(instructions: str, items: list[Any], trigger: int) -> boo
     return False
 
 
-async def compact_for_window(items: list[Any], *, instructions: str = "") -> list[Any] | None:
+async def compact_for_window(
+    items: list[Any], *, instructions: str = "", on_usage: Any = None
+) -> list[Any] | None:
     """**入口二**：将要送进模型的那一份输入超过阈值时，压成「摘要 + 能装下的轮」。
 
     返回**替换用**的条目列表；``None`` = 不用压（没开 / 没超 / 压了也没用）。
+
+    on_usage: 摘要那次出站调用的 usage 回调（成本要进**这一次运行**的账，
+        见 ``budget.note_bypass``）。
 
     与"会话侧写回"的分工见模块 docstring 的"为什么窗口压缩不做写回"：这里只改
     **这一次调用送进模型的内容**，库里那份交给历史压缩。
@@ -772,7 +781,7 @@ async def compact_for_window(items: list[Any], *, instructions: str = "") -> lis
     keep_from = _plan_keep_from(payload, keep=keep)
     if keep_from is None:
         return None
-    summary = await _summarize_async(payload[:keep_from])
+    summary = await _summarize_async(payload[:keep_from], on_usage=on_usage)
     if not summary:
         return None
     tail = payload[keep_from:]

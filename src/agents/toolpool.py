@@ -38,6 +38,14 @@
 ------------------------------------------
 退化成"无限等待"，但**仍然走独立池** —— 因为隔离是安全边界，不是优化。这个组合的
 行为与改造前一致（同样是丢进线程池、同样没有单步上界），只是不再和服务层抢线程。
+
+顺带管一件事：**单次返回的字符上界**（``AGENT_TOOL_RESULT_MAX_CHARS``）
+-------------------------------------------------------------------
+本项目自有的工具全部经 ``tools._isolated`` 进到 ``run_tool_step``，所以"截断过长
+返回"放在这里，新加一个工具就自动受保护。放到各工具内部就是"新写工具时忘了截"，
+而漏了没有任何症状 —— 直到某天一次检索把上下文窗口顶爆，表现成"模型忘了要做什么"
+（理由见 ``clip_result``）。
+⚠️ ``as_tool`` 包出来的专家工具不经过这里，见 ``run_tool_step`` 末尾的边界说明。
 """
 
 from __future__ import annotations
@@ -54,8 +62,10 @@ from .. import observability
 from ..envutil import env_float, env_int
 
 __all__ = [
+    "clip_result",
     "default_workers",
     "dispose",
+    "result_max_chars",
     "run_tool_step",
     "step_timeout_seconds",
     "workers",
@@ -91,6 +101,57 @@ def step_timeout_seconds() -> float:
 _POOL: ThreadPoolExecutor | None = None
 
 
+def result_max_chars() -> int:
+    """**一次**工具返回的字符上界（``0`` = 不限）。
+
+    为什么需要它（2026-10-21 补）
+    ------------------------
+    ``kb_search`` 只限**条数**（``top_k`` 上限 10），不限**字符**。而一条片段有多长
+    取决于切分后的 chunk：一页表格、一段长 PDF，单条就能上万字。于是"10 条"可能
+    是 2k 字符，也可能是 20 万字符 —— 后者一次就能吃掉半个上下文窗口。
+
+    没有这个上界时，唯一的约束是事后裁剪（``history_budget``），而裁剪是**从最老的
+    开始丢**：工具返回把窗口顶爆，被丢的是用户原话（见 ``history_budget._trim_sync``
+    的锚点说明）。也就是说"一次检索太长"会表现成"模型忘了自己在做什么"。
+
+    应该在**入口**就把单次返回封住，而不是让下游去收拾。
+
+    默认 8000 字符：本项目切分后的单条片段通常在 300~1500 字，10 条满打满算也就
+    一万多；8000 已经足够让模型看清"这批检索里有什么"，同时保证连查十次也只有
+    8 万字符量级。
+
+    ⚠️ 只截 ``str``：工具也可能返回 dict / list（结构化产出），按字符截断会把它们
+    变成**非法 JSON**，模型拿到的是坏数据 —— 那比截断更糟。
+    """
+    return env_int("AGENT_TOOL_RESULT_MAX_CHARS", 8000, lo=0)
+
+
+def clip_result(value: Any, *, tool: str = "") -> Any:
+    """把过长的**字符串**返回截断，并附一句可操作说明；其余类型原样返回。
+
+    截断说明必须写清三件事：原文多长、这里给了多少、想看更多该怎么做。少最后一条
+    的话，模型会以为"就这么多"，于是拿半段资料下结论 —— 而它没有任何线索能察觉
+    自己看到的是残片。
+    """
+    limit = result_max_chars()
+    if limit <= 0:
+        return value
+    if not isinstance(value, str):
+        return value
+    if len(value) <= limit:
+        return value
+    observability.counter("agent_tool_result_truncated_total", tool=tool or "?")
+    head = value[:limit]
+    tail = (
+        f"\n\n…（工具返回过长，已截断：原文 {len(value)} 字符，这里只给了前 {limit} 字符。"
+        "需要更多内容就缩小检索范围再来一次，不要拿这半段当作全部。）"
+    )
+    logging.info(
+        "工具返回过长已截断：%s %d → %d 字符", tool or "?", len(value), limit
+    )
+    return head + tail
+
+
 def _pool() -> ThreadPoolExecutor:
     """懒建、进程内唯一。懒建的理由：配置是**运行期**读的（测试可改 env）。"""
     global _POOL
@@ -120,10 +181,10 @@ async def run_tool_step(
 
     timeout = step_timeout_seconds()
     if timeout <= 0:
-        return await future
+        return clip_result(await future, tool=tool)
 
     try:
-        return await asyncio.wait_for(future, timeout)
+        out = await asyncio.wait_for(future, timeout)
     except TimeoutError:
         # `wait_for` 已经 cancel 过它；再 cancel 一次是为了覆盖"排队中还没开始"的
         # 那一档 —— 那种情况下线程池会直接跳过它，动作**不会发生**。
@@ -135,6 +196,14 @@ async def run_tool_step(
             tool or "?", timeout,
         )
         raise
+    # ★ 截断放在**唯一出口**（这里），而不是每个工具里各写一份（2026-10-21）：
+    # 本项目自有的工具全部经 `tools._isolated` 进到这个函数，于是新加一个就能自动
+    # 受保护；散到工具内部则是"新写一个工具时忘了截"——这种漏法没有任何症状，
+    # 直到某天一次检索把窗口顶爆。
+    # ⚠️ 边界：`as_tool` 包出来的专家工具（research / slides / illustration）**不经过**
+    # 这里 —— 它们的返回值由各自的 output_extractor 从结构化产出序列化而来，长度由
+    # 输出类型约束，不走这条通路。给自己的工具加截断时别以为专家也一起管了。
+    return clip_result(out, tool=tool)
 
 
 def dispose(*, wait: bool = False) -> None:

@@ -1040,6 +1040,68 @@ def _warn_about_missing_timeout() -> None:
 _warn_about_missing_timeout()
 
 
+def _warn_about_disabled_guards() -> None:
+    """生产环境把长任务的闸门**全关着**时，给一条可检索的告警（2026-10-21）。
+
+    为什么需要这一条
+    --------------
+    这些能力都是"默认关"的（按项目老规矩：会改变模型看到的东西 / 会掐断任务的，
+    默认不动）。于是有一个很具体的风险：**部署上线了、代码也齐了，但一道闸门都
+    没开**。运维看到的是"配置项都在、文档也写了"，而实际行为与三个月前完全一致 ——
+    长任务只有 ``AGENT_MAX_TURNS``（12 圈）这一道上界。
+
+    这不是代码缺陷，是配置拍板，所以**只告警、不拒绝启动**（与
+    ``_warn_about_missing_timeout`` 同一处置）。但必须是**可检索**的一条：写成
+    info 级别就会被默认日志级别吞掉，而那正是这个风险的样子。
+
+    为什么一次把三项拼成一条日志
+    ------------------------
+    三项各自打一条的话，值班的人会以为"Is a warning 一共三条、处理第一条就好"。
+    它们的性质是**同一个**："长任务防护没启用"。一条日志列出全部未开的，才好一次性拍板。
+    """
+    if not config.IS_PRODUCTION:
+        return
+    off: list[str] = []
+    if not _env_flag("AGENT_MULTISTEP_GUARD"):
+        off.append("AGENT_MULTISTEP_GUARD（反思闸门：提醒 / 撤回 / 停止三级全不生效）")
+    if _env_zero("AGENT_RUN_TOKEN_BUDGET"):
+        off.append("AGENT_RUN_TOKEN_BUDGET（一次运行没有 token 上限）")
+    if _env_zero("AGENT_RUN_TIMEOUT_SECONDS"):
+        off.append("AGENT_RUN_TIMEOUT_SECONDS（一次运行没有墙钟上限）")
+    if not off:
+        return
+    logging.warning(
+        "生产环境的 agent 长任务防护未启用 %d 项：%s。"
+        "当前这些任务只受 AGENT_MAX_TURNS（%s 圈）约束 —— 没有中途介入、没有成本上限、"
+        "没有时长上限。有意如此可忽略本条；否则见 PRODUCTION_CONFIG.md 的长任务防护一节。",
+        len(off),
+        "；".join(off),
+        config.AGENT_MAX_TURNS,
+    )
+
+
+def _env_flag(name: str) -> bool:
+    """环境变量里这个开关是不是开的（缺省视为关）。"""
+    return (os.getenv(name) or "").strip() in ("1", "true", "True", "yes", "on")
+
+
+def _env_zero(name: str) -> bool:
+    """这个数值配置是不是"没配 / 配成 0"（缺省视为 0；解析不出来按"没配"处理）。
+
+    ⚠️ 这两条刻意**不复用** ``src/envutil``：那是 ``src/`` 的工具，而本模块要读的
+    是"运维到底写没写这个键"这个**文本层面**的事实 —— 走 ``env_int`` 会把 0 与
+    "没写"归一成同一个值，而这一条告警要区分的正是这两者之外的第三种情况
+    （写了但是 0，等于没开）。
+    """
+    try:
+        return float((os.getenv(name) or "0").strip() or 0) <= 0
+    except ValueError:
+        return False
+
+
+_warn_about_disabled_guards()
+
+
 def _client_ip(request: Request) -> str:
     """取客户端 IP 作为限流维度。
 
@@ -2754,6 +2816,9 @@ async def _stream_run(turn, req_kind: str, tenant: str = "",
             yield _record(_sse_json("task_outcome", {
                 "outcome": outcome_kind,
                 "reason": (verdict.reason if verdict is not None else "") or "",
+                # 两份清单**成对**给：只有 unfinished 时，前端没法回答"那前面几步算不算数"。
+                # 新增字段是向后兼容的（老客户端忽略未知键），所以不需要版本号。
+                "accomplished": list(verdict.accomplished) if verdict is not None else [],
                 "unfinished": list(verdict.unfinished) if verdict is not None else [],
             }))
 

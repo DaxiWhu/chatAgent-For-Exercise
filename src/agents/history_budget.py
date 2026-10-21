@@ -61,6 +61,11 @@
    （≈ 0.17ms 每千 token）；改成"量到预算为止"后，无论库里堆了多少，
    编码量都封顶在"预算 + 最后一条"上。
 
+5. **目标与摘要不下刀**（2026-10-21 加）：第 1 条只保住了"最后一条"，而最后一条
+   通常是**最新的工具返回**，不是目标本身。目标在列表最前面 —— 恰好是"从最老开始
+   丢"第一批被丢的。所以另钉两个锚点：最后一条用户条目、开头的 system 摘要。
+   它们不参与预算判断（超了也留）。代价是保留段不再连续，见 ``_trim_sync`` 的说明。
+
 为什么是 **async**（2026-10-03 改）
 ---------------------------------
 分词编码是纯 CPU，跑在协程里会**占住整个事件循环** —— 本进程内其它并发请求
@@ -217,11 +222,22 @@ async def _compact_before_trim(data: Any) -> Any:
     try:
         # 惰性导入：``compaction`` 在模块级导入本模块（它要用同一把 token 尺子），
         # 这里再模块级导入就成环了。
+        from . import budget
         from .compaction import compact_for_window
 
+        # 成本归到**这一次运行**上：`CallModelData.context` 就是用户自己的 TContext
+        # （官方 `run_config.py` 的字段声明是 ``context: TContext | None``），
+        # 所以这里能直接拿到 stats。拿不到（None）就不传 —— 压缩照压，只是不记账。
+        stats = getattr(getattr(data, "context", None), "stats", None)
+        on_usage = (
+            (lambda usage: budget.note_bypass(stats, "compaction", usage))
+            if stats is not None
+            else None
+        )
         replacement = await compact_for_window(
             list(model_data.input or []),
             instructions=model_data.instructions or "",
+            on_usage=on_usage,
         )
     except Exception as e:  # noqa: BLE001  压缩失败不该影响作答
         logging.warning("窗口压缩失败，本轮按原样送模型：%s", e)
@@ -252,10 +268,63 @@ async def trim_model_input(data: Any) -> Any:
     return await asyncio.to_thread(_trim_sync, data)
 
 
+def is_user_item(item: Any) -> bool:
+    """这个条目是不是**用户说的话**（也就是"一轮的起点"）。
+
+    两种形态都要认：
+
+    * **SDK 会话 / 模型输入**：dict，``role == "user"`` —— 与官方
+      ``select_compaction_candidate_items`` 里那个 ``_is_user_message`` 同一判据
+      （那里还额外认 ``type == "message"``，两种写法都有，这里统一看 ``role``）。
+    * **消息对象**（官方 Session 里存的是 dict，部分调用点传的是 LangChain 的
+      ``HumanMessage``）：用 ``.type == "human"`` 判而不是 ``isinstance``：
+      ``BaseMessage.type`` 是稳定的公开属性，这样 ``src/agents/`` 不必硬依赖
+      langchain。
+
+    ⚠️ 为什么住在**本模块**而不是 ``compaction``：两边都要用（压缩要切"轮的边界"，
+    裁剪要钉"目标锚点"），而 ``compaction`` 已经在模块级导入本模块 —— 反过来放就成环。
+    方向只能是"低层拥有判据、高层引用它"。
+    """
+    if isinstance(item, dict):
+        return (item.get("role") or "") == "user"
+    return getattr(item, "type", "") == "human"
+
+
+def is_system_item(item: Any) -> bool:
+    """这个条目是不是一条 **system 消息**（本项目里唯一的用途：压缩摘要）。
+
+    压缩把摘要写成 ``{"role": "system"}`` 放在**最前面**（见
+    ``compaction._session_replacement``），所以"第一条是 system"就等于"这条输入
+    带着一份摘要"。裁剪侧靠这个判据决定要不要钉住它。
+    """
+    if isinstance(item, dict):
+        return (item.get("role") or "") == "system"
+    return getattr(item, "type", "") == "system"
+
+
 def _trim_sync(data: Any) -> Any:
     """同步实现（测量 + 裁剪）。只由 ``trim_model_input`` 在线程里调用。
 
     只在**超预算**时才动；没超时原样返回（不做任何拷贝）。
+
+    保留的不是"一段连续的后缀"，而是「后缀 + 若干**锚点**」（2026-10-21 改）
+    ------------------------------------------------------------------------
+    原来的实现是"从最新往前累加、超了就停"，保留段必然是 ``items[k:]`` 这样一段
+    连续后缀。这在长任务里有一个**结构性**的坏处：压缩生成的摘要放在**最前面**、
+    用户原话也在最前面，而"从最老开始丢"意味着**这两条第一批被丢掉**。
+
+    于是长任务跑到后半程，模型面前只剩最近十几个工具返回，**没有一句话说明它要
+    做什么**。这不是模型跑偏，是输入里真的没有了目标。
+
+    所以现在钉三个锚点（无条件保留，超预算也留）：
+
+    1. **最后一条**（口径 1，一直如此）—— 本轮刚发生的事；
+    2. **最后一条用户条目** —— 本轮那句要求（人工打回轮则是意见）；
+    3. **开头的 system 摘要**（如果有）—— 很久以前发生过什么。
+
+    代价是保留段不再连续，所以要显式按"保留下标集合"取，并照样走官方的
+    ``drop_orphan_function_calls`` 清孤儿。多留的两三条各几十到几百 token，
+    换的是"模型始终知道自己在做什么"，值得。
     """
     from agents.run_config import ModelInputData
 
@@ -274,25 +343,49 @@ def _trim_sync(data: Any) -> Any:
         return model_data
 
     try:
+        anchors: set[int] = {len(items) - 1}
+        # 开头的 system 摘要：压缩刚从最前面放的，钉住它。
+        if is_system_item(items[0]):
+            anchors.add(0)
+        # 最后一条用户条目 = 本轮的目标。找不到时（纯工具续跑）只有一个末条锚点。
+        for index in range(len(items) - 1, -1, -1):
+            if is_user_item(items[index]):
+                anchors.add(index)
+                break
+
         # 从**最新往最老**累加，一旦"再加上这条就超预算"立刻停 —— 更老的条目
         # 必定被丢，量它们纯属浪费（口径 4，也是开销上界的来源）。
+        # ⚠️ 锚点不参与这个判断：它们是"就算超了也要留"的那几条。
+        keep: set[int] = set()
         total = count_tokens(model_data.instructions or "")
-        i = len(items) - 1
-        while i >= 0:
+        for i in range(len(items) - 1, -1, -1):
             cost = _item_tokens(items[i])
             # 最后一条是本轮新输入，无条件保留（口径 1）：连它都不留下的结果
             # 是"模型看不到用户刚说的话"，而请求照常 200。
-            if i < len(items) - 1 and total + cost > budget:
+            if i not in anchors and i < len(items) - 1 and total + cost > budget:
                 break
+            keep.add(i)
             total += cost
-            i -= 1
-        keep_from = i + 1
 
-        if keep_from == 0:
+        # 比停点更老的锚点（例如最前面那条摘要）补回来 —— 它们不在 keep 里
+        # 是因为循环已经停了，不是因为预算允许丢它们。
+        for i in sorted(anchors):
+            if i in keep:
+                continue
+            keep.add(i)
+            total += _item_tokens(items[i])
+
+        dropped = len(items) - len(keep)
+        # "剩下的全是锚点、却还超预算" = 再怎么裁也没得裁了。这个判据要在**两个**
+        # 出口上都判：`dropped == 0` 时（输入本身就只有锚点）同样该报，否则最极端的
+        # 那一种情形反而最安静。
+        over = total > budget and keep == anchors
+        if dropped <= 0:
+            if over:
+                _note_over_budget(total, budget, len(anchors))
             return model_data  # 没超预算
 
-        dropped = keep_from
-        kept = items[keep_from:]
+        kept = [items[i] for i in sorted(keep)]
 
         # 裁完必须清孤儿（口径 3，委托官方）。`output_pruning_indexes` 传全量：
         # 我们丢的是**头部**，留下的第一条很可能就是"调用方已被丢掉"的工具结果；
@@ -312,19 +405,25 @@ def _trim_sync(data: Any) -> Any:
     observability.histogram("agent_history_dropped_items", dropped)
     observability.histogram("agent_history_input_tokens", total)
 
-    if len(kept) <= 1 and total > budget:
-        # 只剩本轮新输入一条仍超额：**不再继续裁**（裁掉它等于模型看不见用户刚说的话），
-        # 交给模型侧判定。这条告警指向配置：预算偏小，或单条输入过长。
-        observability.counter("agent_history_over_budget_total")
-        logging.warning(
-            "跨轮历史预算不足：已裁到只剩本轮新输入（约 %d token）仍超过预算 %d ⇒ "
-            "本轮照常发出，由模型侧判定。若频繁出现，请调大 AGENT_HISTORY_TOKEN_LIMIT "
-            "或检查单条输入为何这么长。",
-            total,
-            budget,
-        )
+    if over:
+        # 只剩锚点仍超额：**不再继续裁**（裁掉它们等于模型看不见目标、也看不见
+        # 刚说的话），交给模型侧判定。这条告警指向配置：预算偏小，或单条输入过长。
+        _note_over_budget(total, budget, len(anchors))
 
     return ModelInputData(input=kept, instructions=model_data.instructions)
+
+
+def _note_over_budget(total: int, budget: int, anchor_count: int) -> None:
+    """记一条"裁到只剩锚点还超额"（单一口径，上面两个出口共用）。"""
+    observability.counter("agent_history_over_budget_total")
+    logging.warning(
+        "跨轮历史预算不足：已裁到只剩 %d 条锚点（约 %d token）仍超过预算 %d ⇒ "
+        "本轮照常发出，由模型侧判定。若频繁出现，请调大 AGENT_HISTORY_TOKEN_LIMIT "
+        "或检查单条输入为何这么长。",
+        anchor_count,
+        total,
+        budget,
+    )
 
 
 def reset_history_budget_state() -> None:

@@ -47,6 +47,9 @@ MAX_UNFINISHED = 5
 清单自己**不能变成新的膨胀源**：它要进审核队列、也可能进结构化返回。超出部分只报条数。
 """
 
+MAX_DONE = 5
+"""已完成清单最多列几条（理由同上）。"""
+
 DELIVERED = "delivered"
 PARTIAL = "partial"
 MANUAL = "manual"
@@ -80,7 +83,7 @@ class FallbackVerdict:
 
     取值：``none`` / ``error`` / ``off_track`` / ``review_failed`` / ``guardrail`` /
     ``no_output`` / ``loop`` / ``stuck`` / ``max_turns`` / ``token_budget`` /
-    ``guard_stop`` / ``tool_approval``。
+    ``run_timeout`` / ``guard_stop`` / ``tool_approval``。
 
     ⚠️ 必须保持有界。把它做成"把异常原文塞进去"会让指标基数爆炸
     （异常原文带 request id、上游返回体、可能含用户数据）—— 那是 ``TaskOutcome.error``
@@ -96,6 +99,22 @@ class FallbackVerdict:
     unfinished: list[str] = field(default_factory=list)
     """未完成清单（步骤清单里 ``ok`` 之外的条目），**有上限**。"""
 
+    accomplished: list[str] = field(default_factory=list)
+    """**已经做成**的步骤清单（``status == "ok"``），**有上限**。
+
+    为什么需要它（2026-10-21 补）
+    ------------------------
+    原来只报"哪几步没做成"。可"部分结果"这个词对用户/审核人真正要回答的是
+    **边界在哪**："第 3 步失败了"这句话单独看没有意义 —— 不知道前两步的结论还
+    算不算数，就不知道还能不能拿这份答复去用。
+
+    长任务尤其明显：一次跑了八步，交出六步的成果并标明"第 7、8 步没做成"，
+    这份东西能用；只写"第 7、8 步没做成"，用户得自己去正文里猜前六步算不算数。
+
+    ⚠️ 与 ``unfinished`` 一样**有上限**，且只有 ``ok`` 才算 —— ``running``（还没
+    定格）不进这一栏：把"正在做"说成"做成了"是这类清单最坏的错法。
+    """
+
     @property
     def is_fallback(self) -> bool:
         """有没有发生兜底（**正常交付**与**待授权**都不算）。
@@ -109,6 +128,10 @@ class FallbackVerdict:
     def unfinished_text(self) -> str:
         """清单的一行文本（转人工与日志共用；空清单返回空串）。"""
         return "；".join(self.unfinished)
+
+    def accomplished_text(self) -> str:
+        """已完成清单的一行文本（同上）。"""
+        return "；".join(self.accomplished)
 
 
 def decide(context: Any, *, exit_reason: str, answer: str) -> FallbackVerdict:
@@ -131,6 +154,16 @@ def decide(context: Any, *, exit_reason: str, answer: str) -> FallbackVerdict:
     stopped = getattr(state, "stopped", None)
     produced = bool((answer or "").strip())
     unfinished = _unfinished(steps)
+    accomplished = _accomplished(steps)
+
+    def _v(outcome: str, reason: str, category: str) -> FallbackVerdict:
+        """构造一条结论：两份清单由**一个**地方填，不逐行手写。
+
+        为什么收成一层：七行里每一行都要带同样的两份清单，逐行传参的结果是"新加一行
+        时漏了其中一份"，而漏掉的表现是那张清单**偶尔为空** —— 读起来像"这一步真的
+        什么都没做成"，而真相是"这一行忘记填"。两处维护一定漂，索性只留一处。
+        """
+        return FallbackVerdict(outcome, reason, category, unfinished, accomplished)
 
     # ⓪ 待用户授权（加固阶段三）：**不是问题、也不是终态**。模型请求了一个高危动作
     # （落盘 / 生成图片），这一轮就地停下来等人点头；用户点头或拒绝之后还会接着跑。
@@ -140,18 +173,18 @@ def decide(context: Any, *, exit_reason: str, answer: str) -> FallbackVerdict:
     # 那正是"不接这一档"会走到的位置 —— 用户看到的是一条**错误报告**而不是"等你授权"。
     # 这不是推断：探针 P4 实测过（``tmp_probe/probe_tool_approval.py``）。
     if exit_reason == "awaiting_approval":
-        return FallbackVerdict(AWAITING, "tool_approval", BUSINESS, unfinished)
+        return _v(AWAITING, "tool_approval", BUSINESS)
 
     # ① 崩溃 / 限流 / 协议错：运行**根本没跑成**，谈不上"内容对错"。
     # 排在最前是有意的：这条路径没有草稿可审（产出为空），送进审核队列只会多出一条
     # "原因不明"的待审项。开发信号照发（见 ``run_agent`` 收尾处的 WARNING 与指标）。
     if exit_reason == "error":
-        return FallbackVerdict(FAILED, "error", SYSTEM, unfinished)
+        return _v(FAILED, "error", SYSTEM)
 
     # ② 跑偏：**业务类**。方向做错的内容比不交更糟 —— 哪怕它写得再漂亮也不给用户，
     # 交给人工判断。⚠️ 判据用"报过跑偏"（累计）而不是"这次报的是跑偏"：跑偏过就必须有人看。
     if kinds.get("off_track"):
-        return FallbackVerdict(MANUAL, "off_track", BUSINESS, unfinished)
+        return _v(MANUAL, "off_track", BUSINESS)
 
     # ③ 评审结论**不进这张表**（2026-10-19 删掉的那一行：``review_failed`` ⇒ 转人工）。
     #
@@ -169,7 +202,7 @@ def decide(context: Any, *, exit_reason: str, answer: str) -> FallbackVerdict:
     # 被拦下的那段内容会作为草稿存进审核队列，因为"这是不是误拦"没有原文根本判不了。
     # 草稿由 ``run_agent`` 收尾时写（入口护栏 = 用户那句请求；出口护栏 = 被拒的产出）。
     if exit_reason in ("input_guardrail", "output_guardrail"):
-        return FallbackVerdict(MANUAL, "guardrail", BUSINESS, unfinished)
+        return _v(MANUAL, "guardrail", BUSINESS)
 
     # ⑤ 没有可交付的答复：**系统类**（停止 + 开发信号）。它包含三种情形，各自带上真原因，
     # 否则"兜底老在兜同一类事"与"偶发一次"在图上看不出来：
@@ -178,15 +211,19 @@ def decide(context: Any, *, exit_reason: str, answer: str) -> FallbackVerdict:
     #     只是没收敛），所以这一路只能靠 `exit_reason` 判，不能只看清单；
     #   · token 预算烧穿（`token_budget`，2026-10-21）—— 同上：它是"别再花了"，
     #     不是"内容不对"，判据也只能靠 `exit_reason`；
+    #   · 墙钟到点（`run_timeout`，2026-10-21）—— 同上：它是"等太久了"，
+    #     不是"内容不对"；同样只能靠 `exit_reason`（此时步骤清单可能全是 ok）；
     #   · 其余（跑完了、没报错、就是什么都没说出来）。
     if not produced:
         if stopped:
-            return FallbackVerdict(FAILED, "guard_stop", SYSTEM, unfinished)
+            return _v(FAILED, "guard_stop", SYSTEM)
         if exit_reason == "max_turns":
-            return FallbackVerdict(FAILED, "max_turns", SYSTEM, unfinished)
+            return _v(FAILED, "max_turns", SYSTEM)
         if exit_reason == "token_budget":
-            return FallbackVerdict(FAILED, "token_budget", SYSTEM, unfinished)
-        return FallbackVerdict(FAILED, "no_output", SYSTEM, unfinished)
+            return _v(FAILED, "token_budget", SYSTEM)
+        if exit_reason == "run_timeout":
+            return _v(FAILED, "run_timeout", SYSTEM)
+        return _v(FAILED, "no_output", SYSTEM)
 
     # ⑥ 有答复，但**出现过问题信号** ⇒ 照常交付 + 标明"部分结果"。
     # "问题信号"只算两类：反思报过打转 / 卡住，或运行是被停下来的。
@@ -195,10 +232,11 @@ def decide(context: Any, *, exit_reason: str, answer: str) -> FallbackVerdict:
     # 失败的步骤仍然进 `unfinished` 清单（要如实告知哪几步没做成），只是它不**触发**这一档。
     signal = _signal(kinds, stopped, exit_reason)
     if signal:
-        return FallbackVerdict(PARTIAL, signal, SYSTEM, unfinished)
+        return _v(PARTIAL, signal, SYSTEM)
 
     # ⑦ 其余：正常交付。清单不带（没有要申报的东西，带一份空清单只会让前端多一种分支）。
-    return FallbackVerdict(DELIVERED, "none", "", [])
+    # ⚠️ 这里是唯一**不走** ``_v`` 的一行：正常交付刻意不带两份清单（理由见上一句）。
+    return FallbackVerdict(DELIVERED, "none", "")
 
 
 def report(verdict: FallbackVerdict, *, exit_reason: str, agent: str) -> None:
@@ -223,7 +261,14 @@ def report(verdict: FallbackVerdict, *, exit_reason: str, agent: str) -> None:
     if not verdict.is_fallback:
         return
     observability.counter("agent_fallback_total", reason=verdict.reason, agent=agent)
-    tail = f"未完成：{verdict.unfinished_text()}" if verdict.unfinished else ""
+    # 两份清单一并进日志：只写"未完成"时，读日志的人无法判断这次交付的**边界**在哪
+    # （前几步的结论还算不算数），而那正是兜底最需要说清的一件事。
+    parts = []
+    if verdict.accomplished:
+        parts.append(f"已完成：{verdict.accomplished_text()}")
+    if verdict.unfinished:
+        parts.append(f"未完成：{verdict.unfinished_text()}")
+    tail = "；".join(parts)
     if verdict.category == SYSTEM:
         # 系统类的兜底意味着"要改代码"（机制没兜住模型）⇒ 必须让开发侧看到。
         logging.warning(
@@ -253,6 +298,8 @@ def _signal(kinds: dict[str, int], stopped: str | None, exit_reason: str) -> str
         return "guard_stop"
     if exit_reason == "token_budget":
         return "token_budget"
+    if exit_reason == "run_timeout":
+        return "run_timeout"
     if exit_reason == "max_turns":
         return "max_turns"
     return ""
@@ -282,5 +329,24 @@ def _unfinished(steps: list[Any]) -> list[str]:
     ]
     rest = len(broken) - len(lines)
     if rest > 0:
+        lines.append(f"…还有 {rest} 项")
+    return lines
+
+
+def _accomplished(steps: list[Any]) -> list[str]:
+    """步骤清单里**做成了**的那些（``status == "ok"``），**有上限**。
+
+    为什么只认 ``ok``、不认"不是 failed"：这两者的差集是 ``running``（还没定格）——
+    把"正在做"写进"做成了"是这份清单最坏的错法，因为它会让用户以为边界比实际更靠后。
+    所以这里与 ``_unfinished`` 的 fail-safe 方向**相反**：那边宁可多报，这边宁可少报。
+    """
+    done = [step for step in steps if getattr(step, "status", "") == "ok"]
+    lines = [
+        f"第 {getattr(step, 'seq', 0)} 步 {getattr(step, 'tool', '')}"
+        for step in done[:MAX_DONE]
+    ]
+    rest = len(done) - len(lines)
+    if rest > 0:
+        # 与 unfinished 同一口径：清单本身不能变成新的膨胀源。
         lines.append(f"…还有 {rest} 项")
     return lines

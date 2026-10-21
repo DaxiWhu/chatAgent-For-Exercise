@@ -101,7 +101,7 @@ def _isolate(monkeypatch):
     """
     for name in _KNOBS:
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(R, "_reflect_sync", lambda evidence: {"problem": "ok"})
+    monkeypatch.setattr(R, "_reflect_sync", lambda evidence, **kw: {"problem": "ok"})
     R.reset_reflection_state()
 
 
@@ -763,7 +763,7 @@ def test_an_end_to_end_run_does_not_blow_up_when_the_gate_fires(tmp_path, monkey
 # --------------------------------------------------------------------------- #
 def _loop(problem: str = "loop", step: int = 1):
     """让假旁路模型稳定报"同一类问题、同一步"。"""
-    return lambda evidence: {"problem": problem, "summary": "在打转", "step": step}
+    return lambda evidence, **kw: {"problem": problem, "summary": "在打转", "step": step}
 
 
 def _tool_items(call_id: str, tool: str = "kb_search", output: str = "结果") -> list[dict]:
@@ -952,7 +952,7 @@ def test_only_the_same_kind_of_problem_counts_towards_the_line(monkeypatch):
     "没纠正"，于是升级到一个和当前问题无关的处置上。
     """
     scripted = iter([_loop("loop"), _loop("stuck"), _loop("loop")])
-    monkeypatch.setattr(R, "_reflect_sync", lambda evidence: next(scripted)(evidence))
+    monkeypatch.setattr(R, "_reflect_sync", lambda evidence, **kw: next(scripted)(evidence))
     _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=1)
     ctx = TaskContext()
     for i in range(1, 4):

@@ -96,6 +96,13 @@ to the model"）。所以"提醒模型"只能表现为"在下一次模型调用�
 超时必须独立（``AGENT_REFLECT_TIMEOUT``），而 client 的超时是构造期参数 ⇒ 没法
 和摘要共用同一个实例。走旁路 ⇒ **不计入 ``AGENT_MAX_TURNS``、也不进 SDK tracing**
 ⇒ 超时必须自己设（见 ``_reflect_sync``）。
+
+⚠️ 但**成本必须计**（2026-10-21 补）：旁路不等于免费。这一次调用的 usage 通过
+``budget.note_bypass`` 记进 ``AgentStats.bypass_tokens``，于是它既进
+``agent_bypass_tokens_total``（能回答"反思花了多少"），也进 ``budget.used_of``
+（token 预算必须管住真实账单，而不是只管 ``Runner`` 那几次调用）。
+漏掉这一笔的表现很隐蔽：预算看着从没被碰到，账单却在涨 —— 而且读数完全对得上，
+因为"少算的那部分"根本没有出现在任何一条曲线里。
 """
 
 from __future__ import annotations
@@ -110,6 +117,7 @@ from typing import Any
 
 from .. import observability
 from ..envutil import env_float, env_int
+from . import budget
 
 __all__ = [
     "AgentStoppedByGuard",
@@ -689,8 +697,13 @@ async def _run(context: Any, evidence: str, trigger: str) -> None:
     异常处理器里留一条记录，而有人的代码以为"反思会自己好"。
     """
     started = time.perf_counter()
+    stats = getattr(context, "stats", None)
     try:
-        raw = await asyncio.to_thread(_reflect_sync, evidence)
+        raw = await asyncio.to_thread(
+            _reflect_sync,
+            evidence,
+            on_usage=lambda usage: budget.note_bypass(stats, "reflection", usage),
+        )
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001  反思失败不该影响业务
@@ -909,12 +922,17 @@ def _client_or_none() -> Any:
     return _client
 
 
-def _reflect_sync(evidence: str) -> dict | None:
+def _reflect_sync(evidence: str, *, on_usage: Any = None) -> dict | None:
     """跑一次反思（**同步**：由 ``_run`` 丢进线程，理由同 ``compaction`` —— 一次
     同步 HTTP 往返跑在协程里会把本进程所有并发请求一起停住）。
 
     返回 ``None`` 的含义是"这次没结论"（没配 Key / 调用失败 / 超时 / 解析不出来），
     调用方按"没问题"处理。
+
+    on_usage: 拿到这一次的 ``usage`` 时回调一次（``budget.note_bypass`` 的入口）。
+        为什么用回调而不是把 usage 塞进返回值：返回值还带着"有没有结论"这个语义，
+        改成二元组会让**每一个**调用点都要拆一次；而 usage 与"有没有解析出结论"
+        是正交的两件事（解析失败也照样花了钱，那一笔也必须在账上）。
     """
     client = _client_or_none()
     if client is None:
@@ -937,6 +955,12 @@ def _reflect_sync(evidence: str) -> dict | None:
     except Exception as e:  # noqa: BLE001  上游抖动 / 网关不认 / 超时
         _note_failure(e)
         return None
+    # 记在**成功返回之后、解析之前**：这一次出站调用已经花掉了，不管后面能不能
+    # 解析出结论。放到 return 之后就没机会了，放到前面则失败路径也会错记一笔。
+    if on_usage is not None:
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            on_usage(usage)
     return _parse_finding(text)
 
 

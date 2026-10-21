@@ -52,6 +52,20 @@
 不是"震荡事件数"：``A→B→A→B`` 记 1，接着又 ``A→B`` 记 2。这样 ``sum`` 直接读出
 "多转了几圈"，比只报"发生过一次"更容易定阈值。
 
+按**工具名**的失败计数（2026-10-21 补的第三个盲区）
+-------------------------------------------------
+前两个判据（重复 / 震荡）都用「工具名 + 规范化参数」的指纹，于是它们都看不见
+**"一个工具坏了、模型换着参数试了八次"**：八次不同参数就是八个不同指纹，各一次，
+两条判据都到不了阈值。
+
+而它烧掉的时间和"原样重试"一模一样。所以另起一条只看**工具名**的计数
+（``StepLog.fail_count``），到 ``AGENT_TOOL_FAIL_LIMIT`` 次就把回给模型的文案换成
+"别再用它了"（``_GIVE_UP_MESSAGE``）。三者判据各不相同、互不替代：
+
+* ``repeat_counts``  —— 同一个动作做了几次（原样重试）；
+* ``tail_cycle``     —— 两个/三个动作来回（换着试同一个思路）；
+* ``fail_count``     —— 这个工具还能不能指望（换参数试同一个坏工具）。
+
 两个"看板上必然看不见"的缺口（2026-10-19 补）
 ---------------------------------------------
 1. **一个从没被选过的工具，在指标里根本不存在。** 计数器只在被调用时产生时间序列，
@@ -75,6 +89,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -86,6 +101,7 @@ __all__ = [
     "StepLog",
     "ToolStep",
     "calls_from_response",
+    "fail_limit",
     "steps_enabled",
     "tool_error_handler",
 ]
@@ -118,6 +134,33 @@ _TIMEOUT_MESSAGE = (
 超时之后**照样完成**。不写这一句，模型会重试一遍，文件就被写两遍。
 """
 
+_GIVE_UP_MESSAGE = (
+    "工具 {tool} 在这一轮里已经失败 {count} 次了。**不要再调用它**。\n"
+    "换个参数重试同一个已经坏掉/用不上的工具，只会继续烧时间，不会得到新结果 ——"
+    "前面那几次失败里没有一次是因为参数写法不同。\n"
+    "现在可以：① 换一条路拿到需要的东西（换一个工具，或把范围缩到最小再试一次）；"
+    "② 直接说明这一步做不到，用已经拿到的材料把其余部分做完；"
+    "③ 如果这一步是整件事的前提，就停在这里并说清卡在哪里。"
+)
+"""同一个工具失败到上限时回给模型的话（``AGENT_TOOL_FAIL_LIMIT``）。
+
+为什么需要这一档、而重复计数不够
+--------------------------------
+重复计数与震荡判据的指纹是「工具名 + **规范化参数**」——它们回答的是"同一个动作
+做了几次"。而"一个工具坏了，模型换着参数试了八次"在这两个判据下**完全隐形**：
+八个不同参数就是八个不同指纹，各出现一次，两个判据都到不了阈值。
+
+这正是 ``toolpool`` 里"不新增熔断"那条决定没有覆盖的那一格：那条决定的理由是
+"指纹重复会上升、会被反思接住"，而那个链条只在**原样重试**时成立。
+
+处置上刻意**不做**两件事：
+
+* **不把工具从集合里摘掉** —— 工具集是 ``Agent.tools``（构造期绑定），运行中改它
+  等于改模型看到的世界，而且改坏了没人能发现；回一句"别再用它"效果相同、可逆。
+* **不阻断运行** —— 这一步失败不等于整件事做不成，硬停会把一个可绕过的问题
+  升级成整单失败。真正的"停"留给第 3 级刹车（那里有整套归因与告警）。
+"""
+
 
 def steps_enabled() -> bool:
     """工具步骤记录的总开关（**默认开**）。
@@ -130,6 +173,20 @@ def steps_enabled() -> bool:
     仍然**可关**：``AGENT_TOOL_STEPS=0``。要再加一层开关或改默认值，落点就在这里。
     """
     return bool(env_int("AGENT_TOOL_STEPS", 1, lo=0, hi=1))
+
+
+def fail_limit() -> int:
+    """同一个工具失败几次之后，改回一句"别再用它"（``0`` = 不启用）。
+
+    默认 3：一次失败可能是参数写法问题（换一个参数确实能成），两次也还可能是
+    偶发（外部服务抖了一下）；到第三次还不行，基本就是"这个工具此刻用不了"。
+    再往上就是纯烧时间 —— 而它还不会被重复判据看见（理由见 ``_GIVE_UP_MESSAGE``）。
+
+    ⚠️ 判据是**工具名**，不是"工具名 + 参数"。这一点与重复计数**刻意不同**：
+    重复回答"同一个动作做了几次"，这里回答"这个工具还能不能指望"。用指纹会让
+    "换参数重试同一个坏工具"重新变得隐形，而那正是这条要治的形态。
+    """
+    return env_int("AGENT_TOOL_FAIL_LIMIT", 3, lo=0)
 
 
 def _fingerprint(name: str, arguments: Any) -> str:
@@ -241,10 +298,23 @@ def tool_error_handler(tool_name: str):
     def handler(ctx: Any, error: BaseException) -> str:
         from agents.tool import default_tool_error_function
 
-        if steps_enabled():
-            log = _log_of(ctx)
-            if log is not None:
-                log.fail(tool_name, error)
+        log = _log_of(ctx) if steps_enabled() else None
+        if log is not None:
+            log.fail(tool_name, error)
+        # 失败次数到线 ⇒ 改成"别再用它"（判据是**工具名**，理由见 ``_GIVE_UP_MESSAGE``）。
+        # ⚠️ 只在**刚好到线**那一次记指标：之后每一次调用都 >= 线，按 >= 记会让这条
+        # 曲线等于"坏工具被调了几次"，而它要回答的是"多少个工具被劝退了"。
+        limit = fail_limit()
+        if log is not None and limit > 0:
+            count = log.fail_count(tool_name)
+            if count >= limit:
+                if count == limit:
+                    observability.counter("agent_tool_give_up_total", tool=tool_name)
+                    logging.warning(
+                        "工具 %s 本轮已失败 %d 次 ⇒ 回给模型的文案改为「不要再用它」",
+                        tool_name, count,
+                    )
+                return _GIVE_UP_MESSAGE.format(tool=tool_name, count=count)
         if isinstance(error, TimeoutError):
             # 超时**不能**直接套官方默认实现：它给模型的是一句没有出路的报错，
             # 而这里要的是「注入错误上下文让模型自己修」—— 说清"可以怎么做"，
@@ -386,6 +456,25 @@ class StepLog:
         "发生过"，那个配置项就没有意义了。
         """
         return self.tail_cycle()[1]
+
+    def fail_count(self, tool: str) -> int:
+        """这个工具在本轮**已经失败过几次**（只看已定格的条目）。
+
+        与 ``repeat_counts`` / ``tail_cycle`` 刻意用**不同**的判据：那两条按
+        「工具名 + 规范化参数」的指纹数，回答"同一个动作做了几次"；这里只按
+        **工具名**数，回答"这个工具还能不能指望"。
+
+        为什么必须两种都有：模型"换参数重试一个坏工具"时，每次参数都不同 ⇒ 每次都是
+        新指纹 ⇒ 两个指纹类判据到不了阈值，看板与闸门一起沉默。而它烧掉的时间与
+        "原样重试"完全一样。
+
+        ⚠️ 只数 ``failed``，不数 ``ok``：一个工具成功八次、失败一次，不构成"它坏了"。
+        """
+        return sum(
+            1
+            for step in self.steps
+            if step.settled and step.status == "failed" and step.tool == tool
+        )
 
     def as_list(self) -> list[dict]:
         return [s.as_dict() for s in self.steps]

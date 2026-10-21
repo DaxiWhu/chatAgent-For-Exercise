@@ -105,7 +105,7 @@ from agents import (
 from .. import observability
 from ..envutil import env_int
 from ..rag import citation_check
-from . import approval, budget, fallback, reflection, runtime, supplements
+from . import approval, budget, deadline, fallback, reflection, runtime, supplements
 from .context import TaskContext
 from .frontline import frontline_agent
 from .guards import (
@@ -256,18 +256,24 @@ def _guardrail_name(exc: BaseException) -> str | None:
 
 
 async def model_input_filter(data: Any) -> Any:
-    """``RunConfig.call_model_input_filter`` 的**装配处**：预算 → 裁剪 → 注入。
+    """``RunConfig.call_model_input_filter`` 的**装配处**：时限 → 预算 → 裁剪 → 注入。
 
     四步各有归属，这里只负责顺序：
 
-    ⓪ ``budget.check`` —— 到线就抛 ``AgentStoppedByBudget``（**排在最前**）。
-       排在这里有两个理由：① 这一处就是"钱马上要花了"的那一拍，判在别处
-       （工具结束、或运行收尾）要么判不到这次读入、要么已经是事后记账；
-       ② 排在裁剪**之前**，超预算时不必先算一遍 token 再扔掉结果 ——
-       裁剪本身就要分词，而超预算的运行往往正是历史最长的那些。
-    ① ``history_budget.trim_model_input`` —— 窗口压缩 + 按 token 硬截断；
-    ② ``reflection.inject_reflections`` —— 追加一条 system 消息（反思闸门的结论）；
-    ③ ``_inject_supplements`` —— 追加用户在本节点运行期间补说的话。
+    ⓪ ``deadline.check`` —— 跑太久就抛 ``AgentStoppedByDeadline``（**排在最前**）。
+       为什么在预算之前：时间与钱往往同时超线，而**时间是用户直接感知的那个**
+       （"我等了二十分钟"），也常常是花钱多的**原因**（圈数多）。
+       判成 ``run_timeout`` 之后，成本曲线照旧在，运维仍然看得见"它花了很多钱"；
+       反过来判成 ``token_budget``，就把"它慢"这个更根本的原因藏起来了。
+    ① ``budget.check`` —— 到线就抛 ``AgentStoppedByBudget``。
+       这一处就是"钱马上要花了"的那一拍，判在别处（工具结束、或运行收尾）要么
+       判不到这次读入、要么已经是事后记账。
+    ② ``history_budget.trim_model_input`` —— 窗口压缩 + 按 token 硬截断；
+    ③ ``reflection.inject_reflections`` —— 追加一条 system 消息（反思闸门的结论）；
+    ④ ``_inject_supplements`` —— 追加用户在本节点运行期间补说的话。
+
+    ⚠️ 前两道闸门都排在裁剪**之前**：到线时不必先算一遍 token / 先跑一次压缩再扔掉
+    结果 —— 裁剪要分词、压缩要**调一次模型**，而超线的运行往往正是历史最长的那些。
 
     ⚠️ **顺序不能反**：注入排在裁剪**之后**，塞进去的提醒才不会在下一次模型调用时
     被当成"超预算的老历史"裁掉。反过来的症状是"提醒过、但模型没按提醒做"，而日志与
@@ -278,16 +284,15 @@ async def model_input_filter(data: Any) -> Any:
     ⚠️ 注入**不占**预算：它排在预算判定之后，所以输入可能比 ``AGENT_HISTORY_TOKEN_LIMIT``
     略高一点 —— 那是有意的，一条几十字的提醒远小于"提醒没生效"的代价。
     同样地，**注入也不计入 token 预算的判定**：``budget.check`` 用的是"上一次调用
-    已经花掉的量"（``AgentStats`` 的累计），不是这次输入的预估值 —— 它判的是
-    "还该不该继续"，不是"这一条能不能塞下"。
+    已经花掉的量"（``AgentStats`` 的累计，含旁路），不是这次输入的预估值 ——
+    它判的是"还该不该继续"，不是"这一条能不能塞下"。
     """
-    budget.check(getattr(data, "context", None))
+    context = getattr(data, "context", None)
+    deadline.check(context)
+    budget.check(context)
     trimmed = await trim_model_input(data)
-    injected = await reflection.inject_reflections(
-        trimmed, context=getattr(data, "context", None)
-    )
-    return _inject_supplements(injected, getattr(injected, "context", None)
-                              or getattr(data, "context", None))
+    injected = await reflection.inject_reflections(trimmed, context=context)
+    return _inject_supplements(injected, getattr(injected, "context", None) or context)
 
 
 def _item_text(item: Any) -> str:
@@ -440,6 +445,30 @@ def _verdict_of(context: TaskContext) -> str:
     if verdict is None:
         return "unreviewed"
     return "passed" if getattr(verdict, "score", "") == "pass" else "review_failed"
+
+
+def _bypass_slice(
+    before: dict[str, dict[str, int]], current: dict[str, dict[str, int]]
+) -> dict[str, dict[str, int]]:
+    """把旁路 token 从"累计"切成"这一次运行的增量"。
+
+    为什么要单独一个函数而不是在 ``replace(...)`` 里内联：``bypass_tokens`` 是
+    **嵌套字典**，``dataclasses.replace`` 只会原样搬引用 —— 上一份的字典被下一次
+    运行接着改，于是第二次运行报出来的是两次之和。表现是"同一个 agent 的成本在
+    请求内递增"，而每一次读数单独看都"有值、不为零"，不会触发任何告警。
+
+    ⚠️ 增量两栏都为 0 的来源**直接丢掉**：留着它，``budget.report`` 里那些
+    ``if kind_in:`` 虽然会跳过计数，但字典本身会让"这一次到底动过哪条旁路"这个
+    问题在调试时产生误导（看起来像动过，其实一笔都没有）。
+    """
+    out: dict[str, dict[str, int]] = {}
+    for source, entry in (current or {}).items():
+        was = before.get(source) or {}
+        delta_in = int(entry.get("input", 0) or 0) - int(was.get("input", 0) or 0)
+        delta_out = int(entry.get("output", 0) or 0) - int(was.get("output", 0) or 0)
+        if delta_in or delta_out:
+            out[source] = {"input": delta_in, "output": delta_out}
+    return out
 
 
 def _report_run_metrics(stats, exit_reason: str, *, agent: str = "") -> None:
@@ -653,6 +682,10 @@ async def run_agent(
 
     run_config = build_run_config(bound)
     started = time.perf_counter()
+    # 墙钟闸门的起点：**在 Runner.run 之前**，因为闸门判的是"这次运行跑了多久"，
+    # 排队、恢复现场、拼输入都算在内。放在 try 里面就晚了 —— 异常路径下不记起点，
+    # 下次 check 会读到 0 而永不触发（方向安全，但等于闸门失效）。
+    deadline.mark_start(context)
     stats = context.stats
     #: 本次运行开始前的累计读数 —— 用来切出"这一次运行"的增量（见 _report_run_metrics）。
     #: token 也切：一次请求可能跑两个节点（前台 + 接手方），用累计那份会让"每次运行的成本"
@@ -664,6 +697,9 @@ async def run_agent(
         stats.input_tokens,
         stats.output_tokens,
     )
+    # 旁路（反思 / 压缩）那笔同样要切：它的写入是**异步**的（后台任务、工作线程），
+    # 只按"结束时读一次"切片的话，第二个节点会把第一个节点的旁路成本也报进去。
+    before_bypass = {k: dict(v) for k, v in stats.bypass_tokens.items()}
 
     context.delivered.clear()
     if resume is not None:
@@ -750,9 +786,13 @@ async def run_agent(
     except budget.AgentStoppedByBudget:
         # token 预算烧穿（同样从注入口抛出来，理由与上一条完全一致：**排在
         # `except Exception` 之前**，否则"预算用完了"会伪装成"上游崩了"）。
-        # 判定表把它收成 partial / failed，已产出的内容照常交付 —— 预算是"别再多花"，
-        # 不是"这一轮作废"。
+        # 判定表把它收成 failed + token_budget（它在注入口抛出 ⇒ 没有产出物）。
         exit_reason = "token_budget"
+    except deadline.AgentStoppedByDeadline:
+        # 墙钟到点（同样从注入口抛出来，同样必须排在 `except Exception` 之前）。
+        # ⚠️ 与预算一样：这一步抛出时 ``result`` 是 None ⇒ 这一轮**没有答复正文**，
+        # 流式下只有客户端手里的增量。判定表收成 failed + run_timeout。
+        exit_reason = "run_timeout"
     except Exception as e:  # noqa: BLE001  上游抖动 / 协议错误
         logging.exception("agent 链路执行异常")
         exit_reason = "error"
@@ -837,6 +877,7 @@ async def run_agent(
         review_rounds=stats.review_rounds - before[2],
         input_tokens=stats.input_tokens - before[3],
         output_tokens=stats.output_tokens - before[4],
+        bypass_tokens=_bypass_slice(before_bypass, stats.bypass_tokens),
         duration_seconds=duration,
     )
     _report_run_metrics(slice_of_run, exit_reason, agent=getattr(agent, "name", ""))
