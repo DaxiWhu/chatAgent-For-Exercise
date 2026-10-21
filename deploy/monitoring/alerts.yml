@@ -1156,6 +1156,27 @@ groups:
           description: "过去 15 分钟有 {{ $value }} 次预算计算失败，失败时**原样把历史交给模型**。日志只打首条（详情搜「跨轮历史的 token 预算算不出来」），其余只计数。"
           runbook: "1) 日志搜「跨轮历史的 token 预算算不出来」，那里有完整异常；2) kind=ModuleNotFoundError ⇒ 没装 tiktoken（requirements.txt 已声明）；OfflineTiktokenError / 网络类 ⇒ 拉不到词表，此时会自动退化成**字符数近似**并打一条 warning，功能不中断；3) kind=TypeError / AttributeError ⇒ SDK 升级后 shape 变了，看 src/agents/history_budget.py 的 _trim_sync；4) 观察该序列停止增长即为恢复。"
 
+      - alert: AgentToolStepTimeoutFrequent
+        # ★ 又一条"不报错的坏"：工具单步超时（`AGENT_TOOL_TIMEOUT_SECONDS`，默认 20s）。
+        #   超时**不会**让这一轮失败 —— 它被转成一句给模型的话（"换做法/缩小范围，
+        #   或先做完其余部分"），模型往往能自己绕过去。于是请求 200、错误率正常、
+        #   可用性正常，代价是**答案少了一段依据 + 延迟多了一大截**。
+        #   没有这条告警就只能靠"用户觉得最近答得虚"来发现。
+        # 判据是**速率**而不是"出现过"：冷启动后第一次检索要加载索引，偶尔一次
+        #   超时属于正常；连续出现才说明工具真的变慢/卡住，或超时预算配小了。
+        # ⚠️ 工具跑在**独立线程池**里（AGENT_TOOL_WORKERS）。这条告警涨起来时，
+        #   服务的其它入口（限流、落库、结算）仍然是健康的 —— 那正是隔离的目的，
+        #   但也会让人误以为"服务没事"。别按整体错误率去判断。
+        expr: increase(agent_tool_step_timeout_total[15m]) > 3
+        for: 5m
+        labels:
+          category: agent
+          severity: warning
+        annotations:
+          summary: "工具单步超时（近 15 分钟 {{ $value }} 次，tool={{ $labels.tool }}）"
+          description: "工具在一次调用内没有按时返回，已放弃等待并把这一圈交还给模型。模型可能自行绕过，所以**不一定**表现为失败；真实代价是答案缺少那一步的依据、以及这一轮的延迟。tool 标签指出是哪个工具（kb_search / save_text_asset / generate_image / deliver）。"
+          runbook: "1) 先看 tool 标签：kb_search 超时 ⇒ 查检索后端（向量库/rerank 地址、索引大小、是否冷启动正在加载）；落盘类 ⇒ 查磁盘与目录权限；2) 日志搜「工具单步超时」，那条 warning 带工具名与实际等待秒数；3) 判断是「工具真的慢」还是「预算配小了」：看 agent_tool_result_total 里同工具的耗时分布，若 p95 就贴着 AGENT_TOOL_TIMEOUT_SECONDS，调大预算即可；若耗时本身在涨，先查依赖；4) 若同时出现 AgentRunFailureRateHigh 或答案里反复出现「这一步没做成」，说明模型没能绕过 ⇒ 先按 1) 修工具，不要只调大超时；5) 观察该序列停止增长即为恢复。"
+
       - alert: AgentRunFailureRateHigh
         # 与 availability 组的 HighErrorRate 分工：那条看的是 HTTP 5xx，
         # 而 agent 内部失败会**被兜成一封得体的话术**（synthize 里降级为

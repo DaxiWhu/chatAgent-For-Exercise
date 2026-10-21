@@ -257,6 +257,30 @@ def test_close_handler_is_async_and_wired():
     assert asyncio.iscoroutinefunction(handler), "回调必须是 async 函数"
 
 
+def test_the_stream_carries_a_heartbeat(monkeypatch):
+    """★ 心跳必须**显式**传，且真的取配置值。
+
+    为什么钉这条：首 token 之前那段静默期（模型思考 + 工具执行）里 TCP 上一个
+    字节都没有，长连接只能靠这个注释帧保住。它原来来自 sse_starlette 的默认值
+    （3.3.4 是 15s，``ping=None`` 时才用它）—— 第三方默认值升版会变，改成 0 或
+    关掉**都不会报错**，症状只是"长回答偶发中断"，而且服务日志里干干净净。
+
+    ⚠️ 必须**改配置值**再断言，不能只比 `ping_interval > 0`：库的默认值（15）与
+    我们的默认值（15）恰好相同，删掉 `ping=` 之后比出来的结果一模一样 ——
+    变异验证实测过这条，原写法在"删掉显式传参"时**仍然全绿**。
+    """
+    from app import config as C
+
+    assert C.SSE_PING_SECONDS > 0, "默认配置把心跳关掉了（长连接会在静默期被反代掐断）"
+
+    monkeypatch.setattr(C, "SSE_PING_SECONDS", 7)
+    resp = M._sse({"messages": []}, "chat", tenant="t", thread_id="x")
+
+    assert resp.ping_interval == 7, (
+        "`_sse` 没有把配置的心跳间隔传给库（吃的是第三方默认值，升版会静默变）"
+    )
+
+
 def test_signal_is_idempotent(monkeypatch):
     """重复置位只计数一次：库的监听循环理论上可能多次进入，重复计数会让指标虚高。"""
     metrics.reset()

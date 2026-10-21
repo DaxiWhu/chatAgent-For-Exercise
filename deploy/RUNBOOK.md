@@ -1153,6 +1153,35 @@ curl -s --noproxy '*' localhost:8000/metrics | grep agent_history_budget_errors_
 
 恢复判据：该序列**停止增长**。
 
+#### `AgentToolStepTimeoutFrequent`（warning，5m）—— 这一步没等到结果
+（`increase(agent_tool_step_timeout_total[15m]) > 3`）
+
+工具在一次调用内超过 `AGENT_TOOL_TIMEOUT_SECONDS`（默认 20s）仍未返回，于是**放弃
+等待**、把这一圈交还给模型。⚠️ 它**不一定**表现为失败：回给模型的话是"换做法 / 缩小
+范围 / 先做完其余部分"，模型往往能绕过去 —— 于是请求 200、错误率正常、可用性正常，
+真实代价是**答案少了一段依据 + 这一轮变慢**。这类"不报错的坏"只能靠这条告警发现。
+
+```bash
+# 哪个工具在超时
+curl -s --noproxy '*' localhost:8000/metrics | grep agent_tool_step_timeout_total
+# 实际等待时长与工具名（warning 里都有）
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=300 app-stable | grep '工具单步超时'
+# 同工具的正常耗时分布：p95 是否本来就贴着超时线
+curl -s --noproxy '*' localhost:8000/metrics | grep agent_tool_result_total
+```
+- `tool="kb_search"` ⇒ 查检索侧：向量库/rerank 地址、索引大小、**是否冷启动正在加载**；
+- `tool` 是落盘类 ⇒ 查磁盘与 `AGENT_ASSET_DIR` 权限（写不进去会一直挂着等 IO）；
+- **先判"工具真慢"还是"预算配小了"**：`agent_tool_result_total` 里该工具的耗时分
+  布若 p95 紧贴 `AGENT_TOOL_TIMEOUT_SECONDS`，调大预算；若耗时本身在涨，先查依赖。
+  ⚠️ 不要只调大超时把告警压下去 —— 那等于把"工具坏了"变成"用户多等 20 秒"。
+- 同时出现 `AgentRunFailureRateHigh`，或答案里反复写"这一步没做成" ⇒ 模型没能绕过，
+  先按上面修工具。
+
+> ⚠️ 工具跑在**独立线程池**（`AGENT_TOOL_WORKERS`）。这条涨起来时，限流、落库、结算
+> 仍然是健康的 —— 那正是隔离的目的，但也会让人误判成"服务没事"。别看整体错误率。
+
+恢复判据：该序列**停止增长**（注意是"不再出现"，不是"降到 0"——它是一个增量指标）。
+
 #### `AgentRunFailureRateHigh`（warning，10m）
 异常收尾比例 > 20%（`exit_reason` ∈ `error` / `evaluator_error` / `max_turns`）。
 
@@ -1383,3 +1412,10 @@ python scripts/tasks.py kb-prune -- --include-stale --apply   # 连「内容已�
    不看证据的灰度只是"慢一点的发布"。
 5. **"`/health/live` 绿了就是健康的"** —— liveness 刻意只回进程标识、不查依赖
    （失败才重启容器）。依赖健康与否要看 `/health/ready`。
+6. **"发布时个别用户的回答断在半句，是他们的网络问题"** —— 先查这里的三个值：
+   `REQUEST_TIMEOUT_SECONDS`（请求总时限，180）≤ `GRACEFUL_SHUTDOWN_TIMEOUT`
+   （排空上界，**默认跟随总时限** = 190）< `stop_grace_period`（容器宽限期，210s）。
+   只要排空上界小于总时限，发布会**主动取消**那些本来还被允许继续跑的请求；
+   只要宽限期小于排空上界，容器会在排空完成前 SIGKILL（日志里连一条都留不下）。
+   启动日志里若有「断在半句」那条警告，就是第一个关系被配反了。
+   `tests/test_graceful_shutdown.py` 钉住了这三个值的联动，改一个不改另一个会红。

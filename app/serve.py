@@ -31,9 +31,12 @@ worker 数：`APP_WORKERS` 优先，其次 `WEB_CONCURRENCY`（容器/PaaS 的�
 会自动注入），默认 1。两个名字都认，是为了避免"Dockerfile 里用 WEB_CONCURRENCY、
 文档里写 APP_WORKERS"导致**设了却不生效**——那类静默失效最难排查。
 
-优雅关闭：`GRACEFUL_SHUTDOWN_TIMEOUT`（默认 30s）是在途请求的排空上界。
+优雅关闭：`GRACEFUL_SHUTDOWN_TIMEOUT`（默认**跟随 `REQUEST_TIMEOUT_SECONDS`**，
+即"总时限 + 10s 收尾余量"，未配总时限时 30s）是在途请求的排空上界。
 **改动时必须同步 `deploy/app/docker-compose.yml` 的 `stop_grace_period`**（要大于它），
 否则容器会在排空完成前被 SIGKILL —— 那正是"发布时个别用户回答断掉"的成因。
+反过来也有一条：排空上界若**小于**请求总时限，等于发布时主动取消那些"本来还被允许
+继续跑"的请求。两个方向都由 `tests/test_graceful_shutdown.py` 守着。
 """
 import argparse
 import asyncio
@@ -103,25 +106,70 @@ def resolve_workers() -> int:
 #    compose 的值要**大于**这个上界（留出排空 + 进程退出的时间）。
 #    只改一处等于没改 —— 若 compose 更小，容器会在我们排空完成前就被 SIGKILL。
 #
-# 取值理由：本服务单次请求的时间预算在 llm/rerank 客户端超时里（30s 级），
-# 30s 足够放完一个正常的长回答；再长说明是真卡住了，宁可放弃也不要拖死发布。
+# 取值口径（2026-10-21 修正）：**默认值跟随请求总时限**，不再钉死 30s。
+# 原来的 30s 是按"单次模型调用 30s"推的，但一次请求可以跑十几圈（见
+# `AGENT_MAX_TURNS`），请求总时限早已配到 180s —— 于是"排空 30s"意味着
+# **任何跑过 30 秒的请求都会在发布时被取消**，而它本来还能再跑 150 秒正常完成。
+# 用户看到的是"回答断在半句"，日志里只有一条"排空超时"，看起来像是个别请求卡住。
+_DRAIN_UNLIMITED_FALLBACK = 30
+"""请求总时限**未配置**（0 = 不限）时的排空上界。
+
+这种情况下没有任何取值是对的：一个请求可以跑到永远，排空上界再大也只是早死晚死。
+所以这里给一个保守值，并在 `resolve_graceful_timeout` 里明确提醒"生产必须配
+`REQUEST_TIMEOUT_SECONDS`" —— 那条配置本来就在 `PRODUCTION_CONFIG.md` 的必配项里。
+"""
+
+_DRAIN_MARGIN_SECONDS = 10
+"""排空上界比请求总时限多留的那一点。
+
+留的不是"再跑一会儿"，而是**收尾动作**：总时限到点后还要下发 timeout 事件、
+结算配额、写待审队列、关上游连接，这些都跑在请求自己的执行栈里。把排空上界卡得
+和总时限一样紧，等于每次都在收尾中途把协程取消掉 —— 那正是"额度扣了、记录没落"的成因。
+"""
+
+
+def _default_graceful_timeout() -> int:
+    """默认排空上界 = 请求总时限 + 收尾余量（未配总时限时退回 30s）。"""
+    try:
+        from app import config
+    except Exception:                       # noqa: BLE001  配置都导不进来时别挡住启动
+        return _DRAIN_UNLIMITED_FALLBACK
+    request_timeout = int(getattr(config, "REQUEST_TIMEOUT_SECONDS", 0) or 0)
+    if request_timeout <= 0:
+        return _DRAIN_UNLIMITED_FALLBACK
+    return request_timeout + _DRAIN_MARGIN_SECONDS
+
+
 def resolve_graceful_timeout() -> int:
-    """解析排空上界：`GRACEFUL_SHUTDOWN_TIMEOUT`（秒），默认 30。
+    """解析排空上界：`GRACEFUL_SHUTDOWN_TIMEOUT`（秒），默认跟随请求总时限。
+
+    默认值不是常数，见 `_default_graceful_timeout`：`REQUEST_TIMEOUT_SECONDS=180`
+    ⇒ 排空上界 190，`stop_grace_period` 必须大于它。
 
     非法/非正值忽略并打印，取默认 —— 与 `resolve_workers` 同一口径：
     配置错误不该让服务起不来。
     """
+    fallback = _default_graceful_timeout()
     raw = (os.getenv("GRACEFUL_SHUTDOWN_TIMEOUT") or "").strip()
     if not raw:
-        return 30
+        return fallback
     try:
         n = int(raw)
     except ValueError:
-        print(f"[serve] GRACEFUL_SHUTDOWN_TIMEOUT={raw!r} 不是整数，已忽略（用 30）", flush=True)
-        return 30
+        print(f"[serve] GRACEFUL_SHUTDOWN_TIMEOUT={raw!r} 不是整数，已忽略（用 {fallback}）", flush=True)
+        return fallback
     if n < 1:
-        print(f"[serve] GRACEFUL_SHUTDOWN_TIMEOUT={n} 小于 1，已忽略（用 30）", flush=True)
-        return 30
+        print(f"[serve] GRACEFUL_SHUTDOWN_TIMEOUT={n} 小于 1，已忽略（用 {fallback}）", flush=True)
+        return fallback
+    if n < fallback:
+        # 显式配小了：**照用**（配置错误不该让服务起不来），但必须说出来。
+        # 这条最容易被当成"发布调快一点"的优化，代价是长回答被截断，且症状不可归因。
+        print(
+            f"[serve] ⚠️ GRACEFUL_SHUTDOWN_TIMEOUT={n} 小于请求总时限对应的排空上界"
+            f"（{fallback}）⇒ 滚动发布时跑过 {n}s 的在途请求会被取消，回答断在半句。"
+            "要么调大它，要么调小 REQUEST_TIMEOUT_SECONDS。",
+            flush=True,
+        )
     return n
 
 

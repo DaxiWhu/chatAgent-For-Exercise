@@ -342,6 +342,15 @@ async def lifespan(_app):
             await agent_session.dispose_session_backend()
         except Exception as e:  # noqa: BLE001  关闭路径上的失败不该改变退出码
             logging.warning("跨轮历史引擎释放失败（不影响关闭）：%s", e)
+        # 工具执行线程池：取消还在排队的工具调用。**不等**正在跑的那一个 ——
+        # 超时停不掉线程（见 `src/agents/toolpool.py`），等它等于让关闭挂在一个
+        # 可能永远不返回的调用上，而 Docker 侧还有 stop_grace_period 兜底。
+        try:
+            from src.agents import toolpool
+
+            toolpool.dispose()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("工具线程池释放失败（不影响关闭）：%s", e)
         # 本进程自己的同步 PG 池同理：不关就留下一批 PG 后端进程，
         # 直到服务端 idle 超时。滚动发布时新旧副本的连接会**叠加**。
         try:
@@ -3138,6 +3147,10 @@ def _sse(turn, req_kind: str, *, tenant: str, subject: str = "",
                     timeout=config.REQUEST_TIMEOUT_SECONDS,
                     idem_key=idem_key, idem_fp=idem_fp, run_id=run_id),
         client_close_handler_callable=signal.mark_closed,
+        # 心跳帧（SSE 注释行）：首 token 之前那段静默期靠它保住连接。
+        # **显式传**而不是吃库的默认值 —— 见 `config.SSE_PING_SECONDS` 的说明：
+        # 第三方默认值升版会变，而那条症状（长回答偶发中断）没有任何报错。
+        ping=config.SSE_PING_SECONDS,
         # 提示词版本随响应头下发（**不改 SSE 事件载荷** —— 那是对外契约）。
         # 颗粒度正好是需要的那个：一条回答 = 一个响应 = 一个版本号，
         # 客户端、网关访问日志、抓包都能记下来。线上答得不好时，

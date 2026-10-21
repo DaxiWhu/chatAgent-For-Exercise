@@ -1057,3 +1057,90 @@ def test_exposure_is_silent_when_disabled(monkeypatch, sink):
     StepLog().note_exposed(["kb_search"])
 
     assert sink.counters("agent_tool_exposed_total") == []
+
+
+# --------------------------------------------------------------------------- #
+# 六、单步超时（2026-10-21）
+#
+# 这一节钉的是**链路**，不是"能不能超时"（那在 `test_toolpool.py`）：
+#   超时 ⇒ 记一条 failed（独立档位） ⇒ 回给模型一句可操作的话
+#        ⇒ 同一动作反复超时 ⇒ 计入重复 ⇒ 由反思闸门按既有阈值熔断。
+# 一段链断在任何一处，超时都会退化成"看不见的失败"或"模型无限重试同一个动作"。
+# --------------------------------------------------------------------------- #
+def test_a_timeout_is_its_own_failure_reason():
+    """★ 超时单独一档：它既不是参数错，也不是实现崩。
+
+    判据必须看**异常类型**：下游处置完全不同 —— ``bad_args`` 去改工具描述或参数
+    结构，``error`` 去查实现或依赖，``timeout`` 去看预算、数据量或外部依赖。
+    第二条断言同时否掉"按文本判"：一句写着 timed out 的 RuntimeError 不是超时。
+    """
+    from src.agents.steps import _failure_reason
+
+    assert _failure_reason(TimeoutError()) == "timeout"
+    assert _failure_reason(RuntimeError("timed out")) == "error"
+
+
+def test_a_timeout_is_recorded_as_failed_with_its_own_reason(sink):
+    """超时在清单里是 ``failed`` + ``reason=timeout``。
+
+    兜底出口列"未完成步骤"读的就是这份状态。若超时被记成 ok（或根本没记），
+    用户拿到的部分结果不会带上"这一步没做成"，而那正是这套清单存在的意义。
+    """
+    log = StepLog()
+    _begin(log, "kb_search", '{"query": "x"}')
+    log.fail("kb_search", TimeoutError())
+
+    assert log.steps[0].status == "failed"
+    assert log.steps[0].reason == "timeout"
+    assert [e[3].get("reason") for e in sink.counters("agent_tool_result_total")] == ["timeout"]
+
+
+def test_the_timeout_message_tells_the_model_the_action_may_already_have_run():
+    """★ 超时回给模型的话必须同时说清两件事，否则模型多半会直接重做。
+
+    ① 可以怎么做（缩小范围 / 换做法 / 放弃这一步先把其余部分做完）；
+    ② 超时只表示"没等到结果"，**不表示没执行** —— 落盘类动作可能在超时之后照样
+       完成，重做会把文件写两遍（而文件名相同会覆盖，连痕迹都留不下）。
+    """
+    from src.agents import tools
+
+    handler = _installed_handler(tools.deliver)
+    text = handler(_tool_context(TaskContext(), "deliver", "{}"), TimeoutError())
+
+    assert "超时" in text
+    assert "不表示「没执行」" in text
+    assert "重做" in text
+
+
+def test_a_non_timeout_failure_keeps_the_official_message():
+    """非超时失败仍用官方默认文案。
+
+    换掉它是退步：官方那句经过版本演进，模型对它的先验更稳；而这里只需要补
+    "超时"这一种官方没有语义的失败。
+    """
+    from agents.tool import default_tool_error_function
+
+    from src.agents import tools
+
+    task = TaskContext()
+    ctx = _tool_context(task, "deliver", "{}")
+    error = RuntimeError("boom")
+    handler = _installed_handler(tools.deliver)
+
+    assert handler(ctx, error) == default_tool_error_function(ctx, error)
+
+
+def test_repeated_timeouts_raise_the_repeat_count():
+    """★ 同一动作连续超时 ⇒ ``max_repeat`` 上升。
+
+    这就是"同一子任务重试超过 N 次即熔断"的输入：反思闸门读的就是这个值。
+    刻意不在这里钉具体阈值（阈值由 ``AGENT_REFLECT_ON_REPEAT`` 定）—— 这里只钉
+    "超时**会计入**重复"。不计的话，超时就成了唯一一种"永远不算打转"的失败，
+    模型可以无限重试同一个动作而不触发任何熔断。
+    """
+    log = StepLog()
+    for index in range(3):
+        _begin(log, "kb_search", '{"query": "x"}', f"c{index}")
+        log.fail("kb_search", TimeoutError())
+
+    assert log.max_repeat == 3

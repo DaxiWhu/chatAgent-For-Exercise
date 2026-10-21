@@ -371,3 +371,116 @@ def test_compose_keeps_loopback_db_binding(compose_cfg):
     assert any(p.startswith("127.0.0.1:") for p in ports), (
         f"pgvector 端口未绑定回环：{ports}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 请求总时限 ⇒ 排空上界 ⇒ 容器宽限期（2026-10-21）
+#
+# 上面那一组只钉了「③ 容器宽限期 > ② 排空上界」。漏掉的是另一头：
+# **② 小于 ①（请求总时限）** 时，一次发布动作会主动取消那些"本来还被允许继续跑"
+# 的请求 —— 那一刻没有任何代码出错，用户看到回答断在半句，服务端只有一条
+# "排空超时"，看起来像个别请求卡住。所以三个值必须当成一条链来钉。
+# ---------------------------------------------------------------------------
+def test_the_drain_default_follows_the_request_budget(monkeypatch):
+    """★ 排空上界默认**跟随**请求总时限，不是常数 30。
+
+    钉的是"跟随"这个关系，不是具体数字：数字要跟着总时限一起改，关系不能断。
+    原来写死 30 是按"单次模型调用 30s"推的，可一次请求能跑十几圈（`AGENT_MAX_TURNS`），
+    总时限早已是 180 —— 于是默认配置下"排空 30s"意味着跑过 30 秒的请求在发布时被取消。
+    """
+    from app import config as C
+    from app import serve as S
+
+    monkeypatch.delenv("GRACEFUL_SHUTDOWN_TIMEOUT", raising=False)
+
+    monkeypatch.setattr(C, "REQUEST_TIMEOUT_SECONDS", 180)
+    assert S.resolve_graceful_timeout() == 190, "排空上界没有跟着总时限走"
+
+    monkeypatch.setattr(C, "REQUEST_TIMEOUT_SECONDS", 60)
+    assert S.resolve_graceful_timeout() == 70
+
+
+def test_without_a_request_budget_the_drain_falls_back_to_a_constant(monkeypatch):
+    """总时限为 0（不限）时退回一个常数。
+
+    这种情况下没有任何取值是对的（一个请求可以跑到永远），所以这里只保证
+    别算出 0 或负数 —— uvicorn 拿到 0 会**立刻**掐断所有在途响应，
+    比原来的 30s 更糟，而且症状同样是"发布时回答断掉"。
+    """
+    from app import config as C
+    from app import serve as S
+
+    monkeypatch.delenv("GRACEFUL_SHUTDOWN_TIMEOUT", raising=False)
+    monkeypatch.setattr(C, "REQUEST_TIMEOUT_SECONDS", 0)
+    assert S.resolve_graceful_timeout() == 30
+
+
+def test_a_drain_shorter_than_the_request_budget_is_announced(monkeypatch, capsys):
+    """★ 显式把排空配得比总时限短：**照用，但必须喊出来**。
+
+    照用是既有一致口径（配置错误不该让服务起不来）。喊出来是因为这条最容易被
+    当成"让发布快一点"的优化，而它的症状（发布时部分回答断在半句）归因不到配置上：
+    日志里只有一条排空超时，没有"这条路本来还剩 150 秒"。
+    """
+    from app import config as C
+    from app import serve as S
+
+    monkeypatch.setattr(C, "REQUEST_TIMEOUT_SECONDS", 180)
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "30")
+
+    assert S.resolve_graceful_timeout() == 30
+    out = capsys.readouterr().out
+    assert "GRACEFUL_SHUTDOWN_TIMEOUT=30" in out
+    assert "断在半句" in out
+
+
+def _sample_request_budget() -> int:
+    """读 `.env.example` 里的请求总时限（运维照抄的那个值）。"""
+    text = (ROOT / ".env.example").read_text(encoding="utf-8")
+    m = re.search(r"^REQUEST_TIMEOUT_SECONDS=(\d+)\s*$", text, re.M)
+    assert m, ".env.example 里找不到 REQUEST_TIMEOUT_SECONDS（样例文件被改坏了？）"
+    return int(m.group(1))
+
+
+def test_the_sample_request_budget_is_covered_by_the_drain_default(monkeypatch):
+    """★ 照文档配出来的总时限，必须被**默认**排空上界覆盖。
+
+    这条把两份文件绑在一起：`REQUEST_TIMEOUT_SECONDS=180` 是生产样例值，
+    若默认排空仍是 30s，那么"照文档配好"的部署在发布时照样会截断长回答 ——
+    而配置本身看起来完全正确（每一项都配了）。
+    """
+    from app import config as C
+    from app import serve as S
+
+    budget = _sample_request_budget()
+    assert budget > 0, "样例里必须给正的总时限（0 = 不限，排空上界就没有意义）"
+
+    monkeypatch.delenv("GRACEFUL_SHUTDOWN_TIMEOUT", raising=False)
+    monkeypatch.setattr(C, "REQUEST_TIMEOUT_SECONDS", budget)
+    drain = S.resolve_graceful_timeout()
+    assert drain >= budget, (
+        f"默认排空上界({drain}s) 小于样例总时限({budget}s) —— "
+        "发布时会把还在允许时间内的请求取消"
+    )
+
+
+def test_compose_grace_period_covers_the_sample_request_budget(compose_cfg, monkeypatch):
+    """★ 全链条最后一段：①≤②<③ 必须同时成立。
+
+    只钉 ③>② 是不够的：一旦 ② 跟随 ① 变成 190，③ 若还是 45 就立刻断裂。
+    这里用样例里的 ① 推 ②，再要求 ③ 大于它 —— 改任何一个值都得三个一起过。
+    """
+    from app import config as C
+    from app import serve as S
+
+    budget = _sample_request_budget()
+    monkeypatch.delenv("GRACEFUL_SHUTDOWN_TIMEOUT", raising=False)
+    monkeypatch.setattr(C, "REQUEST_TIMEOUT_SECONDS", budget)
+    drain = S.resolve_graceful_timeout()
+
+    for name in ("app-stable", "app-canary"):
+        grace = _parse_seconds(compose_cfg["services"][name]["stop_grace_period"])
+        assert grace > drain, (
+            f"{name} 的 stop_grace_period({grace}s) 不大于排空上界({drain}s) —— "
+            "容器会在排空完成前 SIGKILL（这在 ② 跟随 ① 之后才暴露出来）"
+        )

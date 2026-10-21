@@ -21,11 +21,14 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from agents import RunContextWrapper, function_tool
 
@@ -36,6 +39,7 @@ from ..rag.retrieval import build_citations
 from . import approval
 from .context import TaskContext
 from .steps import tool_error_handler
+from .toolpool import run_tool_step
 
 __all__ = [
     "deliver",
@@ -64,10 +68,41 @@ def _ensure_dir(path: Path) -> Path:
     return path
 
 
+def _isolated(tool: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """把一个**同步**工具实现包成 async：进独立线程池跑，带单步超时。
+
+    为什么用装饰器而不是把每个函数体改写成 ``async def`` + ``await``
+    --------------------------------------------------------------
+    函数体本身没有任何 IO 可等待（检索器与落盘都是同步 API）。改写只会把
+    "同步实现"和"线程切换"两件事揉进同一个缩进层级里，让每个 ``return`` 都要多
+    想一层。这里让实现保持同步、**执行方式**交给这一层，两件事各自可读。
+
+    为什么必须包（而不是让官方用 ``to_thread``）
+    -------------------------------------------
+    官方对同步工具用 ``asyncio.to_thread`` ⇒ 事件循环的**默认线程池**，与服务层
+    ``_off()`` 共用。一个卡住的工具会把限流/落库/结算的线程一起占掉（见
+    ``toolpool`` 的模块说明）。包成 async 之后官方直接 await 本函数，线程由
+    ``toolpool`` 的独立池提供。
+
+    ``functools.wraps`` 是必需的：``function_tool`` 靠 ``inspect.signature`` 生成
+    给模型看的参数 schema，包装层丢了签名就等于"工具没有参数"。
+    """
+
+    def wrap(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        async def inner(*args: Any, **kwargs: Any) -> Any:
+            return await run_tool_step(fn, *args, tool=tool, **kwargs)
+
+        return inner
+
+    return wrap
+
+
 # --------------------------------------------------------------------------- #
 # 检索：真实知识库（按租户分片的检索器由上下文注入）
 # --------------------------------------------------------------------------- #
 @function_tool(failure_error_function=tool_error_handler("kb_search"))
+@_isolated("kb_search")
 def kb_search(ctx: RunContextWrapper[TaskContext], query: str, top_k: int = DEFAULT_TOP_K) -> str:
     """在知识库里检索与 query 相关的原文片段，返回带出处编号（形如 [1]）的条目。
 
@@ -141,6 +176,7 @@ def kb_search(ctx: RunContextWrapper[TaskContext], query: str, top_k: int = DEFA
     failure_error_function=tool_error_handler("save_text_asset"),
     needs_approval=approval.needs_approval_callback,
 )
+@_isolated("save_text_asset")
 def save_text_asset(ctx: RunContextWrapper[TaskContext], name: str, content: str) -> str:
     """把一段文本落盘成资产文件，返回资产路径。
 
@@ -167,6 +203,7 @@ def save_text_asset(ctx: RunContextWrapper[TaskContext], name: str, content: str
     failure_error_function=tool_error_handler("generate_image"),
     needs_approval=approval.needs_approval_callback,
 )
+@_isolated("generate_image")
 def generate_image(ctx: RunContextWrapper[TaskContext], prompt: str, style: str = "flat") -> str:
     """按画面描述生成一张插图，返回资产路径。
 
@@ -221,6 +258,7 @@ def generate_image(ctx: RunContextWrapper[TaskContext], prompt: str, style: str 
     failure_error_function=tool_error_handler("deliver"),
     needs_approval=approval.delivery_needs_approval,
 )
+@_isolated("deliver")
 def deliver(ctx: RunContextWrapper[TaskContext], content: str, needs_review: bool = False) -> str:
     """把这一次要给用户的正文交付出去。
 
