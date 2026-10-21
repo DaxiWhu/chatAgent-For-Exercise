@@ -233,8 +233,9 @@ def test_repeat_comes_from_the_step_log():
 
 def test_counts_tolerate_an_empty_context():
     """空上下文 ⇒ 四个 0，且**不抛异常**（这是个观测函数）。"""
-    assert R.counts_of(TaskContext()) == {"tools": 0, "heavy": 0, "hops": 0, "repeat": 0}
-    assert R.counts_of(SimpleNamespace()) == {"tools": 0, "heavy": 0, "hops": 0, "repeat": 0}
+    empty = {"tools": 0, "heavy": 0, "hops": 0, "repeat": 0, "oscillate": 0}
+    assert R.counts_of(TaskContext()) == empty
+    assert R.counts_of(SimpleNamespace()) == empty
 
 
 # --------------------------------------------------------------------------- #
@@ -1083,7 +1084,9 @@ def test_an_already_stopped_run_raises_without_waiting(monkeypatch, sink):
     assert [f.level for f in ctx.reflection.pending] == [1], "停之前还在处理队列"
     assert ctx.reflection.stopped == "capped"
     assert [e[3] for e in sink.counters("agent_recovery_level_total")] == [
-        {"level": "3"}
+        # `problem` 是 2026-10-21 加的：没有判出问题时给 `unknown`，
+        # 不是空串（空标签值在这个项目的口径里无法与"标签没设"区分）。
+        {"level": "3", "problem": "unknown"}
     ]
 
 
@@ -1204,7 +1207,9 @@ def test_unlocatable_step_stops_the_run_and_is_counted(monkeypatch, sink):
         {"reason": "not_found"}
     ]
     assert [e[3] for e in sink.counters("agent_recovery_level_total")] == [
-        {"level": "3"}
+        # `problem` 是 2026-10-21 加的：没有判出问题时给 `unknown`，
+        # 不是空串（空标签值在这个项目的口径里无法与"标签没设"区分）。
+        {"level": "3", "problem": "unknown"}
     ]
 
 
@@ -1376,3 +1381,67 @@ def test_the_goal_reaches_the_model_inside_a_real_run(tmp_path):
     seen = _flatten(model.calls[0].input)
     assert "同一个检索做了第 4 次" in seen
     assert "回到原始目标看一遍：把这份 PDF 里的三张表整理成对比结论" in seen
+
+
+# --------------------------------------------------------------------------- #
+# 九、回滚频率要能归因（2026-10-21）
+#
+# 此前 `agent_recovery_level_total` 只有 `level` 一个标签：能回答"回退了几次"，
+# 回答不了"因为哪类问题回退的"。而这两件事的处置完全不同 —— 打转要改提示词里的
+# 做事方式，跑偏要改约束，卡住要查工具或数据。没有 `problem` 标签，运维只能看到
+# "回退变多了"，然后把三类问题当成一类去改。
+# --------------------------------------------------------------------------- #
+def test_level1_counts_the_problem_type(sink):
+    """第 1 级（注入提醒）要带上问题类型。"""
+    ctx = TaskContext()
+    ctx.reflection.pending.append(
+        R.ReflectiveFinding(problem="off_track", summary="做的是另一件事")
+    )
+
+    asyncio.run(R.inject_reflections(_inputs({"role": "user", "content": "问"}), context=ctx))
+
+    assert [e[3] for e in sink.counters("agent_recovery_level_total")] == [
+        {"level": "1", "problem": "off_track"}
+    ]
+
+
+def test_level2_counts_the_problem_type(sink):
+    """★ 第 2 级（撤回那一步）是"回滚频率"的正主，必须能按问题类型拆开。"""
+    ctx = TaskContext()
+    ctx.reflection.pending.append(
+        R.ReflectiveFinding(
+            problem="loop", summary="在打转", step=1, call_id="c1",
+            tool="kb_search", level=2,
+        )
+    )
+
+    asyncio.run(
+        R.inject_reflections(
+            _inputs({"role": "user", "content": "问"}, *_tool_items("c1")), context=ctx
+        )
+    )
+
+    assert [e[3] for e in sink.counters("agent_recovery_level_total")] == [
+        {"level": "2", "problem": "loop"}
+    ]
+
+
+def test_level3_carries_the_problem_that_triggered_it(sink):
+    """★ 第 3 级（刹车）带的是**最近一次判出来的问题类型**。
+
+    停因（``capped`` / ``not_found`` …）回答的是"为什么退不了"，问题类型回答的是
+    "退的是什么问题"。两个维度都要有：只有停因时，运维知道该调额度，却不知道该调
+    哪一条判据的阈值。
+    """
+    ctx = TaskContext()
+    ctx.reflection.stopped = "capped"
+    ctx.reflection.last_problem = "stuck"
+
+    with pytest.raises(R.AgentStoppedByGuard):
+        asyncio.run(
+            R.inject_reflections(_inputs({"role": "user", "content": "问"}), context=ctx)
+        )
+
+    assert [e[3] for e in sink.counters("agent_recovery_level_total")] == [
+        {"level": "3", "problem": "stuck"}
+    ]

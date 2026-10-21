@@ -211,6 +211,18 @@ def _on_repeat() -> int:
     return env_int("AGENT_REFLECT_ON_REPEAT", 3, lo=2)
 
 
+def _on_oscillation() -> int:
+    """**来回震荡转到第几圈**触发（``A→B→A→B`` 是 2 圈）。
+
+    默认 **2**，比 ``AGENT_REFLECT_ON_REPEAT`` 的 3 更低，这不是随手定的：震荡检测的
+    全部价值就在"单个动作还没到重复阈值"的那一段。配成 3 会让它永远晚于重复判据 →
+    退化成一条永不独立生效的判据（`A→B→A→B` 时每个动作也已各 3 次，重复那条会先报）。
+
+    下限 2 是它的定义：``1 圈`` 不是震荡。
+    """
+    return env_int("AGENT_REFLECT_ON_OSCILLATION", 2, lo=2)
+
+
 def max_level1() -> int:
     """第 1 级（注入反馈）的上限：一次运行里最多注入几次结论。"""
     return env_int("AGENT_REFLECT_MAX_LEVEL1", 2, lo=1)
@@ -307,6 +319,9 @@ def counts_of(context: Any) -> dict[str, int]:
       **永远不会触发**。留着它是因为拓扑一变（加第三个节点）它就立刻有用，
       而"忘了加这个计数"是读代码看不出来的；不要因为"现在不会触发"把它删掉。
     * ``repeat`` —— 同一动作被做过的最多次数（``StepLog.max_repeat``）。
+    * ``oscillate`` —— 尾部同一个短周期已经转了几圈（``StepLog.oscillation_cycles``）。
+      ⚠️ 它**不是** ``repeat`` 的变体，补的是 ``repeat`` 的结构性盲区：
+      ``A→B→A→B`` 时 A、B 各 2 次，``repeat`` 到不了 3 ⇒ 那条判据对这种打转完全沉默。
 
     取不到任何一项都按 0 算 —— 这是个观测函数，不该因为形态差异抛异常。
     """
@@ -314,8 +329,18 @@ def counts_of(context: Any) -> dict[str, int]:
     heavy = sum(1 for s in steps if getattr(s, "tool", "") in _HEAVY_TOOLS)
     stats = getattr(context, "stats", None)
     hops = len(list(getattr(stats, "handoffs", []) or []))
-    repeat = int(getattr(getattr(context, "steps", None), "max_repeat", 0) or 0)
-    return {"tools": len(steps), "heavy": heavy, "hops": hops, "repeat": repeat}
+    log = getattr(context, "steps", None)
+    repeat = int(getattr(log, "max_repeat", 0) or 0)
+    # 尾部往复已经转了几整圈（``A→B→A→B`` = 2）。它补的正是 ``repeat`` 的盲区：
+    # 两个动作来回时每个都只做了两次，``repeat`` 到不了 3 ⇒ 那条判据完全沉默。
+    oscillate = int(getattr(log, "oscillation_cycles", 0) or 0)
+    return {
+        "tools": len(steps),
+        "heavy": heavy,
+        "hops": hops,
+        "repeat": repeat,
+        "oscillate": oscillate,
+    }
 
 
 def _fired_total(state: ReflectionState) -> int:
@@ -463,6 +488,14 @@ class ReflectionState:
     docstring 第 2 条），模型看到那条动作又回来了、很可能再调一次。
     """
 
+    last_problem: str = ""
+    """最近一次判出来的问题类型（``loop`` / ``stuck`` / ``off_track``）。
+
+    只用于指标的 ``problem`` 标签（见 ``_raise_stopped``）。⚠️ 它是"最近一次"而不是
+    "最严重的"：指标要回答的是"这次介入是被哪类问题触发的"，而处置永远跟着最近一次
+    结论走 —— 用累计里最严重的那个会与实际处置对不上。
+    """
+
     stopped: str = ""
     """第 3 级（停止重试）的**停因**；空串 = 没停。
 
@@ -572,8 +605,14 @@ def evidence_of(context: Any) -> str:
     * **重复的**（``loop`` 最直接的证据）；
     * **重量级的**（要判"跑偏"就得看到它到底调了几次专家、落了几次盘）。
 
-    再补最近两条（保证模型知道"现在停在哪一步"），去重后按发生顺序排列、最多
-    ``_MAX_EVIDENCE`` 条。
+    再补两样（保证模型能回答"此刻停在哪、在不在绕"）：
+    * **最近的动作顺序**（``_MAX_SEQUENCE`` 步的工具名，按发生先后）—— 2026-10-21 加。
+      理由：上面那三类是**按指纹聚合**的，``A→B→A→B`` 在聚合视图里只是"A 两次、B 两次"，
+      读起来像"查了两遍资料"而不像"来回试"。这个往复是 ``repeat`` 判据的结构性盲区
+      （每个动作都没到 3 次），只有顺序能看出来；
+    * 最近两条（保证模型知道"现在停在哪一步"）。
+
+    去重后按发生顺序排列、最多 ``_MAX_EVIDENCE`` 条。
     """
     steps = list(getattr(getattr(context, "steps", None), "steps", []) or [])
     repeats = getattr(getattr(context, "steps", None), "repeat_counts", None)
@@ -603,11 +642,23 @@ def evidence_of(context: Any) -> str:
     goal = _goal_line(context)
     if goal:
         lines.append(goal)
-    lines += [
+    oscillate = counts.get("oscillate", 0)
+    tally = (
         f"工具调用共 {counts['tools']} 次（其中重量级 {counts['heavy']} 次），"
-        f"换人 {counts['hops']} 次，同一动作最多重复 {counts['repeat']} 次。",
-        "涉及的动作（可能不全，只列了有迹象的）：",
-    ]
+        f"换人 {counts['hops']} 次，同一动作最多重复 {counts['repeat']} 次"
+    )
+    if oscillate >= 2:
+        # 只在真的转起来时才写：``0`` / ``1`` 圈是常态，写进去只是噪声。
+        tally += f"，最近的动作在来回重复（已 {oscillate} 圈）"
+    lines += [tally + "。"]
+    # ★ 动作**顺序**必须单独给一行（2026-10-21）：上面那份"涉及的动作"是按指纹聚过的，
+    #   ``A→B→A→B`` 在里面读起来就是"A 重复 2 次、B 重复 2 次"，**看不出它们在交替** ——
+    #   而那正是"在两个方案之间来回试"的形状。只给工具名（不带参数）控制长度。
+    sequence = [getattr(s, "tool", "") for s in steps[-_MAX_SEQUENCE:]]
+    sequence = [name for name in sequence if name]
+    if len(sequence) >= 3:
+        lines.append("最近的动作顺序（看有没有来回重复）：" + " → ".join(sequence) + "。")
+    lines.append("涉及的动作（可能不全，只列了有迹象的）：")
     for step in picked:
         detail = (getattr(step, "detail", "") or "").strip()
         lines.append(
@@ -619,6 +670,14 @@ def evidence_of(context: Any) -> str:
 
 _MAX_EVIDENCE = 20
 """证据条数上限 —— 反思的输入也要有界（它与主线共用同一个网关配额）。"""
+
+_MAX_SEQUENCE = 10
+""""最近的动作顺序"最多列几步。
+
+10 的理由：判断一个往复至少要看两个完整周期（``A B A B``），而周期最长 3
+⇒ 6 步是下限；取 10 留出"周期 3 转两圈多一点"的空间。再长就只是把证据变成
+一份步骤清单 —— 而它要回答的是"此刻还在不在绕"，不是"从头都干了什么"。
+"""
 
 
 async def _run(context: Any, evidence: str, trigger: str) -> None:
@@ -655,6 +714,11 @@ async def _run(context: Any, evidence: str, trigger: str) -> None:
     # 而撤回要按 `call_id` 定位 —— 拿模型编的编号去定位等于把撤回交给模型决定。
     _attach_step(context, finding)
     state.kinds[finding.problem] = state.kinds.get(finding.problem, 0) + 1
+    # 记住"最近一次判出来的问题类型"，只为了给指标的 ``problem`` 标签 —— 第 3 级是在
+    # ``_raise_stopped`` 里抛的，那里手里只有 ``state.stopped``（一个停因字符串），
+    # 拿不到 finding。不记这一笔，刹车指标就只能回答"停过几次"，
+    # 回答不了"因为哪类问题停的" —— 而后者才是决定改提示词还是改配置的依据。
+    state.last_problem = finding.problem
     revert, refusal = _revert_decision(state, finding)
     if revert:
         state.reverted += 1
@@ -729,7 +793,13 @@ def _raise_stopped(state: ReflectionState) -> None:
     为什么在"抛"这一处计数、而不是在判定那一处：判定出来 ≠ 真的停成了 —— 若判定发生时
     运行已经跑完（不再有模型调用），刹车就踩不下去。这个指标要回答的是"**真的中断过几次**"。
     """
-    observability.counter("agent_recovery_level_total", level="3")
+    observability.counter(
+        "agent_recovery_level_total",
+        level="3",
+        # 没有 problem 时给 `unknown` 而不是空串：空标签值在这个项目的指标口径里
+        # 无法与"标签没设"区分，看板上会悄悄丢进一条看不见的序列。
+        problem=state.last_problem or "unknown",
+    )
     logging.warning("多步防护第 3 级：停止重试（原因=%s）", state.stopped)
     raise AgentStoppedByGuard(state.stopped)
 
@@ -768,14 +838,15 @@ def _one_line(value: Any) -> str:
 # --------------------------------------------------------------------------- #
 _REFLECT_PROMPT = (
     "你在监督一个正在执行任务的智能体。下面给你它**要做的事**、"
-    "**已经做过的动作**与四个计数。"
+    "**已经做过的动作**（含动作发生的先后顺序）与几个计数。"
     "请判断它是不是出了问题，并**只输出一个 JSON 对象**，字段如下：\n"
     '{"problem": "ok|loop|stuck|off_track", "summary": "一句话说明", '
     '"step": 出问题的步号（没有就给 0）, "advice": "一句可执行的建议"}\n'
     "\n"
     "取值含义：\n"
     "- ok：没有异常，动作推进正常（**拿不准就选它**）。\n"
-    "- loop：在原地打转 —— 同一个动作被反复做。\n"
+    "- loop：在原地打转。两种形态都算：**同一个动作被反复做**，"
+    "以及**两三个动作来回重复**（A→B→A→B，换了个做法但思路没换）。\n"
     "- stuck：卡住了 —— 反复失败，没有推进。\n"
     "- off_track：偏离了原来的任务。\n"
     "\n"
@@ -783,6 +854,9 @@ _REFLECT_PROMPT = (
     "「照现在这条路走下去，还能交付目标要的那个东西吗」。"
     "**只有明显答偏（做的是另一件事、或早就跑题）才判它** —— "
     "目标没写全、动作看起来绕着走但仍在为它服务，都算 ok。\n"
+    "\n"
+    "判断 loop 时以「最近的动作顺序」那一行为准，不要只看计数："
+    "两个动作各自只做过两次，也可能已经是一个来回。\n"
     "\n"
     "硬性要求：不要解释、不要客套话、不要输出 JSON 以外的任何内容；"
     "没有把握时给 ok。"
@@ -954,13 +1028,15 @@ async def inject_reflections(model_data: Any, *, context: Any = None) -> Any:
                 continue
             changed = True
             notes.append(finding.as_revert_note(goal=goal))
-            observability.counter("agent_recovery_level_total", level="2")
+            observability.counter(
+                "agent_recovery_level_total", level="2", problem=finding.problem or "unknown"
+            )
             logging.info(
                 "第 2 级：撤回第 %d 步（%s，call_id=%s），连带移除 %d 条上下文条目",
                 finding.step, finding.tool, finding.call_id, dropped,
             )
             continue
-        if _take_level1_slot(state):
+        if _take_level1_slot(state, finding.problem):
             notes.append(finding.as_note(goal=goal))
     state.pending.clear()
 
@@ -974,12 +1050,14 @@ async def inject_reflections(model_data: Any, *, context: Any = None) -> Any:
     return _rebuild(model_data, items, "\n\n".join(notes))
 
 
-def _take_level1_slot(state: ReflectionState) -> bool:
+def _take_level1_slot(state: ReflectionState, problem: str = "") -> bool:
     """占一个第 1 级注入额度；没有额度了返回 False（并计一次"额度不够"）。"""
     if state.injected >= max_level1():
         return False
     state.injected += 1
-    observability.counter("agent_recovery_level_total", level="1")
+    observability.counter(
+        "agent_recovery_level_total", level="1", problem=problem or "unknown"
+    )
     return True
 
 
@@ -1101,12 +1179,16 @@ _THRESHOLDS.update(
         "tools": _after_tools,
         "heavy": _after_heavy,
         "hops": _after_hops,
+        # ⚠️ ``oscillate`` 必须排在 ``repeat`` **之前**：两者同时到期时只报第一个，
+        # 而"两个动作来回"报成"同一动作重复"会让人去查一个不存在的重复调用
+        # （看板上那条动作确实只做了两次，与"重复"这个词对不上）。
+        "oscillate": _on_oscillation,
         "repeat": _on_repeat,
     }
 )
 """放在文件末尾：阈值函数都在上面定义完了，这里只是把它们登记成"触发原因 → 阈值"。
 
-⚠️ 键的顺序就是判定的优先级（工具 → 重量级 → 换人 → 重复）。多个同时到期时只报
+⚠️ 键的顺序就是判定的优先级（工具 → 重量级 → 换人 → **震荡** → 重复）。多个同时到期时只报
 第一个 —— 每条结论都会带上触发原因（指标标签），同时报多个会让"到底为什么触发"
 这一栏失去意义。
 """

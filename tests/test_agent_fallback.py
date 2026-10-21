@@ -115,6 +115,10 @@ def test_row4_guardrails_are_manual_and_business(reason):
     [
         ("guard_stop", "capped", "guard_stop"),
         ("max_turns", "", "max_turns"),
+        # 预算烧穿与轮数用尽是同一类"被打断"，但**必须各自的理由**：
+        # 一个该调预算/查为什么这么费，一个该调 AGENT_MAX_TURNS —— 混成 max_turns
+        # 会让人去调轮数上限，而真正的问题是这一轮烧了太多 token。
+        ("token_budget", "", "token_budget"),
         ("passed", "", "no_output"),
     ],
 )
@@ -133,6 +137,7 @@ def test_row5_no_answer_is_failed_and_keeps_the_real_reason(exit_reason, stopped
         ("passed", {"loop": 3}, "", "loop"),
         ("passed", {"stuck": 2}, "", "stuck"),
         ("max_turns", {}, "", "max_turns"),
+        ("token_budget", {}, "", "token_budget"),
         ("guard_stop", {}, "capped", "guard_stop"),
     ],
 )

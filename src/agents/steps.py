@@ -36,6 +36,22 @@
 清单侧对应 ``StepLog.repeat_counts()`` / ``StepLog.max_repeat``：下一次反思闸门
 直接读它判"该不该介入"，不必另建一份重复状态 —— 两处分别维护一定会漂。
 
+震荡（两个动作来回）—— 2026-10-21 补
+--------------------------------------
+重复计数有一个**结构性的盲区**：模型在两个动作之间来回试（``A→B→A→B``）时，
+每个动作各做了两次，两个计数都到不了"三次"的阈值 ⇒ 看板安静，闸门也不介入。
+而它恰恰是最典型的打转形态之一 —— 换一个工具再试同一个思路，比原样重试更像
+"真的在想办法"，所以更不容易被人肉眼发现。
+
+判据是**尾部周期重复**（``StepLog.tail_cycle``）：取已定格动作的指纹序列，看末尾
+是否存在长度 2 或 3 的模式连续出现 ≥2 次。为什么只到 3：更长的周期在 12 圈的运行里
+凑不齐两轮，写进去只会是一条永远不触发的判据（"配了但永不生效"比没有更难发现）；
+而"相同结果的重试"在实践中几乎都落在 1~3 个动作的循环里。
+
+指标 ``agent_action_oscillation_total{period}`` 的口径是"**每多转一整圈记一次**"，
+不是"震荡事件数"：``A→B→A→B`` 记 1，接着又 ``A→B`` 记 2。这样 ``sum`` 直接读出
+"多转了几圈"，比只报"发生过一次"更容易定阈值。
+
 两个"看板上必然看不见"的缺口（2026-10-19 补）
 ---------------------------------------------
 1. **一个从没被选过的工具，在指标里根本不存在。** 计数器只在被调用时产生时间序列，
@@ -76,6 +92,13 @@ __all__ = [
 
 _MAX_DETAIL = 200
 """结果 / 错误摘要的长度上限。只记**摘要**，原文不进日志（与项目口径一致）。"""
+
+_CYCLE_PERIODS = (2, 3)
+"""判"来回震荡"时检查的模式长度。
+
+只到 3 的理由见模块 docstring：更长的周期在一次最多 ``AGENT_MAX_TURNS``（默认 12）
+圈的运行里凑不齐两轮，写上就是一条永不触发的判据 —— 而"配了但不生效"比没有更难发现。
+"""
 
 _TIMEOUT_MESSAGE = (
     "工具 {tool} 这一步超时了：已经放弃等待，没有拿到结果。\n"
@@ -308,6 +331,62 @@ class StepLog:
                 counts[step.fingerprint] = counts.get(step.fingerprint, 0) + 1
         return {fp: n for fp, n in counts.items() if n >= 2}
 
+    def tail_cycle(self) -> tuple[int, int]:
+        """尾部**周期重复** ⇒ ``(周期, 连续出现几次)``；没有则 ``(0, 0)``。
+
+        为什么要单独一个判据：``repeat_counts`` 按指纹各数各的，``A→B→A→B`` 时
+        A、B 各 2 次，都到不了"三次"的阈值 ⇒ 那条判据对这种打转**完全沉默**。
+        而"换一个动作再试同一个思路"正是最容易被误认为"在想办法"的形态。
+
+        判据只看**末尾**（不是整段里任意位置），理由是"要不要现在介入"只取决于
+        "它此刻还在不在绕"：整段里出现过一次往返、之后已经走出来，那不该再报。
+
+        ⚠️ 只数**已定格**的步骤，与 ``repeat_counts`` 同口径 —— 读出来的量与指标
+        播报同源，两处分别维护一定会漂（漂的表现是"指标有数、闸门不动"）。
+        ⚠️ 序列**遇到空指纹就停**（不是跳过）：空指纹意味着"认不出这一步是不是同一个
+        动作"（参数没配上）。跳过它会让 ``A B C A B``（C 认不出）被读成 ``A B A B`` ——
+        一条假的震荡比漏报更难查，因为它会把一条正常的多步流程标成打转。
+        """
+        tail: list[str] = []
+        for step in reversed(self.steps):
+            if not step.settled:
+                continue
+            if not step.fingerprint:
+                break
+            tail.append(step.fingerprint)
+        fingerprints = list(reversed(tail))
+        best = (0, 0)
+        for period in _CYCLE_PERIODS:
+            if len(fingerprints) < period * 2:
+                continue
+            last = fingerprints[-period:]
+            if len(set(last)) < 2:
+                # 周期内全是同一个动作（``A A A A``）不是"来回"，是纯重复 ——
+                # 那由 ``repeat_counts`` 负责报。这里放过它，否则 A 做四次会被说成
+                # "两个动作来回"，而看板上那两步长得一模一样，对不上。
+                continue
+            if fingerprints[-period * 2 : -period] != last:
+                continue
+            cycles = 2
+            while len(fingerprints) >= period * (cycles + 1):
+                previous = fingerprints[-period * (cycles + 1) : -period * cycles]
+                if previous != last:
+                    break
+                cycles += 1
+            if cycles > best[1]:
+                best = (period, cycles)
+        return best
+
+    @property
+    def oscillation_cycles(self) -> int:
+        """尾部往复已经转了几整圈（``0`` / ``1`` = 没有震荡）。
+
+        反思闸门读它判"该不该介入"（阈值 ``AGENT_REFLECT_ON_OSCILLATION``，默认 2 圈）。
+        取圈数而不是布尔：阈值要能配成"转两圈才看"或"转三圈才看"，布尔值只能表达
+        "发生过"，那个配置项就没有意义了。
+        """
+        return self.tail_cycle()[1]
+
     def as_list(self) -> list[dict]:
         return [s.as_dict() for s in self.steps]
 
@@ -426,6 +505,9 @@ class StepLog:
         #    "打转"指标直接等于总调用数，而症状是"指标看着有数、其实全是噪声"。
         #    空指纹（没配到参数的步骤）不参与：把它们算作"同一动作"会凭空造出重复。
         repeated = bool(step.fingerprint) and self._count_settled(step.fingerprint) > 0
+        # 震荡同样必须在设 settled **之前**读一次尾部 —— 定格之后这一步就进了序列，
+        # 只有"之前 / 之后"比较才知道这一拍有没有**多转一整圈**。
+        cycle_before = self.tail_cycle()
         step.settled = True
         step.status = status
         step.reason = reason
@@ -438,6 +520,13 @@ class StepLog:
         )
         if repeated:
             observability.counter("agent_action_repeats_total", tool=step.tool)
+        cycle_after = self.tail_cycle()
+        if cycle_after[1] > cycle_before[1]:
+            # 口径：**每多转一整圈记一次**（不是"震荡事件数"）。A→B→A→B 记 1，
+            # 再来一轮 A→B 记 2 ⇒ `sum` 直接就是"多转了几圈"。
+            observability.counter(
+                "agent_action_oscillation_total", period=str(cycle_after[0])
+            )
         if step.duration:
             observability.histogram(
                 "agent_tool_duration_seconds", step.duration, tool=step.tool

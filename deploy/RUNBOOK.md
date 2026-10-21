@@ -1182,6 +1182,63 @@ curl -s --noproxy '*' localhost:8000/metrics | grep agent_tool_result_total
 
 恢复判据：该序列**停止增长**（注意是"不再出现"，不是"降到 0"——它是一个增量指标）。
 
+#### `AgentRevertFrequent`（warning，5m）—— 机制开始替模型改上下文了
+（`increase(agent_recovery_level_total{level="2"}[30m]) > 2`）
+
+第 2 级：模型在同一类问题上被提醒过一次之后仍然重复，系统**把出问题那一步及其之后的
+动作从模型输入里撤掉**，让它回到那一步之前重新决定。
+
+> ⚠️ 这**不是**失败。被撤回的运行大多数仍能正常交付 —— 所以
+> `agent_task_outcome_total{outcome="delivered"}` 上完全看不到它。这条告警是"回滚频率"
+> 的唯一线上口径，也是判断"这套防护值不值得开"的依据。
+>
+> ⚠️ **前提**：`AGENT_MULTISTEP_GUARD` 默认**关**。关着时这条序列**不存在**，
+> 告警永不触发 —— 那不是"没发生"，是"闸门没开"。别把静默读成正常。
+
+```bash
+# 按问题类型拆开看（loop / stuck / off_track 三条的改法完全不同）
+curl -s --noproxy '*' localhost:8000/metrics | grep 'agent_recovery_level_total'
+# 同一动作被做了几次（loop 的主证据）
+curl -s --noproxy '*' localhost:8000/metrics | grep agent_action_repeats_total
+# 两个动作来回（repeat 判据看不见的那一半）
+curl -s --noproxy '*' localhost:8000/metrics | grep agent_action_oscillation_total
+```
+- `problem="loop"` ⇒ 看是哪个工具被反复调，再看它的返回**有没有让模型看出"没结果"**；
+  同时看 `agent_action_oscillation_total`：那个在涨而 `agent_action_repeats_total` 不涨，
+  就是"两个动作来回试"的形态。
+- `problem="stuck"` ⇒ 查 `agent_tool_result_total{status="failed"}` 的同工具 `reason`：
+  `bad_args` 改工具描述、`error` 查实现/依赖、`timeout` 查预算与数据量。
+- `problem="off_track"` ⇒ 内容层问题，查该 agent 的 instructions 里任务边界。
+
+恢复判据：该序列停止增长。若同时出现 `AgentGuardStopFrequent`，说明撤回也没纠正 ⇒
+先按那一条处置（那边是"机制已经放弃"）。
+
+#### `AgentGuardStopFrequent`（warning，1m）—— 刹车了，这次运行被中断
+（`increase(agent_recovery_level_total{level="3"}[30m]) > 0`）
+
+第 3 级：提醒与撤回都没能让模型跳出问题，机制主动中断本次运行
+（`exit_reason="guard_stop"` ⇒ 判定表收成 `failed`）。用户看到的是"这次答不出来"或半段内容。
+
+**判据是"有发生"而不是速率**：这是终止性事件，一次就代表一次运行没跑完。
+
+```bash
+# 停因只在日志里（capped / not_found / not_fixed / side_effect）
+docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=500 app-stable \
+  | grep '多步防护第 3 级'
+# 用户侧影响面
+curl -s --noproxy '*' localhost:8000/metrics | grep 'agent_task_outcome_total'
+```
+- `capped` ⇒ 撤回额度用完（`AGENT_REFLECT_MAX_LEVEL2`）。先确认是不是**同一个问题**
+  反复触发，再决定调额度 —— 直接调大会让它在同一个坑里撤更多步。
+- `not_found` ⇒ 那一步已被 token 裁剪或历史压缩吃掉，撤回无处下手。查
+  `AGENT_HISTORY_TOKEN_LIMIT` 是否偏小、或压缩是否把步骤结构压没了（摘要里应有
+  "第 N 步 动作 → 关键结果"）。
+- `not_fixed` ⇒ 撤了同类问题又出现。这是**内容层**问题（提示词/约束），不是配置。
+- `side_effect` ⇒ 出问题的动作是落盘类（不可撤）。看那个工具是否该拆成
+  "准备 + 提交"两步，让"准备"可撤。
+- 先看 `problem` 标签再动手：它回答"退的是什么问题"，停因回答"为什么退不了"，
+  两个维度缺一个就会改错地方。
+
 #### `AgentRunFailureRateHigh`（warning，10m）
 异常收尾比例 > 20%（`exit_reason` ∈ `error` / `evaluator_error` / `max_turns`）。
 

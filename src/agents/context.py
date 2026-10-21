@@ -96,6 +96,12 @@ class AgentStats:
     guardrail: str = ""
     duration_seconds: float = 0.0
 
+    # -- 成本（2026-10-21）--
+    input_tokens: int = 0
+    """本次运行累计的**输入** token（所有模型调用相加）。"""
+    output_tokens: int = 0
+    """本次运行累计的**输出** token。"""
+
     # -- 检索（agent 链路上的检索由 researcher 工具发起）--
     retrieval_calls: int = 0
     retrieved_chunks: int = 0
@@ -117,6 +123,8 @@ class AgentStats:
             "exit_reason": self.exit_reason,
             "guardrail": self.guardrail,
             "duration_seconds": round(self.duration_seconds, 6),
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
             "retrieval_calls": self.retrieval_calls,
             "retrieved_chunks": self.retrieved_chunks,
             "empty_retrievals": self.empty_retrievals,

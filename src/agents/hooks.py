@@ -99,7 +99,20 @@ class AgentRunHooks(RunHooks[TaskContext]):
 
         这里取的是"模型请求了哪些工具" —— 工具的两个钩子都**不带参数、也不带定位
         编号**，所以工具入参只能从响应这一侧取（从工具钩子那一侧取不到）。
+
+        ⚠️ **token 累计必须放在 ``steps_enabled()`` 那句之前**（2026-10-21）。它读的是
+        ``AGENT_TOOL_STEPS``，而那是"动作清单"的开关；把成本统计挡在一个观察开关后面，
+        表现为"关掉步骤记录之后，token 预算再也不触发"—— 一个配了预算、看着有配置项、
+        实际永远不生效的失效，且没有任何东西会报错。
         """
+        stats = stats_of(context)
+        usage = getattr(response, "usage", None)
+        if stats is not None and usage is not None:
+            # 官方 ``Usage`` 的字段名（``agents/usage.py``）：input_tokens / output_tokens。
+            # 用 getattr + or 0：不是每个网关/模型都会回全这些字段（本地模型常见），
+            # 缺字段时按 0 算是安全的 —— 少算只会"晚一点触发预算"，不会拦错。
+            stats.input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
+            stats.output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
         if not steps_enabled():
             return
         log = steps_of(context)

@@ -86,8 +86,11 @@ class ScriptedModel(Model):
     "模型**看到**了什么"（例如 handoff 到底以什么名字出现在工具位上）。
     """
 
-    def __init__(self, script):
+    def __init__(self, script, usage: Usage | None = None):
         self._script = list(script)
+        # 默认 ``Usage()``（全 0）—— 与"网关不回 usage"同一形态，是刻意留着的默认值：
+        # token 预算那条链路的**静默失效**就是它，用例要能复现。
+        self._usage = usage if usage is not None else Usage()
         self.calls = []
 
     @property
@@ -116,7 +119,7 @@ class ScriptedModel(Model):
         assert self._script, "脚本已用尽：实际发生的模型调用比预期更多"
         out = self._script.pop(0)
         items = out if isinstance(out, list) else [out]
-        return ModelResponse(output=items, usage=Usage(), response_id=None)
+        return ModelResponse(output=items, usage=self._usage, response_id=None)
 
     def assert_complete(self) -> None:
         assert not self._script, f"脚本还剩 {len(self._script)} 步没被消费"

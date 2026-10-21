@@ -79,7 +79,8 @@ class FallbackVerdict:
     """为什么落到这一档（**有限枚举，做指标标签用**）。
 
     取值：``none`` / ``error`` / ``off_track`` / ``review_failed`` / ``guardrail`` /
-    ``no_output`` / ``loop`` / ``stuck`` / ``max_turns`` / ``guard_stop`` / ``tool_approval``。
+    ``no_output`` / ``loop`` / ``stuck`` / ``max_turns`` / ``token_budget`` /
+    ``guard_stop`` / ``tool_approval``。
 
     ⚠️ 必须保持有界。把它做成"把异常原文塞进去"会让指标基数爆炸
     （异常原文带 request id、上游返回体、可能含用户数据）—— 那是 ``TaskOutcome.error``
@@ -175,12 +176,16 @@ def decide(context: Any, *, exit_reason: str, answer: str) -> FallbackVerdict:
     #   · 第 3 级踩过刹车（`guard_stop`）—— 运行被打断，产出物根本来不及成形；
     #   · 轮次烧完（`max_turns`）—— ⚠️ 实测那一刻步骤清单可能**全是 ok**（模型在正常调工具、
     #     只是没收敛），所以这一路只能靠 `exit_reason` 判，不能只看清单；
+    #   · token 预算烧穿（`token_budget`，2026-10-21）—— 同上：它是"别再花了"，
+    #     不是"内容不对"，判据也只能靠 `exit_reason`；
     #   · 其余（跑完了、没报错、就是什么都没说出来）。
     if not produced:
         if stopped:
             return FallbackVerdict(FAILED, "guard_stop", SYSTEM, unfinished)
         if exit_reason == "max_turns":
             return FallbackVerdict(FAILED, "max_turns", SYSTEM, unfinished)
+        if exit_reason == "token_budget":
+            return FallbackVerdict(FAILED, "token_budget", SYSTEM, unfinished)
         return FallbackVerdict(FAILED, "no_output", SYSTEM, unfinished)
 
     # ⑥ 有答复，但**出现过问题信号** ⇒ 照常交付 + 标明"部分结果"。
@@ -237,7 +242,7 @@ def report(verdict: FallbackVerdict, *, exit_reason: str, agent: str) -> None:
 def _signal(kinds: dict[str, int], stopped: str | None, exit_reason: str) -> str:
     """第 ⑥ 行的"问题信号"（返回空串 = 没有信号）。
 
-    顺序即优先级：打转 → 卡住 → 第 3 级停过 → 轮次烧完。多个同时成立时只报第一个
+    顺序即优先级：打转 → 卡住 → 第 3 级停过 → 预算烧穿 → 轮次烧完。多个同时成立时只报第一个
     （与反思的触发原因同一考虑：同时报多个会让"到底为什么"这一栏失去意义）。
     """
     if kinds.get("loop"):
@@ -246,6 +251,8 @@ def _signal(kinds: dict[str, int], stopped: str | None, exit_reason: str) -> str
         return "stuck"
     if stopped:
         return "guard_stop"
+    if exit_reason == "token_budget":
+        return "token_budget"
     if exit_reason == "max_turns":
         return "max_turns"
     return ""

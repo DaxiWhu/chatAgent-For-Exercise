@@ -1156,6 +1156,41 @@ groups:
           description: "过去 15 分钟有 {{ $value }} 次预算计算失败，失败时**原样把历史交给模型**。日志只打首条（详情搜「跨轮历史的 token 预算算不出来」），其余只计数。"
           runbook: "1) 日志搜「跨轮历史的 token 预算算不出来」，那里有完整异常；2) kind=ModuleNotFoundError ⇒ 没装 tiktoken（requirements.txt 已声明）；OfflineTiktokenError / 网络类 ⇒ 拉不到词表，此时会自动退化成**字符数近似**并打一条 warning，功能不中断；3) kind=TypeError / AttributeError ⇒ SDK 升级后 shape 变了，看 src/agents/history_budget.py 的 _trim_sync；4) 观察该序列停止增长即为恢复。"
 
+      - alert: AgentRevertFrequent
+        # ★ 第 2 级（撤回那一步）在涨 —— 这是"回滚频率"的唯一线上口径。
+        #   它与 `agent_fallback_total{reason="loop"}` 不是一回事：那条数的是
+        #   **结局**（最后按打转收尾），这条数的是**过程**（机制真的动手撤了上下文）。
+        #   一次运行可以在撤回之后被救回来、正常交付 —— 那种情况结局指标完全看不到，
+        #   而"救回来的次数"恰恰是判断"这套机制值不值得开"的依据。
+        # ⚠️ 前提：`AGENT_MULTISTEP_GUARD` 默认**关**。关着时这条序列**不存在**，
+        #   告警永远不会触发 —— 那不是"没发生"，是"这道闸门没开"。别把静默读成正常。
+        # 按 `problem` 拆着看：loop 多 ⇒ 模型爱在原地试；stuck 多 ⇒ 工具/数据有问题；
+        #   off_track 多 ⇒ instructions 或约束写得不够。三条的改法完全不同。
+        expr: increase(agent_recovery_level_total{level="2"}[30m]) > 2
+        for: 5m
+        labels:
+          category: agent
+          severity: warning
+        annotations:
+          summary: "多步防护撤回变频繁（近 30 分钟 {{ $value }} 次，problem={{ $labels.problem }}）"
+          description: "模型在同一类问题上被提醒过一次之后仍然重复，机制已经把出问题那一步（及其之后的动作）从模型输入里撤掉，让它回到那一步之前重新决定。这**不是**失败 —— 大多数被撤回的运行最后仍能正常交付；但频率上升说明提示词或工具的输出没有把「这条路走不通」传达清楚。problem 标签区分 loop（原地打转）/ stuck（反复失败）/ off_track（偏离目标）。"
+          runbook: "1) 先确认闸门是开着的（`AGENT_MULTISTEP_GUARD=1`）；关着时这条序列不存在，别按「没告警=没问题」理解。2) 看 problem 标签：loop ⇒ 查 `agent_action_repeats_total` 与 `agent_action_oscillation_total` 是哪个工具在被反复调用，再看该工具的返回内容是否让模型看不出「没结果」；stuck ⇒ 查 `agent_tool_result_total{status=\"failed\"}` 里同工具的失败档位（bad_args 改描述、error 查实现、timeout 查预算）；off_track ⇒ 查该 agent 的 instructions 里任务边界是否清楚。3) 若同时出现 AgentGuardStopFrequent，说明撤回也没能纠正 ⇒ 按那条的步骤先处置。4) 恢复判据：该序列停止增长。"
+
+      - alert: AgentGuardStopFrequent
+        # ★ 第 3 级（刹车）发生过 —— "机制已经放弃让模型自己改"。
+        #   判据是"有发生"而不是速率：它是**终止性**事件，一次就意味着一次运行被
+        #   中断（`exit_reason="guard_stop"` ⇒ 判定表收成 failed），用户拿不到完整答复。
+        #   这类事情不该以"每天几十次"的频率存在，所以 1 次就值得看一眼。
+        expr: increase(agent_recovery_level_total{level="3"}[30m]) > 0
+        for: 1m
+        labels:
+          category: agent
+          severity: warning
+        annotations:
+          summary: "多步防护踩了刹车（近 30 分钟 {{ $value }} 次，problem={{ $labels.problem }} 停因见日志）"
+          description: "提醒与撤回都没能让模型跳出问题，机制主动中断了这次运行。用户侧表现是「这次答不出来」或只拿到半段内容。`problem` 是最近一次判出来的问题类型；**停因**（capped / not_found / not_fixed / side_effect）只在日志里，它回答的是「为什么退不了」。"
+          runbook: "1) 日志搜「多步防护第 3 级：停止重试」，那条 warning 带停因；2) 停因 capped ⇒ 撤回额度用完了（`AGENT_REFLECT_MAX_LEVEL2`），先确认是不是同一个问题反复触发，再决定调额度而不是无脑加大；3) not_found ⇒ 那一步已经被 token 裁剪或历史压缩吃掉，撤回无处下手 ⇒ 查 `AGENT_HISTORY_TOKEN_LIMIT` 是否偏小、或压缩是否把步骤结构压没了；4) not_fixed ⇒ 撤了同类问题又出现 ⇒ 改 prompts/instructions，这是内容层的问题；5) side_effect ⇒ 出问题的动作是落盘类（不可撤）⇒ 看该工具是否该拆成「准备 + 提交」两步；6) 同时看 `agent_task_outcome_total{outcome=\"failed\"}` 确认用户侧影响面。"
+
       - alert: AgentToolStepTimeoutFrequent
         # ★ 又一条"不报错的坏"：工具单步超时（`AGENT_TOOL_TIMEOUT_SECONDS`，默认 20s）。
         #   超时**不会**让这一轮失败 —— 它被转成一句给模型的话（"换做法/缩小范围，

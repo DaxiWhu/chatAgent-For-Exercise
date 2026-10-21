@@ -35,7 +35,7 @@
 | `REQUEST_TIMEOUT_SECONDS` | ✅ `180` | 单请求**总时限**已装。注意 `_MODEL` 上的 `timeout=30` 只管**单次调用**，而一次请求可以跑多轮（自评审不通过会再来一轮）⇒ 没有它总时长无上界，而且 **`GRACEFUL_SHUTDOWN_TIMEOUT` 的排空上界会形同虚设**（它等的是在途请求，而在途请求自己不会结束）。超时会下发结构化 `timeout` 事件后收流，**已产出的正文照常交付**。<br>⚠️ 它同时是**发布时能放完多久请求**的准数：排空上界默认 = 本值 + 10s（见下一行），容器宽限期必须大于排空上界 | `120`（保守可给 `180`） |
 | `GRACEFUL_SHUTDOWN_TIMEOUT` | 未设（默认 = `REQUEST_TIMEOUT_SECONDS + 10`） | uvicorn 等在途请求的**排空上界**。默认值**跟随请求总时限**，不再写死 30s —— 写死 30 时，一次发布会把所有跑过 30 秒的请求取消，而它们本来还被允许再跑 150 秒。那 10s 不是"再跑一会儿"，是**收尾动作**（下发 timeout 事件、结算配额、写待审队列、关上游）。<br>⚠️ 三值联动：**请求总时限 ≤ 排空上界 < 容器宽限期**（当前 `180 ≤ 190 < 210`，宽限期在 `deploy/app/docker-compose.yml`）。显式把它配得比总时限小**会照用但打一条警告**（启动日志搜「断在半句」）。<br>⚠️ 总时限为 `0`（不限）时默认退回 30s —— 那种配置下没有任何取值是对的，排空上界只是"早死晚死" | 不设（跟随总时限）；确实要设就设成 ≥ 总时限 + 10，并同步调大容器宽限期 |
 | `TRUST_PROXY_HEADERS` | ✅ `0` | 直连场景下 `0` 是**正确**的。但**一旦部署到 Nginx/网关后面**必须改 `1`：否则限流按**代理 IP** 统计，全体用户共用一个计数桶 ⇒ 要么集体误伤、要么被单人吃满。compose 里已为两个 app 服务注入 `TRUST_PROXY_HEADERS: "1"`（它们确实在 nginx 后面）。<br>⚠️ **设 `1` 只是必要条件**：代理还必须用**覆盖式**写入 `X-Forwarded-For`（`$remote_addr`）。若代理用 nginx 的 `$proxy_add_x_forwarded_for`（**追加式**，客户端那段留在最左），应用取到的第一段仍是**客户端伪造的值**，限流照样被绕过（2026-10-04 修，守卫见 `tests/test_deploy_topology.py`） | 反代后设 `1`；直连保持 `0` |
-| `ALERT_SINK_WECOM_WEBHOOK` 等三个通道 | ⚠️ **全部为空**（当前**最紧的一个待办**） | 告警转发的出口。**不填 ⇒ `alert-sink` 只把事件记进日志**（这是刻意设计：没配通道不阻塞、不报错），于是 Prometheus 里的 FIRING 永远变不成一条发到人手里的消息。**6 组 64 条**规则 + 六级路由全都写好了，差的只有这一步。<br>⚠️ **两个坑**：① 填完必须用 `docker compose --env-file .env -f deploy/app/docker-compose.yml config \| grep -i webhook` 自证值真的传进去了（**漏 `--env-file` 时它静默不生效**，见本文档开头的说明）；② `alert_sink.py --selftest` 只能证明网关进程活着，**必须再真触发一次告警**（停 `app-canary` 让 `ChatAgentDown` 响）才算闭环 | 填企业微信/飞书机器人 URL；自建网关填 `ALERT_SINK_GENERIC_WEBHOOK` |
+| `ALERT_SINK_WECOM_WEBHOOK` 等三个通道 | ⚠️ **全部为空**（当前**最紧的一个待办**） | 告警转发的出口。**不填 ⇒ `alert-sink` 只把事件记进日志**（这是刻意设计：没配通道不阻塞、不报错），于是 Prometheus 里的 FIRING 永远变不成一条发到人手里的消息。**6 组 66 条**规则 + 六级路由全都写好了，差的只有这一步。<br>⚠️ **两个坑**：① 填完必须用 `docker compose --env-file .env -f deploy/app/docker-compose.yml config \| grep -i webhook` 自证值真的传进去了（**漏 `--env-file` 时它静默不生效**，见本文档开头的说明）；② `alert_sink.py --selftest` 只能证明网关进程活着，**必须再真触发一次告警**（停 `app-canary` 让 `ChatAgentDown` 响）才算闭环 | 填企业微信/飞书机器人 URL；自建网关填 `ALERT_SINK_GENERIC_WEBHOOK` |
 | `ALERT_SINK_SHARED_SECRET` | ⚠️ 为空 —— **刻意保持为空，别单独填它** | 网关的来源校验：非空时要求每个 POST 带 `X-Alert-Sink-Secret` 头且匹配，否则回 **403**。⚠️ **陷阱就在这里**：`alertmanager.yml` 的四个 receiver **没有** `http_config`，**根本不会送这个头** ⇒ 你填了这个变量，等于**把全部告警打成 403**（Alertmanager 重试几次后放弃，表现成"配置全对但没人收到"，网关日志里只有一行 403）。要用它必须**两处一起改**：给四个 receiver 补 `http_config: http_headers: X-Alert-Sink-Secret: [...]` —— 而 Alertmanager **不支持 `${VAR}` 插值**，密钥只能写进配置文件，又回到"凭据进版本库"（这正是本网关要避免的事）。<br>**当前实际暴露面本就有限**：宿主机端口是回环绑定（`127.0.0.1:8081:8080`），仅剩"同 compose 网络内其它容器可伪造告警"，那更适合用部署侧网络隔离解决 | **留空**。确实要开 ⇒ 两处一起改，并接受密钥进配置文件 |
 | `REDIS_PASSWORD` / `POSTGRES_PASSWORD` / `GRAFANA_PASSWORD` | ✅ `REDIS_PASSWORD` 已生成；另两个走 compose 默认值 | 编排层口令（由 compose 从 `.env` 插值，`app` 不读）。**`POSTGRES_PASSWORD` 仍是默认 `123456`** —— 上生产前必须换，且注意它**只在数据卷首次初始化时生效**（详见 `deploy/SECRETS.md` §4.3）。密钥管理的整体方案见 `deploy/SECRETS.md` | 见 `deploy/SECRETS.md` |
 
@@ -133,7 +133,7 @@ pip install langfuse openinference-instrumentation-openai-agents
 OpenAI 后台上报会被一并顶掉 —— 这也是为什么配了 Langfuse 时**不能**再关 tracing
 （关了连 span 都不产生，插桩收不到东西）。
 
-**告警要真正接上**：`deploy/monitoring/alerts.yml` 里有 **6 组 64 条**规则
+**告警要真正接上**：`deploy/monitoring/alerts.yml` 里有 **6 组 66 条**规则
 （可用性 / SLO / 成本 / 安全 / **平台自身** / **agent 能力链路**）。其中两条是
 "任何一次即 critical"：`TenantMismatchDetected`（有人在冒充租户）、
 `SessionOwnershipViolation`（有人在猜 `thread_id` 串读会话）—— 这两条一旦触发
@@ -256,6 +256,7 @@ PromQL 是全串匹配，写成 `le="1"` 不会报错，只会让该规则**永�
 | `AGENT_MAX_ATTEMPTS` | `3` | ⚠️ **当前无代码读取（死配置）**。它原本是"评审回灌的轮数上限"；2026-10-02 评审改成模型可选的 `as_tool` 之后就没有回灌循环了，2026-10-19 删评分闸后连"按评审结论重跑"这条路也不存在 —— 现在只有 `app/config.py` 把它读进来回显，`src/agents` 一处都不读。留着是为了不破坏既有 `.env` 与启动自检，**不要按它去调行为** |
 | `AGENT_MAX_TURNS` | `12` | 单次 `Runner.run` 内允许的 **LLM 调用次数**（官方语义，**不是对话轮次**）。设成对话轮次的量级（比如 3）会让正常的"查两次资料"直接抛 `MaxTurnsExceeded` |
 | `AGENT_TIMEOUT_SECONDS` | `30` | 单次模型调用的超时（OpenAI 客户端级） |
+| `AGENT_RUN_TOKEN_BUDGET` | `0`（不限） | **一次运行的 token 预算**（输入 + 输出，2026-10-21 新增）。`AGENT_MAX_TURNS` 限的是**圈数**，不是成本：一圈可能几百 token，也可能十几万（一次工具返回塞进整份文档）⇒ "12 圈"在长任务里可以是几十万 token。到线在**下一次模型调用之前**停下（`exit_reason="token_budget"`），已产出内容照交、判定表收成 `failed`/`partial` + 原因 `token_budget`。⚠️ 默认不限，与 `REQUEST_TIMEOUT_SECONDS` 同口径：默认值配小会大面积截断正常长任务，症状是"模型最近答得敷衍"。⚠️ **上游不回 usage 时它不生效**（累计恒 0）—— 唯一静默失效方式，靠 `agent_run_tokens_unmeasured_total` + 日志「一个 token 都没量到」暴露，看到那条先查网关的 `usage` 字段，**别去调预算值** |
 | `AGENT_TOOL_TIMEOUT_SECONDS` | `20` | **单个工具执行**的等待上界（`0` = 不限）。⚠️ 与上一行不是一回事：一个管一次模型调用，一个管一次工具调用，独立可调。超时**不会**让这一轮失败 —— 它被转成一句给模型的话（换做法/缩小范围/先做完其余部分），模型自己绕。所以它是"悄无声息地少一段依据 + 变慢"，必须靠 `AgentToolStepTimeoutFrequent` 发现。⚠️ 唯一的兜底是请求级总时限（默认 `0` = 不限）⇒ 不配这项等于「工具卡住，请求永不结束」 |
 | `AGENT_TOOL_WORKERS` | `0`（按 CPU 推导，`min(32, cpu+4)`） | 工具执行的**独立**线程池容量。为什么必须独立：官方对同步工具用 `asyncio.to_thread`，那是**事件循环的默认池**，与服务层 `_off()`（限流、会话归属、落库、结算）共用 ⇒ 工具卡住会拖累全进程。隔离后这个池是**可牺牲的**：打满时表现为"工具排队/超时"，而不是"服务不可用" |
 | `AGENT_EVALUATOR_TRIES` | `2` | ⚠️ **当前无代码读取（死配置）**。原意是"评审调用的重试次数"；评审改成 `as_tool` 之后，嵌套 run 的重试由 SDK 自己管，这个值没人用。与 `AGENT_MAX_ATTEMPTS` 同一条：留配置、别指望它改变行为 |
@@ -531,7 +532,7 @@ curl -s localhost:8000/health/ready | python -m json.tool
        ⚠️ 同理，`llm_inter_chunk_seconds` **要求一次回答至少有两个 chunk** 才会出现
        第一个样本。所有请求都"一句话答完"时它不会出现，这是正常的；
        反过来，它在有长回答的时段仍然为空，才说明埋点没走到。
-16. [ ] `deploy/monitoring/alerts.yml` 已加载（**6 组 64 条**），且 `review_pending` 有"长时间 > 0"的告警
+16. [ ] `deploy/monitoring/alerts.yml` 已加载（**6 组 66 条**），且 `review_pending` 有"长时间 > 0"的告警
 17. [ ] `chatagent-slo` 组已加载（面板上能看到 **7 条**燃尽率规则 + 2 条预算余量规则；
        7 = availability 3 条 + latency 2 条 + stream_latency 2 条），
        且 `SLO.md` 的两张表与表达式一致（`pytest tests/test_monitoring_config.py` 会钉住）。

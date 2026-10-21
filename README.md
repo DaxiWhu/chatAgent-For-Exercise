@@ -678,6 +678,31 @@ python scripts/tasks.py eval           # 或 make eval：三层门禁 + scorecar
 python scripts/eval_scorecard.py --baseline scripts/scorecard.json   # 与上次对比，标出退化
 ```
 
+### 第四层：长任务（要真实模型，**不进 CI**）
+
+前三层评的都是**一次作答**：给材料、问一句、看答案。它们测不出"一个十来步的任务
+最后到底做成了没有" —— 那种失败是"跑着跑着偏了，或者陷在某个子步骤里反复试"，
+只在多步之后才出现。所以在改 `instructions` 或反思阈值之后，长任务有没有变差
+本来只能靠感觉。
+
+```bash
+python scripts/eval_longrun.py --out scripts/longrun_baseline.json        # 首次：生成基线
+python scripts/eval_longrun.py --baseline scripts/longrun_baseline.json   # 之后：与基线比
+```
+
+量的是：**完成率**（`delivered`）/ 部分结果率 / 兜底率 / **偏离率**（反思报过
+`off_track`）/ 打转率 / 卡住率 / 平均步数 / 未完成步数 / 平均 token 与耗时。
+退化判据是可解释的（完成率掉 5 个点、偏离率涨 5 个点、平均 token 涨 30%），
+有退化时退出码 1，可以当发布前的手动门禁。
+
+三点必须知道：
+
+- **它真花钱**（调上游模型）。用例 5 条、每条限篇幅 —— 这是能力画像，不是压测。
+- **基线必须自己先跑一次生成**，没有出厂数字：基线取决于你用的模型、提示词版本、
+  语料。任何"预设一个合理基线"的说法都不成立。
+- 脚本**强制打开** `AGENT_MULTISTEP_GUARD`：偏离率/打转率/卡住率全部来自反思闸门，
+  闸门关着时那三行恒为 0 —— 那是"没测"，不是"没问题"。
+
 ### 口径必须钉死——否则同一份代码给出两套结论
 
 `src/rag/retrieval.py` 在**导入期**就 `load_dotenv(dotenv_path=仓库根/.env)`，把

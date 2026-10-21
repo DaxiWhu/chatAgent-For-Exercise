@@ -128,6 +128,17 @@
 - `_settle` 里**在设 `settled` 之前**判"这个指纹之前出现过没有"：设之后再判会把
   **自己**算进去 ⇒ 每一条都被判成重复，"打转"指标直接等于总调用数。
 - 播报：同一动作**出现第二次起、每多一次播一次** `agent_action_repeats_total{tool}`。
+
+✅ **补盲区（2026-10-21）**：上面这条按**单个动作**计数，`A→B→A→B` 时 A、B 各两次
+⇒ 到不了阈值 3，判据完全沉默。补的是 `StepLog.tail_cycle()`（尾部周期 2/3 的重复）
+与 `agent_action_oscillation_total{period}`，并接进 `_THRESHOLDS`（键序排在 `repeat`
+**之前**：两者同时到期时报"来回"比报"重复"准确 —— 看板上那个动作确实只做了两次）。
+
+⚠️ **"计划修改次数"这一项没有对应物，如实记在这里**：本项目的模型没有显式计划
+（2026-10-21 与用户确认**不做**"先出计划再执行"那一关），所以既没有"计划"也没有
+"被修改的计划"。能做且已做的是**回滚频率**（`agent_recovery_level_total{level="2"}`
+按 `problem` 拆开），以及第 3 级刹车的发生次数。这两条合起来回答的是同一个问题 ——
+"机制替模型改上下文的频率"，只是入口不是计划而是动作清单。
   口径是整次运行内累计（不设窗口），且与 `repeat_counts()` **同源**（都只数已定格的
   步骤）⇒ 播报次数恒等于 `Σ(每个动作次数 − 1)`，两处不会各算各的。
 - **跟随 `AGENT_TOOL_STEPS`**，没有独立开关 —— 指纹本来就在步骤清单里，重复次数只是
@@ -333,7 +344,11 @@
 | `agent_reflection_duration_seconds` | histogram | | 反思自己多慢 ✅ 第三步已落地 |
 | `agent_reflection_timeout_total` | counter | | 反思没跑完 ✅ 第三步已落地（超时单独计数：它指向**配置**，与"网关抖动"处置不同） |
 | `agent_reflection_late_total` | counter | | 结论没赶上（白跑）✅ 第三步已落地（它在涨 ⇒ `AGENT_REFLECT_TIMEOUT` 或阈值配得不合适） |
-| `agent_recovery_level_total` | counter | `level` | 1 / 2 / 3 各发生几次 ✅ 第 3、4、5 步已全部落地（`1` = 注入提醒、`2` = 撤回那一步、`3` = 踩刹车中断本次运行）。⚠️ `3` 是在**抛出那一下**计的、不是在"判定出来"那一下 —— 判定 ≠ 真的停成了（判定发生时运行可能已经没有下一次模型调用了） |
+| `agent_recovery_level_total` | counter | `level` / `problem` | 1 / 2 / 3 各发生几次，**且能按问题类型归因**（2026-10-21 加 `problem` 标签）。⚠️ 加标签前的形态只能回答"回退了几次"，回答不了"因为哪类问题回退的" —— 而 loop 要改做事方式、stuck 要查工具/数据、off_track 要改约束，三者的处法完全不同。🟰 **"回滚频率"就是这一条的 `level="2"`**（撤回那一步），`level="3"` 是刹车；两者各有告警（`AgentRevertFrequent` / `AgentGuardStopFrequent`）。 |
+| `agent_action_oscillation_total` | counter | `period` | **两个动作来回**（`A→B→A→B`，2026-10-21 加）。口径是"每多转一整圈记一次"，所以 `sum` = 多转了几圈，不是"震荡事件数"。⚠️ 它补的是 `agent_action_repeats_total` 的结构性盲区：来回试时每个动作都只做两次，重复判据（阈值 3）完全沉默。 |
+| `agent_run_tokens_total` | counter | `kind` / `agent` | **运行内 token 用量**（`input` / `output`，2026-10-21 加）。每次运行的量，带 `agent` 标签 ⇒ 能回答"钱花在哪个 agent 上"。 |
+| `agent_run_budget_stop_total` | counter | | token 预算烧穿而停下（`exit_reason="token_budget"`）。 |
+| `agent_run_tokens_unmeasured_total` | counter | `agent` | **配了预算却一个 token 都没量到**（网关不回 usage）。⚠️ 它在涨不等于出错，等于"这个部署里预算根本没生效" —— 此时别去调预算值。 |
 | `agent_recovery_skipped_total` | counter | `reason` | **到线了却没撤成**：`not_found`（那一步已被裁剪/压缩吃掉）/ `side_effect`（动作有副作用、白名单外）/ `capped`（额度用完）。⚠️ 它在涨说明"问题还在、但已经没得退了" ⇒ 该调额度，或该上第 3 级 ✅ 第 4 步已落地（这三个值现在**各对应一个第 3 级停因**，见 `PLAN_step5_fallback.md` §5） |
 | `agent_task_outcome_total` | counter | `outcome` / `agent` | **任务完成率**（缺口二）：delivered / partial / manual / failed ✅ 第 5 步已落地。⚠️ 标签值就是代码里那四个常量（同名同值 ⇒ 看板上"完成率掉了"能直接对到判定，中间不过一次翻译） |
 | `agent_fallback_total` | counter | `reason` / `agent` | 兜底各类原因各几次（`reason` 是**有限枚举**：none / error / off_track / guardrail / no_output / loop / stuck / max_turns / guard_stop）。⚠️ 2026-10-19 起枚举里**没有** `review_failed` —— 评审没过不再进兜底表（见 `PLAN_step5_fallback.md` §4 第③行） |

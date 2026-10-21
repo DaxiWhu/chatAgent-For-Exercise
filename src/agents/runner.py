@@ -105,7 +105,7 @@ from agents import (
 from .. import observability
 from ..envutil import env_int
 from ..rag import citation_check
-from . import approval, fallback, reflection, runtime, supplements
+from . import approval, budget, fallback, reflection, runtime, supplements
 from .context import TaskContext
 from .frontline import frontline_agent
 from .guards import (
@@ -256,10 +256,15 @@ def _guardrail_name(exc: BaseException) -> str | None:
 
 
 async def model_input_filter(data: Any) -> Any:
-    """``RunConfig.call_model_input_filter`` 的**装配处**：裁剪 → 注入反思 → 注入补充。
+    """``RunConfig.call_model_input_filter`` 的**装配处**：预算 → 裁剪 → 注入。
 
     四步各有归属，这里只负责顺序：
 
+    ⓪ ``budget.check`` —— 到线就抛 ``AgentStoppedByBudget``（**排在最前**）。
+       排在这里有两个理由：① 这一处就是"钱马上要花了"的那一拍，判在别处
+       （工具结束、或运行收尾）要么判不到这次读入、要么已经是事后记账；
+       ② 排在裁剪**之前**，超预算时不必先算一遍 token 再扔掉结果 ——
+       裁剪本身就要分词，而超预算的运行往往正是历史最长的那些。
     ① ``history_budget.trim_model_input`` —— 窗口压缩 + 按 token 硬截断；
     ② ``reflection.inject_reflections`` —— 追加一条 system 消息（反思闸门的结论）；
     ③ ``_inject_supplements`` —— 追加用户在本节点运行期间补说的话。
@@ -272,7 +277,11 @@ async def model_input_filter(data: Any) -> Any:
 
     ⚠️ 注入**不占**预算：它排在预算判定之后，所以输入可能比 ``AGENT_HISTORY_TOKEN_LIMIT``
     略高一点 —— 那是有意的，一条几十字的提醒远小于"提醒没生效"的代价。
+    同样地，**注入也不计入 token 预算的判定**：``budget.check`` 用的是"上一次调用
+    已经花掉的量"（``AgentStats`` 的累计），不是这次输入的预估值 —— 它判的是
+    "还该不该继续"，不是"这一条能不能塞下"。
     """
+    budget.check(getattr(data, "context", None))
     trimmed = await trim_model_input(data)
     injected = await reflection.inject_reflections(
         trimmed, context=getattr(data, "context", None)
@@ -646,7 +655,15 @@ async def run_agent(
     started = time.perf_counter()
     stats = context.stats
     #: 本次运行开始前的累计读数 —— 用来切出"这一次运行"的增量（见 _report_run_metrics）。
-    before = (stats.model_calls, stats.tool_calls, stats.review_rounds)
+    #: token 也切：一次请求可能跑两个节点（前台 + 接手方），用累计那份会让"每次运行的成本"
+    #: 把前一个节点的也算进去 —— 看板上的单价直接翻倍。
+    before = (
+        stats.model_calls,
+        stats.tool_calls,
+        stats.review_rounds,
+        stats.input_tokens,
+        stats.output_tokens,
+    )
 
     context.delivered.clear()
     if resume is not None:
@@ -730,6 +747,12 @@ async def run_agent(
         # ⚠️ 这里**不冒泡**（与 `error` 那条不同）：主线的收尾要照常走完 ——
         # 判定表会把它收成 `failed`（运行被打断 ⇒ 没有产出物）。
         exit_reason = "guard_stop"
+    except budget.AgentStoppedByBudget:
+        # token 预算烧穿（同样从注入口抛出来，理由与上一条完全一致：**排在
+        # `except Exception` 之前**，否则"预算用完了"会伪装成"上游崩了"）。
+        # 判定表把它收成 partial / failed，已产出的内容照常交付 —— 预算是"别再多花"，
+        # 不是"这一轮作废"。
+        exit_reason = "token_budget"
     except Exception as e:  # noqa: BLE001  上游抖动 / 协议错误
         logging.exception("agent 链路执行异常")
         exit_reason = "error"
@@ -807,22 +830,31 @@ async def run_agent(
 
     # 上报"能力"指标：跑成没跑成、跑得多慢、花了多少次模型调用与工具调用。
     # 传**这一次运行**的切片（见 _report_run_metrics 的说明）。
-    _report_run_metrics(
-        replace(
-            stats,
-            model_calls=stats.model_calls - before[0],
-            tool_calls=stats.tool_calls - before[1],
-            review_rounds=stats.review_rounds - before[2],
-            duration_seconds=duration,
-        ),
-        exit_reason,
-        agent=getattr(agent, "name", ""),
+    slice_of_run = replace(
+        stats,
+        model_calls=stats.model_calls - before[0],
+        tool_calls=stats.tool_calls - before[1],
+        review_rounds=stats.review_rounds - before[2],
+        input_tokens=stats.input_tokens - before[3],
+        output_tokens=stats.output_tokens - before[4],
+        duration_seconds=duration,
     )
+    _report_run_metrics(slice_of_run, exit_reason, agent=getattr(agent, "name", ""))
+    # token 成本与"预算到底有没有生效"在这里报（口径 = 上面同一份切片）。
+    # ⚠️ 必须与 `_report_run_metrics` 用**同一份**切片：分成两次 replace 迟早会有一处
+    # 忘了减 before，表现是"某个 agent 的成本偏高"，而两次读数都"看起来正常"。
+    budget.report(slice_of_run, agent=getattr(agent, "name", ""))
 
     # 交付物：``passed`` 已经含 ``review_failed``（评审没过照样交，见上），
     # 这里额外放行的只剩 ``max_turns`` —— 它可能已经写出了完整答复，只是没收敛；
     # 有疑点但不确凿，交给人工复核比丢给用户一句空话好。
     # 被护栏拦下的不给（那是确凿的坏产出）；转交的也不给（那一段内容压根不是给用户看的）。
+    #
+    # ⚠️ ``token_budget`` **不在这里**（2026-10-21 明确）：它在注入口抛出 ⇒ ``result``
+    # 是 None ⇒ ``answer`` 本来就是空串，放行等于写一句永远不生效的代码。它必然落到
+    # 判定表第⑤行（failed + token_budget），那是对的：这次运行确实没有收口。
+    # 流式下客户端已经收到的增量由接口层按既有口径下发（与超时中断同一条路），
+    # 不在这里伪造一份"交付物"。
     deliverable = answer if passed or exit_reason == "max_turns" else ""
 
     # 兜底判定（第 5 步）：**转交**那一步不进表 —— 它没有交付物，拿它进表会让每一次
