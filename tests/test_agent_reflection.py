@@ -1252,3 +1252,127 @@ def test_level_two_ignores_the_injection_budget():
     assert out.input[0] == {"role": "user", "content": "问"}
     assert len(out.input) == 2
     assert ctx.reflection.injected == R.max_level1(), "第 2 级不该动第 1 级的计数"
+
+
+# --------------------------------------------------------------------------- #
+# 八、原始目标：反思要判"偏没偏"，先得知道"题是什么"（2026-10-21）
+#
+# 在这之前，反思拿到的证据只有"动作清单 + 四个计数"，**没有目标**。于是 ``off_track``
+# 实际上是靠工具名猜意图：判出来了也给不出"偏离了哪一句要求"的建议。下面这组用例钉的
+# 是"目标进得来、进得对、进得有界"，以及"没有目标时不编一句假目标"。
+# --------------------------------------------------------------------------- #
+def test_evidence_carries_the_original_goal():
+    """★ 证据第一行必须是原始目标 —— 判 ``off_track`` 的唯一参照。"""
+    ctx = TaskContext(goal="把这份 PDF 里的三张表整理成对比结论")
+    _do(ctx, "kb_search", '{"q": "表1"}', 1)
+
+    evidence = R.evidence_of(ctx)
+
+    assert evidence.splitlines()[0].endswith("把这份 PDF 里的三张表整理成对比结论")
+    assert "原始目标" in evidence
+
+
+def test_evidence_omits_the_goal_line_when_there_is_none():
+    """★ 没有目标时**整行不写**，不许编一句"完成用户的任务"顶上。
+
+    编一句放之四海皆准的目标，等于让 ``off_track`` 永远判不出来 —— 任何动作都
+    "还算在完成任务"。那样比没有目标更糟：它看起来在工作，实际永远不会报警。
+    """
+    ctx = TaskContext()
+    _do(ctx, "kb_search", '{"q": "a"}', 1)
+
+    evidence = R.evidence_of(ctx)
+
+    assert "原始目标" not in evidence
+    assert evidence.startswith("工具调用共")
+
+
+def test_a_long_goal_is_truncated_with_a_marker():
+    """★ 目标有上限，且截断要**标出来**。
+
+    上限的理由与证据条数同源：输入必须有界（它与主线共用同一份网关配额）。标记的理由
+    不同 —— 不标的话模型会把截断处当成目标的结尾，然后按半句话判"偏离"。
+    """
+    ctx = TaskContext(goal="甲" * (R._MAX_GOAL_CHARS + 200))
+    _do(ctx, "kb_search", '{"q": "a"}', 1)
+
+    evidence = R.evidence_of(ctx)
+
+    assert "（已截断）" in evidence
+    assert evidence.count("甲") <= R._MAX_GOAL_CHARS, "目标没截断（反思输入会随用户输入膨胀）"
+
+
+def test_the_note_reads_the_goal_back():
+    """★ 提醒里要**回读一次**目标：修正做法时唯一能参照的就是它。"""
+    finding = R.ReflectiveFinding(problem="loop", summary="同一个检索做了第 4 次")
+
+    note = finding.as_note(goal="写一份季度财报解读")
+
+    assert "回到原始目标看一遍：写一份季度财报解读" in note
+
+
+def test_the_revert_note_reads_the_goal_back():
+    """撤回一步之后"接下来该干什么"只能由目标回答，否则模型会挑个"更安全"的动作重来。"""
+    finding = R.ReflectiveFinding(problem="loop", step=3, tool="kb_search", call_id="c3")
+
+    note = finding.as_revert_note(goal="写一份季度财报解读")
+
+    assert "回到原始目标看一遍：写一份季度财报解读" in note
+
+
+def test_both_notes_stay_clean_without_a_goal():
+    """没有目标时不出现"回到原始目标看一遍："这个空壳（否则模型会以为目标就是空的）。"""
+    finding = R.ReflectiveFinding(problem="loop", step=3, call_id="c3")
+
+    assert "回到原始目标" not in finding.as_note()
+    assert "回到原始目标" not in finding.as_revert_note()
+
+
+def test_the_goal_is_fixed_at_run_start(tmp_path):
+    """★ 目标在**运行开始时**定格成本轮那句话。
+
+    现读的话，反思后台任务拿到的是"已经跑了几步之后"的上下文 —— 它必须与"这一步
+    为什么被做"对齐，而不是与被判的那一刻对齐。
+    """
+    ctx = make_ctx(tmp_path)
+    model = ScriptedModel([decide("答复。")])
+
+    asyncio.run(_run_frontline("写一份季度财报解读", ctx=ctx, model=model))
+
+    assert ctx.goal == "写一份季度财报解读"
+
+
+def test_a_revise_round_targets_the_feedback_not_the_old_prompt(tmp_path):
+    """★ 人工打回轮的目标是**意见**，不是那句原话。
+
+    写原话的后果很具体：这一轮动作全是在"改稿"，而反思面前的目标仍是"写一份…"⇒
+    它一路判 ``ok`` —— 目标写错了比没有目标更糟，因为它让判断看起来合理。
+    """
+    ctx = make_ctx(tmp_path)
+    ctx.human_feedback = "把语气改正式，结论放最前面"
+    model = ScriptedModel([decide("改好了。")])
+
+    asyncio.run(_run_frontline("写一份季度财报解读", ctx=ctx, model=model))
+
+    assert ctx.goal.startswith("按人工审核意见修改：")
+    assert "把语气改正式" in ctx.goal
+    assert not ctx.goal.startswith("写一份季度财报解读")
+
+
+def test_the_goal_reaches_the_model_inside_a_real_run(tmp_path):
+    """★★ 端到端：回读的目标**真的出现在模型看到的输入里**。
+
+    只断言 ``as_note`` 的返回值是不够的 —— 那个字符串还要经过注入口、装回
+    ``ModelInputData``、再交给 SDK 的每一次模型调用。这条走完整链路，断言"模型看到了什么"。
+    """
+    ctx = make_ctx(tmp_path)
+    ctx.reflection.pending.append(
+        R.ReflectiveFinding(problem="loop", summary="同一个检索做了第 4 次")
+    )
+    model = ScriptedModel([decide("答复。")])
+
+    asyncio.run(_run_frontline("把这份 PDF 里的三张表整理成对比结论", ctx=ctx, model=model))
+
+    seen = _flatten(model.calls[0].input)
+    assert "同一个检索做了第 4 次" in seen
+    assert "回到原始目标看一遍：把这份 PDF 里的三张表整理成对比结论" in seen

@@ -375,13 +375,19 @@ class ReflectiveFinding:
     def is_problem(self) -> bool:
         return self.problem in _PROBLEMS and self.problem != "ok"
 
-    def as_note(self) -> str:
+    def as_note(self, *, goal: str = "") -> str:
         """注入模型的文本。
 
         ⚠️ 两句话必须写进去，缺一句都会改变模型的行为：
         ① **"不是用户的新要求"** —— 注入的是一条 system 消息，不写这句，模型可能
            把它当成新任务去做（"好的，我重新开始"），而它要做的恰恰是**接着干**；
         ② **"也不是让你重新开始"** —— 只提醒、不改变任务。
+
+        ``goal``：原始目标。给了就在末尾**回读一次**。这不是装饰 —— 提醒本身只说
+        "你刚才做得可能有问题"，模型修正时唯一能参照的就是它；目标不在眼前时，
+        最常见的反应是"换个更保守的做法把这一步糊过去"，而不是"回到要求上"。
+        每步都回读原文会把历史翻倍，所以只在**提醒真正发生**时回读（这一轮本来
+        也没几步会触发）。
         """
         parts = [f"[自动检查] {self.summary or '系统发现刚才的做法可能有问题'}。"]
         if self.problem in _PROBLEM_TEXT:
@@ -390,19 +396,23 @@ class ReflectiveFinding:
             parts.append(f"涉及第 {self.step} 步。")
         if self.advice:
             parts.append(f"建议：{self.advice}")
+        if goal:
+            parts.append(f"回到原始目标看一遍：{goal}")
         parts.append(
             "这**不是**用户的新要求，也不是让你重新开始 —— 继续当前任务，"
             "但请换一种做法。"
         )
         return " ".join(parts)
 
-    def as_revert_note(self) -> str:
+    def as_revert_note(self, *, goal: str = "") -> str:
         """第 2 级的注入文本：**告诉模型那一步已经被撤掉了**。
 
         ⚠️ 不写"已撤掉"会得到最坏的一种组合：模型看不到那一步，却收到一段
         "你在第 N 步打转"的提醒 —— 它要么当成幻觉忽略，要么再去把那个动作做一遍
         （而"再做一遍"正是退回要阻止的事）。
         ⚠️ **"不是用户的新要求"这句同样必须留**：撤回说明看着更像一条指令。
+        ``goal`` 同样要回读：撤掉一步之后"接下来该干什么"只能由目标回答，
+        否则模型会顺手挑一个"看起来更安全"的动作重来。
         """
         what = f"第 {self.step} 步" + (f"（{self.tool}）" if self.tool else "")
         parts = [
@@ -414,6 +424,8 @@ class ReflectiveFinding:
             parts.append(f"当时看到的情况：{self.summary}。")
         if self.advice:
             parts.append(f"建议：{self.advice}")
+        if goal:
+            parts.append(f"回到原始目标看一遍：{goal}")
         parts.append(
             "这**不是**用户的新要求，也不是让你重新开始 —— 请从那里**之前**重新决定，"
             "换一种做法，不要重复同一个动作。"
@@ -517,6 +529,38 @@ def maybe_reflect(context: Any) -> None:
     task.add_done_callback(state.tasks.discard)
 
 
+_MAX_GOAL_CHARS = 500
+"""喂给反思的原始目标最多多长。
+
+为什么要截：目标就是用户那句话，而入口允许到 10 万字符。整段塞进去会让"判一次
+打转"的输入随用户输入线性膨胀 —— 而反思只想知道"要解决什么"，不需要原文的每个字。
+截断会标注出来（``（已截断）``），不让模型以为那就是全文。
+"""
+
+
+def _goal_text(context: Any) -> str:
+    """清洗 + 截断后的原始目标；没有目标时返回空串。
+
+    ⚠️ 没有目标时必须返回空串、由调用方**整行不写**，而不是写一句"完成用户的任务"：
+    一句放之四海皆准的目标会让 ``off_track`` 永远判不出来 —— 任何动作都"还算在完成
+    任务"，而那正是这条证据要防的失灵。
+    """
+    goal = " ".join(str(getattr(context, "goal", "") or "").split())
+    if not goal:
+        return ""
+    if len(goal) > _MAX_GOAL_CHARS:
+        goal = goal[:_MAX_GOAL_CHARS] + "…（已截断）"
+    return goal
+
+
+def _goal_line(context: Any) -> str:
+    """证据里那行原始目标；没有目标时返回空串。"""
+    goal = _goal_text(context)
+    if not goal:
+        return ""
+    return f"原始目标（判断是否偏离时以它为准）：{goal}"
+
+
 def evidence_of(context: Any) -> str:
     """交给反思模型的**证据**（结构化、只给有迹象的那几条）。
 
@@ -555,7 +599,11 @@ def evidence_of(context: Any) -> str:
     picked = picked[-_MAX_EVIDENCE:]
 
     counts = counts_of(context)
-    lines = [
+    lines: list[str] = []
+    goal = _goal_line(context)
+    if goal:
+        lines.append(goal)
+    lines += [
         f"工具调用共 {counts['tools']} 次（其中重量级 {counts['heavy']} 次），"
         f"换人 {counts['hops']} 次，同一动作最多重复 {counts['repeat']} 次。",
         "涉及的动作（可能不全，只列了有迹象的）：",
@@ -719,7 +767,8 @@ def _one_line(value: Any) -> str:
 # 反思本身（旁路模型；同步实现，由 ``_run`` 丢进线程）
 # --------------------------------------------------------------------------- #
 _REFLECT_PROMPT = (
-    "你在监督一个正在执行任务的智能体。下面给你它**已经做过的动作**与四个计数。"
+    "你在监督一个正在执行任务的智能体。下面给你它**要做的事**、"
+    "**已经做过的动作**与四个计数。"
     "请判断它是不是出了问题，并**只输出一个 JSON 对象**，字段如下：\n"
     '{"problem": "ok|loop|stuck|off_track", "summary": "一句话说明", '
     '"step": 出问题的步号（没有就给 0）, "advice": "一句可执行的建议"}\n'
@@ -729,6 +778,11 @@ _REFLECT_PROMPT = (
     "- loop：在原地打转 —— 同一个动作被反复做。\n"
     "- stuck：卡住了 —— 反复失败，没有推进。\n"
     "- off_track：偏离了原来的任务。\n"
+    "\n"
+    "判 off_track 时必须对照第一行的「原始目标」：问自己"
+    "「照现在这条路走下去，还能交付目标要的那个东西吗」。"
+    "**只有明显答偏（做的是另一件事、或早就跑题）才判它** —— "
+    "目标没写全、动作看起来绕着走但仍在为它服务，都算 ok。\n"
     "\n"
     "硬性要求：不要解释、不要客套话、不要输出 JSON 以外的任何内容；"
     "没有把握时给 ok。"
@@ -884,6 +938,8 @@ async def inject_reflections(model_data: Any, *, context: Any = None) -> Any:
     changed = items is not original
 
     notes: list[str] = []
+    #: 原始目标只取一次 —— 提醒与退回文案都要回读它（见 ``as_note`` 的说明）。
+    goal = _goal_text(context)
     for finding in state.pending:
         if finding.level == 2:
             items, dropped = _apply_revert(items, state, finding)
@@ -897,7 +953,7 @@ async def inject_reflections(model_data: Any, *, context: Any = None) -> Any:
                 state.stopped = state.stopped or "not_found"
                 continue
             changed = True
-            notes.append(finding.as_revert_note())
+            notes.append(finding.as_revert_note(goal=goal))
             observability.counter("agent_recovery_level_total", level="2")
             logging.info(
                 "第 2 级：撤回第 %d 步（%s，call_id=%s），连带移除 %d 条上下文条目",
@@ -905,7 +961,7 @@ async def inject_reflections(model_data: Any, *, context: Any = None) -> Any:
             )
             continue
         if _take_level1_slot(state):
-            notes.append(finding.as_note())
+            notes.append(finding.as_note(goal=goal))
     state.pending.clear()
 
     if state.stopped:

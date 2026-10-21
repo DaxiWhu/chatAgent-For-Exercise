@@ -504,3 +504,44 @@ def test_config_exposes_compaction_for_startup_echo():
     assert hist["compact"] is False  # 默认关
     assert hist["keep_rounds"] >= 1
     assert 0 < hist["compact_ratio"] <= 1
+
+
+# --------------------------------------------------------------------------- #
+# 摘要必须带**步骤骨架**（2026-10-21，对照 `agent/心得.md` 的「多处理」一节）
+#
+# 心得原文："在上下文进行压缩的时候保留结构性摘要（即保留步骤编号，动作，关键结果和
+# 是否成功）"。原来那条提示词只要求"需求与约束 / 已结论 / 进行到哪一步"——压完一段
+# 二十步的任务，接手者知道"进行到哪一步"，却不知道前十九步做过什么、哪几步失败了。
+# 后果很具体：摘要里没有"这条路走不通"的信息，模型只能把那条路再试一遍才知道。
+#
+# ⚠️ 为什么用"读提示词"这种结构断言：这条要求**只存在于提示词里**，没有任何运行时
+# 行为能证明它 —— 摘要内容由模型自由生成，用例造不出稳定断言。所以钉住"指令里必须
+# 有这四要素"，而不是钉住某一次摘要长什么样。
+# --------------------------------------------------------------------------- #
+def test_the_summary_prompt_demands_a_step_skeleton():
+    prompt = C._SUMMARY_PROMPT
+
+    assert "第 N 步" in prompt, "没要求按步编号 —— 摘要会退化成一段自由文本"
+    assert "动作" in prompt
+    assert "关键结果" in prompt
+    assert "失败" in prompt and "未完成" in prompt, (
+        "没要求保留失败/未完成的步骤 ⇒ 接手者会把走不通的路再试一遍"
+    )
+
+
+def test_the_summary_prompt_keeps_its_two_anti_fabrication_rules():
+    """结构要求不能把原来两条硬约束挤掉：不编造、不评价。
+
+    第一条尤其要紧 —— 摘要会被当成"很久以前确实发生过的事"塞进模型输入，编造一条
+    步骤的后果是模型据此推断"这一步已经做过了"，然后跳过真正该做的事。
+    """
+    prompt = C._SUMMARY_PROMPT
+
+    assert "不许编造" in prompt
+    assert "结果未明" in prompt, "看不出成败时要允许它说不知道，而不是硬编一个成功"
+    assert "不要写建议" in prompt
+
+
+def test_the_summary_prompt_still_caps_its_length():
+    """上限必须留着：摘要是"更省"，不是"再存一份全文"。"""
+    assert "字以内" in C._SUMMARY_PROMPT

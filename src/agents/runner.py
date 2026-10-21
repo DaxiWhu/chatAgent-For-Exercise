@@ -514,6 +514,25 @@ def _build_input_items(
     return items
 
 
+def _goal_of(prompt: str, context: TaskContext) -> str:
+    """本轮"要解决的问题"的一句话表述（写进 ``context.goal``）。
+
+    三种情形必须分开，否则反思拿到的是一个**错的目标**，比没有目标更糟：
+
+    * **人工打回轮** —— ``prompt`` 还是那句原话（前台是本轮第一个节点），但这一轮真正
+      要做的是"按意见改"。写原话会让反思以为一切照旧，而它面前的动作全是"在改稿"⇒
+      一路判 ``ok``。所以这里写的是意见。
+    * **正常轮** —— 用户那句话。
+    * 两者都为空（理论上不会）—— 空串，反思那一侧会跳过目标行（见
+      ``reflection.evidence_of``），**不要**在这里编一句"完成用户的任务"顶上：
+      一句放之四海皆准的目标会让 ``off_track`` 永远判不出来。
+    """
+    feedback = (context.human_feedback or "").strip()
+    if feedback:
+        return f"按人工审核意见修改：{feedback}"
+    return (prompt or "").strip()
+
+
 async def _run_streamed(
     agent: Agent[TaskContext],
     run_input: Any,
@@ -653,6 +672,10 @@ async def run_agent(
         # "那次运行实际收到的"对不上，排查时无从复现。
         context.thread_id = session_id
         context.supplement_cursor = supplements.cursor(session_id)
+        # 目标在**运行开始时**定格：反思闸门要拿它判"还在不在解题"，而它跑在后台、
+        # 只能读上下文 —— 现读的话拿到的是"已经跑了几步之后"的上下文，与判据同源
+        # 就没意义了（它必须与"这一步为什么被做"对齐，不是与被判的那一刻对齐）。
+        context.goal = _goal_of(prompt, context)
 
     answer = ""
     exit_reason = "error"
