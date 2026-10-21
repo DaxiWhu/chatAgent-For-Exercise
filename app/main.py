@@ -2298,14 +2298,29 @@ async def _turn_events(turn, context, out: dict):
         await queue.put((text, call_id))
 
     async def _drive() -> None:
-        try:
-            out["outcome"] = await run_turn(turn, context=context, on_text=_push)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001  统一交给调用方
-            out["error"] = e
-        finally:
-            queue.put_nowait(sentinel)
+        # trace 属性挂在**真正跑运行的那个任务里**，不是外面：`propagate_attributes`
+        # 靠 span **启动时**读 context 生效，而 span 全在 `run_turn` 内部创建。
+        # 放这里还有一个好处 —— attach / detach 落在同一个任务上下文里，不会把
+        # 属性泄给同进程的其它并发请求。
+        #
+        # 挂的是「日志里那个 rid」+ 会话 + 租户：用户报"这次答得不对"时只拿得出
+        # rid，不挂上去就只能按时间点捞。取不到引擎或没配后端时，`trace_scope`
+        # 退化成 nullcontext，这里没有分支。
+        with tracing.trace_scope(
+            request_id=get_request_id(),
+            thread_id=getattr(turn, "thread_id", "") or getattr(context, "thread_id", ""),
+            # 租户取 `turn.tenant`（端点归一后的检索租户）而不是 `context.tenant`：
+            # 后者是由前者派生的，拿派生值会让"某一层忘了传"看起来像"没有租户"。
+            tenant=getattr(turn, "tenant", "") or getattr(context, "tenant", ""),
+        ):
+            try:
+                out["outcome"] = await run_turn(turn, context=context, on_text=_push)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001  统一交给调用方
+                out["error"] = e
+            finally:
+                queue.put_nowait(sentinel)
 
     task = asyncio.create_task(_drive())
     try:

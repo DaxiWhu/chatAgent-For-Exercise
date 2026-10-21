@@ -156,8 +156,8 @@ class TaskContext:
     """取检索器的**工厂**（不是实例）。
 
     刻意传工厂而不是实例：检索器是按租户懒加载 + 有界缓存的（见
-    ``graph.get_retriever``），在任务开始时就取等于把"可能用不上"的那次构建
-    提前做掉。工厂让"真正调 kb_search 时才构建"这件事保持成立。
+    ``src/rag/pool.py`` 的 ``get_retriever``），在任务开始时就取等于把"可能用不上"
+    的那次构建提前做掉。工厂让"真正调 kb_search 时才构建"这件事保持成立。
     """
 
     citations: list = field(default_factory=list)

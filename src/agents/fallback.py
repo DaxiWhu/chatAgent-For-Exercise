@@ -143,7 +143,7 @@ def decide(context: Any, *, exit_reason: str, answer: str) -> FallbackVerdict:
 
     # ① 崩溃 / 限流 / 协议错：运行**根本没跑成**，谈不上"内容对错"。
     # 排在最前是有意的：这条路径没有草稿可审（产出为空），送进审核队列只会多出一条
-    # "原因不明"的待审项。开发信号照发（见 graph 侧的 WARNING 与指标）。
+    # "原因不明"的待审项。开发信号照发（见 ``run_agent`` 收尾处的 WARNING 与指标）。
     if exit_reason == "error":
         return FallbackVerdict(FAILED, "error", SYSTEM, unfinished)
 
@@ -166,7 +166,7 @@ def decide(context: Any, *, exit_reason: str, answer: str) -> FallbackVerdict:
 
     # ④ 护栏拦下的：**业务类** ⇒ 转人工。这里**有意偏离**官方"被拒的输出不落库"的语义 ——
     # 被拦下的那段内容会作为草稿存进审核队列，因为"这是不是误拦"没有原文根本判不了。
-    # 草稿由 graph 侧写（入口护栏 = 用户那句请求；出口护栏 = 被拒的产出）。
+    # 草稿由 ``run_agent`` 收尾时写（入口护栏 = 用户那句请求；出口护栏 = 被拒的产出）。
     if exit_reason in ("input_guardrail", "output_guardrail"):
         return FallbackVerdict(MANUAL, "guardrail", BUSINESS, unfinished)
 
@@ -206,7 +206,7 @@ def report(verdict: FallbackVerdict, *, exit_reason: str, agent: str) -> None:
     （见 ``tests/test_agents_pipeline.py::test_each_run_reports_its_own_agent_label``）。
 
     为什么单独一个函数、由 ``runner`` 在判定后立刻调一次：上报点必须跟判定点一样只有一个。
-    散成"图里也报一次、接口层再报一次"，第一个后果就是同一次运行被记两遍，
+    散成"``run_agent`` 里报一次、接口层再报一次"，第一个后果就是同一次运行被记两遍，
     看板上的完成率立刻失真。
 
     决策 10（"没产出、也没异常信号时开发人员需要知道"）落成：**一条 WARNING 日志

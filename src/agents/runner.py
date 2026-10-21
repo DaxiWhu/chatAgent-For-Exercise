@@ -143,8 +143,9 @@ class TaskOutcome:
     attempts: int
     """本轮的 ``Runner.run`` 次数。
 
-    评审改成 ``as_tool`` 后不再有重试循环，所以恒为 1；保留字段是为了
-    ``graph`` 能照旧写 state 的 ``iteration``。
+    评审改成 ``as_tool`` 后不再有重试循环，所以恒为 1 —— **它不再是"返工几轮"的
+    信号**（那个看 ``AgentStats.review_rounds``）。字段留着是因为调用方（能力探针
+    脚本、日志）把它当"这一次跑了几回"报出来，删了要让那些输出改格式。
     """
 
     final_agent: str
@@ -180,8 +181,9 @@ class TaskOutcome:
     fallback: fallback.FallbackVerdict | None = None
     """兜底判定（第 5 步）。``None`` = 没判（**转交**那一步没有交付物，不进判定表）。
 
-    ⚠️ 它是**收尾口径的唯一来源**：图那两处收尾（``frontline`` / ``literary``）不再各自
-    判"该交还是该停"，只读这个结论。两处各判一次的结果必然是两套规则，改一处漏一处。
+    ⚠️ 它是**收尾口径的唯一来源**：`run_agent` 收尾时判一次、写在这里，服务层只管
+    按它下发事件。判两次的结果必然是两套规则 —— 改一处漏一处，而症状是"某类失败
+    该转人工却直接报错"，只有对应用例能发现。
     """
 
     fallback_draft: str = ""
@@ -190,16 +192,6 @@ class TaskOutcome:
     ⚠️ 它**不是交付物**。官方语义是"被拒的候选输出不落库"，这里有意偏离，
     只为让审核人判断"这是不是误拦" —— 那种判断没有原文根本做不了
     （``PLAN_step5_fallback.md`` §11）。
-    """
-
-    decision: dict[str, Any] = field(default_factory=dict)
-    """**已废弃**（2026-10-20）：此前装的是前台的 ``FrontlineDecision``，供图的条件边路由。
-
-    换成官方 handoff 之后，"这一步是谁收的尾"由 ``final_agent`` 表达、有没有换人由
-    ``handoffs`` 表达，不再需要任何结构化判定。``app/main.py`` 与 ``src/graph.py``
-    的读者都已随图删掉；现在只剩 ``scripts/agent_capability_probe.py`` 与
-    ``tests/test_agents_pipeline.py`` 按"本轮是 reply 还是 transfer"读它。
-    新代码不要再读 —— 要判"有没有转交"请看 ``exit_reason`` / ``final_agent``。
     """
 
     approvals: list[approval.ApprovalRequest] = field(default_factory=list)
@@ -343,13 +335,13 @@ def build_run_config(model: Any | None = None) -> RunConfig:
     父 run 的**（SDK 源码：``resolved_run_config = run_config or context.run_config``）。
     ⇒ 这里挂一次，前台、专家、嵌套 run 全部用同一个模型。
 
-    出口护栏挂在这里：它只对"产出**最终输出**的那个 agent"生效，而拆成图节点之后
-    "谁是最后一个 agent"取决于走到哪个节点（前台答复 → 前台；转交 → 文学专家）——
+    出口护栏挂在这里：它只对"产出**最终输出**的那个 agent"生效，而"谁是最后一个
+    agent"取决于这一轮有没有发生交接（自己答复 → 前台；交接 → 文学专家）——
     挂在 RunConfig 才与"谁是最后一个"完全无关。每一次运行的最终输出都会被它检查，
-    而"这一步没有交付物"的情形（转交）由护栏自己跳过，见 ``guards._deliverable``。
+    而"这一步没有交付物"的情形由护栏自己跳过，见 ``guards._deliverable``。
 
     ⚠️ 入口护栏**不在这里**（2026-10-03 从本函数移走）。它现在挂在
-    ``frontline_agent.input_guardrails``：每轮的第一个 agent 节点固定是前台，
+    ``frontline_agent.input_guardrails``：每轮的第一个 agent 固定是前台，
     "第一份输入必被扫"从此是**结构保证**的，不需要再靠"挂得离拓扑远一点"来兜。
     两处都挂会让每次运行跑两遍 —— 官方那两个池子是**相加**：
     ``starting_agent.input_guardrails + (run_config.input_guardrails or [])``。
@@ -394,10 +386,10 @@ def build_run_config(model: Any | None = None) -> RunConfig:
 #: 引用"入口是哪个 agent"，而写在函数体里就只能靠读源码。
 ENTRY_AGENT = frontline_agent
 
-#: 由前台的结构化判定路由过去的那个 agent（文学创作）。
+#: 由前台通过官方 ``handoffs`` 交接过去的那个 agent（文学创作）。
 #:
 #: ⚠️ 它**不是**"第二个前台"：只有前台能答复用户，本 agent 跑完即收尾
-#: （图里 ``literary → route_agent_review``），没有"再转回前台"这条边 ——
+#: （交接之后控制权不回来 —— 官方的 handoff 是"换人接着跑"，没有"再转回前台"这回事），
 #: 入口已经固定为前台，下一轮用户说话自然回到前台。
 LITERARY_AGENT = literary_agent
 
@@ -670,7 +662,6 @@ async def run_agent(
     result = None
     #: 本次运行结束时停在哪个 agent。空 = run 没跑到底 ⇒ 调用方保持 state 原值不变。
     ended_on = ""
-    decision: dict[str, Any] = {}
 
     try:
         if on_text is None:
@@ -765,9 +756,6 @@ async def run_agent(
             and bool(ended_on)
             and ended_on != ENTRY_AGENT.name
         )
-        # ``decision`` 保留给图/接口层的旧读取方，但它是**从上面的既成事实推出来的**，
-        # 不再是模型产出的结构化对象 —— 图删掉之后这个字段应当一起消失。
-        decision = {"action": "transfer" if transfer else "reply", "content": answer}
         # 渲染大纲、收资产：确定性步骤，放在代码里而不是做成工具。
         _flush_deterministic_steps(context)
         # 转交：这次运行没有"前台给用户的答复"，产出是接手方写的东西。
@@ -867,7 +855,6 @@ async def run_agent(
         error=error_kind,
         fallback=verdict,
         fallback_draft=fallback_draft,
-        decision=decision,
         approvals=list(approvals),
         run_snapshot=run_snapshot,
         citations=list(context.citations),

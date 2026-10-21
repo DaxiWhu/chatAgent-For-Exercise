@@ -51,9 +51,9 @@ except Exception:  # noqa: BLE001  .env 缺失时照常跑（用真实环境变�
 # --------------------------------------------------------------------------- #
 CASES = [
     {
-        "name": "文学创作（期望：前台判定 action=transfer → 文学节点接手）",
+        "name": "文学创作（期望：exit_reason=transfer → 文学 agent 接手）",
         "prompt": "写一篇 80 字以内的微型小说，主题是灯塔。",
-        "watch": "前台是否判定转交（对比第 4 条：不该转的有没有乱转）；评审几轮通过",
+        "watch": "这一轮有没有转交（对比第 4 条：不该转的有没有乱转）；评审几轮通过",
     },
     {
         "name": "事实问答（期望：as_tool research + 带引用）",
@@ -92,8 +92,9 @@ async def _run_turn(prompt: str, ctx, *, session_id: str = ""):
     同一次运行内部** —— 再补一次运行就会把同一轮跑两遍：文学那段的产出被覆盖、
     token 与工具调用统计翻倍，而探针照样"看起来正常"。
 
-    返回 `(outcome, ctx, action)`：`action` 取自 `outcome.decision`，它是 runner
-    从**既成事实**（最终 agent 是不是入口 agent）推出来的，不是模型另给的字段。
+    返回 `(outcome, ctx)`。**"有没有转交"读 `outcome.exit_reason`**，不再有一个
+    单独的结构化判定字段（2026-10-21 连同 `TaskOutcome.decision` 一起删了）——
+    那是图时代给条件边用的，而官方的判据只有"运行结束在谁手上"。
     异常**不**在这里兜 —— 调用方要把失败本身报出来。
     """
     from src.agents.runner import ENTRY_AGENT, run_agent
@@ -101,7 +102,7 @@ async def _run_turn(prompt: str, ctx, *, session_id: str = ""):
     outcome = await run_agent(
         ENTRY_AGENT, prompt=prompt, context=ctx, session_id=session_id
     )
-    return outcome, ctx, (outcome.decision.get("action") or "")
+    return outcome, ctx
 
 
 async def _run_one(
@@ -128,11 +129,11 @@ async def _run_one(
     ctx = build_ctx()
     started = time.perf_counter()
     outcome = None
-    action = ""          # 前台那一次运行给出的判定（reply / transfer）
+    transferred = False   # 本次运行是否以"交给别人接手"收尾（判据 = exit_reason）
     error = ""
     for rl_try in range(rl_retries + 1):
         try:
-            outcome, ctx, action = await _run_turn(case["prompt"], ctx)
+            outcome, ctx = await _run_turn(case["prompt"], ctx)
         except Exception as e:  # noqa: BLE001  探测脚本要把失败本身报出来
             outcome, error = None, f"{type(e).__name__}: {e}"
         if outcome is not None:
@@ -146,6 +147,7 @@ async def _run_one(
             ctx = build_ctx()      # 重建：让重试后的统计是干净的
             started = time.perf_counter()
     wall = time.perf_counter() - started
+    transferred = bool(outcome is not None and outcome.exit_reason == "transfer")
 
     print(f"\n{'=' * 78}")
     print(f"[{index}] {case['name']}")
@@ -164,8 +166,7 @@ async def _run_one(
     stats = ctx.stats.as_dict()
     print(f"出口      : exit_reason={outcome.exit_reason} passed={outcome.passed} "
           f"attempts={outcome.attempts} 最终 agent={outcome.final_agent}")
-    print(f"前台判定  : {action or '<没拿到结构化判定>'}"
-          f"{'（已交给文学节点接手）' if action == 'transfer' else ''}")
+    print(f"转交      : {'是 —— ' + outcome.final_agent + ' 接手' if transferred else '否（本次运行自行收尾）'}")
     if outcome.guardrail:
         print(f"护栏      : {outcome.guardrail}")
     print(f"编排      : 转交记录={_fmt_handoffs(stats.get('handoffs') or [])}")
@@ -188,7 +189,7 @@ async def _run_one(
         "index": index, "name": case["name"], "exit_reason": outcome.exit_reason,
         "passed": outcome.passed, "attempts": outcome.attempts,
         "final_agent": outcome.final_agent, "guardrail": outcome.guardrail or "",
-        "frontline_action": action,
+        "transferred": transferred,
         "handoffs": stats.get("handoffs") or [], "agents": stats.get("agents") or [],
         "model_calls": stats.get("model_calls") or 0,
         "tool_calls": stats.get("tool_calls") or 0,
@@ -204,7 +205,7 @@ def _summary(rows: list[dict]) -> None:
     print(f"\n{'=' * 78}")
     print("能力画像汇总")
     print(f"{'=' * 78}")
-    head = (f"{'#':<3}{'出口':<16}{'判定':<10}{'轮':<3}{'模型':<5}{'工具':<5}"
+    head = (f"{'#':<3}{'出口':<16}{'转交':<10}{'轮':<3}{'模型':<5}{'工具':<5}"
             f"{'检索':<5}{'引用':<5}{'资产':<5}{'耗时':<7}{'评审':<6}")
     print(head)
     print("-" * len(head))
@@ -215,7 +216,7 @@ def _summary(rows: list[dict]) -> None:
             continue
         print(
             f"{r['index']:<3}{r['exit_reason']:<16}"
-            f"{(r.get('frontline_action') or '-'):<10}"
+            f"{('transfer' if r.get('transferred') else '-'):<10}"
             f"{r['attempts']:<3}{r['model_calls']:<5}{r['tool_calls']:<5}"
             f"{r['retrieval_calls']:<5}{r['citations']:<5}{r['assets']:<5}"
             f"{str(r['seconds']) + 's':<7}{r['last_score']:<6}"
@@ -284,7 +285,7 @@ async def _run_cross_turn() -> dict:
     print(f"  会话已存: {len(items)} 条")
 
     print(f"第二句    : {q2}")
-    second, _, _ = await _run_turn(q2, build_ctx(), session_id=sid)
+    second, _ = await _run_turn(q2, build_ctx(), session_id=sid)
     body = (second.answer or "").strip()
     print(f"  回答    : {body[:120] or '<空>'}")
     remembered = "张工" in body or "张" in body

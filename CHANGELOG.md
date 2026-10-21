@@ -11,6 +11,28 @@
 
 ## [Unreleased]
 
+### 变更 — trace 现在能按 `request_id` / 会话反查；`TaskOutcome.decision` 删除（2026-10-21）
+
+上一批把 tracing 接到了官方插桩上，但留了一条断链：**日志里的 `request_id` 在 trace
+里查不到**。这一批补上，同时清掉最后一个图时代的产物。
+
+- **属性注入走 Langfuse 的 `propagate_attributes`**（`app/tracing.py::trace_scope`），
+  在 `_turn_events` 的驱动任务里包住整个运行：挂 `session_id`（会话）+
+  `metadata.request_id` / `metadata.tenant`。用户报 `X-Request-ID` 时能直接搜到链路。
+- **另外两条路都试过、都不行**（都有源码依据，不是猜的）：OpenInference 的
+  `using_attributes` 与官方的 `TracingConfig.metadata` —— 这个插桩的
+  `on_trace_start` 只设 span kind，既不读 OpenInference 的 context 属性、也不转发
+  trace metadata。能生效的是 Langfuse 的 SpanProcessor：它在 `on_start` 里把 context
+  里的传播属性盖到**任何**插桩产生的 span 上。
+- ⚠️ 因此作用域**必须包住整个运行**（属性在 span 启动时读取，事后补只影响新建 span）。
+  `tests/test_observability.py::test_the_turn_runs_inside_the_trace_scope` 钉住这个顺序。
+- **`TaskOutcome.decision` 删除**：它自己写着"图删掉之后应当一起消失"，而图已经删了。
+  字段是 `final_agent` / `exit_reason` 的重复表述（`{"action": "transfer" | "reply"}`），
+  留着就是第二处真相。读者一并改掉：`scripts/agent_capability_probe.py`（改读
+  `exit_reason`）与 `tests/test_agents_pipeline.py` 两处断言。
+- 顺手把 `src/agents/` 里 7 处"现在时"的图描述改成官方口径（`graph.get_retriever`
+  这种已不存在的符号、`run_agent` 收尾处的指代、"图节点"当拓扑讲的地方）。
+
 ### 破坏性变更 — 编排图整体删除：一轮请求 = 一次 `Runner.run`（2026-10-20）
 
 官方 Agents SDK **没有图**这种原语。此前"图还在、只是把某个职责搬出去"的做法到此为止：
@@ -83,9 +105,9 @@
   一次网络请求，配错凭据时会把启动拖住甚至拖死，而可观测配错不该影响可用性。
 - `build_run_config` / `trace_callbacks` 与 `_stream_run` 的 `run_config` 参数一并删除
   （唯一的读者是一句"兜底取 `thread_id`"，而 `TurnRequest.thread_id` 是必填字段）。
-- ⚠️ **`request_id` → trace 这条链现在确实不在**：旧实现把它写进那个没人读的
-  metadata。要恢复得在 OTel 那一层做（resource attribute 或 `TraceConfig`），本次没做
-  —— 别把"日志里有 rid"读成"trace 里能按 rid 搜"。
+- ⚠️ **当时 `request_id` → trace 这条链还不存在**（旧实现把它写进那个没人读的
+  metadata）。2026-10-21 补上了，见本文件顶部那条「trace 现在能按 `request_id` /
+  会话反查」；在那之前别把"日志里有 rid"读成"trace 里能按 rid 搜"。
 - 新增依赖是**可选的**（`requirements.txt` 里以注释形式列出）：`langfuse` +
   `openinference-instrumentation-openai-agents`，不装则整条能力不存在，其余功能不受影响。
 

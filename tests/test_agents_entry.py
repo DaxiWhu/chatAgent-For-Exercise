@@ -169,3 +169,13 @@ def test_removed_routing_primitives_stay_removed():
     stats = AgentStats()
     assert not hasattr(stats, "route") and not hasattr(stats, "route_reason")
     assert hasattr(stats, "review_rounds")
+
+    # 结果上不再有"这一步是 reply 还是 transfer"的结构化判定。
+    # 它是 `final_agent` / `exit_reason` 的重复表述，当年只为图的条件边存在；
+    # 留着就是一个会有人去读的第二处真相（读到的值还会随"从既成事实反推"的
+    # 实现细节漂移）。要判"有没有转交"看 `exit_reason`。
+    from src.agents.runner import TaskOutcome
+
+    assert "decision" not in TaskOutcome.__dataclass_fields__, (
+        "`TaskOutcome.decision` 又回来了 —— 它是图时代给条件边用的重复真相"
+    )

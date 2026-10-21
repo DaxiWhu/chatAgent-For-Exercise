@@ -30,12 +30,43 @@ LangSmith 那一支**只覆盖还在用 LangChain 的脚本**（`scripts/eval_ge
 用 `ChatOpenAI.invoke`），agent 链路不进 LangSmith —— 它的 tracing 认的是
 LangChain 的回调，与官方 SDK 不是一个体系。别把"配了 LANGCHAIN_API_KEY"读成
 "agent 链路也有 trace"。
+
+怎么让一条 trace 能被日志里的 request_id 反查到（2026-10-21）
+--------------------------------------------------------------
+用户报"这次答得不对"时，他手上只有响应头里的 request_id。要能拿它搜到 trace，
+就得把 request_id 挂成 trace 上的属性。三条**看起来**都行、实际只有一条行的路
+（都读过源码，不是猜的）：
+
+1. `openinference.instrumentation.using_attributes(...)` —— **不行**。
+   `OpenAIAgentsInstrumentor` 的 `on_trace_start` 只做一件事：
+   `start_span(name=trace.name, attributes={OPENINFERENCE_SPAN_KIND: AGENT})`。
+   全程没有读过 OpenInference 的 context 属性，也不转发 `trace.metadata`
+   （`_processor.py` 里连 `metadata` 这个词都没出现）。
+2. 官方 `RunConfig.tracing = TracingConfig(metadata={...})` —— **不行**。
+   SDK 自己确实存了这份 metadata，但上面那条说明它不会被这个插桩导出。
+3. Langfuse 的 `propagate_attributes(...)` —— **行**，官方文档在 Agents SDK 那一节
+   用的就是它。原因在 `langfuse/_client/span_processor.py`：
+   `on_start()` 里读 `_get_propagated_attributes_from_context(context)`，然后
+   `_set_span_attributes_within_limit(span, propagated_attributes)` —— 这是挂在
+   **TracerProvider 上的 SpanProcessor**，于是**任何**插桩产生的 span（包括
+   OpenInference 的）只要在作用域内启动，都会被盖上这批属性。
+   ⚠️ 它靠"span 启动时读 context"，所以作用域必须**包住整个运行**，不能事后补
+   —— 事后补只影响之后新建的 span。
+
+因此 `trace_scope()` 是唯一入口：包住一轮 `run_turn`，把 request_id / 会话 /
+租户挂上去。没配后端时它退化成 `nullcontext()`，一个字节都不写。
 """
 
+import contextlib
 import logging
 import os
 
 from . import config
+
+#: 生效的后端名（"langfuse" / "langsmith" / "none"），由 `init_tracing()` 设定。
+#: `trace_scope()` 只认它 —— 不看环境变量，避免"启动时没启用、请求时又按环境变量
+#: 走另一套判断"这种两处真相。
+_ACTIVE_BACKEND = "none"
 
 
 def init_tracing() -> str:
@@ -47,27 +78,79 @@ def init_tracing() -> str:
       - 没配任何后端 ⇒ `agents.set_tracing_disabled(True)`，**彻底不产生 trace**；
       - 配了 Langfuse ⇒ 设置 `LANGFUSE_*` 环境变量并插桩（处理器由插桩自己替换）；
       - 配了 LangSmith ⇒ 只写 `LANGCHAIN_*` 环境变量（对 agent 链路无效，见模块说明）。
+
+    同时把结论记进 `_ACTIVE_BACKEND`，供 `trace_scope()` 使用 —— 重复调用是安全的
+    （每次都会重新判定并覆盖，测试里就是这么用的）。
     """
+    global _ACTIVE_BACKEND
+
     if config.LANGSMITH_API_KEY:
         # LangChain 官方 tracing 只认这几个环境变量名（LANGCHAIN_* 为旧名，同义）。
         os.environ["LANGCHAIN_TRACING_V2"] = "true"
         os.environ["LANGCHAIN_API_KEY"] = config.LANGSMITH_API_KEY
         os.environ["LANGCHAIN_PROJECT"] = config.LANGCHAIN_PROJECT
+        _ACTIVE_BACKEND = "langsmith"
         logging.info("tracing 已启用：LangSmith（project=%s）—— ⚠️ 只覆盖仍用 LangChain "
                      "的脚本，agent 链路不进 LangSmith", config.LANGCHAIN_PROJECT)
         return "langsmith"
 
     if config.LANGFUSE_PUBLIC_KEY and config.LANGFUSE_SECRET_KEY:
         if _enable_langfuse():
+            _ACTIVE_BACKEND = "langfuse"
             logging.info("tracing 已启用：Langfuse（OpenInference OTel 插桩）")
             return "langfuse"
         logging.warning("Langfuse 已配置但初始化失败，本次不产生任何 trace")
         _disable_sdk_tracing()
+        _ACTIVE_BACKEND = "none"
         return "none"
 
     _disable_sdk_tracing()
+    _ACTIVE_BACKEND = "none"
     logging.info("tracing 未配置（Langfuse/LangSmith 均未填），本次不产生 trace")
     return "none"
+
+
+def trace_scope(*, request_id: str = "", thread_id: str = "",
+                tenant: str = ""):
+    """给"接下来这一整轮运行"挂上可反查的属性（会话 / request_id / 租户）。
+
+    request_id: 响应头里回给客户端的那个值 —— **它是用户唯一报得出来的标识**。
+        不挂上去，``grep rid`` 出得来日志、却搜不到任何 trace，"这次答得不对"
+        就只能按时间点大海捞针。
+    thread_id: 会话 id。Langfuse 侧按 session 聚合，多轮对话才连得起来。
+    tenant: 租户。作为 metadata 维度，便于按租户看成本与失败率。
+
+    **必须包住整个运行**（进入作用域之后再调 `Runner.run`）：属性是在 span
+    **启动时**由 Langfuse 的 SpanProcessor 读 context 盖上去的，事后补只影响之后
+    新建的 span。理由与源码位置见模块 docstring。
+
+    没配后端 / 没装 `langfuse` 时返回 `nullcontext()` —— 调用点无需分支判断，
+    也无需 try。
+    """
+    if _ACTIVE_BACKEND != "langfuse":
+        return contextlib.nullcontext()
+    metadata: dict[str, str] = {}
+    if request_id:
+        metadata["request_id"] = request_id
+    if tenant:
+        metadata["tenant"] = tenant
+    if not (thread_id or metadata):
+        return contextlib.nullcontext()
+    try:
+        from langfuse import propagate_attributes  # type: ignore
+    except Exception as e:  # noqa: BLE001  （装了 instrumentor 但没装 langfuse：不产生 trace）
+        logging.debug("没有 langfuse.propagate_attributes，本轮不挂 trace 属性：%s", e)
+        return contextlib.nullcontext()
+    try:
+        # `session_id` / `metadata` 都有校验（US-ASCII、≤200 字符），不合规时
+        # Langfuse 只打 warning 并丢弃该项，不会抛（`propagate_attributes` 的
+        # docstring 明写"Invalid values are logged as warnings and dropped"）。
+        # 所以这里不额外做字符集清洗 —— 清了反而与"日志里那个 rid"对不上。
+        return propagate_attributes(session_id=thread_id or None,
+                                    metadata=metadata or None)
+    except Exception as e:  # noqa: BLE001  （tracing 配错不该打断请求）
+        logging.debug("挂 trace 属性失败，本轮 trace 没有这些维度：%s", e)
+        return contextlib.nullcontext()
 
 
 def _enable_langfuse() -> bool:

@@ -336,9 +336,11 @@ def test_middleware_records_metrics_and_error_counter():
 # 从来没有读者 —— 官方 `Runner.run` 不认 `configurable` / `metadata` —— 所以那
 # 两条用例守的是一个**死行为**，随函数一起删掉了。
 #
-# **request_id → trace 这条链现在确实不在**：要在 OTel 那一层做（resource
-# attribute 或 `TraceConfig`），本次没做。别把"日志里有 rid"读成"trace 里也能按
-# rid 搜"。
+# request_id → trace 这条链在 2026-10-21 补上了，入口是 `tracing.trace_scope()`
+# （Langfuse 的 `propagate_attributes`）。**没有**用 OpenInference 的
+# `using_attributes`，也没有用官方的 `TracingConfig.metadata`：这个插桩两样都不读
+# （`_processor.py::on_trace_start` 只设 span kind）。详见 `app/tracing.py` 的模块
+# docstring，那里贴了三条路的源码依据。
 def test_no_configured_backend_means_no_trace_at_all(monkeypatch):
     """没配任何后端 ⇒ 官方 SDK **根本不产生 trace**，而不是"产生但没地方送"。
 
@@ -441,3 +443,108 @@ def test_langfuse_goes_through_the_official_instrumentor(monkeypatch):
     assert provider.create_trace("probe").trace_id != "no-op", (
         "tracing 被关掉了：插桩拿不到 span，配了等于没配"
     )
+
+
+def test_trace_scope_is_inert_when_no_backend_is_configured(monkeypatch):
+    """没配后端 ⇒ `trace_scope` 必须退化成 `nullcontext`，一位都不写。
+
+    为什么不用 try 兜住"导入失败"就算完：请求热路径上每次调用都去 `import langfuse`
+    会白白付一次模块查找；更要紧的是 —— 如果这里返回的是真作用域，而底层没有
+    TracerProvider，`attach/detach` 照样会跑，出问题时表现为"随机某个请求的 span
+    带着别人的属性"，极难查。所以判据是"没启用就什么都不做"。
+    """
+    import contextlib
+
+    from app import tracing
+
+    monkeypatch.setattr(tracing, "_ACTIVE_BACKEND", "none")
+    scope = tracing.trace_scope(request_id="rid-1", thread_id="t-1", tenant="acme")
+    assert isinstance(scope, contextlib.nullcontext)
+    with scope:      # 进出都不该抛
+        pass
+
+
+def test_trace_scope_hands_the_request_id_and_session_to_langfuse(monkeypatch):
+    """配了 Langfuse ⇒ 把 request_id / 会话 / 租户交给 `propagate_attributes`。
+
+    为什么是它、不是 `using_attributes` 或官方的 `TracingConfig.metadata`：
+    这个插桩两样都不读（`_processor.py::on_trace_start` 只设 span kind），而
+    Langfuse 的 SpanProcessor 会在 `on_start` 里把 context 里的传播属性盖到**任何**
+    span 上。依据见 `app/tracing.py` 的模块 docstring。
+    """
+    import contextlib
+    import sys
+    import types
+
+    from app import tracing
+
+    seen: dict = {}
+
+    def _fake_propagate(**kwargs):
+        seen.update(kwargs)
+        return contextlib.nullcontext()
+
+    lf = types.ModuleType("langfuse")
+    lf.propagate_attributes = _fake_propagate
+    monkeypatch.setitem(sys.modules, "langfuse", lf)
+    monkeypatch.setattr(tracing, "_ACTIVE_BACKEND", "langfuse")
+
+    with tracing.trace_scope(request_id="rid-abc", thread_id="t-9", tenant="acme"):
+        pass
+
+    assert seen["session_id"] == "t-9", "会话没交给 Langfuse：多条 trace 聚不到同一个 session 上"
+    assert seen["metadata"] == {"request_id": "rid-abc", "tenant": "acme"}, (
+        "request_id 没进 trace 属性 —— 用户报的 rid 就只能搜到日志、搜不到链路"
+    )
+
+
+def test_the_turn_runs_inside_the_trace_scope(monkeypatch):
+    """`_stream_run` 必须**真的**把运行包在作用域里，且顺序是"先进入、再跑"。
+
+    这一条是上一版 tracing 的死因复刻：函数写对了、没人调，代码看起来接上了而一条
+    trace 都没有。所以钉两件事：
+      · 作用域拿到了 rid / 会话 / 租户（从 `get_request_id()` 与 turn 读，不是空转）；
+      · 进入作用域发生在 `run_turn` **之前**、退出在其后 —— 属性是靠 span **启动时**
+        读 context 生效的，包错了位置等于没挂。
+    """
+    import asyncio
+    import contextlib
+
+    from app import main as M
+    from src.agents.runner import TaskOutcome
+
+    seen: dict = {}
+
+    @contextlib.contextmanager
+    def _fake_scope(**kwargs):
+        seen["kwargs"] = kwargs
+        seen["entered"] = True
+        yield
+        seen["exited"] = True
+
+    class _Turn:
+        async def __call__(self, req, *, context, on_text=None):
+            seen["entered_before_run"] = seen.get("entered", False)
+            return TaskOutcome(answer="ok", attempts=1,
+                               final_agent="frontline_agent",
+                               passed=True, exit_reason="passed")
+
+    monkeypatch.setattr(M.tracing, "trace_scope", _fake_scope)
+    monkeypatch.setattr(M, "run_turn", _Turn())
+
+    async def _drain() -> list:
+        return [ev async for ev in M._stream_run(
+            M.TurnRequest(prompt="hi", thread_id="t-1", tenant="t1"), "chat",
+            tenant="t1", subject="u1", thread_id="t-1")]
+
+    token = set_request_id("rid-wire")
+    try:
+        events = asyncio.run(_drain())
+    finally:
+        reset_request_id(token)
+
+    assert seen["kwargs"] == {"request_id": "rid-wire", "thread_id": "t-1",
+                              "tenant": "t1"}, "作用域拿到的是空值 —— 那等于没挂"
+    assert seen["entered_before_run"] is True, "作用域在运行开始之后才进 —— span 已经建好了"
+    assert seen.get("exited") is True
+    assert any(e.get("event") == "done" for e in events)

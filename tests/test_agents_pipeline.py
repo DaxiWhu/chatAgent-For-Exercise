@@ -268,7 +268,6 @@ def test_handoff_ends_the_run_on_the_literary_agent(tmp_path):
     model.assert_complete()
 
     assert out.exit_reason == "transfer"
-    assert out.decision["action"] == "transfer"
     assert out.final_agent == "literary_writer"
     assert out.answer == "灯塔守望者的第七个冬天。"
     assert out.passed is True
@@ -406,7 +405,9 @@ def test_as_tool_research_keeps_control_at_the_frontline(tmp_path):
     model.assert_complete()
 
     assert out.final_agent == "frontline_agent"
-    assert out.decision["action"] == "reply"
+    # "没有转交"的判据只有两个：结束在谁手上、`exit_reason` 是不是 transfer。
+    # 图时代的 `decision["action"]` 已随图删除（它本来就是这两件事实的重复表述）。
+    assert out.exit_reason != "transfer"
     assert ctx.stats.handoffs == []                  # 没有发生转移
     assert "researcher" in ctx.stats.agents          # 但专家确实被调用了
     assert len(ctx.citations) == 1 and ctx.citations[0]["n"] == 1

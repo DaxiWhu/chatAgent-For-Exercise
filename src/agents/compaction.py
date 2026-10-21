@@ -297,10 +297,10 @@ _SUMMARY_PROMPT = (
     "控制在 400 字以内。"
 )
 
-#: 摘要客户端（懒建、进程内唯一）。**同步** client：四个调用点里有三个在协程里
-#: （走 ``asyncio.to_thread``），一个在图节点里（langgraph 把同步节点丢进线程池，
-#: 见 ``pregel/_call.py`` 的 ``run_in_executor``）—— 用同步 client + 到线程里跑，
-#: 两条路只需要**一份**实现，也不会出现"异步 client 绑在别的 loop 上"的问题。
+#: 摘要客户端（懒建、进程内唯一）。**同步** client：调用方既有协程（走
+#: ``asyncio.to_thread``）、也有脚本/启动期的同步上下文（见 ``src/agents/reflection.py``
+#: 同样这么处理）—— 用同步 client + 到线程里跑，两条路只需要**一份**实现，也不会
+#: 出现"异步 client 绑在别的 loop 上"的问题。
 _client: Any = None
 _client_failed = False
 _failure_logged = False

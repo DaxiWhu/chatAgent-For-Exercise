@@ -105,7 +105,7 @@
 
 | 变量 | 当前状态 | 说明 |
 |---|---|---|
-| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_HOST` | 未设置 | Langfuse 链路。**三填二**（host 可留空用官方云）；与 LangSmith 二选一。⚠️ **还需要额外装两个包**：`langfuse` + `openinference-instrumentation-openai-agents`（不在生产 `requirements.txt` 里，见 §3.1）。装了才真的上报；没装时启动日志会明确写"缺依赖"，`tracing` 后端回落 `none` —— **不会**出现"日志说接上了、面板里一条都没有" |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_HOST` | 未设置 | Langfuse 链路。**三填二**（host 可留空用官方云）；与 LangSmith 二选一。⚠️ **还需要额外装两个包**：`langfuse` + `openinference-instrumentation-openai-agents`（不在生产 `requirements.txt` 里，见 §3.1）。装了才真的上报；没装时启动日志会明确写"缺依赖"，`tracing` 后端回落 `none` —— **不会**出现"日志说接上了、面板里一条都没有"。装上之后，每条 trace 上带 `session_id`（会话）与 `metadata.request_id`（响应头回给客户端的那个值）⇒ **用户报 `X-Request-ID` 时能直接搜到那条链路**，不是只能搜日志 |
 | `LANGSMITH_API_KEY` / `LANGCHAIN_PROJECT` | 未设置 | LangSmith 链路（`app/tracing.py` 把这两个值翻译成 LangChain 侧认的三个环境变量：开启开关 / API Key / 项目名 —— LangChain **只认环境变量**，没有别的配置入口）。⚠️ 它覆盖的是 LangChain 那一层调用（如 `scripts/eval_generation.py`），**不覆盖**官方 Agents SDK 自己的 tracing |
 | `METRICS_ENABLED` | ✅ `1` | `/metrics` 已开 |
 | `LOG_FORMAT` | ✅ `json` | 一行一 JSON，便于日志系统检索；本地想看人眼友好改 `text` |
