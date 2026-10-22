@@ -1008,8 +1008,8 @@ def test_token_budget_trims_history_but_never_the_current_turn(tmp_path, monkeyp
     这条会红。
 
     ⚠️ 预算只管**历史**，不管本轮新输入：最后一条永远保留。裁掉它等于模型连用户
-    刚说的话都看不到，而请求会照常成功 —— 最难发现的一种坏。所以两条断言缺一不可：
-    "最老的那条没了" + "本轮那句还在"。
+    刚说的话都看不到，而请求会照常成功 —— 最难发现的一种坏。所以断言是三条：
+    "中间那一轮没了" + "第一轮的原话还在（锚点）" + "本轮那句还在"。
     """
     long_answer = "答" * 400  # 单条就超过预算，确保"条数少但 token 超"
     monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "300")
@@ -1020,7 +1020,11 @@ def test_token_budget_trims_history_but_never_the_current_turn(tmp_path, monkeyp
 
     third = model.calls[2].input
     assert _saw(third, "第三问"), "本轮新输入被一起裁掉了"
-    assert not _saw(third, "第一问"), "最老的条目没被裁掉 ⇒ token 预算没有生效"
+    # 判据用"中间那一轮"而不是"第一问"：第一轮的原话现在被「第一条用户条目」锚点
+    # 钉住（它是"这件事一开始要做什么"，超预算也留）。用"第二问"同样能证明
+    # token 预算在动手 —— 按条数裁的实现两条都不会丢。
+    assert not _saw(third, "第二问"), "中间那一轮没被裁掉 ⇒ token 预算没有生效"
+    assert _saw(third, "第一问"), "第一轮的原话是「最初目标」锚点，必须留下"
 
 
 def test_history_budget_zero_means_unlimited(tmp_path, monkeypatch):
@@ -1101,7 +1105,9 @@ def test_run_config_trims_by_tokens_and_omits_reasoning_ids(monkeypatch):
     data = CallModelData(
         model_data=ModelInputData(
             input=[
-                {"role": "user", "content": "很早以前那句。" * 50},
+                # ⚠️ 第一条刻意是 assistant：``user`` 打头会触发"第一条用户条目"锚点
+                # （它代表"这件事一开始要做什么"，超预算也留），这里就验不出"只剩一条"了。
+                {"role": "assistant", "content": "很早以前的回答。" * 50},
                 {"role": "user", "content": "最近那句。"},
             ],
             instructions="",

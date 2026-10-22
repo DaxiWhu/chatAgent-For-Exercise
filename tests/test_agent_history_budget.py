@@ -80,6 +80,12 @@ def test_filter_passes_through_an_unknown_shape():
 # 2. 裁的口径
 # --------------------------------------------------------------------------- #
 def test_over_budget_drops_the_oldest_and_keeps_the_current_turn(monkeypatch):
+    """超预算时从**最老**的一端丢，且本轮新输入一定留下。
+
+    ⚠️ "最老"有一个例外：**第一条用户条目**被锚点钉住（代表"这件事一开始要做什么"，
+    见 ``test_the_first_user_message_survives``）。所以这里断言的是"中间那段被丢"，
+    不是"除了末条全丢" —— 后者是锚点上线前的口径。
+    """
     monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "50")
     items = [
         {"role": "user", "content": "老问题" * 200},
@@ -87,9 +93,9 @@ def test_over_budget_drops_the_oldest_and_keeps_the_current_turn(monkeypatch):
         {"role": "user", "content": "这一轮"},
     ]
     out = _trim(_cd(items))
-    assert out.input == [{"role": "user", "content": "这一轮"}], (
-        "超预算时必须从**最老的**开始丢，且留下的是本轮新输入"
-    )
+    texts = [i["content"] for i in out.input]
+    assert "这一轮" in texts, "超预算时必须留下本轮新输入"
+    assert "老回答" * 200 not in texts, "中间的旧历史必须从最老的开始丢"
 
 
 def test_the_last_item_survives_even_when_it_alone_exceeds_the_budget(monkeypatch):
@@ -119,7 +125,9 @@ def test_instructions_count_against_the_budget(monkeypatch):
     才显现 —— 平时全绿、偶发报错，最难定位的那一类。
     """
     items = [
-        {"role": "user", "content": "老" * 200},
+        # ⚠️ 第一条刻意用 assistant：这里验的是"指令占不占预算"，而 user 打头会触发
+        # "第一条用户条目"锚点，让两次运行的差异被锚点抹平（判据就测不出来了）。
+        {"role": "assistant", "content": "上一轮的回答" * 200},
         {"role": "user", "content": "这一轮"},
     ]
     budget = _json_tokens(items[0]) + _json_tokens(items[1]) + 5
@@ -142,7 +150,9 @@ def test_orphan_tool_output_is_dropped_with_the_call_it_belongs_to(monkeypatch):
     *"tool call items that do not have corresponding outputs"* 那一族）。
     这一步委托官方 ``drop_orphan_function_calls``，本用例钉的是"它确实被调了"。
     """
-    pad = {"role": "user", "content": "填充" * 300}
+    # ⚠️ 开头这条刻意是 assistant：这里要造的是"被丢的那段"里只有普通条目，
+    # 不含"第一条用户条目"锚点（否则它会被留下，孤儿场景就构造不出来）。
+    pad = {"role": "assistant", "content": "填充" * 300}
     call = {"type": "function_call", "call_id": "c1", "name": "kb_search", "arguments": "{}"}
     output = {"type": "function_call_output", "call_id": "c1", "output": "命中一段"}
     current = {"role": "user", "content": "这一轮"}
@@ -161,11 +171,14 @@ def test_keeps_the_longest_suffix_that_fits(monkeypatch):
 
     边界刻意取"刚好等于预算"：判定必须是 `超了才停`，不是 `够了就停`，
     否则每次都会白丢一轮历史。
+
+    ⚠️ 前两条刻意是 assistant：若用 ``user`` 打头，"第一条用户条目"锚点会把被丢那段
+    里的第一条捞回来，这条判据（后缀长度）就测不准了 —— 锚点有自己的用例。
     """
     items = [
-        {"role": "user", "content": "第一轮" * 100},
-        {"role": "user", "content": "第二轮" * 100},
-        {"role": "user", "content": "第三轮" * 100},
+        {"role": "assistant", "content": "第一步" * 100},
+        {"role": "assistant", "content": "第二步" * 100},
+        {"role": "user", "content": "第三轮要求" * 100},
     ]
     budget = _json_tokens(items[1]) + _json_tokens(items[2])
     monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", str(budget))

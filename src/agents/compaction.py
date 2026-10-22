@@ -294,6 +294,40 @@ _SUMMARY_PROMPT = (
     "控制在 600 字以内。"
 )
 
+_MAX_GOAL_CHARS = 500
+"""传给摘要模型的"最初目标"最多多长。
+
+⚠️ 与 ``reflection._MAX_GOAL_CHARS`` 同一个数、同一个理由：目标就是用户那句话，
+入口允许到 10 万字符，整段塞进去会让**每一次压缩**的输入都跟着用户输入线性膨胀，
+而摘要只需要知道"要解决什么"。两处都改的时候要一起改 —— 它们回答的是同一个问题
+（"目标要精简到什么程度才够判读"），数字不一致只会让排查时多一个变量。
+"""
+
+
+def _summary_system_prompt(goal: str = "") -> str:
+    """摘要提示词，并在给出目标时追加一行"这件事一开始要做什么"。
+
+    ⚠️ 目标必须写在 **system** 里、而不是拼进待压缩的正文：
+    拼进正文它看起来就像"对话里出现过的一句话"，摘要模型可能把它当成用户说过的
+    话再复述一遍（于是摘要里出现一段"用户要求…"的伪引用）；写在 system 里它才是
+    一条**要求**。
+
+    ⚠️ 不写这一行的后果不是"摘要差一点"，而是**摘要的第一项靠猜**：
+    ``_SUMMARY_PROMPT`` 让模型写"任务与约束"，但它只能从被压掉那段对话里反推 ——
+    当那段的开头已经被上一次压缩换成摘要时，唯一还能代表"最初要干什么"的东西
+    就是这里传进来的目标。
+    """
+    text = " ".join(str(goal or "").split())
+    if not text:
+        return _SUMMARY_PROMPT
+    if len(text) > _MAX_GOAL_CHARS:
+        text = text[:_MAX_GOAL_CHARS] + "…（已截断）"
+    return (
+        f"{_SUMMARY_PROMPT}\n\n"
+        f"这件事一开始的目标是：{text}\n"
+        "第一项「任务与约束」必须与它对齐：摘要里描述的任务不能变成另一件事。"
+    )
+
 #: 为什么是"两部分"而不是一句自由文本（2026-10-21 改）
 #: ---------------------------------------------------
 #: 原来只要求"需求与约束 / 已结论 / 进行到哪一步"，于是压完一段二十步的任务，
@@ -384,7 +418,9 @@ def _segment_body(segment: list[Any]) -> str:
     return body
 
 
-def summarize_items(segment: list[Any], *, on_usage: Any = None) -> str:
+def summarize_items(
+    segment: list[Any], *, on_usage: Any = None, goal: str = ""
+) -> str:
     """把一段历史压成摘要（**同步**；没有模型能力时返回空串）。
 
     返回空串有明确含义：**这次压不了**（没配 Key / 建不起 client / 调用失败 /
@@ -394,6 +430,10 @@ def summarize_items(segment: list[Any], *, on_usage: Any = None) -> str:
     on_usage: 拿到这一次的 ``usage`` 时回调一次。**只有窗口压缩那条路会传**
     （它属于某一次运行，成本要进那一次运行的账）；会话写回那条路是后台任务、
     不属于任何一次运行，传 None。
+
+    goal: 这件事**一开始要干什么**。只有窗口压缩那条路会传（它有 ``context``）；
+    会话写回是后台任务、手上只有历史，没有"这一次运行的目标"可传 —— 那时摘要
+    模型只能从对话里反推，如实写在这里，不要以为它总能拿到目标。
 
     ⚠️ 为什么这件事必须做：压缩是**长任务里最贵的一笔**——它要把被压掉的那一整段
     历史（可能几十万 token）重新读一遍。不记账的话，token 预算就是"只管主链路"，
@@ -414,7 +454,7 @@ def summarize_items(segment: list[Any], *, on_usage: Any = None) -> str:
         resp = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": _SUMMARY_PROMPT},
+                {"role": "system", "content": _summary_system_prompt(goal)},
                 {"role": "user", "content": body},
             ],
         )
@@ -442,13 +482,17 @@ def summarize_items(segment: list[Any], *, on_usage: Any = None) -> str:
     return text
 
 
-async def _summarize_async(segment: list[Any], *, on_usage: Any = None) -> str:
+async def _summarize_async(
+    segment: list[Any], *, on_usage: Any = None, goal: str = ""
+) -> str:
     """协程侧的摘要入口：真正的活在**线程**里干。
 
     与 ``history_budget.trim_model_input`` 同一手法 —— 一次同步 HTTP 往返跑在协程里
     会把本进程所有并发请求（含正在推的 SSE 流）一起停住。
     """
-    return await asyncio.to_thread(summarize_items, segment, on_usage=on_usage)
+    return await asyncio.to_thread(
+        summarize_items, segment, on_usage=on_usage, goal=goal
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +789,8 @@ def _items_tokens_over(instructions: str, items: list[Any], trigger: int) -> boo
 
 
 async def compact_for_window(
-    items: list[Any], *, instructions: str = "", on_usage: Any = None
+    items: list[Any], *, instructions: str = "", on_usage: Any = None,
+    goal: str = "",
 ) -> list[Any] | None:
     """**入口二**：将要送进模型的那一份输入超过阈值时，压成「摘要 + 能装下的轮」。
 
@@ -753,6 +798,13 @@ async def compact_for_window(
 
     on_usage: 摘要那次出站调用的 usage 回调（成本要进**这一次运行**的账，
         见 ``budget.note_bypass``）。
+
+    goal: 这件事一开始要干什么（``TaskContext.goal``）。传下去是为了让摘要的
+        第一项「任务与约束」**有据可依**，而不是让模型从被压掉的那段里反推 ——
+        那段可能已经被上一次压缩换成了摘要，越往后的压缩越只能靠这里给。
+        ⚠️ 它只影响摘要的**提示词**，不参与 ``_items_tokens_over`` 的判据：
+        判据量的是"要送进模型的那份输入"，加一段提示词会让压缩更容易触发，
+        而那与"窗口是不是真的快满了"无关。
 
     与"会话侧写回"的分工见模块 docstring 的"为什么窗口压缩不做写回"：这里只改
     **这一次调用送进模型的内容**，库里那份交给历史压缩。
@@ -781,7 +833,7 @@ async def compact_for_window(
     keep_from = _plan_keep_from(payload, keep=keep)
     if keep_from is None:
         return None
-    summary = await _summarize_async(payload[:keep_from], on_usage=on_usage)
+    summary = await _summarize_async(payload[:keep_from], on_usage=on_usage, goal=goal)
     if not summary:
         return None
     tail = payload[keep_from:]

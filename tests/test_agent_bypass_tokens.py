@@ -148,8 +148,9 @@ def test_window_compaction_passes_the_sink_down(monkeypatch):
     """``compact_for_window`` 必须把回调传进摘要函数 —— 漏传就是"记了但没生效"。"""
     got: dict = {}
 
-    async def fake_summarize(segment, *, on_usage=None):
+    async def fake_summarize(segment, *, on_usage=None, **kw):
         got["on_usage"] = on_usage
+        got["extra"] = kw
         return "摘要"
 
     monkeypatch.setattr(C, "history_compact_enabled", lambda: True)
@@ -195,8 +196,9 @@ def test_the_trim_path_wires_compaction_into_the_run_stats(monkeypatch):
 
     got: dict = {}
 
-    async def fake_compact(items, *, instructions="", on_usage=None):  # noqa: ARG001
+    async def fake_compact(items, *, instructions="", on_usage=None, **kw):  # noqa: ARG001
         got["on_usage"] = on_usage
+        got["extra"] = kw
         return None
 
     monkeypatch.setattr(C, "compact_for_window", fake_compact)

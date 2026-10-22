@@ -129,6 +129,33 @@ def test_no_user_item_is_tolerated(monkeypatch):
     assert out.input[-1] == _msg("assistant", "乙")
 
 
+def test_the_first_user_message_survives(monkeypatch):
+    """★★ 预算小到只剩锚点时，**这件事一开始要干什么**也必须还在。
+
+    与 ``test_the_last_user_message_survives_a_tiny_budget`` 是一对：那条钉"本轮
+    该做什么"，这条钉"整件事最初要做什么"。只钉末条时，长任务跑到后半程模型看得见
+    眼前这一步、看不见整件事 —— 表现是局部做得很好、整体答偏。
+
+    ⚠️ 它守的是"**还没被压缩过**"的那段时间：压过一次之后最初那句已经进了摘要，
+    那时代表"最初"的是摘要（由 system 锚点钉住），不是这条用户条目。
+    """
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "1")
+    items = [
+        _msg("user", "一开始要做的事"),
+        _msg("assistant", "好的"),
+        _msg("assistant", "中间一"),
+        _msg("user", "中间插了一句"),
+        _msg("assistant", "最近的返回"),
+    ]
+
+    out = _trim(items)
+
+    texts = [i.get("content") for i in out.input]
+    assert "一开始要做的事" in texts
+    assert "最近的返回" in texts
+    assert "中间一" not in texts, "锚点不是不裁了：中间那条该丢还是要丢"
+
+
 def test_anchors_are_not_counted_as_a_failure_to_trim(monkeypatch):
     """锚点占满之后仍超额 ⇒ 记一条"预算不足"，而不是无声无息。
 
