@@ -99,12 +99,41 @@ from ..envutil import env_int
 
 __all__ = [
     "StepLog",
+    "ToolContractError",
     "ToolStep",
     "calls_from_response",
     "fail_limit",
     "steps_enabled",
     "tool_error_handler",
 ]
+
+try:  # pragma: no cover - SDK 缺失时退化成普通异常（项目整体依赖它，这里只是不添硬依赖）
+    from agents.exceptions import ModelBehaviorError as _ModelBehaviorError
+except Exception:  # noqa: BLE001
+    _ModelBehaviorError = Exception  # type: ignore[assignment,misc]
+
+
+class ToolContractError(_ModelBehaviorError):  # type: ignore[valid-type,misc]
+    """模型给的输入**不满足工具自己的契约**（空内容、多给了不认识的字段……）。
+
+    为什么必须抛，不能 ``return`` 一句"失败"
+    ---------------------------------------
+    工具的返回值在步骤清单里一律算 ``ok``。于是"落盘被拒"会被记成做成了：
+    ``fallback`` 的已完成清单会把它列上去，兜底那边看到的是"这一步成了"。
+    失败只发生在**用户打开文件的那一刻** —— 那是这一整套防护要消灭的形态。
+
+    为什么继承 ``ModelBehaviorError``
+    -------------------------------
+    1. **归因正确**：这是模型填错了，不是实现坏了 ⇒ ``_failure_reason`` 按异常类型
+       自动判成 ``bad_args``（它本来就认这个类型，不需要另外登记一档）。
+    2. **不崩整轮**：官方把任何 ``Exception`` 都先交给工具的失败处理函数
+       （``maybe_invoke_function_tool_failure_error_function``），转成一段文案退回
+       模型重试。换成裸 ``Exception`` 也一样能接住，但会归到 ``error`` 档，让看板把
+       模型的输入错误报成工具实现坏了。
+
+    ⚠️ 消息里必须写清「哪里不对 + 该怎么改」：官方默认文案会把 ``str(error)`` 原样
+    拼进去，那是模型唯一能看到的线索，也是它能一次改对的前提。
+    """
 
 _MAX_DETAIL = 200
 """结果 / 错误摘要的长度上限。只记**摘要**，原文不进日志（与项目口径一致）。"""

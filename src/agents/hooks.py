@@ -169,13 +169,18 @@ class AgentRunHooks(RunHooks[TaskContext]):
         收尾之后另做一件事：**判一次反思闸门**（见 ``reflection.maybe_reflect``）。
         位置选在这里是因为闸门数的几个量（工具总数、重复次数）都是"定格"的产物 ——
         早一步判会读到还没定格的清单，重复数会系统性偏小。
+
+        ⚠️ 工具名**必须传进去**（2026-10-22）：闸门里有一个无条件的检查点是
+        "刚交付"（判产出是否为目标要的东西）。不传名字，那个检查点永远不会触发 ——
+        而"从没在交付前检查过"与"检查了都没问题"在看板上完全一样。
         """
         log = steps_of(context)
+        name = getattr(tool, "name", "") or ""
         if log is not None:
-            log.finish(getattr(tool, "name", "") or "", result)
+            log.finish(name, result)
         inner = getattr(context, "context", None)
         if isinstance(inner, TaskContext):
-            reflection.maybe_reflect(inner)
+            reflection.maybe_reflect(inner, tool=name)
 
 
 AGENT_HOOKS = AgentRunHooks()

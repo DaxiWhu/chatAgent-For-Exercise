@@ -54,6 +54,7 @@ _KNOBS = (
     "AGENT_REFLECT_AFTER_HEAVY",
     "AGENT_REFLECT_AFTER_HOPS",
     "AGENT_REFLECT_ON_REPEAT",
+    "AGENT_REFLECT_AFTER_STARTED",
     "AGENT_REFLECT_MAX_LEVEL1",
     "AGENT_REFLECT_MAX_LEVEL2",
     "AGENT_REFLECT_MAX_FIRES",
@@ -242,7 +243,9 @@ def test_counts_tolerate_an_empty_context():
 # 三、触发：什么时候该看，以及别乱看
 # --------------------------------------------------------------------------- #
 def test_nothing_fires_before_the_threshold(monkeypatch):
-    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=3)
+    # AGENT_REFLECT_AFTER_STARTED=0 关掉"第 2 个动作后无条件检查"那个强制点
+    # （2026-10-22 新增）：本例测的是**计数型判据**的门槛，强制点会让它在第 2 步就响。
+    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=3, AGENT_REFLECT_AFTER_STARTED=0)
     ctx = TaskContext()
     for i in range(1, 3):
         _do(ctx, "kb_search", json.dumps({"q": i}), i)
@@ -254,7 +257,7 @@ def test_nothing_fires_before_the_threshold(monkeypatch):
 
 
 def test_fires_when_the_threshold_is_reached(monkeypatch):
-    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=3)
+    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=3, AGENT_REFLECT_AFTER_STARTED=0)
     ctx = TaskContext()
     for i in range(1, 4):
         _do(ctx, "kb_search", json.dumps({"q": i}), i)
@@ -272,7 +275,7 @@ def test_refires_only_on_the_next_multiple(monkeypatch):
     而每次反思都是一次真实模型调用 ⇒ 反思会比主线还贵（方案风险清单里列过）。
     写成"每个原因只触发一次"的后果：第四步的"没纠正就升级"失去依据。
     """
-    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=8)
+    _enable(monkeypatch, AGENT_REFLECT_AFTER_TOOLS=8, AGENT_REFLECT_AFTER_STARTED=0)
     ctx = TaskContext()
     for i in range(1, 9):
         _do(ctx, "kb_search", json.dumps({"q": i}), i)
@@ -293,7 +296,12 @@ def test_each_reason_keeps_its_own_multiple(monkeypatch):
     ⚠️ 这里刻意用**非重量级**的检索来造"重复"：换成 ``save_text_asset`` 的话
     ``heavy`` 会先到期（它默认阈值只有 3），测的就不是"重复"这一路了。
     """
-    _enable(monkeypatch, AGENT_REFLECT_ON_REPEAT=3, AGENT_REFLECT_AFTER_TOOLS=99)
+    _enable(
+        monkeypatch,
+        AGENT_REFLECT_ON_REPEAT=3,
+        AGENT_REFLECT_AFTER_TOOLS=99,
+        AGENT_REFLECT_AFTER_STARTED=0,
+    )
     ctx = TaskContext()
     for i in range(1, 3):
         _do(ctx, "kb_search", '{"q": "same"}', i)
@@ -799,7 +807,7 @@ def test_a_too_small_fire_cap_warns_once(monkeypatch, caplog):
     R._warn_once_if_the_cap_is_too_small()
     R._warn_once_if_the_cap_is_too_small()
 
-    hits = [r for r in caplog.records if "第 2 级" in r.getMessage()]
+    hits = [r for r in caplog.records if "配置自检" in r.getMessage()]
     assert len(hits) == 1, f"配置自检打了 {len(hits)} 次"
 
 

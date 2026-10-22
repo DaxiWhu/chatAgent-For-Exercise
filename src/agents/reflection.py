@@ -231,6 +231,25 @@ def _on_oscillation() -> int:
     return env_int("AGENT_REFLECT_ON_OSCILLATION", 2, lo=2)
 
 
+_FORCED: tuple[str, ...] = ("delivery", "early")
+"""两个**无条件**检查点的名字（``delivery`` = 刚交付，``early`` = 已经开始动了）。
+
+它们不是计数阈值，而是"时间点"：计数型判据回答"跑了多久该看一眼"，这两个回答
+"这两个时刻**必须**看一眼"。理由见 ``_forced_trigger``。
+"""
+
+
+def _forced_early_after() -> int:
+    """跑到第几个动作时**无条件**检查一次（``0`` = 不启用）。
+
+    默认 **2**：第一次动作之后还看不出方向（那只是"开始了"），第三次又可能已经跑偏
+    两轮。第 2 次是"方向刚成形、还没走远"的那个点 —— 此时判出偏离，代价最小。
+
+    下限 0 是逃生口：配 0 只留下"交付那一刻"那个检查点（更省，但早期跑偏发现得晚）。
+    """
+    return env_int("AGENT_REFLECT_AFTER_STARTED", 2, lo=0)
+
+
 def max_level1() -> int:
     """第 1 级（注入反馈）的上限：一次运行里最多注入几次结论。"""
     return env_int("AGENT_REFLECT_MAX_LEVEL1", 2, lo=1)
@@ -248,12 +267,20 @@ def max_level2() -> int:
 def _max_fires() -> int:
     """一次运行里最多**发起**几次反思。
 
-    ⚠️ 它**必须 ≥ ``max_level1() + max_level2()``**，否则第 2 级永远轮不到：
-    额度会被第 1 级先用光，而"第 2 级从不触发"这件事**不报错、也不影响交付**
-    （见 ``_warn_once_if_the_cap_is_too_small``）。默认 3 = 2 + 1，正好够
-    "提醒 2 次 + 撤回 1 次"。
+    ⚠️ 它**必须 ≥ ``max_level1() + max_level2() + 两个强制检查点``**，否则第 2 级
+    永远轮不到，或者两个强制检查点被计数型判据先占光：
+    额度会被第 1 级先用光，而"第 2 级从不触发"与"交付前没检查"这两件事**都不报错、
+    也不影响交付**（见 ``_warn_once_if_the_cap_is_too_small``）。
+
+    默认值由另外两个配置**推导**（``2 + 1 + 2 = 5``），刻意不写死：这是个"三个数之间
+    必须成立的关系"，写成独立数字只会多出一种配错的组合。``AGENT_REFLECT_MAX_FIRES``
+    仍然可以覆盖。
     """
-    return env_int("AGENT_REFLECT_MAX_FIRES", 3, lo=1)
+    return env_int(
+        "AGENT_REFLECT_MAX_FIRES",
+        max_level1() + max_level2() + len(_FORCED),
+        lo=1,
+    )
 
 
 def _level2_line() -> int:
@@ -290,26 +317,30 @@ _cap_warned = False
 
 
 def _warn_once_if_the_cap_is_too_small() -> None:
-    """配置自检：发起上限装不下两级额度 ⇒ 第 2 级永远轮不到。
+    """配置自检：发起上限装不下"两级额度 + 两个强制检查点" ⇒ 有东西永远轮不到。
 
     ⚠️ 这个组合的危害正是"没有症状"：反思照常触发、提醒照常注入、指标照常在涨，
-    只有"退回"从不发生 —— 而"退回很少见"与"退回不可能发生"在看板上长得一模一样。
+    只有"退回"从不发生、或者"交付前那一眼"从不发生 —— 而"很少见"与"不可能发生"
+    在看板上长得一模一样。
     所以哪怕只是一个 warning 也要打（同 ``history_budget`` 那条打一次就够的做法：
     本函数在**每次工具结束**都会被调到，不能每次都打）。
     """
     global _cap_warned
     if _cap_warned:
         return
-    if _max_fires() >= max_level1() + max_level2():
+    need = max_level1() + max_level2() + len(_FORCED)
+    if _max_fires() >= need:
         return
     _cap_warned = True
     logging.warning(
         "反思闸门配置自检：AGENT_REFLECT_MAX_FIRES=%d < AGENT_REFLECT_MAX_LEVEL1=%d + "
-        "AGENT_REFLECT_MAX_LEVEL2=%d ⇒ **第 2 级（退回）永远不会触发**（额度会被第 1 级"
-        "先用光）。这不会报错、也不影响交付，只会让退回静默失效。",
+        "AGENT_REFLECT_MAX_LEVEL2=%d + 强制检查点 %d ⇒ **退回与强制检查会静默失效**"
+        "（额度会被先到的那几类判据用光）。这不会报错、也不影响交付，只会让某些介入"
+        "永远不发生。",
         _max_fires(),
         max_level1(),
         max_level2(),
+        len(_FORCED),
     )
 
 
@@ -408,7 +439,7 @@ class ReflectiveFinding:
     def is_problem(self) -> bool:
         return self.problem in _PROBLEMS and self.problem != "ok"
 
-    def as_note(self, *, goal: str = "") -> str:
+    def as_note(self, *, goal: str = "", discard_delivery: bool = False) -> str:
         """注入模型的文本。
 
         ⚠️ 两句话必须写进去，缺一句都会改变模型的行为：
@@ -421,6 +452,10 @@ class ReflectiveFinding:
         最常见的反应是"换个更保守的做法把这一步糊过去"，而不是"回到要求上"。
         每步都回读原文会把历史翻倍，所以只在**提醒真正发生**时回读（这一轮本来
         也没几步会触发）。
+
+        discard_delivery：本轮已交付的那份**已被作废**（判出偏离时）。不告诉模型，
+        它会以为"东西已经交出去了"，于是只修后面几步、不再交付 —— 而作废之后
+        ``runner`` 取不到交付物，用户最终拿到的是一段更差的 ``final_output``。
         """
         parts = [f"[自动检查] {self.summary or '系统发现刚才的做法可能有问题'}。"]
         if self.problem in _PROBLEM_TEXT:
@@ -429,6 +464,11 @@ class ReflectiveFinding:
             parts.append(f"涉及第 {self.step} 步。")
         if self.advice:
             parts.append(f"建议：{self.advice}")
+        if discard_delivery:
+            parts.append(
+                "你刚才交付的那一份**已被系统作废、不会发给用户**（它不符合原始目标）。"
+                "请按目标重做，然后用 deliver 重新交付一份。"
+            )
         if goal:
             parts.append(f"回到原始目标看一遍：{goal}")
         parts.append(
@@ -437,7 +477,7 @@ class ReflectiveFinding:
         )
         return " ".join(parts)
 
-    def as_revert_note(self, *, goal: str = "") -> str:
+    def as_revert_note(self, *, goal: str = "", discard_delivery: bool = False) -> str:
         """第 2 级的注入文本：**告诉模型那一步已经被撤掉了**。
 
         ⚠️ 不写"已撤掉"会得到最坏的一种组合：模型看不到那一步，却收到一段
@@ -446,6 +486,10 @@ class ReflectiveFinding:
         ⚠️ **"不是用户的新要求"这句同样必须留**：撤回说明看着更像一条指令。
         ``goal`` 同样要回读：撤掉一步之后"接下来该干什么"只能由目标回答，
         否则模型会顺手挑一个"看起来更安全"的动作重来。
+
+        discard_delivery：本轮已登记的那份交付**同时被作废**。撤回的语义是"从这一步
+        到末尾全部重来"，而交付是那之后的状态快照 ⇒ 留着它就等于"撤了中间几步、却把
+        基于它们做出的结论照样发出去"。
         """
         what = f"第 {self.step} 步" + (f"（{self.tool}）" if self.tool else "")
         parts = [
@@ -457,6 +501,11 @@ class ReflectiveFinding:
             parts.append(f"当时看到的情况：{self.summary}。")
         if self.advice:
             parts.append(f"建议：{self.advice}")
+        if discard_delivery:
+            parts.append(
+                "你刚才交付的那一份**也一并作废了、不会发给用户**"
+                "（它建立在已被撤掉的动作之上）。请重做之后用 deliver 重新交付。"
+            )
         if goal:
             parts.append(f"回到原始目标看一遍：{goal}")
         parts.append(
@@ -472,6 +521,21 @@ class ReflectionState:
 
     fired: dict[str, int] = field(default_factory=dict)
     """每个触发原因**已经触发过几次**（用来算"下一个阈值整数倍"）。"""
+
+    forced: set[str] = field(default_factory=set)
+    """已经用掉的两个**强制检查点**（``delivery`` / ``early``）。
+
+    与 ``fired`` 分开记的理由：``fired`` 的语义是"这个原因触发了几次"，用于算下一次
+    阈值整数倍；强制点没有"下一次"（它就那一个时刻），用 ``fired`` 表达会让
+    ``_due`` 以为它还该按倍数再来。
+    """
+
+    discarded: int = 0
+    """被**作废**的已交付内容次数（判出偏离时清掉 ``delivered["delivery"]``）。
+
+    记次数而不是布尔：一次运行里"交一版 → 判偏离作废 → 再交一版 → 又判偏离"是
+    可能的，而"作废过几次"是判断"这个任务到底有多难收敛"的唯一数据。
+    """
 
     pending: list[ReflectiveFinding] = field(default_factory=list)
     """已拿到、**还没注入**的结论（注入后清空）。"""
@@ -540,31 +604,74 @@ def _state_of(context: Any) -> ReflectionState | None:
 # --------------------------------------------------------------------------- #
 # 发起（钩子调用；**不阻塞**）
 # --------------------------------------------------------------------------- #
-def maybe_reflect(context: Any) -> None:
-    """够了就发起一次反思。**必须在有事件循环的异步上下文里调用**（钩子）。"""
+def _forced_trigger(counts: dict[str, int], state: ReflectionState, tool: str) -> str | None:
+    """两个**无条件**检查点：交付之后、第 N 次动作之后。命中就返回原因名。
+
+    为什么必须有它们（2026-10-22）
+    -----------------------------
+    其余五个触发原因全是**计数型**，而"跑偏"不是计数能表达的：一个动作很快、一次都
+    没重复、也没失败的模型，可以在第 2 步就把方向做错，然后一路顺畅地做完整件错事。
+    计数型判据在这种情况下全程沉默 —— **最贵的失败反而最不会被检查**。
+
+    ``delivery``：交付那一刻最值得看。它是产出定稿的时刻，也是"用户马上要看到"的时刻；
+    此时判出偏离还来得及拦（见 ``inject_reflections`` 里的作废逻辑）。
+
+    ``early``：第 ``AGENT_REFLECT_AFTER_STARTED``（默认 2）个动作之后。此时方向刚成形、
+    还没走远，判出偏离的代价最小。
+
+    只触发一次（``state.forced``）：无条件 ≠ 每圈。每圈都查会让反思比主线还贵，而
+    "第二次看同一个方向"几乎没有新信息 —— 真正需要再看一眼的时刻由 ``delivery`` 负责。
+
+    判定顺序：``delivery`` 在前。两者同时满足时（第 2 个动作恰好是交付）报更具体的那个，
+    否则"交了个错东西"会被记成"早期检查"，看板上追不到原因。
+
+    ``AGENT_REFLECT_AFTER_STARTED=0`` 只关掉 ``early``，``delivery`` 不受它控制 ——
+    交付前那一眼没有"配成 0"的选项：它是这个功能的全部价值所在。
+    """
+    if tool == "deliver" and "delivery" not in state.forced:
+        return "delivery"
+    threshold = _forced_early_after()
+    if threshold > 0 and counts.get("tools", 0) >= threshold and "early" not in state.forced:
+        return "early"
+    return None
+
+
+def maybe_reflect(context: Any, *, tool: str = "") -> None:
+    """够了就发起一次反思。**必须在有事件循环的异步上下文里调用**（钩子）。
+
+    tool: 刚结束的那个工具名。只有 ``deliver`` 会改变判定（见 ``_forced_trigger``）；
+    其余工具名不影响结果，传空串也安全。
+    """
     if not guard_enabled():
         return
     _warn_once_if_the_cap_is_too_small()
     state = _state_of(context)
     if state is None:
         return
+    counts = counts_of(context)
+    forced = _forced_trigger(counts, state, tool)
     if _fired_total(state) >= _max_fires():
-        # ⚠️ 这里的上限是**发起**上限，不是注入上限（第 3 步时两者相等，第 4 步拆开了）：
-        # 第 2 级要在"第 1 级的注入额度已经用光"之后才轮到，用注入上限卡发起次数
-        # 会让退回永远没机会。多发的结论仍然没有位置可去（每次注入都会清空待注入队列），
-        # 所以它本身也不是越小越好 —— 配成 `AGENT_REFLECT_MAX_LEVEL1 + MAX_LEVEL2` 即可。
+        # ⚠️ 强制检查点因为**额度用光**而没发起 ⇒ 这是一次静默退化（"交付前没检查"与
+        # "检查了但没问题"在看板上长得一样）。所以单独计一条，让它可以被看见。
+        if forced:
+            observability.counter(
+                "agent_reflection_skipped_total", reason="cap", trigger=forced
+            )
         return
-    trigger = _due(counts_of(context), state)
+    trigger = forced or _due(counts, state)
     if trigger is None:
         return
     state.fired[trigger] = state.fired.get(trigger, 0) + 1
-    evidence = evidence_of(context)
+    if trigger in _FORCED:
+        state.forced.add(trigger)
+    evidence = evidence_of(context, trigger=trigger)
     try:
         task = asyncio.create_task(_run(context, evidence, trigger))
     except RuntimeError:
         # 没有事件循环（同步调用 / 已关闭）⇒ 放弃这一次。反思是可选能力，
         # 绝不能因为"这里没有 loop"把主线带崩。
         state.fired[trigger] -= 1
+        state.forced.discard(trigger)
         return
     state.tasks.add(task)
     task.add_done_callback(state.tasks.discard)
@@ -602,7 +709,31 @@ def _goal_line(context: Any) -> str:
     return f"原始目标（判断是否偏离时以它为准）：{goal}"
 
 
-def evidence_of(context: Any) -> str:
+_MAX_DELIVERY_CHARS = 1200
+"""交付前检查时，给反思模型看的**正文**长度上限。
+
+为什么要给正文：判"只做了一半就宣布完成"必须有正文可看。不给的话，交付前那次检查
+只能从步骤清单猜产出长什么样 —— 而那正是它要判断的东西。
+
+为什么有上限：正文就是用户那一篇答复，入口允许到 10 万字符。整段塞进去会让"交一次
+就反思一次"的输入随答复长度线性膨胀。1200 字足够看出"结构是否完整、有没有答到目标
+问的那件事"，不够用于逐字评审 —— 逐字评审是人工审核与出口护栏的职责，不是这里的。
+"""
+
+
+def _delivery_line(context: Any) -> str:
+    """交付前检查专用：把"即将交付的正文"给反思模型看（截断并标注）。"""
+    delivered = getattr(context, "delivered", None)
+    text = delivered.get("delivery") if isinstance(delivered, dict) else ""
+    text = " ".join(str(text or "").split())
+    if not text:
+        return ""
+    if len(text) > _MAX_DELIVERY_CHARS:
+        text = text[:_MAX_DELIVERY_CHARS] + "…（已截断）"
+    return f"即将交付给用户的正文（判断是否符合目标时以它为准）：{text}"
+
+
+def evidence_of(context: Any, *, trigger: str = "") -> str:
     """交给反思模型的**证据**（结构化、只给有迹象的那几条）。
 
     只给"有迹象的"是刻意的：把全部步骤发过去，输入会随任务长度线性膨胀，而长任务里
@@ -619,6 +750,9 @@ def evidence_of(context: Any) -> str:
       读起来像"查了两遍资料"而不像"来回试"。这个往复是 ``repeat`` 判据的结构性盲区
       （每个动作都没到 3 次），只有顺序能看出来；
     * 最近两条（保证模型知道"现在停在哪一步"）。
+
+    trigger: 触发原因。``"delivery"`` 时额外给**即将交付的正文** —— 交付前那次检查
+    若看不到正文，就判不出"只做了一半就宣布完成"（见 ``_delivery_line``）。
 
     去重后按发生顺序排列、最多 ``_MAX_EVIDENCE`` 条。
     """
@@ -650,6 +784,14 @@ def evidence_of(context: Any) -> str:
     goal = _goal_line(context)
     if goal:
         lines.append(goal)
+    if trigger == "delivery":
+        lines.append(
+            "这是**交付前**的一次检查：下面那份正文马上要发给用户了。"
+            "请判断它是否真的交付了原始目标要的东西（不只是步骤有没有跑完）。"
+        )
+        delivery = _delivery_line(context)
+        if delivery:
+            lines.append(delivery)
     oscillate = counts.get("oscillate", 0)
     tally = (
         f"工具调用共 {counts['tools']} 次（其中重量级 {counts['heavy']} 次），"
@@ -861,12 +1003,15 @@ _REFLECT_PROMPT = (
     "- loop：在原地打转。两种形态都算：**同一个动作被反复做**，"
     "以及**两三个动作来回重复**（A→B→A→B，换了个做法但思路没换）。\n"
     "- stuck：卡住了 —— 反复失败，没有推进。\n"
-    "- off_track：偏离了原来的任务。\n"
+    "- off_track：偏离了原来的任务。**下面三种形态，命中任意一条就要判它**：\n"
+    "  ① **换了主题** —— 做的是另一件事，哪怕做得很完整、很漂亮；\n"
+    "  ② **只做了一半就宣布完成** —— 目标要的三样只交了一样，却说「已完成」；\n"
+    "  ③ **用不相干的资料顶替** —— 目标要 A 类材料（知识库里的、指定范围的），"
+    "交的却是 B 类（凭印象写的、别处的、来源说不清的）。\n"
     "\n"
     "判 off_track 时必须对照第一行的「原始目标」：问自己"
     "「照现在这条路走下去，还能交付目标要的那个东西吗」。"
-    "**只有明显答偏（做的是另一件事、或早就跑题）才判它** —— "
-    "目标没写全、动作看起来绕着走但仍在为它服务，都算 ok。\n"
+    "三条都不命中时给 ok —— 目标没写全、动作看起来绕着走但仍在为它服务，都算 ok。\n"
     "\n"
     "判断 loop 时以「最近的动作顺序」那一行为准，不要只看计数："
     "两个动作各自只做过两次，也可能已经是一个来回。\n"
@@ -1051,7 +1196,9 @@ async def inject_reflections(model_data: Any, *, context: Any = None) -> Any:
                 state.stopped = state.stopped or "not_found"
                 continue
             changed = True
-            notes.append(finding.as_revert_note(goal=goal))
+            # 撤回的语义是"从这一步到末尾全部重来" ⇒ 基于那些动作做出来的交付一并作废。
+            discard = _discard_delivery(context, state, reason="revert")
+            notes.append(finding.as_revert_note(goal=goal, discard_delivery=discard))
             observability.counter(
                 "agent_recovery_level_total", level="2", problem=finding.problem or "unknown"
             )
@@ -1061,7 +1208,12 @@ async def inject_reflections(model_data: Any, *, context: Any = None) -> Any:
             )
             continue
         if _take_level1_slot(state, finding.problem):
-            notes.append(finding.as_note(goal=goal))
+            # ⚠️ 作废**必须**排在额度判断之内：拿不到额度时这条提醒不会注入，那时清掉
+            # 交付就是"用户什么都收不到、模型也不知道"—— 比不作废更糟。
+            discard = finding.problem == "off_track" and _discard_delivery(
+                context, state, reason="off_track"
+            )
+            notes.append(finding.as_note(goal=goal, discard_delivery=discard))
     state.pending.clear()
 
     if state.stopped:
@@ -1187,6 +1339,31 @@ def _apply_revert(
         if call_id:
             state.revoked.add(call_id)
     return items[:index], len(cut)
+
+
+def _discard_delivery(context: Any, state: ReflectionState, *, reason: str) -> bool:
+    """把本轮**已登记的那份交付**作废；返回"这次是否真的作废了什么"。
+
+    为什么必须作废（2026-10-22）
+    ---------------------------
+    ``runner`` 取答复的规则是"有已登记的交付就用它，否则用 ``final_output``"。而撤回
+    与提醒都**不清**这个登记 ⇒ 判出偏离、也提醒了模型，但模型没重新交付时，用户收到的
+    还是被否掉的那份旧稿。强制检查就白做了，而且看不出来（指标里那次检查是成功的）。
+
+    为什么必须与"一定会注入的提醒"绑定（由调用方保证顺序）
+    ---------------------------------------------------
+    悄悄清掉而不同时说，模型以为东西已经交出去了，于是只修后面几步、不再交付 ⇒ 最终
+    答复退化成 ``final_output``（一段没人审过、也没打算给用户的文本），比不作废更糟。
+    """
+    delivered = getattr(context, "delivered", None)
+    if not isinstance(delivered, dict) or not delivered.get("delivery"):
+        return False
+    delivered.pop("delivery", None)
+    delivered.pop("delivery_reviewed", None)
+    state.discarded += 1
+    observability.counter("agent_delivery_discarded_total", reason=reason)
+    logging.info("作废本轮已交付内容（原因=%s，累计 %d 次）⇒ 之后必须重新交付", reason, state.discarded)
+    return True
 
 
 def reset_reflection_state() -> None:
