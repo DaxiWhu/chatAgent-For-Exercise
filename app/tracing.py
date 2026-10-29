@@ -26,10 +26,16 @@ OpenInference 的 OTel 插桩 `OpenAIAgentsInstrumentor`。为什么是它、而
    全文）。本项目用自建 `AsyncOpenAI` 客户端、配置项叫 `AGNES_*`，所以那条上报
    要么失败被吞（白跑线程），要么用错 key 把对话内容发给第三方。
 
-LangSmith 那一支**只覆盖还在用 LangChain 的脚本**（`scripts/eval_generation.py`
-用 `ChatOpenAI.invoke`），agent 链路不进 LangSmith —— 它的 tracing 认的是
-LangChain 的回调，与官方 SDK 不是一个体系。别把"配了 LANGCHAIN_API_KEY"读成
-"agent 链路也有 trace"。
+LangSmith 那一支**当前只写 LangChain 侧的环境变量**（`scripts/eval_generation.py`
+用 `ChatOpenAI.invoke`），所以 agent 链路上**没有** trace。这**不是能力限制**：
+官方已提供 `langsmith.integrations.openai_agents_sdk.OpenAIAgentsTracingProcessor`，
+用 `set_trace_processors` 挂到 SDK 上即可（与 Langfuse 插桩是**同一个点位**，
+二者互斥），本项目尚未接入。
+
+⚠️ 2026-10-29 订正：上面这段此前写的是"agent 链路进不了 LangSmith"，
+那个结论对当时的 SDK 成立、对现在不成立。别把"配了 `LANGCHAIN_API_KEY`"读成
+"agent 链路也有 trace" —— 这两件事现在是分开的。接入前先跑
+`python scripts/trace_probe.py`（零成本、不发网络）确认转换层正常。
 
 怎么让一条 trace 能被日志里的 request_id 反查到（2026-10-21）
 --------------------------------------------------------------
@@ -77,7 +83,8 @@ def init_tracing() -> str:
     副作用（三种，互斥）：
       - 没配任何后端 ⇒ `agents.set_tracing_disabled(True)`，**彻底不产生 trace**；
       - 配了 Langfuse ⇒ 设置 `LANGFUSE_*` 环境变量并插桩（处理器由插桩自己替换）；
-      - 配了 LangSmith ⇒ 只写 `LANGCHAIN_*` 环境变量（对 agent 链路无效，见模块说明）。
+      - 配了 LangSmith ⇒ 只写 `LANGCHAIN_*` 环境变量（**当前不产生 agent trace**，
+        官方 Agents SDK 集成尚未接入；见模块说明与 `scripts/trace_probe.py`）。
 
     同时把结论记进 `_ACTIVE_BACKEND`，供 `trace_scope()` 使用 —— 重复调用是安全的
     （每次都会重新判定并覆盖，测试里就是这么用的）。
@@ -91,7 +98,8 @@ def init_tracing() -> str:
         os.environ["LANGCHAIN_PROJECT"] = config.LANGCHAIN_PROJECT
         _ACTIVE_BACKEND = "langsmith"
         logging.info("tracing 已启用：LangSmith（project=%s）—— ⚠️ 只覆盖仍用 LangChain "
-                     "的脚本，agent 链路不进 LangSmith", config.LANGCHAIN_PROJECT)
+                     "的脚本；agent 链路当前无 trace（官方集成未接入）",
+                     config.LANGCHAIN_PROJECT)
         return "langsmith"
 
     if config.LANGFUSE_PUBLIC_KEY and config.LANGFUSE_SECRET_KEY:
