@@ -2377,15 +2377,25 @@ async def _turn_events(turn, context, out: dict):
         # 挂的是「日志里那个 rid」+ 会话 + 租户：用户报"这次答得不对"时只拿得出
         # rid，不挂上去就只能按时间点捞。取不到引擎或没配后端时，`trace_scope`
         # 退化成 nullcontext，这里没有分支。
-        with tracing.trace_scope(
-            request_id=get_request_id(),
-            thread_id=getattr(turn, "thread_id", "") or getattr(context, "thread_id", ""),
-            # 租户取 `turn.tenant`（端点归一后的检索租户）而不是 `context.tenant`：
-            # 后者是由前者派生的，拿派生值会让"某一层忘了传"看起来像"没有租户"。
-            tenant=getattr(turn, "tenant", "") or getattr(context, "tenant", ""),
-        ):
+        #
+        # 这三个值只算一次：日志、Langfuse 属性、LangSmith 运行元数据必须同源。
+        # 各算一遍的后果是"日志里搜到的 rid 在平台上搜不到" —— 而这恰恰是报障时
+        # 唯一可用的入口。
+        _rid = get_request_id()
+        _tid = getattr(turn, "thread_id", "") or getattr(context, "thread_id", "")
+        # 租户取 `turn.tenant`（端点归一后的检索租户）而不是 `context.tenant`：
+        # 后者是由前者派生的，拿派生值会让"某一层忘了传"看起来像"没有租户"。
+        _tenant = getattr(turn, "tenant", "") or getattr(context, "tenant", "")
+        # LangSmith 的每轮元数据走运行配置（`RunConfig.trace_metadata`），
+        # 不是 `trace_scope`：后者靠上下文变量，只有 Langfuse 那条路认。
+        # 空值不塞进去 —— 平台侧空串会变成一个真实取值，没法按"缺失"过滤。
+        _trace_meta = {k: v for k, v in (("request_id", _rid), ("tenant", _tenant)) if v}
+        with tracing.trace_scope(request_id=_rid, thread_id=_tid, tenant=_tenant):
             try:
-                out["outcome"] = await run_turn(turn, context=context, on_text=_push)
+                out["outcome"] = await run_turn(
+                    turn, context=context, on_text=_push,
+                    trace_metadata=_trace_meta or None,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001  统一交给调用方

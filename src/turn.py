@@ -97,11 +97,15 @@ async def run_turn(
     *,
     context: TaskContext,
     on_text: TextSink | None = None,
+    trace_metadata: dict[str, Any] | None = None,
 ) -> runner.TaskOutcome:
     """跑这一轮，返回它的结果。
 
     on_text: 给了就走官方流式（``Runner.run_streamed``），正文边产边交出去；
         不给就整段返回。两种形态的结果完全一致。
+    trace_metadata: 这次运行的元数据，原样透传给 ``runner.run_agent``。
+        ``request_id`` 属于传输层概念，本模块不认识它 —— 由 ``app/`` 组装好传进来，
+        与 ``src/`` 不反向依赖 ``app/`` 的既有约定一致。
     """
     context.human_feedback = req.human_feedback or ""
     if req.deliver_text:
@@ -123,5 +127,6 @@ async def run_turn(
         session_id=req.thread_id,
         resume=req.resume,
         on_text=on_text,
+        trace_metadata=trace_metadata,
         **extra,
     )

@@ -26,16 +26,25 @@ OpenInference 的 OTel 插桩 `OpenAIAgentsInstrumentor`。为什么是它、而
    全文）。本项目用自建 `AsyncOpenAI` 客户端、配置项叫 `AGNES_*`，所以那条上报
    要么失败被吞（白跑线程），要么用错 key 把对话内容发给第三方。
 
-LangSmith 那一支**当前只写 LangChain 侧的环境变量**（`scripts/eval_generation.py`
-用 `ChatOpenAI.invoke`），所以 agent 链路上**没有** trace。这**不是能力限制**：
-官方已提供 `langsmith.integrations.openai_agents_sdk.OpenAIAgentsTracingProcessor`，
-用 `set_trace_processors` 挂到 SDK 上即可（与 Langfuse 插桩是**同一个点位**，
-二者互斥），本项目尚未接入。
+LangSmith 那一支（2026-10-30 起**已接入 agent 链路**）：用官方
+`langsmith.integrations.openai_agents_sdk.OpenAIAgentsTracingProcessor`，通过
+`set_trace_processors` 挂到 SDK 上。它与 Langfuse 的 OpenInference 插桩占用
+**同一个点位**（都是替换处理器列表），二者互斥，`init_tracing()` 里 LangSmith 优先
+—— 两套 key 都填的时候 Langfuse 分支不会执行。
 
-⚠️ 2026-10-29 订正：上面这段此前写的是"agent 链路进不了 LangSmith"，
-那个结论对当时的 SDK 成立、对现在不成立。别把"配了 `LANGCHAIN_API_KEY`"读成
-"agent 链路也有 trace" —— 这两件事现在是分开的。接入前先跑
-`python scripts/trace_probe.py`（零成本、不发网络）确认转换层正常。
+同时仍然写 `LANGCHAIN_*` 环境变量：那部分是给还在用 LangChain 的脚本
+（`scripts/eval_generation.py` 的 `ChatOpenAI.invoke`），与 agent 链路互不相干。
+别把"配了 key"直接读成"agent 链路有 trace"，中间还差"处理器真的挂上了"这一步。
+
+⚠️ 接入后仍然"看不到东西"的两个已知原因，都是**零报错**的：
+
+  - SDK 全局 tracing 处于禁用状态 ⇒ 处理器一个 span 都收不到。所以
+    `_enable_langsmith()` 必须显式解禁，理由见该函数说明。
+  - 运行配置里没给 `group_id` / `trace_metadata` ⇒ trace 是有的，但同一会话的
+    几轮串不起来、拿 request_id 搜不到。这两个字段在
+    `src/agents/runner.py::build_run_config`。
+
+接入或改动前先跑 `python scripts/trace_probe.py`（零成本、不发网络）确认转换层正常。
 
 怎么让一条 trace 能被日志里的 request_id 反查到（2026-10-21）
 --------------------------------------------------------------
@@ -82,9 +91,13 @@ def init_tracing() -> str:
 
     副作用（三种，互斥）：
       - 没配任何后端 ⇒ `agents.set_tracing_disabled(True)`，**彻底不产生 trace**；
-      - 配了 Langfuse ⇒ 设置 `LANGFUSE_*` 环境变量并插桩（处理器由插桩自己替换）；
-      - 配了 LangSmith ⇒ 只写 `LANGCHAIN_*` 环境变量（**当前不产生 agent trace**，
-        官方 Agents SDK 集成尚未接入；见模块说明与 `scripts/trace_probe.py`）。
+      - 配了 LangSmith ⇒ 写 `LANGCHAIN_*` 环境变量，并用官方转换层处理器替换
+        SDK 的处理器列表（agent 链路与仍走 LangChain 的脚本都有 trace）；
+      - 配了 Langfuse ⇒ 设置 `LANGFUSE_*` 环境变量并插桩（处理器由插桩自己替换）。
+
+    判定顺序是 LangSmith 在前：两套 key 都填时只有 LangSmith 生效。这是刻意的 ——
+    两者占同一个点位（`set_trace_processors`），同时挂会互相覆盖，而"哪一个生效"
+    必须可预测，不能取决于环境变量的字典顺序。
 
     同时把结论记进 `_ACTIVE_BACKEND`，供 `trace_scope()` 使用 —— 重复调用是安全的
     （每次都会重新判定并覆盖，测试里就是这么用的）。
@@ -93,14 +106,20 @@ def init_tracing() -> str:
 
     if config.LANGSMITH_API_KEY:
         # LangChain 官方 tracing 只认这几个环境变量名（LANGCHAIN_* 为旧名，同义）。
-        os.environ["LANGCHAIN_TRACING_V2"] = "true"
-        os.environ["LANGCHAIN_API_KEY"] = config.LANGSMITH_API_KEY
-        os.environ["LANGCHAIN_PROJECT"] = config.LANGCHAIN_PROJECT
-        _ACTIVE_BACKEND = "langsmith"
-        logging.info("tracing 已启用：LangSmith（project=%s）—— ⚠️ 只覆盖仍用 LangChain "
-                     "的脚本；agent 链路当前无 trace（官方集成未接入）",
-                     config.LANGCHAIN_PROJECT)
-        return "langsmith"
+        # 用 setdefault：环境里显式设过（比如 `LANGCHAIN_TRACING_V2=false`）就以
+        # 环境为准，不在 import 期把它悄悄翻成 true。
+        os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+        os.environ.setdefault("LANGCHAIN_API_KEY", config.LANGSMITH_API_KEY)
+        os.environ.setdefault("LANGCHAIN_PROJECT", config.LANGCHAIN_PROJECT)
+        if _enable_langsmith():
+            _ACTIVE_BACKEND = "langsmith"
+            logging.info("tracing 已启用：LangSmith（project=%s，agent 链路已挂处理器）",
+                         config.LANGCHAIN_PROJECT)
+            return "langsmith"
+        logging.warning("LangSmith 已配置但 agent 链路接入失败，本次不产生 agent trace")
+        _disable_sdk_tracing()
+        _ACTIVE_BACKEND = "none"
+        return "none"
 
     if config.LANGFUSE_PUBLIC_KEY and config.LANGFUSE_SECRET_KEY:
         if _enable_langfuse():
@@ -132,6 +151,12 @@ def trace_scope(*, request_id: str = "", thread_id: str = "",
     **启动时**由 Langfuse 的 SpanProcessor 读 context 盖上去的，事后补只影响之后
     新建的 span。理由与源码位置见模块 docstring。
 
+    ⚠️ **这套机制只对 Langfuse 有效**，对 LangSmith 是空转（返回 `nullcontext()`）。
+    LangSmith 的属性靠在**构造运行配置时**给字段（`group_id` 给会话、
+    `trace_metadata` 给 request_id，见 `src/agents/runner.py::build_run_config`），
+    与"包一层上下文"是两套独立机制。两套都配着的时候，两处都要有值才不会缺维度；
+    只配 LangSmith 时，这个 `with` 块不产生任何效果 —— 也不会报错。
+
     没配后端 / 没装 `langfuse` 时返回 `nullcontext()` —— 调用点无需分支判断，
     也无需 try。
     """
@@ -159,6 +184,53 @@ def trace_scope(*, request_id: str = "", thread_id: str = "",
     except Exception as e:  # noqa: BLE001  （tracing 配错不该打断请求）
         logging.debug("挂 trace 属性失败，本轮 trace 没有这些维度：%s", e)
         return contextlib.nullcontext()
+
+
+def _enable_langsmith() -> bool:
+    """把 agent 链路接到 LangSmith：挂官方转换层处理器。
+
+    必须显式做两件事（都核过 SDK 源码，不是推断）：
+
+    1. **替换**处理器列表。`set_trace_processors` 的语义就是"替换"：它会把 SDK
+       默认那个 `BatchTraceProcessor(BackendSpanExporter())` 顶掉 —— 那个默认处理器
+       会拿环境里的 `OPENAI_API_KEY` 把 prompt 与回复全文发往 `api.openai.com`，
+       失败还会被静默吞掉。本项目用自建客户端、没有那个 key，留着它要么白跑线程，
+       要么把对话内容送到不该去的地方。
+    2. **显式解禁**。`set_trace_processors` **不只是替换、它不解禁**：两个函数
+       各自改 provider 上的不同字段。只要本进程里先前走过"没配后端"那条分支
+       （`_disable_sdk_tracing()`），SDK 就根本不产生 span —— 处理器挂得再对也
+       收不到任何东西，症状只是"平台没有 trace"，零报错。
+
+    顺序是"先替换、再解禁"：反过来的话，从解禁到替换之间默认处理器仍在位。
+    这一瞬间没有运行、不会真发出去，但先替换没有代价，也不留窗口。
+
+    与 Langfuse **互斥**：Langfuse 的 OpenInference 插桩内部同样替换这个列表，
+    两者占用同一个点位。`init_tracing()` 里 LangSmith 在前，所以两套 key 都填时
+    只有 LangSmith 生效。
+
+    返回 True 表示已挂上；缺依赖或挂载失败返回 False（由调用方降级）。
+    **绝不抛** —— 可观测配错了不该让服务起不来。
+    """
+    try:
+        from langsmith.integrations.openai_agents_sdk import (  # type: ignore
+            OpenAIAgentsTracingProcessor,
+        )
+
+        from agents import set_trace_processors, set_tracing_disabled
+    except Exception as e:  # noqa: BLE001  （没装包 = 没这层能力，不是故障）
+        logging.warning("LangSmith 已配置但缺依赖（装 langsmith[openai-agents]）：%s", e)
+        return False
+    try:
+        # 不传 client：让它自己按 `LANGCHAIN_API_KEY` / `LANGSMITH_API_KEY` 造，
+        # 上面那几个 setdefault 已经把值备好了。
+        set_trace_processors([
+            OpenAIAgentsTracingProcessor(project_name=config.LANGCHAIN_PROJECT),
+        ])
+        set_tracing_disabled(False)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.warning("LangSmith 接入失败，本次不产生 agent trace：%s", e)
+        return False
 
 
 def _enable_langfuse() -> bool:

@@ -271,7 +271,7 @@ def _outcome_for(ctx, *, exit_reason: str, answer: str, review_reason: str = "")
 def _fake_turn(outcome, *, stream=None):
     """替身运行：`stream` 是"边产边交出去"的那些片段（None = 整段返回）。"""
 
-    async def _run(req, *, context, on_text=None):
+    async def _run(req, *, context, on_text=None, trace_metadata=None):
         if on_text is not None and stream is not None:
             for chunk in stream:
                 await on_text(chunk, "call-1")

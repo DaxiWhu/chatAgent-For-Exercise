@@ -39,7 +39,7 @@ def _fake_turn(answer="改好的草稿", *, review_reason=""):
     """替身运行：`/v1/review` 的每个分支最后都会跑一轮，这里只需吐一段正文。"""
     from src.agents.runner import TaskOutcome
 
-    async def _run(req, *, context, on_text=None):
+    async def _run(req, *, context, on_text=None, trace_metadata=None):
         if on_text is not None and answer:
             await on_text(answer, "call-1")
         return TaskOutcome(
@@ -405,7 +405,7 @@ class _CitedTurn:
               "section": "概览", "snippet": "梧州市……\n特产：六堡茶",
               "truncated": False, "table_md": None}]
 
-    async def __call__(self, req, *, context, on_text=None):
+    async def __call__(self, req, *, context, on_text=None, trace_metadata=None):
         from src.agents.runner import TaskOutcome
 
         if on_text is not None:

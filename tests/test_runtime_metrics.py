@@ -37,7 +37,7 @@ class _FakeTurn:
         self.chunks = list(chunks)
         self.answer = answer
 
-    async def __call__(self, req, *, context, on_text=None):
+    async def __call__(self, req, *, context, on_text=None, trace_metadata=None):
         from src.agents.runner import TaskOutcome
 
         if on_text is not None:

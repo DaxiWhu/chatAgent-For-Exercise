@@ -43,7 +43,7 @@ def _loose_gates(monkeypatch):
 def _fake_turn():
     """替身 `src.turn.run_turn`：只吐一段"ok"，不碰模型。"""
     class _T:
-        async def __call__(self, req, *, context, on_text=None):
+        async def __call__(self, req, *, context, on_text=None, trace_metadata=None):
             from src.agents.runner import TaskOutcome
 
             if on_text is not None:

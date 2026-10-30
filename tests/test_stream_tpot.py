@@ -42,7 +42,7 @@ class _FakeTurn:
     def __init__(self, chunks):
         self._chunks = list(chunks)
 
-    async def __call__(self, req, *, context, on_text=None):
+    async def __call__(self, req, *, context, on_text=None, trace_metadata=None):
         from src.agents.runner import TaskOutcome
 
         for content, call_id, delay in self._chunks:

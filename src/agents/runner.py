@@ -341,7 +341,9 @@ def _inject_supplements(data: Any, context: Any) -> Any:
     return data
 
 
-def build_run_config(model: Any | None = None) -> RunConfig:
+def build_run_config(model: Any | None = None, *,
+                     group_id: str | None = None,
+                     trace_metadata: dict[str, Any] | None = None) -> RunConfig:
     """一处装配、全链路生效。
 
     ``RunConfig.model`` 的优先级**高于** ``Agent.model``（官方三层优先级里最高的
@@ -379,6 +381,23 @@ def build_run_config(model: Any | None = None) -> RunConfig:
       编号，**回灌会 404**（官方 ``prepare_input_with_session`` 的注释）。SDK 在读、
       写两侧都要应用这个策略，所以它必须是"运行配置"级、不是某一处的局部处理。
       漏配的表现是"某一天开始，多轮对话突然报错"，而单轮测试全绿。
+
+    可观测的两个标识也在这里挂（2026-10-30 起）—— 它们是**官方字段**，不是自造的：
+
+    * ``group_id``：这是 trace 的会话归组键。LangSmith 的转换层在
+      ``on_trace_start`` 里把它写成 ``metadata["thread_id"]``（``trace.export()``
+      带 ``group_id``，处理器照抄），平台侧"同一次对话的几轮"就是按它聚起来的。
+      不传 ⇒ 每一轮都是独立的一条 trace，**多轮对话永远串不成一条线**，且没有任何
+      报错。本项目一轮 = 一个 ``thread_id``，所以这里直接传 ``session_id``。
+    * ``trace_metadata``：每轮**不同**的运行级元数据。``request_id`` 只能走这里 ——
+      用户报"这次答得不对"时手上只有响应头那个 rid，而平台的搜索框按 metadata 建
+      索引，不挂上去就只能按时间点大海捞针。
+
+    ⚠️ 这两个字段**只对 LangSmith 生效**。Langfuse 那条路走的是
+    ``app/tracing.py::trace_scope()``（上下文变量，靠节点启动时读取），与这里是
+    两套独立机制；两个后端都配着的时候，两处都要有值才不会缺维度。
+    ⚠️ 它们是 ``RunConfig`` 的字段，而 ``as_tool()`` 的嵌套 run 会**继承**父 run 的
+    配置（与 ``model`` 同一条规则），所以挂一次就覆盖整棵嵌套调用。
     """
     return RunConfig(
         model=model,
@@ -389,6 +408,11 @@ def build_run_config(model: Any | None = None) -> RunConfig:
         # 默认会把对话内容带上追踪。本服务的内容是用户数据，
         # 与 main.py 里"日志不落原文"的口径一致：关掉。
         trace_include_sensitive_data=False,
+        # 会话归组键 / 每轮运行级元数据。空值统一归一成 None：
+        # 官方字段的默认值就是 None，传空串会让"没有会话"变成"会话 id 是空串"，
+        # 平台侧会出现一个所有无会话请求都挤进去的分组。
+        group_id=group_id or None,
+        trace_metadata=trace_metadata or None,
     )
 
 
@@ -638,6 +662,7 @@ async def run_agent(
     append_prompt: bool = True,
     resume: approval.ResumeRequest | None = None,
     on_text: Any | None = None,
+    trace_metadata: dict[str, Any] | None = None,
 ) -> TaskOutcome:
     """跑**一个** agent 一次，返回这次运行的结果。
 
@@ -665,6 +690,10 @@ async def run_agent(
         ``Runner.run_streamed``（见 ``_run_streamed``），不给就走 ``Runner.run``
         （整段返回）。两条分支产出的 ``TaskOutcome`` 完全一致 —— 差别只在
         "什么时候把字交出去"，不在"跑成什么样"。
+    trace_metadata: 这次运行的元数据（原样交给 ``RunConfig.trace_metadata``）。
+        **本层不解释它的内容** —— ``request_id`` / ``tenant`` 是传输层概念，
+        ``src/`` 不认识它们，由 ``app/`` 侧组装后传进来；反过来 ``src/`` 去读
+        ``app/`` 的上下文变量会形成反向依赖。空字典与 None 等价。
 
     ⚠️ 只跑**一次** ``Runner.run``：评审已改成模型可调用的 ``as_tool``，
     这里没有"评审不通过就回灌重来"的循环（见模块 docstring）。
@@ -680,7 +709,8 @@ async def run_agent(
     if bound is None:
         raise RuntimeError("agent 链路未就绪（未装配模型）")
 
-    run_config = build_run_config(bound)
+    run_config = build_run_config(bound, group_id=session_id,
+                                  trace_metadata=trace_metadata)
     started = time.perf_counter()
     # 墙钟闸门的起点：**在 Runner.run 之前**，因为闸门判的是"这次运行跑了多久"，
     # 排队、恢复现场、拼输入都算在内。放在 try 里面就晚了 —— 异常路径下不记起点，

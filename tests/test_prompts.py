@@ -197,7 +197,7 @@ def test_prompt_version_reaches_the_response_header(monkeypatch):
     from app.ratelimit import RateLimiter
     from src.agents.runner import TaskOutcome
 
-    async def _fake_turn(req, *, context, on_text=None):
+    async def _fake_turn(req, *, context, on_text=None, trace_metadata=None):
         if on_text is not None:
             await on_text("草稿", "call-1")
         return TaskOutcome(answer="草稿", attempts=1, final_agent="frontline_agent",

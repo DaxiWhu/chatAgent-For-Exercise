@@ -54,7 +54,7 @@ class _FakeTurn:
         self.closed = False
         self.cancelled = False
 
-    async def __call__(self, req, *, context, on_text=None):
+    async def __call__(self, req, *, context, on_text=None, trace_metadata=None):
         from src.agents.runner import TaskOutcome
 
         try:
@@ -88,7 +88,7 @@ class _TurnRaisesOnShutdown(_FakeTurn):
     上游若只产一段就卡住，主循环会停在"等下一段"上，断连根本没机会生效。
     """
 
-    async def __call__(self, req, *, context, on_text=None):
+    async def __call__(self, req, *, context, on_text=None, trace_metadata=None):
         try:
             for i in range(50):
                 await asyncio.sleep(0.02)

@@ -523,8 +523,9 @@ def test_the_turn_runs_inside_the_trace_scope(monkeypatch):
         seen["exited"] = True
 
     class _Turn:
-        async def __call__(self, req, *, context, on_text=None):
+        async def __call__(self, req, *, context, on_text=None, trace_metadata=None):
             seen["entered_before_run"] = seen.get("entered", False)
+            seen["trace_metadata"] = trace_metadata
             return TaskOutcome(answer="ok", attempts=1,
                                final_agent="frontline_agent",
                                passed=True, exit_reason="passed")
@@ -545,6 +546,214 @@ def test_the_turn_runs_inside_the_trace_scope(monkeypatch):
 
     assert seen["kwargs"] == {"request_id": "rid-wire", "thread_id": "t-1",
                               "tenant": "t1"}, "作用域拿到的是空值 —— 那等于没挂"
+    assert seen["trace_metadata"] == {"request_id": "rid-wire", "tenant": "t1"}, (
+        "request_id 没进运行元数据（`RunConfig.trace_metadata`）——"
+        "LangSmith 侧按 rid 搜不到这次运行，而这正是报障时唯一的入口"
+    )
     assert seen["entered_before_run"] is True, "作用域在运行开始之后才进 —— span 已经建好了"
     assert seen.get("exited") is True
     assert any(e.get("event") == "done" for e in events)
+
+
+# --------------------------------------------------------------------------- #
+# LangSmith：agent 链路的接入（2026-10-30）
+#
+# 与 Langfuse 那组判据对称 —— 挂上了没有、缺依赖时有没有如实降级、
+# 两个都配时谁生效。差别在"挂到哪"：Langfuse 靠插桩，LangSmith 直接挂官方
+# 转换层处理器，所以这里钉的是 `set_trace_processors` / `set_tracing_disabled`
+# 这两个调用本身。
+# --------------------------------------------------------------------------- #
+def _stub_langsmith(monkeypatch, calls: dict, order: list) -> None:
+    """把官方处理器换成记录型替身，同时记录两个 SDK 调用的**顺序**。
+
+    为什么顺序也要记：`set_trace_processors` 的语义是"替换"，它**不解禁**全局
+    开关。先解禁再替换的写法看着也能跑，但中间那段默认处理器（往 OpenAI 后端
+    发原文的那个）仍在位 —— 不留这个窗口是免费的。
+    """
+    import sys
+    import types
+
+    import agents
+
+    class _FakeProcessor:
+        def __init__(self, **kwargs):
+            calls["processor_kwargs"] = kwargs
+
+    mod = types.ModuleType("langsmith.integrations.openai_agents_sdk")
+    mod.OpenAIAgentsTracingProcessor = _FakeProcessor
+    monkeypatch.setitem(sys.modules, "langsmith.integrations.openai_agents_sdk", mod)
+
+    def _set_processors(processors):
+        order.append("set_trace_processors")
+        calls["processors"] = processors
+
+    def _set_disabled(disabled):
+        order.append("set_tracing_disabled")
+        calls["disabled"] = disabled
+
+    monkeypatch.setattr(agents, "set_trace_processors", _set_processors)
+    monkeypatch.setattr(agents, "set_tracing_disabled", _set_disabled)
+
+
+def _preset_langchain_env(monkeypatch) -> None:
+    """预先占住三个键，让被测代码里的 `setdefault` 全是空操作。
+
+    不占的话 `init_tracing()` 会真的往 `os.environ` 写新键，而 monkeypatch 只
+    记录自己设过的键 —— 那些写进去的值会跨用例残留。
+    """
+    for k, v in (("LANGCHAIN_TRACING_V2", "true"),
+                 ("LANGCHAIN_API_KEY", "lsv2_pt_test"),
+                 ("LANGCHAIN_PROJECT", "chatagent")):
+        monkeypatch.setenv(k, v)
+
+
+def test_langsmith_goes_through_the_official_processor(monkeypatch):
+    """配了密钥 ⇒ 必须替换处理器列表**并**解禁，两件事缺一不可。
+
+    少做替换：SDK 默认处理器还在，会把 prompt 与回复全文发往 api.openai.com。
+    少做解禁：处理器挂上了但 SDK 根本不产生 span —— 症状只是"平台没有 trace"，
+    日志零报错。而"同一进程里先前走过没配后端那条分支"正是启动期的常态。
+    """
+    from app import tracing
+
+    calls: dict = {}
+    order: list = []
+    _stub_langsmith(monkeypatch, calls, order)
+    _preset_langchain_env(monkeypatch)
+    monkeypatch.setattr(tracing.config, "LANGSMITH_API_KEY", "lsv2_pt_test")
+    monkeypatch.setattr(tracing.config, "LANGCHAIN_PROJECT", "chatagent")
+
+    assert tracing.init_tracing() == "langsmith"
+    assert calls["processor_kwargs"] == {"project_name": "chatagent"}, (
+        "处理器没带上项目名 —— trace 会落到默认项目里，按项目找记录时看不到"
+    )
+    assert len(calls["processors"]) == 1, (
+        "处理器列表不是「恰好一个」：多挂一个会和 Langfuse 抢同一个点位"
+    )
+    assert calls["disabled"] is False, (
+        "没解禁：`set_trace_processors` 只替换不解禁，这里挂上去也收不到任何 span"
+    )
+    assert order == ["set_trace_processors", "set_tracing_disabled"], (
+        f"顺序不对（实际 {order}）：先解禁会让默认上报处理器多活一段"
+    )
+
+
+def test_langsmith_without_its_dependencies_is_not_claimed(monkeypatch):
+    """配了 LangSmith 但缺依赖 ⇒ 如实返回 "none"，不许谎报已启用。
+
+    谎报的代价与 Langfuse 那条同源：面板里一条都没有，而启动日志说"已启用"，
+    于是所有人先怀疑网络和密钥。
+    """
+    import sys
+
+    from agents.tracing import get_trace_provider
+
+    from app import tracing
+
+    _preset_langchain_env(monkeypatch)
+    monkeypatch.setitem(sys.modules, "langsmith.integrations.openai_agents_sdk", None)
+    monkeypatch.setattr(tracing.config, "LANGSMITH_API_KEY", "lsv2_pt_test")
+    monkeypatch.setattr(tracing.config, "LANGFUSE_PUBLIC_KEY", "")
+    monkeypatch.setattr(tracing.config, "LANGFUSE_SECRET_KEY", "")
+
+    assert tracing.init_tracing() == "none"
+
+    provider = get_trace_provider()
+    monkeypatch.setattr(provider, "_manual_disabled", None, raising=False)
+    provider._refresh_disabled_flag()
+
+
+def test_langsmith_wins_when_both_backends_are_configured(monkeypatch):
+    """两套密钥都在 ⇒ 只有 LangSmith 生效，Langfuse 分支**整个不执行**。
+
+    两者占同一个点位（都是替换 `set_trace_processors` 的列表）。谁生效必须是
+    确定的，不能取决于 import 顺序或字典顺序 —— 否则"到底有没有 trace、发到哪"
+    就成了环境相关的偶然事件。
+    """
+    from app import tracing
+
+    calls: dict = {}
+    order: list = []
+    _stub_langsmith(monkeypatch, calls, order)
+    _preset_langchain_env(monkeypatch)
+    monkeypatch.setattr(tracing.config, "LANGSMITH_API_KEY", "lsv2_pt_test")
+    monkeypatch.setattr(tracing.config, "LANGFUSE_PUBLIC_KEY", "pk-lf-x")
+    monkeypatch.setattr(tracing.config, "LANGFUSE_SECRET_KEY", "sk-lf-x")
+
+    def _must_not_run() -> bool:
+        raise AssertionError(
+            "LangSmith 已生效却又去初始化 Langfuse —— 两个后端会互相覆盖处理器列表"
+        )
+
+    monkeypatch.setattr(tracing, "_enable_langfuse", _must_not_run)
+
+    assert tracing.init_tracing() == "langsmith"
+    assert calls["processor_kwargs"]["project_name"] == "chatagent"
+
+
+def test_run_config_carries_session_and_trace_metadata():
+    """`build_run_config` 必须把会话键与每轮元数据落到官方字段上。
+
+    为什么是这两个字段（都核过源码，不是推断）：
+      · `group_id` → `Trace.export()["group_id"]` → 转换层写成
+        `metadata["thread_id"]`，平台侧的多轮聚合**只认它**；
+      · `trace_metadata` → `create_trace(metadata=...)` → 导出后由处理器合并进
+        run 的 metadata，按 request_id 搜索走的就是这条。
+    """
+    from src.agents.runner import build_run_config
+
+    cfg = build_run_config(None, group_id="t-7",
+                           trace_metadata={"request_id": "rid-7"})
+
+    assert cfg.group_id == "t-7", "会话键没进运行配置：同一会话的几轮会各自独立"
+    assert cfg.trace_metadata == {"request_id": "rid-7"}, (
+        "request_id 没进运行配置：用户报的 rid 搜不到任何 trace"
+    )
+
+
+def test_run_config_normalises_empty_identifiers_to_none():
+    """空串必须归一成 None，不能原样塞进去。
+
+    `group_id=""` 在平台侧是一个**真实取值**，所有"没有会话"的请求会挤进同一个
+    分组；而且没法按"该字段缺失"过滤。官方字段的默认值本来就是 None。
+    """
+    from src.agents.runner import build_run_config
+
+    cfg = build_run_config(None, group_id="", trace_metadata={})
+
+    assert cfg.group_id is None
+    assert cfg.trace_metadata is None
+
+
+def test_run_agent_uses_the_session_id_as_the_group_id(monkeypatch):
+    """`run_agent` 必须把 `session_id` 当作会话归组键传下去。
+
+    这条映射是"多轮能串成一条线"的全部依据：上一版把会话只交给 LangChain 那套
+    回调，agent 链路里根本没人读它。用哨兵异常截在构造运行配置处，不真跑模型。
+    """
+    import asyncio
+
+    import pytest
+
+    from src.agents import runner
+
+    seen: dict = {}
+
+    class _Stop(Exception):
+        pass
+
+    def _fake_build(model, **kwargs):
+        seen.update(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(runner, "build_run_config", _fake_build)
+
+    with pytest.raises(_Stop):
+        asyncio.run(runner.run_agent(
+            None, prompt="hi", context=object(), model=object(),
+            session_id="t-9", trace_metadata={"request_id": "rid-9"}))
+
+    assert seen["group_id"] == "t-9", (
+        "会话键没传下去（或没取 session_id）—— 平台侧每一轮都是独立的 trace"
+    )
+    assert seen["trace_metadata"] == {"request_id": "rid-9"}

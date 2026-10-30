@@ -616,7 +616,7 @@ def test_chat_hands_the_normalised_tenant_to_the_run(monkeypatch):
 
     seen: dict[str, str] = {}
 
-    async def _capture(req, *, context, on_text=None):
+    async def _capture(req, *, context, on_text=None, trace_metadata=None):
         seen["tenant"] = req.tenant
         return TaskOutcome(answer="好", attempts=1, final_agent="frontline",
                            passed=True, exit_reason="passed")

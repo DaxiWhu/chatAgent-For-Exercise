@@ -61,7 +61,7 @@ def _fake_turn(answer="华东区 1200。", *, citations=None, review_reason=""):
     """
     from src.agents.runner import TaskOutcome
 
-    async def _run(req, *, context, on_text=None):
+    async def _run(req, *, context, on_text=None, trace_metadata=None):
         if on_text is not None and answer:
             await on_text(answer, "call-1")
         return TaskOutcome(
