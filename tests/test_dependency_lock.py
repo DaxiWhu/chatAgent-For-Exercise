@@ -141,3 +141,39 @@ def test_checker_script_passes_on_current_tree():
         capture_output=True, text=True, cwd=str(ROOT),
     )
     assert r.returncode == 0, f"锁定校验未通过：\n{r.stdout}\n{r.stderr}"
+
+
+def test_langsmith_integration_stays_declared():
+    """LangSmith 的 agent 侧集成必须**显式声明**，不能只靠传递依赖。
+
+    为什么单独守这一条
+    ------------------
+    `langsmith` 是 `langchain-core` 的传递依赖，所以"不写这一行也在装"。正因为如此，
+    它最容易被当成"写不写都行"删掉 —— 删了构建照样成功，测试照样全绿，直到上游把
+    下限降回没有 `openai_agents_sdk` 的版本，`app/tracing.py` 的 import 才会失败，
+    然后**静默降级**为不产生 trace（只剩一行 warning，服务照常起）。症状是
+    "配了 key、平台没数据"，既没有异常也没有指标。
+
+    判据是三条，缺一条这个风险就回来：
+      ① requirements.txt 声明了它，且带下限；
+      ② requirements.lock 钉了精确版本；
+      ③ 钉的版本不低于清单下限（否则锁了个不合格的版本，等于没锁）。
+    """
+
+    def _v(text: str) -> tuple[int, ...]:
+        return tuple(int(x) for x in text.split(".") if x.isdigit())
+
+    spec = dict(_parse(REQ)).get("langsmith")
+    assert spec, (
+        "requirements.txt 没声明 langsmith —— 它只是 langchain-core 的传递依赖，"
+        "既不能靠它保证版本，也没法在它缺集成时被构建拦住"
+    )
+    m = re.match(r">=\s*([0-9][0-9.]*)", spec)
+    assert m, f"langsmith 的约束应是 >=x.y.z 的下限形式，现在是 {spec!r}"
+
+    pin = _lock_pins().get("langsmith")
+    assert pin, "requirements.lock 没钉 langsmith —— 上游发新版就会改变构建结果"
+    assert _v(pin) >= _v(m.group(1)), (
+        f"lock 钉的 langsmith {pin} 低于清单下限 {m.group(1)}："
+        "这个版本可能没有 openai_agents_sdk 集成，接上去只会静默不产生 trace"
+    )

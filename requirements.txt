@@ -37,7 +37,19 @@ redis>=5.0
 PyJWT[crypto]>=2.8
 # LLM 链路 tracing（二选一即可）。不装则完全不上报，行为与没有这层代码一致。
 # langfuse>=2.0
-# LangSmith 走 LangChain 原生环境变量，只需 langchain 本身（已在上面）。
+# LangSmith 有两条**互不相干**的路，别混为一谈：
+#   ① LangChain 侧（评测脚本用）：只需 langchain 本身（已在上面），靠 LANGCHAIN_* 环境变量；
+#   ② 官方 Agents SDK 侧（agent 链路）：要 langsmith 的 openai-agents 集成，用
+#      OpenAIAgentsTracingProcessor + set_trace_processors 挂载（app/tracing.py）。
+# ② 于 2026-10-30 接入。在此之前只写环境变量，真实对话**一条 trace 都没有**，
+# 而日志照打"已启用"、不报任何错 —— 别把"配了 key"读成"有 trace"。
+# ⚠️ 不写这一行也装得上，它是 langchain-core 的传递依赖。但**传递依赖的版本不由我们定**：
+# 上游哪天把下限降回没有该集成的版本，app/tracing.py 的 import 就会失败并**静默降级**
+# （只剩一行 warning、服务照常起）⇒ 症状是"配了 key、平台没数据"。显式声明 + 锁版本消灭这一类。
+# 下限写成 0.9.1 是**本机实测可用**的那一版（lock 里钉的就是它）；该集成从哪一版开始有，
+# 没有逐一回溯，所以门槛取实测值，不猜一个更早的数。
+# 接入或改动前先离线验证转换层：python scripts/trace_probe.py（零成本、不发网络）。
+langsmith[openai-agents]>=0.9.1
 # 指标：app/metrics.py 自带 Prometheus 文本输出，**无需** prometheus-client。
 
 # ---- agent 链路（src/agents/，官方 openai-agents SDK）----

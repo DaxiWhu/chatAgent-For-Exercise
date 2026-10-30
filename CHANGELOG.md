@@ -92,10 +92,18 @@ LangChain 那层脚本（如 `scripts/eval_generation.py`）有记录，而真�
   `--live` 才要求 `llm` 节点（假模型不产生 generation span，那是它的局限，
   不是转换层的缺陷）。`--send` 必须配 `LANGSMITH_API_KEY`，**缺密钥当场失败** ——
   缺 key 时上报会被静默丢弃、看起来像成功；发完用 `read_run` 回读做闭环验证。
-- **订正三处过期文档**：`app/tracing.py` 的模块说明与启动日志文案、
+- **订正过期文档**：`app/tracing.py` 的模块说明与启动日志文案、
   `PRODUCTION_CONFIG.md` 的环境变量表、`requirements.txt` 的依赖注释。
-  现在的口径是：**能接，但本项目没接**；服务侧 tracer 仍只有 Langfuse 一支，
-  LangSmith 只覆盖还在用 LangChain 的评测脚本。
+  当时的口径是「能接，但本项目没接」—— 那一版只到探针为止，接线在上面这几条
+  落地后才变成「已接」。同一个文件里两句话并存，会让人以为其中一句是错的。
+- **依赖声明补齐**：`langsmith[openai-agents]>=0.9.1` 从注释改成 `requirements.txt`
+  的正式依赖，并在 `requirements.lock` 钉住 `0.9.1`。不写这行也装得上（它是
+  `langchain-core` 的传递依赖），但**版本就不由我们定了**：上游把下限降回没有
+  `openai_agents_sdk` 的版本时，`app/tracing.py` 的 import 会失败并静默降级为
+  不产生 trace（只剩一行 warning、服务照常起）⇒ 症状是「配了 key、平台没数据」。
+  下限取本机实测可用的 0.9.1，未回溯该集成从哪一版开始有。
+  守卫 `tests/test_dependency_lock.py::test_langsmith_integration_stays_declared`，
+  变异 3/3 红（删声明 / 降版本 / 抹掉下限）。
 - **`tests/test_trace_probe.py`（新，10 条）**：树重建（乱序到达 / 孤儿）、六条判据
   各自的红绿、一次真跑 SDK 的端到端（确认官方处理器确实收下了 `kb_search` 的工具
   节点）、缺密钥必须显式失败。变异 **5/5 守住**。
