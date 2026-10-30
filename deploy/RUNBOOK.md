@@ -218,9 +218,17 @@ curl -sS localhost:8000/health/ready | python -m json.tool
 逐项看 `llm / db / vector_store / run_state` 哪个 `ok=false`。
 
 > ⚠️ **`run_state` 这一项是最容易搞错的**：运行现场若降级成内存实现，
-> 它的文案会明确写 `InMemorySaver（内存，重启丢状态！）`。
+> 它的文案会明确写 `memory（进程内存，重启丢现场！）`。
 > 这是判断"持久化到底有没有接上"的**唯一可靠信号** —— 服务看起来一切正常，
 > 但所有会话状态在重启后会丢。
+>
+> 这一项的另外两种文案别读错：
+> - `postgres（表尚未建立：首次写入时建）` —— 正常（还没运行被打断过）；
+> - `⚠️ 配了 DB_URL 但数据库当前连不上…`（`ok=false`）—— 现场**实际写不进**，
+>   重启即丢。它一定伴随 `checks.db.ok=false`。
+>   ⚠️ 2026-10-30 之前这一档报的是 `ok:true` + "表尚未建立"，是**假绿灯**
+>   （那时探针只读进程内属性、不参考 db 探测结果）；现在 `readiness()` 会把 db 的
+>   结论传给这一项，改回去就会重新变成假绿灯。
 
 #### `HighErrorRate`（critical，5m，5xx > 5%）
 ```bash

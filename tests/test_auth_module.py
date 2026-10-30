@@ -164,3 +164,65 @@ def test_principal_has_role():
     assert p.has_role(("reviewer", "admin")) is True
     assert p.has_role(("admin",)) is False
     assert p.has_role(()) is True, "空白名单表示不限制"
+
+
+# ---------------------------------------------------------------------------
+# 存储不可用 ≠ 凭证错误（2026-10-30）
+# ---------------------------------------------------------------------------
+# 背景（实机）：数据库不可连时 `POST /v1/auth/login` 回 **500「服务内部错误」**，
+# 而这个实例的 `/health/ready` 早就算出 `db.ok=false` 了。500 的意思是"程序有
+# bug"，运维会去翻代码；真因是账号库连不上。
+#
+# 更要紧的是**别报成 401**：那会让所有人同时以为自己密码错了，于是集体去重置
+# 密码 —— 一次可恢复的运维故障被放大成账号事故。
+class _DownAccounts:
+    """账号库连不上（模拟 psycopg 的连接超时）。"""
+
+    def get_user(self, username):
+        import psycopg
+
+        raise psycopg.OperationalError("connection timeout expired")
+
+
+class _NoPoolAccounts:
+    """连接池不可用（`app.pg` 自己的异常类型，不是 psycopg 的）。"""
+
+    def get_user(self, username):
+        from app import pg
+
+        raise pg.PoolUnavailable("池已关闭")
+
+
+class _BuggyAccounts:
+    """代码 bug（不是存储故障）。用来钉住"别把所有异常都当存储错误"。"""
+
+    def get_user(self, username):
+        raise KeyError("password_hash")
+
+
+def test_login_reports_storage_unavailable_when_db_is_down(service):
+    svc = A.AuthService(service.store, accounts=_DownAccounts())
+    with pytest.raises(A.StorageUnavailable) as ei:
+        svc.login_with_password("u", "p")
+    assert ei.value.status_code == 503, "账号库不可用不是客户端的错，不能是 4xx"
+    assert ei.value.code == "storage_unavailable"
+    assert "invalid_credentials" not in ei.value.code
+
+
+def test_login_treats_pool_unavailable_as_storage_error(service):
+    """`app.pg.PoolUnavailable` 不在 psycopg 的异常树里，必须单独认。"""
+    svc = A.AuthService(service.store, accounts=_NoPoolAccounts())
+    with pytest.raises(A.StorageUnavailable) as ei:
+        svc.login_with_password("u", "p")
+    assert ei.value.status_code == 503
+
+
+def test_login_does_not_disguise_code_bugs_as_storage_errors(service):
+    """非存储类异常必须**原样抛出**。
+
+    若这里改成"任何异常都转 503"，一个键名写错就会让登录永久 503、日志里一句
+    真话都没有 —— 比现在的 500 更难查。
+    """
+    svc = A.AuthService(service.store, accounts=_BuggyAccounts())
+    with pytest.raises(KeyError):
+        svc.login_with_password("u", "p")

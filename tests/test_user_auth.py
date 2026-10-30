@@ -902,3 +902,25 @@ def test_relogin_flag_is_false_for_a_fresh_login(client, env):
     tok = _login(client, "bob", "pw-bob")
     body = client.get("/v1/auth/me", headers=_bearer(tok["access_token"])).json()
     assert body["relogin_required"] is False and body["relogin_reason"] == ""
+
+# ---------------------------------------------------------------------------
+# 账号库不可用 ⇒ 503（不是 500，更不是 401）
+# ---------------------------------------------------------------------------
+# 实机症状（2026-10-30）：`/health/ready` 已经报 `db.ok=false`，而登录回
+# `500 服务内部错误` —— 运维看到 500 会去翻代码找 bug，真因是库挂了。
+# 退化成 401 更糟：那等于告诉用户"你的密码错了"，于是所有人同时去重置密码。
+def test_login_returns_503_when_account_store_is_down(client, env, monkeypatch):
+    def _down(username):
+        import psycopg
+
+        raise psycopg.OperationalError("connection timeout expired")
+
+    # `_AUTH.accounts` 就是这个对象，换掉它的读方法即可模拟"库连不上"。
+    monkeypatch.setattr(env["store"], "get_user", _down)
+
+    r = client.post("/v1/auth/login",
+                    json={"username": "alice", "password": "pw-alice"})
+
+    assert r.status_code == 503, f"账号库不可用竟返回 {r.status_code}：{r.text}"
+    assert "storage_unavailable" in r.json()["detail"]
+    assert "服务内部错误" not in r.json()["detail"], "500 的文案会把排查方向带跑"

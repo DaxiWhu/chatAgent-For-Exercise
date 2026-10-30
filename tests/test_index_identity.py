@@ -24,7 +24,7 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -586,6 +586,18 @@ def test_qdrant_meta_point_id_does_not_alias_a_chunk_point():
 # ===========================================================================
 # 6. app 层：就绪探针回显（可见但不判失败）+ 启动自检上报指标
 # ===========================================================================
+def _with_qdrant_client(monkeypatch):
+    """让 `_check_vector_store` 的 qdrant 分支认为客户端库"已安装"。
+
+    为什么需要：2026-10-30 起该分支会真的 `import qdrant_client`（那个库在
+    `src/rag/qdrant_store.py` 里是方法内延迟导入的，只看配置看不出装没装）。
+    本节用例要验的是**索引身份回显**，不是依赖是否装好 —— 不塞这个替身的话，
+    没装 qdrant 的机器上它们会因为"缺客户端库"而红，验的东西就跑偏了。
+    """
+    monkeypatch.setitem(__import__("sys").modules, "qdrant_client",
+                        ModuleType("qdrant_client"))
+
+
 def test_readiness_reports_identity_mismatch_without_failing(monkeypatch):
     """★ 不一致必须**可见**，但**不能**让就绪探针失败。
 
@@ -597,6 +609,7 @@ def test_readiness_reports_identity_mismatch_without_failing(monkeypatch):
     monkeypatch.setattr(R, "VECTOR_STORE", "qdrant")
     monkeypatch.setattr(R, "QDRANT_URL", "http://q:6333")
     monkeypatch.setattr(R, "QDRANT_COLLECTION", "rag_chunks")
+    _with_qdrant_client(monkeypatch)
 
     s = _MetaStore()
     ii.verify(s, model="old-model", dim=1024)
@@ -615,6 +628,7 @@ def test_readiness_says_nothing_when_never_checked(monkeypatch):
 
     monkeypatch.setattr(R, "VECTOR_STORE", "qdrant")
     monkeypatch.setattr(R, "QDRANT_URL", "http://q:6333")
+    _with_qdrant_client(monkeypatch)
     ok, detail = health._check_vector_store()
     assert ok is True
     assert "索引身份" not in detail

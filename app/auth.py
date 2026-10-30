@@ -90,6 +90,53 @@ class AuthError(Exception):
         self.code = code
 
 
+class StorageUnavailable(AuthError):
+    """鉴权依赖的**存储**读不了（账号库 / 会话库连不上、连接池不可用）。
+
+    为什么单独成类，而不是沿用 401 `invalid_credentials`
+    ------------------------------------------------
+    这两件事对客户端意味着完全相反的动作：
+      - `invalid_credentials` ⇒ "你的账号密码不对" ⇒ 用户会去改密码；
+      - `storage_unavailable` ⇒ "服务器这边读不了账号库" ⇒ 用户什么都不该改，
+        等一会儿重试即可（再试还是不行就该找运维）。
+    把一次数据库宕机报成"密码错误"，会让所有人同时去重置密码 —— 那是把一次
+    可恢复的运维故障变成一场账号事故。
+
+    为什么是 503 而不是 500（2026-10-30 实机修）：数据库不可连时登录返回 500
+    「服务内部错误」，而这个实例的 `/health/ready` **早就**算出 `db.ok=false` 了。
+    500 的意思是"程序有 bug"，运维会去翻代码；503 的意思是"依赖暂时不可用"，
+    与就绪探针指向同一件事。上游是否可重试也取决于这个码。
+    """
+
+    def __init__(self, detail="账号或会话存储暂不可用，请稍后重试"):
+        super().__init__(detail, status_code=503, code="storage_unavailable")
+
+
+def _is_storage_error(e: BaseException) -> bool:
+    """这个异常是不是"存储不可用"，而不是"凭证不对"。
+
+    ⚠️ 判据**必须**是具体类型而不是 `except Exception`：后者会把
+    `login_with_password` 里的任何 bug（键名写错、返回类型不符）也报成
+    "存储不可用"，于是登录永久 503、日志里一句真话都没有 —— 那比现在的 500
+    更难查。所以只认这两类：psycopg 的连接/查询错误、以及 `app.pg` 的池不可用。
+
+    延迟导入：`psycopg` 是硬依赖，但 `auth` 被很多轻量测试单独导入，
+    模块级 import 会把这些测试绑到"必须装好驱动"上。
+    """
+    try:
+        from . import pg
+
+        if isinstance(e, pg.PoolUnavailable):
+            return True
+    except Exception:  # noqa: BLE001  配置都导不进来时按"不是存储错误"处理
+        pass
+    try:
+        import psycopg
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(e, psycopg.Error)
+
+
 # ---------------------------------------------------------------------------
 # 本地用户密码（PBKDF2-HMAC-SHA256，标准库）
 # ---------------------------------------------------------------------------
@@ -655,8 +702,19 @@ class AuthService:
 
         ⚠️ `tenant` 为空串是**合法结果**：含义是"这个人还没有租户"，
         不是"读配置兜底"。这是 2026-10-04 定下的口径 —— 没有租户就为空。
+
+        ⚠️ 账号库**读不到**（DB 宕机、连接池耗尽）时抛 `StorageUnavailable`（503），
+        不能让它冒成 500：见那个类的说明。这里**不做**"读失败就当用户不存在"的
+        兜底 —— 那会把一次数据库故障表现成"所有人密码都错了"。
         """
-        user = self.accounts.get_user(username) if self.accounts else None
+        try:
+            user = self.accounts.get_user(username) if self.accounts else None
+        except Exception as e:  # noqa: BLE001  只转存储类错误，其余照原样抛
+            if not _is_storage_error(e):
+                raise
+            metrics.inc("auth_login_total", result="storage_error")
+            logging.warning("登录失败：账号库不可用（%s）", type(e).__name__)
+            raise StorageUnavailable() from e
         if user is None or user.get("status") != "active":
             verify_password(password, _DUMMY_HASH)
             metrics.inc("auth_login_total", result="failed")

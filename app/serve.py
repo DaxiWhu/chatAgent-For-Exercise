@@ -27,6 +27,9 @@ compose、CI 与 RUNBOOK 的启动命令时再一起做**，单独删这一个�
 可用环境变量：APP_HOST / APP_PORT / APP_WORKERS / APP_LOG_LEVEL / APP_RELOAD /
 GRACEFUL_SHUTDOWN_TIMEOUT（命令行参数优先于环境变量）
 
+上述变量与 `AGNES_*` 等**都可以写在 `.env` 里**：本模块在导入期就把 `.env` 灌进
+环境（理由见 `import` 之后那段注释），而 argparse 的默认值是在 `main()` 里才读的。
+
 worker 数：`APP_WORKERS` 优先，其次 `WEB_CONCURRENCY`（容器/PaaS 的惯例名，很多平台
 会自动注入），默认 1。两个名字都认，是为了避免"Dockerfile 里用 WEB_CONCURRENCY、
 文档里写 APP_WORKERS"导致**设了却不生效**——那类静默失效最难排查。
@@ -42,6 +45,41 @@ import argparse
 import asyncio
 import os
 import sys
+
+# ---------------------------------------------------------------------------
+# `.env` 必须在**任何 app 模块被导入之前**加载
+# ---------------------------------------------------------------------------
+# 真实事故（2026-10-30 实测）：只配 `.env` 时，`python -m app.serve` 报
+#   RuntimeError: agent 链路不可用（missing_api_key）⇒ 拒绝启动
+# 而 `.env` 里 `AGNES_API_KEY` 明明有值。
+#
+# 成因是**加载顺序**，不是配置写错：
+#   1. `main()` 调 `resolve_graceful_timeout()`，它经 `_default_graceful_timeout()`
+#      触发 `from app import config` —— 这发生在 `uvicorn.run()` **之前**；
+#   2. `app/config.py` 的常量是**模块级** `API_KEY = _env_str(...)`，导入那一刻
+#      就求值，此时 `.env` 还没人读 ⇒ 固化成一个空串；
+#   3. 之后 uvicorn 才导入 `app.main`，它里面的 `load_dotenv()` 已经太晚 ——
+#      `app.config` 在 `sys.modules` 里，不会重新求值。
+# 测试与探针走的是 `import app.main`，不经过 `resolve_graceful_timeout`，所以
+# `load_dotenv()` 恰好先于 `config` 导入 ⇒ **单测全绿，真实入口必挂**。
+#
+# 为什么不放到 `app/config.py` 顶部（看起来更"一劳永逸"）
+# -----------------------------------------------------
+# 那样会破坏 `tests/conftest.py` 的环境隔离机制：它在导入 `app.config` **之前**
+# 把测试身份（`AUTH_SESSION_SECRET` / `AGNES_API_KEY`）注入环境，而它包装的
+# `load_dotenv` 会在加载后调用 `scrub_behavior_env()` 把**所有**行为变量删掉 ——
+# 于是 config 读到的会话密钥变成空串，全量用例集体 401。顺序是那边刻意设计并
+# 写进注释的，不能为省一行把它挪走。
+#
+# 所以放在**进程入口**这一层：只有 `-m app.serve`（以及 `--reload` 的子进程）走
+# 这条路，测试进程不受影响。其它入口（`app/migrations`、`scripts/*`）本来各自
+# 显式 `load_dotenv()`。
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:                          # noqa: BLE001  dotenv 是可选依赖
+    pass
 
 
 def loop_factory(use_subprocess: bool = False):

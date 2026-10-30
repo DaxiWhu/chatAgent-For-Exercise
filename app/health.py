@@ -92,11 +92,19 @@ def _index_identity_note() -> str:
 
 
 def _check_vector_store() -> tuple[bool, str]:
-    """探向量后端（pg 查 vector 扩展 / qdrant 查配置），并回显索引身份校验结论。
+    """探向量后端（pg 查 vector 扩展 / qdrant 查依赖与配置），并回显索引身份校验结论。
 
     只读探测：**绝不建表、绝不连 Qdrant** —— 连上就是 IO，而就绪探针每几秒一次，
-    那会把它变成一个稳定的外部负载。所以 qdrant 分支只查"地址配没配"
-    （也顺手补上了此前 qdrant 分支完全没有任何检查的缺口）。
+    那会把它变成一个稳定的外部负载。所以 qdrant 分支查的是"地址配没配"与
+    "客户端库装没装"（导入检查，零 IO）。
+
+    ⚠️ **为什么要查 qdrant 客户端是否可导入**（2026-10-30 实机修）：此前该分支
+    只看 `QDRANT_URL`，于是"配了 qdrant 但没装 `qdrant_client`"的实例报
+    `ok:true, backend=qdrant`，而同一份启动日志里躺着
+    `索引身份自检失败：No module named 'qdrant_client'`。这条链路**每次检索都会
+    失败**，就绪探针却一直是绿的 —— 与 `run_state` 那处属于同一类"配了但用不了"。
+    `qdrant_client` 在 `src/rag/qdrant_store.py` 里是**方法内延迟导入**的，所以
+    装没装只有真去 import 才知道，读配置读不出来。
 
     ⚠️ **索引身份不一致不判失败**：那是**数据问题**（库里灌的是旧模型的向量），
     不是这个实例的问题 —— 摘流量、重启都解决不了它，只会额外制造一次停机。
@@ -110,6 +118,11 @@ def _check_vector_store() -> tuple[bool, str]:
     if backend == "qdrant":
         if not R.QDRANT_URL:
             return False, f"RAG_VECTOR_STORE=qdrant 但 QDRANT_URL 未配置{ident}"
+        try:
+            import qdrant_client  # noqa: F401  只验可导入，不建客户端、不连
+        except Exception as e:  # noqa: BLE001  缺库/装坏了都算不可用
+            return False, (f"RAG_VECTOR_STORE=qdrant 但客户端库不可用"
+                           f"（{type(e).__name__}: {e}）⇒ 每次检索都会失败{ident}")
         return True, f"backend=qdrant（集合={R.QDRANT_COLLECTION}）{ident}"
     if backend != "pg":
         return True, f"backend={R.VECTOR_STORE or 'memory'}（无外部依赖）{ident}"
@@ -119,7 +132,7 @@ def _check_vector_store() -> tuple[bool, str]:
     return (ok, ("vector 扩展可用" if ok else "vector 扩展不可用/连不上") + ident)
 
 
-def _check_run_store() -> tuple[bool, str]:
+def _check_run_store(db_reachable: bool | None = None) -> tuple[bool, str]:
     """回显**被打断的运行现场（官方 ``RunState``）存在哪**，用于核对"持久化接上没有"。
 
     为什么这项取代了原来的 `checkpointer`：编排原语只剩 `Agent` + `Runner`，官方
@@ -127,10 +140,20 @@ def _check_run_store() -> tuple[bool, str]:
     存在 `agent_run_state` 表里（见 `app/runs.py`）。所以要核对的东西没变
     （状态到底落库了没有），换了承载物。
 
-    为什么不判失败：内存后端只是"重启丢现场"，服务本身仍可用；判成 not-ready 会让
-    实例被摘流量、反而更糟（Windows 本地开发就属于这种情况）。但它必须**可见** ——
-    否则最典型的翻车是"以为连了 PG，其实静默降级成内存，重启后待审的现场全丢，
-    而日志里查不到"。
+    db_reachable: `readiness()` 里 db 探测的结论。**必须传进来**，原因见下面那条
+    ⚠️。为 None 表示调用方没提供（单测直接调本函数时的默认），此时不做可达性推断。
+
+    ⚠️ **为什么需要 db 的结论**（2026-10-30 实机修）：`RunStore.backend` 只在
+    `_ensure_schema()` **成功执行之后**才变成 `"postgres"`，在这之前它是 `"memory"`
+    而 `dsn` 有值 —— 原来这条分支无条件回 `"postgres（表尚未建立：首次写入时建）"`，
+    于是"配了 DB_URL 但库连不上"的实例得到 `ok:true` + 一句断言持久化已生效的话。
+    实机证据：`/health/ready` 里 `db.ok=false`（connection timeout）与
+    `run_state.ok=true`（"表尚未建立"）同时出现。**这是假绿灯**：现场根本写不进去。
+
+    为什么不判失败（除了上面那种）：内存后端只是"重启丢现场"，服务本身仍可用；
+    判成 not-ready 会让实例被摘流量、反而更糟（Windows 本地开发就属于这种情况）。
+    但"配了 dsn 且库探测失败"是另一回事 —— 它宣称的持久化能力并不存在，所以那一档
+    明确 `ok=False`。
     """
     try:
         import app.main as M  # 延迟导入：避免与 main→health 形成循环导入
@@ -147,6 +170,13 @@ def _check_run_store() -> tuple[bool, str]:
         return True, f"未知（读取失败：{type(e).__name__}）"
     if not enabled:
         return True, "disabled（运行现场不落库，停机一律不可恢复）"
+    if dsn and db_reachable is False:
+        # 配了 DSN 但数据库这一轮探测失败：无论表建没建，现场都写不进去。
+        # 绝不能在这里回"已持久化"或"表尚未建立" —— 那两句都在断言一件假事。
+        return False, (
+            "⚠️ 配了 DB_URL 但数据库当前连不上 ⇒ 运行现场实际写不进，"
+            "被打断的运行重启即丢（先看 db 项）"
+        )
     if backend == "postgres":
         return True, "postgres（已持久化，被打断的运行可跨重启恢复）"
     if dsn:
@@ -195,6 +225,12 @@ def readiness() -> tuple[bool, dict]:
     checks: dict[str, dict] = {}
     overall = True
 
+    #: db 的结论要喂给 run_state（见 `_check_run_store` 的 ⚠️ 段）：
+    #: `RunStore.backend` 在首次写入前恒为 `"memory"`，光读它区分不出
+    #: "表还没建"与"库根本连不上" —— 这两种情况属性长得一模一样，只有 db 探测
+    #: 能分辨。所以这里按**顺序**求值并把它传下去，而不是各探各的。
+    db_ok: bool | None = None
+
     for name, fn in (
         ("llm", _check_llm),
         ("db", _check_db),
@@ -202,10 +238,12 @@ def readiness() -> tuple[bool, dict]:
         ("run_state", _check_run_store),
         ("pg_pool", _check_pg_pool),
     ):
-        ok, detail, ms = _timed(fn)
+        ok, detail, ms = _timed(fn, db_ok) if name == "run_state" else _timed(fn)
         checks[name] = {"ok": ok, "detail": detail, "ms": ms}
         if not ok:
             overall = False
+        if name == "db":
+            db_ok = ok
 
     body = {
         "status": "ok" if overall else "degraded",

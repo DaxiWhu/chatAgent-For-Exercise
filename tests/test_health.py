@@ -67,6 +67,45 @@ def test_vector_check_ok_for_memory_backend(monkeypatch):
     assert ok and "memory" in detail
 
 
+# ---------------------------------------------------------------------------
+# qdrant：配了地址不等于能用（客户端库是**延迟导入**的）
+# ---------------------------------------------------------------------------
+# 背景（2026-10-30 实机）：`RAG_VECTOR_STORE=qdrant` + `QDRANT_URL` 已配，但环境里
+# 没装 `qdrant_client` 时，就绪探针回 `ok:true, backend=qdrant`，而同一份启动日志
+# 里躺着 `索引身份自检失败：No module named 'qdrant_client'` —— 这条链路**每次
+# 检索都会失败**，探针却一直是绿的。
+def test_vector_check_fails_when_qdrant_client_missing(monkeypatch):
+    import sys
+
+    from src.rag import retrieval as R
+
+    monkeypatch.setattr(R, "VECTOR_STORE", "qdrant")
+    monkeypatch.setattr(R, "QDRANT_URL", "http://q:6333")
+    # `sys.modules[name] = None` 会让 `import name` 直接抛 ImportError，
+    # 与"没装这个包"对被测代码完全等价，且不依赖本机是否真装了它。
+    monkeypatch.setitem(sys.modules, "qdrant_client", None)
+
+    ok, detail = health._check_vector_store()
+    assert ok is False, "缺客户端库却报了通过 ⇒ 每次检索都会失败而探针是绿的"
+    assert "客户端库不可用" in detail and "每次检索都会失败" in detail
+
+
+def test_vector_check_ok_when_qdrant_client_present(monkeypatch):
+    """反向对照：库在就必须报通过，否则上面那条会靠"永远失败"蒙过去。"""
+    import sys
+    import types
+
+    from src.rag import retrieval as R
+
+    monkeypatch.setattr(R, "VECTOR_STORE", "qdrant")
+    monkeypatch.setattr(R, "QDRANT_URL", "http://q:6333")
+    monkeypatch.setattr(R, "QDRANT_COLLECTION", "rag_chunks")
+    monkeypatch.setitem(sys.modules, "qdrant_client", types.ModuleType("qdrant_client"))
+
+    ok, detail = health._check_vector_store()
+    assert ok and "qdrant" in detail
+
+
 class _FakeStore:
     """只为承载 backend / dsn 属性的最小替身（对应 `app/runs.RunStore`）。"""
 
@@ -119,6 +158,53 @@ def test_run_state_check_flags_disabled(monkeypatch):
     monkeypatch.setattr(M, "run_store", _FakeStore(enabled=False))
     ok, detail = health._check_run_store()
     assert ok and "disabled" in detail
+
+
+# ---------------------------------------------------------------------------
+# run_state：「配了但连不上」不许报成「持久化已生效」
+# ---------------------------------------------------------------------------
+# 背景（2026-10-30 实机）：`db.ok=false`（connection timeout）与
+# `run_state.ok=true, detail="postgres（表尚未建立：首次写入时建）"` **同时出现在
+# 同一份 /health/ready 里**。后半句在断言一件并不成立的事 —— 库连不上，
+# `_ensure_schema` 根本跑不了，现场一个字节也写不进去。
+def test_run_state_check_flags_unreachable_db(monkeypatch):
+    import app.main as M
+
+    monkeypatch.setattr(M, "run_store", _FakeStore(backend="memory", dsn="postgresql://x"))
+    ok, detail = health._check_run_store(False)   # db 探测失败
+
+    assert ok is False, "库连不上时仍报 ok ⇒ 假绿灯"
+    assert "连不上" in detail and "写不进" in detail
+    assert "表尚未建立" not in detail, "这句话在库连不上时是假的，不能出现"
+
+
+def test_run_state_check_trusts_successful_schema_when_db_is_ok(monkeypatch):
+    """反向对照：库探测通过时，已落成的 postgres 后端仍报持久化生效。"""
+    import app.main as M
+
+    monkeypatch.setattr(M, "run_store", _FakeStore(backend="postgres", dsn="postgresql://x"))
+    ok, detail = health._check_run_store(True)
+    assert ok and "已持久化" in detail
+
+
+def test_readiness_passes_db_result_into_run_state(monkeypatch):
+    """整体联动：db 挂了，run_state 那项必须**跟着说实话**。
+
+    这条守的是"两处探针各探各的"那种实现 —— 单看 `_check_run_store` 是对的，
+    但 `readiness()` 没把 db 的结论传下去，就仍然是假绿灯。
+    """
+    import app.main as M
+
+    monkeypatch.setattr(config, "API_KEY", "sk-test")
+    monkeypatch.setattr(health, "_check_db", lambda: (False, "connection timeout"))
+    monkeypatch.setattr(health, "_check_vector_store", lambda: (True, "stub"))
+    monkeypatch.setattr(health, "_check_pg_pool", lambda: (True, "未建立"))
+    monkeypatch.setattr(M, "run_store", _FakeStore(backend="memory", dsn="postgresql://x"))
+
+    ok, body = health.readiness()
+    assert not ok and body["status"] == "degraded"
+    assert body["checks"]["run_state"]["ok"] is False
+    assert "连不上" in body["checks"]["run_state"]["detail"]
 
 
 def test_run_state_check_fails_open(monkeypatch):
