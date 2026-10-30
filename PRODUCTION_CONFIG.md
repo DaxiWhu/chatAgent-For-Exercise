@@ -107,7 +107,7 @@
 | 变量 | 当前状态 | 说明 |
 |---|---|---|
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_HOST` | 未设置 | Langfuse 链路。**三填二**（host 可留空用官方云）；与 LangSmith 二选一。⚠️ **还需要额外装两个包**：`langfuse` + `openinference-instrumentation-openai-agents`（不在生产 `requirements.txt` 里，见 §3.1）。装了才真的上报；没装时启动日志会明确写"缺依赖"，`tracing` 后端回落 `none` —— **不会**出现"日志说接上了、面板里一条都没有"。装上之后，每条 trace 上带 `session_id`（会话）与 `metadata.request_id`（响应头回给客户端的那个值）⇒ **用户报 `X-Request-ID` 时能直接搜到那条链路**，不是只能搜日志 |
-| `LANGSMITH_API_KEY` / `LANGCHAIN_PROJECT` | 未设置 | LangSmith 链路（`app/tracing.py` 把这两个值翻译成 LangChain 侧认的三个环境变量：开启开关 / API Key / 项目名 —— LangChain **只认环境变量**，没有别的配置入口）。⚠️ 它覆盖的是 LangChain 那一层调用（如 `scripts/eval_generation.py`），**不覆盖**官方 Agents SDK 自己的 tracing |
+| `LANGSMITH_API_KEY` / `LANGCHAIN_PROJECT` | 未设置 | LangSmith 链路。**2026-10-30 起已接入 agent 链路**：除写 LangChain 侧认的三个环境变量（开启开关 / API Key / 项目名，LangChain 只认环境变量）之外，还会用官方 `OpenAIAgentsTracingProcessor` **替换** SDK 的处理器列表并**显式解禁** tracing —— 两件事缺一不可，少做替换默认处理器仍会把 prompt 与回复发往 OpenAI 后端，少做解禁则一条 span 都不产生（且零报错）。⚠️ 与 Langfuse 占**同一个位置、二者互斥**；两套 key 都填时 **LangSmith 优先**，Langfuse 分支不执行。⚠️ 想看到"会话聚合"与"按 `X-Request-ID` 反查"，运行配置里必须带 `group_id` 与 `trace_metadata`（`src/agents/runner.py::build_run_config`，由 `app/main.py` 传入）—— 只配 key 不传这两个字段，trace 是有的，但多轮串不起来、按 rid 搜不到。接入或改动前用 `python scripts/trace_probe.py` 离线验证转换层（零成本、不发网络） |
 | `METRICS_ENABLED` | ✅ `1` | `/metrics` 已开 |
 | `LOG_FORMAT` | ✅ `json` | 一行一 JSON，便于日志系统检索；本地想看人眼友好改 `text` |
 
@@ -424,9 +424,18 @@ curl -s localhost:8000/health/ready | python -m json.tool
 - `postgres（表尚未建立：首次写入时建）` ← 正常（还没运行被打断过；第一次写入建表）
 - `memory（进程内存，重启丢现场！）（未配 DB_URL，属预期）` ← 没接上，回看启动日志
 - `disabled（运行现场不落库，停机一律不可恢复）` ← 明确关了
+- `⚠️ 配了 DB_URL 但数据库当前连不上 ⇒ 运行现场实际写不进…` ← **不正常**，且这一项
+  会是 `ok=false`（同时 `checks.db.ok` 也已经是 `false`）
 
-⚠️ 这一项**不判 not-ready**（内存后端只是"重启丢现场"，服务本身还能用；判失败会让实例
-被摘流量，反而更糟）。所以它必须靠人看一眼，而不是靠探针变红。
+⚠️ 这一项**默认不判 not-ready**（内存后端只是"重启丢现场"，服务本身还能用；判失败会让
+实例被摘流量，反而更糟）。**唯一的例外是"配了 `DB_URL` 但库探测失败"** —— 那一档宣称的
+持久化能力并不存在，2026-10-30 起明确判 `ok=false`。
+
+⚠️ 这里原来只读进程内属性（`RunStore.backend` / `dsn`），而 `backend` 要等首次写入
+建表成功才会变成 `postgres` ⇒ **库连不上时它也报 `ok:true` + "表尚未建立"**，
+与同一份响应里 `db.ok=false` 自相矛盾（实测过）。现在 `readiness()` 会把 db 的探测结论
+传给这一项，这个假绿灯已消除。**别把两处探针改回各自为政** —— `tests/test_health.py`
+里有一条联动用例守着。
 
 ## 七、告警邮件通道（可选，**默认关闭**）
 
@@ -484,7 +493,8 @@ curl -s localhost:8000/health/ready | python -m json.tool
 7. [ ] `/health/ready` 五项都在（llm / db / vector_store / run_state / pg_pool），前三项 ok
 8. [ ] `checks.run_state` 显示 `postgres（已持久化，被打断的运行可跨重启恢复）`
        （`memory（进程内存，重启丢现场！）` ⇒ 停机现场没落库，重启即丢；
-       ⚠️ 这一项**刻意不判 ok=false**，所以探针不会替你发现它，只能人看）
+       ⚠️ 内存降级这一档**刻意不判 ok=false**，探针不会替你发现它，只能人看；
+       而"配了 DB_URL 却连不上"这一档 2026-10-30 起**会**判 ok=false）
 9. [ ] `python -m app.migrations --status` 退出码 0（缺迁移 / 维度不符都会非 0）
 10. [ ] `python -m scripts.pg_backup drill` 跑通（**没恢复过的备份不算备份**）。
        它会把结果写进 `backups/drill-pg.prom`；**这一点必须核对** —— 没写出来就说明

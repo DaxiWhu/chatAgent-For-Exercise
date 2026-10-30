@@ -98,6 +98,12 @@ pytest tests/ -q
 > `APP_PORT` / `APP_WORKERS`（兼容平台注入的 `WEB_CONCURRENCY`）与优雅关闭排空上界
 > `GRACEFUL_SHUTDOWN_TIMEOUT`，这几项裸命令都要自己敲对。
 >
+> `.env` 由**启动入口自己在导入期加载**，所以第 1 步写完就不用再 `export` 一遍；
+> `APP_HOST` / `APP_PORT` 这些也可以直接写在 `.env` 里。这条以前不成立（那时
+> `.env` 只在 `app/main.py` 导入时加载，而入口解析排空上界**早于**它 ⇒ 只配
+> `.env` 必然报 `missing_api_key` 拒绝启动），2026-10-30 已修，由
+> `tests/test_serve_env_bootstrap.py` 用子进程守着。
+>
 > ⚠️ **历史说明（2026-10-20 更新）**：这个入口原本还有一个理由 —— 检查点用的是
 > `AsyncPostgresSaver`（psycopg 异步），而 psycopg 异步**不支持 Windows 的
 > ProactorEventLoop**，所以要注入自适应的事件循环工厂。**异步检查点已经随图一起退役**：
@@ -527,7 +533,7 @@ request_review → END
 | `LOG_FORMAT` / `LOG_LEVEL` | 否 | `json`（默认，生产）/ `text`（本地人眼友好）；级别默认 `INFO` |
 | `HEALTH_READY_TIMEOUT` | 否 | 就绪探针探依赖的超时（秒），默认 `3` |
 | ~~`DISCONNECT_POLL_INTERVAL`~~ | — | **已废弃**。断连检测改为 sse_starlette 的 `client_close_handler_callable` 回调（事件驱动，无轮询间隔可调） |
-| `LANGFUSE_*` / `LANGSMITH_API_KEY` / `LANGCHAIN_PROJECT` | 否 | 链路追踪。两组都留空 = **不产生任何 trace**（连 SDK 默认的 OpenAI 后台上报也会被关掉）。Langfuse 还需要额外装 `langfuse` + `openinference-instrumentation-openai-agents` 两个包，见 `PRODUCTION_CONFIG.md` §3.1 |
+| `LANGFUSE_*` / `LANGSMITH_API_KEY` / `LANGCHAIN_PROJECT` | 否 | 链路追踪。两组都留空 = **不产生任何 trace**（连 SDK 默认的 OpenAI 后台上报也会被关掉）。Langfuse 还需要额外装 `langfuse` + `openinference-instrumentation-openai-agents` 两个包，见 `PRODUCTION_CONFIG.md` §3.1。`LANGSMITH_API_KEY` 自 2026-10-30 起**已接入 agent 链路**（官方 `OpenAIAgentsTracingProcessor`，同时仍覆盖 LangChain 那层评测脚本）；与 Langfuse 只能二选一，两套都填时 LangSmith 优先。接入或改动前用 `python scripts/trace_probe.py` 离线验证转换层 |
 | `REVIEW_NOTIFY_WEBHOOK` / `REVIEW_NOTIFY_FORMAT` | 否 | 待审通知（`generic` / `wecom` / `feishu`）。**留空 = 只入队不通知** |
 
 **RAG 检索**

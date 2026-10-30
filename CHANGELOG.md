@@ -11,6 +11,95 @@
 
 ## [Unreleased]
 
+### 新增 — LangSmith 接入 agent 链路（2026-10-30）
+
+此前 `app/tracing.py` 的 LangSmith 分支**只写 `LANGCHAIN_*` 环境变量**，所以
+LangChain 那层脚本（如 `scripts/eval_generation.py`）有记录，而真实对话的 agent
+链路**一条 trace 都没有** —— 且日志写"已启用"、不报任何错。这不是能力限制，是漏了
+"挂处理器"这一步。
+
+- `app/tracing.py::_enable_langsmith()`：用官方
+  `langsmith.integrations.openai_agents_sdk.OpenAIAgentsTracingProcessor` 替换 SDK 的
+  处理器列表，**并显式 `set_tracing_disabled(False)`**。两件事缺一不可（两个函数改
+  的是 provider 上的不同字段）：少做替换，SDK 默认处理器仍在位，会把 prompt 与回复
+  全文发往 OpenAI 后端；少做解禁，处理器收不到任何 span，而症状只是"平台没有 trace"。
+  顺序定为"先替换、再解禁"，不留默认处理器仍在位的窗口。
+- `src/agents/runner.py::build_run_config()` 新增 `group_id` 与 `trace_metadata`
+  两个官方字段，由 `run_agent` 用 `session_id` 与端点层传入的元数据填上：
+  - `group_id` → `Trace.export()["group_id"]` → 转换层写成 `metadata["thread_id"]`，
+    平台侧的多轮聚合**只认它**；不传则每一轮都是独立 trace。
+  - `trace_metadata` → `create_trace(metadata=...)` → 由处理器合并进 run 的 metadata，
+    按 `X-Request-ID` 反查走的就是这条。注意 `TracingConfig` **没有** metadata 字段
+    （只有 `api_key` 与 `include_task_and_turn_spans`），此前记成走它，已核实纠正。
+  - 空串一律归一成 `None`：`group_id=""` 在平台侧是个真实取值，会把所有"没有会话"
+    的请求挤进同一个分组，且无法按"字段缺失"过滤。
+- `app/main.py`：`request_id` / 会话 / 租户**只算一次**，同时喂给 `trace_scope`
+  （Langfuse）与 `trace_metadata`（LangSmith）。各算一遍的后果是"日志里搜到的 rid
+  在平台上搜不到"，而那正是报障时唯一的入口。
+- 明确一条口径：`trace_scope()` 那套上下文变量机制**只对 Langfuse 生效**，对
+  LangSmith 是空转（`nullcontext`，不报错）。两者占同一个点位，两套 key 都填时
+  **LangSmith 优先**、Langfuse 分支不执行。
+- 守卫：`tests/test_observability.py` 新增 6 条（接入调用与顺序、缺依赖如实降级、
+  双后端优先级、两个字段落地、空值归一、`session_id → group_id` 映射）。
+  变异 8 组全部反向验证（`tmp_probe/mutation_langsmith_20261030.py`，8/8 守住）。
+
+### 修复 — 纯 `.env` 起不来 / 健康检查两处假绿灯 / 登录 500（2026-10-30）
+
+三个都是**实机验证**出来的，且都属于"错了也没有症状"的那一类。
+
+- **`python -m app.serve` 在只配 `.env` 时必然拒绝启动**（`missing_api_key`）。
+  根因不是配置写错，是**加载顺序**：`serve.py` 的 `resolve_graceful_timeout()`
+  在 `uvicorn.run()` **之前**就 `from app import config`，而 `config` 的常量是
+  模块级求值 ⇒ 空 Key 当场固化；等 `app.main` 的 `load_dotenv()` 执行时
+  `app.config` 已在 `sys.modules` 里，不会重新求值。测试与探针走
+  `import app.main`，不经过那条路径 ⇒ **单测全绿、真实入口必挂**。
+  修法：`app/serve.py` 在**任何 app 导入之前**加载 `.env`（不放进 `app/config.py`，
+  那会破坏 `tests/conftest.py` 的测试身份注入顺序 —— 详见该处注释）。
+  顺带修好 `APP_HOST` / `APP_PORT` 等 argparse 默认值读不到 `.env` 的老问题。
+  守卫：`tests/test_serve_env_bootstrap.py`（子进程跑真正的入口模块）。
+- **`/health/ready` 的两处假绿灯**（实测同一份响应里 `db.ok=false` 与
+  `run_state.ok=true` 并存）：
+  - `run_state`：`RunStore.backend` 只在首次建表成功后才变 `postgres`，之前靠
+    `dsn` 非空就报 "postgres（表尚未建立）" —— 库连不上时也这么报。
+    现在 `readiness()` 把 db 探测结论传进去，该组合判 `ok=false` 并写明
+    "现场实际写不进"。
+  - `vector_store`：`RAG_VECTOR_STORE=qdrant` 只看 `QDRANT_URL` 配没配，
+    不查客户端库装没装（`qdrant_client` 是**方法内延迟导入**的），于是
+    "没装库、每次检索必失败"的实例探针报绿。现在加一次导入检查（零 IO）。
+- **登录在账号库不可用时回 500**：应回 **503 `storage_unavailable`**。
+  500 会让运维去翻代码找 bug，而 `/health/ready` 早就算出 `db.ok=false`；
+  退化成 401 更糟 —— 那等于告诉所有用户"你密码错了"。
+  现在 `AuthService.login_with_password` 只把 `psycopg` 连接错误与
+  `app.pg.PoolUnavailable` 转成 `StorageUnavailable`，**其余异常原样抛**
+  （把它们也转 503 会让一个键名写错误报成"存储不可用"，更难查）。
+- **文档订正**：`deploy/RUNBOOK.md` 里 `run_state` 的示例文案还是更早版本的
+  `InMemorySaver（内存，重启丢状态！）`（当前实现根本不会输出这句）；
+  `PRODUCTION_CONFIG.md` 的"怎么确认停机现场真的落库"与上线 checklist 第 8 条
+  同步新判据。
+
+验证：新增 11 条守卫用例；变异 7/7 全部被捕获；全量回归见下方。
+
+### 新增 — LangSmith 转换层离线探针；订正"agent 链路进不了 LangSmith"（2026-10-29）
+
+官方已提供 OpenAI Agents SDK 的原生集成（`langsmith.integrations.openai_agents_sdk`
+的 `OpenAIAgentsTracingProcessor`，用 `set_trace_processors` 挂载），而代码与文档里
+仍写着"agent 链路不进 LangSmith"。那句话对当时的 SDK 成立，对现在不成立。
+
+- **`scripts/trace_probe.py`（新）**：零成本证明转换层正常 —— 给官方处理器换一个
+  **只记录不发送**的 client，收下每次 `create_run` 的入参，再按 `parent_run_id`
+  重新拼树（根 run 是**最后**才上报的，不能按到达顺序拼）。五条判据：唯一根 /
+  根用工作流名 / 无孤儿 / 每条 run 带 `thread_id` / 工具节点被识别为 `tool`。
+  `--live` 才要求 `llm` 节点（假模型不产生 generation span，那是它的局限，
+  不是转换层的缺陷）。`--send` 必须配 `LANGSMITH_API_KEY`，**缺密钥当场失败** ——
+  缺 key 时上报会被静默丢弃、看起来像成功；发完用 `read_run` 回读做闭环验证。
+- **订正三处过期文档**：`app/tracing.py` 的模块说明与启动日志文案、
+  `PRODUCTION_CONFIG.md` 的环境变量表、`requirements.txt` 的依赖注释。
+  现在的口径是：**能接，但本项目没接**；服务侧 tracer 仍只有 Langfuse 一支，
+  LangSmith 只覆盖还在用 LangChain 的评测脚本。
+- **`tests/test_trace_probe.py`（新，10 条）**：树重建（乱序到达 / 孤儿）、六条判据
+  各自的红绿、一次真跑 SDK 的端到端（确认官方处理器确实收下了 `kb_search` 的工具
+  节点）、缺密钥必须显式失败。变异 **5/5 守住**。
+
 ### 变更 — trace 现在能按 `request_id` / 会话反查；`TaskOutcome.decision` 删除（2026-10-21）
 
 上一批把 tracing 接到了官方插桩上，但留了一条断链：**日志里的 `request_id` 在 trace
