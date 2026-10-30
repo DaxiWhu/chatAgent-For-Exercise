@@ -17,7 +17,7 @@ chatAgent/
 │  │  ├─ runner.py           `Runner` 的调用与结果整理（`TaskOutcome`）
 │  │  ├─ frontline.py        入口 agent（判定 reply / transfer）+ 交付工具
 │  │  ├─ specialists.py      专家 agent（检索、文学创作…）
-│  │  ├─ tools.py            `kb_search` 等工具（citations 从这里出来）
+│  │  ├─ tools.py            工具：检索 / 交付 / 落盘，以及时间 / 算术 / 资产回读
 │  │  ├─ approval.py         工具审批：`deliver(needs_review=True)` 停在交付前
 │  │  ├─ compaction.py       跨轮历史压缩
 │  │  └─ session.py          官方 `Session` 的 PG 后端（跨轮历史唯一载体）
@@ -883,7 +883,7 @@ ModelInputData（真正发给模型）
 求差集即可。多出来的字段一律按**参数错**退回模型，文案里写清「多了哪些、只接受
 哪些」，让它一次改对。
 
-四处契约检查共用同一个异常（`ToolContractError`）：
+六处契约检查共用同一个异常（`ToolContractError`）：
 
 | 检查 | 拦住的形态 |
 |---|---|
@@ -891,6 +891,8 @@ ModelInputData（真正发给模型）
 | `save_text_asset` 内容为空 | 写出一个空文件，返回值仍是"已保存" |
 | `generate_image` 描述为空 | 生成不出可用的图，返回值仍是"已生成" |
 | `deliver` 正文为空 | 用户收到一片空白，而这一轮是成功的 |
+| `calculate` 表达式为空 / 不是算式 | 回一句"算不了"，模型当成算过了继续往下写 |
+| `read_asset` 指向落盘目录之外 | 读到任意文件（`../` 在字符串层面看不出来，只有 `resolve()` 之后才知道） |
 
 ⚠️ **违约必须抛异常，不能返回一句"失败"**：返回文本在步骤清单里算 `ok`，兜底的
 "已完成清单"会把它列成做成了，失败只发生在用户打开文件的那一刻。这个异常继承

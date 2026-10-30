@@ -11,6 +11,47 @@
 
 ## [Unreleased]
 
+### 新增 — 四个确定性工具 + 工具选择评测（2026-10-30）
+
+前台原先只有 5 个工具（三个 `as_tool` 专家、评审、`save_text_asset`、`deliver`），
+缺的是三类**确定性的东西**：模型不知道今天几号（训练数据有截止日期）、算术只能心算、
+落盘是**单向**的（写得出去、读不回来，多轮改稿只能靠它记住全文）。
+
+- `src/agents/tools.py` 新增四个只读工具，全部走既有的 `_isolated`（独立线程池 +
+  单步超时 + 返回截断）与 `tool_error_handler`，因此自动受"单步超时、按工具名失败计数、
+  多次失败劝退"三套既有闸门保护：
+  - `get_current_time(timezone)`：非法时区名**直接拒**，不静默回落 —— 回落会让模型按
+    错误基准做后续换算，而它以为自己传的参数生效了。
+  - `calculate(expression)`：AST **白名单**求值，不是 `eval`（输入是模型生成的字符串，
+    `eval` 等于把执行权交给不可信文本）。指数上界 64、结果位数上界 40：`9**9**9` 是合法
+    语法但**算不完**，会占死共享工具池里的一个线程。浮点归一（`0.1+0.2` → `0.3`）。
+  - `list_assets()` / `read_asset(name)`：与 `save_text_asset` 闭环。读取前先 `resolve()`
+    再比前缀 —— `../secret.txt` 在字符串层面看不出来，只有解析成真实路径才知道有没有
+    跑出目录。
+- `src/agents/frontline.py`：挂上四个工具，instructions 补一段「确定性动作（不要用记忆
+  或心算代替）」。只挂在**前台**：专家不做这类动作，多挂只是稀释注意力。
+- **刻意没做** `fetch_url`：抓任意 URL 同时带进 SSRF（内网地址、云元数据端点）与间接
+  注入，而现有的 `guard.wrap_context` 只处理后者。要做先定域名白名单与出网策略 ——
+  那是独立一件事，不该混在"补常见工具"里悄悄上线。
+- `scripts/agent_tool_eval_set.json` + `scripts/agent_tool_eval.py`：工具选择评测集
+  （11 条用例 / 12 个判定轮次），判据是**模型实际调了哪个工具**（读 `TaskContext.steps`，
+  不从模型响应里再解析一遍）。第一次跑就抓到自己的一个假绿：硬判定 12/12 全过，而三个
+  `as_tool` 专家**每次都失败** ⇒ 改成"选中"与"执行成功"两个指标，并单列**空转**
+  （有动作、无一成功）；退出码把空转也算失败。
+- `tests/test_agent_tools_basic.py`（21 条）：路径穿越、`eval` 式表达式、指数炸弹、
+  除零、空输入、多余参数、非 UTF-8 文件、时区非法。**每一处护栏都做了变异验证**
+  （7 条变异全部变红）：包括"把 `_eval_node` 换回 `eval`"、"去掉 `is_relative_to`"、
+  "忽略 timezone 参数"。
+- `tests/test_agent_tool_steps.py` / `tests/test_agents_pipeline.py` 的两条"精确清单"
+  断言同步扩到 10 个工具 —— 它们本来就是用来逼人看一眼"是不是又多了个工具"的。
+
+实测（DeepSeek `deepseek-chat`，读 `.env` 的 `DEEPSEEK_API_KEY`）：工具选择 12/12、
+工具执行 9/19、空转 2 轮。失败全部集中在三个 `as_tool` 专家，根因是上游
+**不支持 `response_format: json_schema`**（实测：`json_schema` → 400
+`This response_format type is unavailable now`，`json_object` → 200），而
+`output_type=PydanticModel` 正是走 `json_schema`。这是 provider 能力差异，不是本项目
+代码缺陷；新增的四个工具都没有结构化输出，在该 provider 下全部可用。
+
 ### 新增 — LangSmith 接入 agent 链路（2026-10-30）
 
 此前 `app/tracing.py` 的 LangSmith 分支**只写 `LANGCHAIN_*` 环境变量**，所以

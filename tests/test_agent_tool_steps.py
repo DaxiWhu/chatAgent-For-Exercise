@@ -592,7 +592,11 @@ def test_every_write_is_a_noop_when_disabled(monkeypatch, sink):
 # 七、接线：七处都不能漏
 # --------------------------------------------------------------------------- #
 def test_all_tools_that_can_fail_install_a_handler():
-    """★ 八处接线**一个都不能漏**（四个 ``function_tool`` + 四个 ``as_tool``）。
+    """★ 八处接线**一个都不能漏**（八个 ``function_tool`` + 四个 ``as_tool``）。
+
+    2026-10-30 补了四个只读工具（get_current_time / calculate / list_assets /
+    read_asset），所以 ``function_tool`` 那一侧从四个变成八个；下面第 3 段把"哪些
+    工具该装"写成了显式清单，新增工具不会因为这段 docstring 没改而漏过去。
 
     为什么按清单数而不是抽查：漏掉一处的症状是**那一类失败彻底不可见** ——
     "专家整体失败"（结构化产出解析不出来）与"专家内部某个工具失败"完全是两回事，
@@ -619,11 +623,17 @@ def test_all_tools_that_can_fail_install_a_handler():
     for name in sorted(expected):
         assert installed(on_frontline[name]), f"{name} 没装错误处理函数"
 
-    # 3. 前台工具表里"装了处理函数"的恰好是这六个 —— 将来新增一个能失败的工具
+    # 3. 前台工具表里"装了处理函数"的恰好是这十个 —— 将来新增一个能失败的工具
     #    却忘了装，这条立刻红；反过来多装了一个也要有人看一眼。
+    #    2026-10-30 加了四个只读小工具（时间 / 算术 / 资产回读）：它们同样可能失败
+    #    （非法时区、除零、路径穿越），失败文案同样要能进步骤清单，所以都装了。
     assert {n for n, t in on_frontline.items() if installed(t)} == expected | {
         "save_text_asset",
         "deliver",
+        "get_current_time",
+        "calculate",
+        "list_assets",
+        "read_asset",
     }
 
 

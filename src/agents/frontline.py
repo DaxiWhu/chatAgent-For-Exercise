@@ -67,7 +67,14 @@ from .specialists import (
     visual_agent,
 )
 from .steps import tool_error_handler
-from .tools import deliver, save_text_asset
+from .tools import (
+    calculate,
+    deliver,
+    get_current_time,
+    list_assets,
+    read_asset,
+    save_text_asset,
+)
 
 __all__ = ["frontline_agent"]
 
@@ -86,6 +93,15 @@ _INSTRUCTIONS = (
     "想确认质量就调用 review_draft；闲聊与追问不必。"
     "⚠️ 一旦调用，就按它给出的改进项改完再交付 —— 它指出问题而你决定不改时，"
     "要么说明理由，要么先改。它**不是**一道必须通过的关卡，只是一份给你自己的第二意见。\n"
+    "\n"
+    "# 确定性动作（不要用记忆或心算代替）\n"
+    "- 要知道今天几号 / 现在几点：调用 get_current_time。你的知识有截止日期，"
+    "凭印象写的日期**看起来**也完全合理，但它是错的。\n"
+    "- 要给出数字结论（合计 / 占比 / 增长率 / 单位换算）：调用 calculate 算一遍。"
+    "过程写对、结果算错是看不到的，而用户会照着这个数做决定。\n"
+    "- 要看上一步落盘了什么、要改那份稿子：先 list_assets 再 read_asset。"
+    "不要靠对话历史回忆内容 —— 历史可能已经被裁剪过，而文件一直在。\n"
+    "\n"
     "5. 交付：正式产出（说明文 / 大纲 / 作品，或任何你要作为最终答复的正文）"
     "调用 deliver，把给用户看的正文放进 content。\n"
     "   - 题材敏感、结论影响面大、或你自己拿不准质量时，把 needs_review 设为 true —— "
@@ -150,6 +166,13 @@ frontline_agent = Agent[TaskContext](
         evaluate_draft_tool,
         # -- 确定性步骤：普通函数工具，不是 agent --
         save_text_asset,
+        # -- 确定性小工具：时间 / 算术 / 资产回读（2026-10-30 补）--
+        # 四个都**不挂审批**：只读、无副作用、不花钱。审批只该落在"撤不回来"的
+        # 动作上（落盘 / 生成），给只读工具加一道确认只会训练用户盲目点同意。
+        get_current_time,
+        calculate,
+        list_assets,
+        read_asset,
         # -- 交付：把正文交出去（顺带承载"要不要人先过目"这个声明）--
         # ⚠️ 它是"按内容决定要不要人审"的**唯一入口**（图只剩一个打标记的
         # ``request_review`` 节点，跑偏/护栏/低分那几档才走它）：

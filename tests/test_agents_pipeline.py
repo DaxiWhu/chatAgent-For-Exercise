@@ -137,8 +137,13 @@ def test_frontline_topology_is_exactly_what_the_design_claims():
     对象 ⇒ 被当成给用户的答复交付出去（用户看到字段名 + 括号）。
     """
     names = {t.name for t in frontline_agent.tools}
+    # 2026-10-30 加了四个只读的确定性工具（时间 / 算术 / 资产回读）：
+    # 它们的判据与"确定性能力不做成 agent"一致 —— 都是**函数**，不是专家。
+    # 这份清单刻意保持"精确相等"而不是"包含"：多挂一个工具也要有人看一眼，
+    # 因为工具是模型可以忘掉的选项，每多一个都在稀释它的注意力。
     assert names == {"research", "build_slide_deck", "make_illustration",
-                     "review_draft", "save_text_asset", "deliver"}
+                     "review_draft", "save_text_asset", "deliver",
+                     "get_current_time", "calculate", "list_assets", "read_asset"}
     assert frontline_agent.output_type is None
     assert [h.name for h in frontline_agent.handoffs or []] == ["literary_writer"]
 

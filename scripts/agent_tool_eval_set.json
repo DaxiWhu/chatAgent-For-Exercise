@@ -1,0 +1,88 @@
+{
+  "_comment": "agent 链路『工具选择』评测集。判据是**模型到底调了哪个工具**，不是答案写得好不好（后者看 eval_answer_set.json）。expect_tools 是**必须出现**的工具（子集判定，允许它多查一次）；forbid_tools 是一个都不许出现；expect_no_tools 用于闲聊——它比 expect_tools=[] 更严格，含义是『一步动作都不该有』。改工具名就要同步改这里，否则用例会静默变成『永远不通过』。",
+  "_note_on_soft_checks": "expect_text_any 是**软判定**（答案里出现其中任一关键词即算过）。它只用于『模型该承认做不到』这一类——那种能力本来就没有对应的工具，硬判工具名判不出来。这类用例在汇总里单独标 [soft]，不要和硬判定混在一起看通过率。",
+  "cases": [
+    {
+      "id": "chat-no-tools",
+      "note": "闲聊不该有任何工具调用。多调一次工具 = 多一次成本 + 多一层延迟，而用户只是打了个招呼。",
+      "prompt": "你好，你是谁？",
+      "expect_no_tools": true
+    },
+    {
+      "id": "thanks-no-tools",
+      "note": "同上，但更短。短请求最容易触发『我还是查一下比较保险』这种多余动作。",
+      "prompt": "好的，谢谢。",
+      "expect_no_tools": true
+    },
+    {
+      "id": "time-today",
+      "note": "模型不知道今天几号。不调工具就会编一个看起来完全合理的日期，而答案里没有任何线索能看出那是编的。",
+      "prompt": "今天是几号？星期几？",
+      "expect_tools": ["get_current_time"],
+      "forbid_tools": ["research"]
+    },
+    {
+      "id": "time-relative",
+      "note": "『还有多少天』必须落在真实日期上。模型可能只调时间工具 + 心算，也可能两个都调——都算过，关键是不能一个都不调就回答。",
+      "prompt": "现在离 2027 年元旦还有多少天？先确认真实日期再算。",
+      "expect_tools": ["get_current_time"]
+    },
+    {
+      "id": "calc-discount",
+      "note": "两步算术，心算最容易在第二步错。不该跑去查知识库——这不是事实问题。",
+      "prompt": "原价 1280 元，先打八折，再减 150 元，最后是多少钱？",
+      "expect_tools": ["calculate"],
+      "forbid_tools": ["research"]
+    },
+    {
+      "id": "calc-growth",
+      "note": "百分比增长率带一位小数。要求『保留一位小数』是为了让结果可比对，也是看模型会不会绕过工具自己四舍五入。",
+      "prompt": "第三季度销售额 482 万，第二季度 415 万，增长率是多少？保留一位小数。",
+      "expect_tools": ["calculate"],
+      "forbid_tools": ["research"]
+    },
+    {
+      "id": "kb-fact",
+      "note": "需要事实依据的问题必须走 research（它内部才是 kb_search）。前台自己直接编一个答案是最常见的失败形态。",
+      "prompt": "限流是怎么算的？",
+      "expect_tools": ["research"]
+    },
+    {
+      "id": "slide-outline",
+      "note": "演示稿要交给专门的 agent，而不是前台自己写三段话。",
+      "prompt": "帮我做一个三页的 PPT 大纲，讲知识库问答系统的检索流程。",
+      "expect_tools": ["build_slide_deck"]
+    },
+    {
+      "id": "illustration",
+      "note": "配图同理：一次一张，走 make_illustration。",
+      "prompt": "给「数据治理」这个主题配一张插图。",
+      "expect_tools": ["make_illustration"]
+    },
+    {
+      "id": "asset-roundtrip",
+      "note": "三轮：先落盘，再列目录，最后读回。这条测的正是本次补 read_asset/list_assets 的动机——写入端与读取端必须成对。",
+      "turns": [
+        {
+          "prompt": "把这三条整理成一份要点清单并存成文件，文件名用 report，不用交付正文：① 检索要按租户隔离；② 引用编号必须全局唯一；③ 工具返回过长要截断。",
+          "expect_tools": ["save_text_asset"]
+        },
+        {
+          "prompt": "我现在手上有哪些已经存下来的文件？",
+          "expect_tools": ["list_assets"]
+        },
+        {
+          "prompt": "把那份 report 文件原样读出来给我看看。",
+          "expect_tools": ["read_asset"]
+        }
+      ]
+    },
+    {
+      "id": "no-web-access",
+      "note": "本项目**没有**抓网页的工具。模型该承认做不到，而不是编一段页面内容——这是最容易骗过用户的一类幻觉。",
+      "prompt": "帮我总结一下 https://example.com/abc 这个页面的内容。",
+      "forbid_tools": ["research"],
+      "expect_text_any": ["无法访问", "打不开", "不能直接访问", "没有联网", "无法获取", "不能获取", "无法读取", "不能读取", "没有抓取"]
+    }
+  ]
+}

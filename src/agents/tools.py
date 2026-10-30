@@ -21,15 +21,20 @@
 
 from __future__ import annotations
 
+import ast
 import functools
 import inspect
 import json
 import logging
+import math
+import operator
 import re
 import time
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agents import RunContextWrapper, function_tool
 
@@ -43,9 +48,13 @@ from .steps import ToolContractError, tool_error_handler
 from .toolpool import run_tool_step
 
 __all__ = [
+    "calculate",
     "deliver",
     "generate_image",
+    "get_current_time",
     "kb_search",
+    "list_assets",
+    "read_asset",
     "render_deck",
     "render_slide_deck",
     "save_text_asset",
@@ -176,6 +185,289 @@ def _isolated(tool: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         return inner
 
     return wrap
+
+
+# --------------------------------------------------------------------------- #
+# 确定性小工具：时间 / 算术 / 资产回读（2026-10-30 补）
+#
+# 为什么这四个是**工具**而不是"让模型自己算/自己记"
+# ------------------------------------------------
+# 判据仍然是本模块开头那条：需要模型"拿主意"的才配 agent，其余都是函数 ——
+# 而"确定性的、有唯一正确答案的"动作，连让模型自由发挥都不该有：
+#
+# * ``get_current_time``：模型的训练数据有截止日期，**它不知道今天几号**。
+#   知识库问答里"最近三个月""今年新规"这类问题全要落在具体日期上，让它猜就是
+#   编一个看起来很合理的日子 —— 而且答案里没有任何线索能看出那是猜的。
+# * ``calculate``：算术是模型最容易"算得像"的能力（过程对、结果错），而错了没人
+#   复核。这里用 AST 白名单求值，不用 ``eval``：``eval`` 的输入是**模型生成**的
+#   字符串，等于把代码执行权交给一段不可信文本。
+# * ``read_asset`` / ``list_assets``：``save_text_asset`` 一直是**单向**的 ——
+#   写得出去、读不回来。于是多轮对话里"把上一步的稿子改一下"只能靠模型记住全文，
+#   而会话一旦被 ``history_budget`` 裁过，它就真的没有了。写入端与读取端必须成对，
+#   否则"落盘"只是一次丢弃。
+#
+# ⚠️ 刻意**没有**做 ``fetch_url``：抓任意 URL 会同时带进 SSRF（内网地址、云元数据
+# 端点）与间接注入（抓回来的正文直接进模型上下文）两个问题，而本项目已有的
+# ``guard.wrap_context`` 只处理后者。要做就得先定域名白名单与出网策略 ——
+# 那是独立一件事，不该混在"补常见工具"里悄悄上线。
+# --------------------------------------------------------------------------- #
+def _asset_base(ctx: Any) -> Path:
+    """取落盘根目录。拿不到上下文时与既有工具用同一个兜底值。"""
+    context = getattr(ctx, "context", None)
+    base = context.asset_dir if isinstance(context, TaskContext) else Path("var/agent_assets")
+    return Path(base)
+
+
+@function_tool(failure_error_function=tool_error_handler("get_current_time"))
+@_isolated("get_current_time")
+def get_current_time(ctx: RunContextWrapper[TaskContext], timezone: str = "Asia/Shanghai") -> str:
+    """返回**现在**的日期与时间（含星期与时区）。
+
+    凡是要落到具体日期的地方都用它，不要凭记忆写"今天"是哪天：
+    你的知识有截止日期，而用户问的是当下。
+
+    Args:
+        timezone: IANA 时区名，默认 ``Asia/Shanghai``（东八区）。
+    """
+    try:
+        zone = ZoneInfo(timezone or "Asia/Shanghai")
+    except (ZoneInfoNotFoundError, ValueError, TypeError) as e:
+        raise ToolContractError(
+            f"不认识的时区名：{timezone!r}。请用 IANA 名称（例如 Asia/Shanghai、"
+            "UTC、America/New_York），不要写「北京时间」「东八区」这类说法。"
+        ) from e
+    now = datetime.now(zone)
+    weekday = "一二三四五六日"[now.weekday()]
+    return now.strftime(f"%Y-%m-%d %H:%M:%S（{zone.key}，星期{weekday}）")
+
+
+#: 允许出现的运算符（**白名单**，不是黑名单）。
+#:
+#: 黑名单在有新语法时必然漏（例如 ``ast.MatMult``、海象表达式），而这里漏一个
+#: 就等于把一整类表达式交给未知实现。白名单漏了只会"这个表达式算不了"，方向安全。
+_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_UNARYOPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+_FUNCS: dict[str, Callable[..., Any]] = {
+    "abs": abs,
+    "round": round,
+    "min": min,
+    "max": max,
+    "sqrt": math.sqrt,
+    "log": math.log,
+    "log10": math.log10,
+    "exp": math.exp,
+    "floor": math.floor,
+    "ceil": math.ceil,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+}
+_CONSTS = {"pi": math.pi, "e": math.e}
+
+_MAX_EXPR_CHARS = 300
+"""表达式长度上界。防的是"把一整段文字当表达式喂进来"那类误用，不是安全边界。"""
+
+_MAX_POW_EXPONENT = 64
+"""指数的绝对值上界。``9**9**9`` 是合法的 Python 表达式，但它是**算不完**的：
+求值会占满一个线程，而工具线程池是共享的（见 ``toolpool``）—— 一个表达式就能让
+其它工具调用排队到超时。"""
+
+_MAX_RESULT_DIGITS = 40
+"""结果规模的第二条闸门（第一条是上面的指数上界）。"""
+
+
+def _eval_node(node: ast.AST) -> Any:
+    """按白名单递归求值。非白名单节点一律抛 ``ToolContractError``（不是 ``ValueError``）。"""
+    if isinstance(node, ast.Expression):
+        return _eval_node(node.body)
+    if isinstance(node, ast.Constant):
+        # ``bool`` 是 ``int`` 的子类，``True + 1`` 会被当成 2 —— 而模型写 "True"
+        # 时想要的是逻辑，不是数字。静默接受它只会让一个错误答案看起来正常。
+        if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+            raise ToolContractError(
+                f"calculate 只支持数字字面量，不支持 {node.value!r}。"
+            )
+        return node.value
+    if isinstance(node, ast.BinOp):
+        op = _BINOPS.get(type(node.op))
+        if op is None:
+            raise ToolContractError(
+                f"calculate 不支持这个运算符：{type(node.op).__name__}。"
+                "支持 + - * / // % ** 与括号。"
+            )
+        left, right = _eval_node(node.left), _eval_node(node.right)
+        if isinstance(node.op, ast.Pow) and abs(right) > _MAX_POW_EXPONENT:
+            raise ToolContractError(
+                f"指数 {right} 超过上界 {_MAX_POW_EXPONENT}：这个幂算不完，已拒绝。"
+                "请改用对数或直接给近似值。"
+            )
+        return op(left, right)
+    if isinstance(node, ast.UnaryOp):
+        op = _UNARYOPS.get(type(node.op))
+        if op is None:
+            raise ToolContractError(
+                f"calculate 不支持这个一元运算符：{type(node.op).__name__}。"
+            )
+        return op(_eval_node(node.operand))
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in _FUNCS:
+            # 用 ``ast.unparse`` 回显被拒的那段调用形态：模型写的是
+            # ``(1).bit_length()`` 这种属性调用时，只报"不支持"它不知道自己错在哪，
+            # 换个写法会继续撞同一堵墙。
+            shown = ast.unparse(node.func) if hasattr(ast, "unparse") else "?"
+            raise ToolContractError(
+                f"calculate 不支持这个函数：{shown}。"
+                f"可用的：{'、'.join(sorted(_FUNCS))}。"
+                "也只能调用它们，不能调用对象上的方法。"
+            )
+        if node.keywords:
+            raise ToolContractError("calculate 的函数不接受关键字参数，请按位置传。")
+        return _FUNCS[node.func.id](*[_eval_node(a) for a in node.args])
+    if isinstance(node, ast.Name):
+        if node.id in _CONSTS:
+            return _CONSTS[node.id]
+        raise ToolContractError(
+            f"calculate 不认识名字 {node.id!r}。常量只有 pi 和 e；"
+            "要算的东西必须是字面量或上面列出的函数。"
+        )
+    raise ToolContractError(
+        f"calculate 不支持这种写法（{type(node).__name__}）。"
+        "请只写算术表达式，例如 (1200-350)*0.8/sqrt(2)。"
+    )
+
+
+def _format_number(value: Any) -> str:
+    """把结果写成**给人看的**形式，并把"太大 / 不是有限数"拦在这里。"""
+    if isinstance(value, complex):
+        raise ToolContractError(
+            "计算结果落到了复数范围（例如对负数开方）。请确认输入是否符合实际含义。"
+        )
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ToolContractError(
+                "计算结果不是有限数（溢出或除以零）。请检查数量级后重新计算。"
+            )
+        if value.is_integer() and abs(value) < 1e16:
+            return str(int(value))
+        return f"{value:.10g}"
+    if isinstance(value, int):
+        if len(str(abs(value))) > _MAX_RESULT_DIGITS:
+            raise ToolContractError(
+                f"结果有 {len(str(abs(value)))} 位，超过上界 {_MAX_RESULT_DIGITS} 位，已拒绝。"
+            )
+        return str(value)
+    raise ToolContractError(f"计算结果类型不支持：{type(value).__name__}。")
+
+
+@function_tool(failure_error_function=tool_error_handler("calculate"))
+@_isolated("calculate")
+def calculate(ctx: RunContextWrapper[TaskContext], expression: str) -> str:
+    """计算一个算术表达式，返回精确结果。
+
+    凡是要给出的数字结论（合计、占比、增长率、换算）都用它算一遍，
+    不要心算 —— 心算错了从结果上看不出来。
+
+    Args:
+        expression: 算术表达式，例如 ``(1200-350)*0.8``。
+            支持 ``+ - * / // % **``、括号，以及 abs/round/min/max/sqrt/log/log10/exp/
+            floor/ceil/sin/cos/tan 与常量 pi、e。
+    """
+    text = (expression or "").strip()
+    if not text:
+        raise ToolContractError("calculate 的 expression 是空的：没有表达式可算，已拒绝。")
+    if len(text) > _MAX_EXPR_CHARS:
+        raise ToolContractError(
+            f"表达式有 {len(text)} 字符，超过上界 {_MAX_EXPR_CHARS}："
+            "这看起来不是一道算式。请只传算式本身。"
+        )
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError as e:
+        raise ToolContractError(
+            f"这不是一个合法的算术表达式：{e.msg}。请检查括号与运算符。"
+        ) from e
+    try:
+        value = _eval_node(tree)
+    except ZeroDivisionError as e:
+        raise ToolContractError("除数是零：这道算式没有结果，请检查输入。") from e
+    except (OverflowError, ValueError) as e:
+        raise ToolContractError(f"计算失败：{e}。请检查输入的数量级或取值范围。") from e
+    return f"{text} = {_format_number(value)}"
+
+
+@function_tool(failure_error_function=tool_error_handler("list_assets"))
+@_isolated("list_assets")
+def list_assets(ctx: RunContextWrapper[TaskContext]) -> str:
+    """列出本次任务已经落盘的文件（名称、大小、修改时间）。
+
+    想确认"手上到底有哪些文件"时用它 —— 不要凭记忆猜文件名：
+    文件名是由 ``save_text_asset`` 的参数规范化后生成的，与你写的不一定一致。
+    """
+    base = _asset_base(ctx)
+    if not base.is_dir():
+        return "本次任务还没有落盘任何文件。"
+    entries = sorted(
+        (p for p in base.iterdir() if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not entries:
+        return "本次任务还没有落盘任何文件。"
+    lines = [f"共 {len(entries)} 个文件（按修改时间倒序，最多列 50 个）："]
+    for path in entries[:50]:
+        stat = path.stat()
+        stamp = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        lines.append(f"- {path.name}（{stat.st_size} 字节，{stamp}）")
+    if len(entries) > 50:
+        lines.append(f"…其余 {len(entries) - 50} 个未列出。")
+    return "\n".join(lines)
+
+
+@function_tool(failure_error_function=tool_error_handler("read_asset"))
+@_isolated("read_asset")
+def read_asset(ctx: RunContextWrapper[TaskContext], name: str) -> str:
+    """读回本次任务已经落盘的文件正文。
+
+    改稿、续写、核对上一步写了什么时用它，而不是靠对话历史回忆 ——
+    历史可能已经被裁剪过，而文件是一直在的。
+
+    Args:
+        name: 文件名（``list_assets`` 返回的那个名字，含扩展名）。
+    """
+    wanted = (name or "").strip()
+    if not wanted:
+        raise ToolContractError(
+            "read_asset 的 name 是空的：不知道要读哪个文件，已拒绝。"
+            "先调用 list_assets 看有哪些文件。"
+        )
+    base = _asset_base(ctx).resolve()
+    target = (base / wanted).resolve()
+    # ⚠️ 必须先 resolve 再比前缀：``../secret.txt`` 这种写法在字符串层面看不出来，
+    # 只有解析成真实路径之后才知道它有没有跑出目录。这一步是**唯一**的边界检查，
+    # 不要因为"name 来自模型、看起来不像路径"就省掉 —— 模型完全可能写出 ../。
+    if not target.is_relative_to(base):
+        raise ToolContractError(
+            f"read_asset 只能读本次任务的落盘目录，{wanted!r} 指到了目录外面（已拒绝）。"
+            "请只传 list_assets 返回的文件名。"
+        )
+    if not target.is_file():
+        available = sorted(p.name for p in base.iterdir() if p.is_file())[:20] if base.is_dir() else []
+        hint = "、".join(available) if available else "（目录里还没有文件）"
+        return f"没有这个文件：{wanted}。当前可读的：{hint}。"
+    try:
+        return target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return f"{wanted} 不是 UTF-8 文本（可能是图片或二进制文件），无法当正文读取。"
+    except OSError as e:
+        return f"读取 {wanted} 失败：{e}"
 
 
 # --------------------------------------------------------------------------- #
