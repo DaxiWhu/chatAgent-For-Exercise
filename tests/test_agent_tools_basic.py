@@ -133,6 +133,37 @@ def test_calculate_refuses_object_method_calls(tmp_path):
     assert "不支持这个函数" in text
 
 
+def test_calculate_tells_the_model_it_cannot_do_dates(tmp_path):
+    """★ 日期写法要**在解析前**拦，而且要给人话。
+
+    实测（2026-10-31 三轮评测，每轮都撞一次）：问"离元旦还有多少天"时模型会写
+    ``2027-01-01 - 2026-10-31``。当时两种错误文案都出现过 ——
+    ``不支持这种写法（Attribute）``（写成 ``datetime(...)``）和
+    ``leading zeros in decimal integer literals…``（``01`` 被当八进制）。
+    后者是 Python 解析器的英文内部错误，对模型零可操作性，它只能盲改再试一次。
+
+    代价不是"答错"，是**每一问多一个往返**。所以描述里也写明了边界
+    （见 ``calculate.description``），让它一开始就不往这个方向试。
+    """
+    for expression in ("2027-01-01 - 2026-10-31", "2027/1/1", "2027年1月1日", "01/01/2027"):
+        text = _invoke(calculate, make_ctx(tmp_path), expression=expression)
+        assert "不支持日期" in text, expression
+        assert "leading zeros" not in text, "不能把 Python 解析器的英文内部错误丢给模型"
+
+    assert "不支持日期" in (calculate.description or "")
+
+
+def test_date_guard_does_not_reject_ordinary_subtraction(tmp_path):
+    """★ 日期判据的宽度要对准 —— 第一版写成 ``\\d{1,4}-\\d{1,2}-\\d{1,2}``，
+    把 ``1-2-3``（一道合法的减法，等于 -4）也当日期拒掉了。
+
+    拒绝用户真正想算的东西，比放过一个日期写法更糟：后者只是多一个往返，
+    前者是**能力凭空少了一块**，而且用户没法从答复里看出为什么。
+    """
+    assert _invoke(calculate, make_ctx(tmp_path), expression="1-2-3") == "1-2-3 = -4"
+    assert _invoke(calculate, make_ctx(tmp_path), expression="100-20-30") == "100-20-30 = 50"
+
+
 def test_calculate_refuses_a_huge_exponent(tmp_path):
     """指数超过上界要拒 —— 它会把工具线程池的一个线程占死。
 

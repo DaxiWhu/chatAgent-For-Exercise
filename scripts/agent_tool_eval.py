@@ -10,13 +10,29 @@
 才能定位。举例：`calculate` 从没被选中过时，答案里的数字照样完全合理
 （模型心算），从产出上根本看不出来。
 
-三条判据（与 ``agent_tool_eval_set.json`` 的字段一一对应）
---------------------------------------------------------
+判据（与 ``agent_tool_eval_set.json`` 的字段一一对应）
+----------------------------------------------------
+前三条判"动作"，后两条判"结果"：
+
 * ``expect_tools``   —— 必须**出现**（子集判定：多查一次不算错）；
+* ``expect_tools_any``—— **任一**出现即可。用于"达成目的有不止一条合理路径"的场合：
+  例如"读一个不存在的文件"，先 ``list_assets`` 看清目录再答**比**直接读更好，
+  硬要求 ``read_asset`` 会把更好的做法判成错误；
 * ``forbid_tools``   —— 一个都**不许**出现（跑错方向比跑少一步更贵）；
 * ``expect_no_tools``—— 闲聊：一步动作都不该有；
-* ``expect_text_any``—— **软判定**，只用于"该承认做不到"那一类（没有对应工具，
-  硬判工具名判不出来）。汇总里单列，不与硬判定混算通过率。
+* ``expect_answer_any`` / ``expect_answer_all`` —— **答案层**硬判定：最后给出的数字/正文
+  对不对。这条是 2026-10-31 补的，因为前两层全绿也可能全是错的：模型调了
+  ``calculate``、工具也确实返回了，但它把**自己心算的**数写进了答复；
+* ``expect_text_regex``—— **软判定**，任一正则命中即算过。**不要用字面词表**：
+  同一个意思实测出现过「做不到 / 做不了 / 无法访问 / 打不开 / 无法打开 /
+  不能发送 / 不能帮你发送」—— 2026-10-31 一天之内被字面词表误报四次，每次都是
+  **行为正确、判据判红**。正则描述的是"否定词 + 动作词"这个句法，不是某一个说法。
+* ``forbid_text_any``—— 答案里**一个都不许出现**（硬判定）。它治的是"假装做到了"：
+  没有发邮件的工具，却回"邮件已发送至 …" —— 提问的人会等一封永远不来的邮件。
+  正向关键词表天生脆弱（``做不了`` ≠ ``做不到``），所以最坏的那种形态要用负向判据兜住。
+
+三层指标分开报（``选择`` / ``执行`` / ``结果``），因为它们的分母和处置都不同。
+混成一个通过率时，"选错工具""工具跑不通""结果算错"长得一模一样。
 
 数据从哪来
 ----------
@@ -26,7 +42,10 @@
 
 ⚠️ 多轮用的是**内存会话替身**（官方没有内存版 ``Session``，见 ``session.py``）。
 所以本脚本验证的是"跨轮能不能拿到历史"，不验证 PG 后端本身。
-⚠️ 会**真的调用上游模型**（花钱）。默认 12 条用例、单条最多 3 轮。
+⚠️ 会**真的调用上游模型**（花钱）。默认 15 条用例 / 18 个判定轮次，单条最多 2 轮。
+
+⚠️ 答案层判据**不许依赖运行日期**。断言"今天是 31 号"这类用例今天过、明天红 ——
+那是评测自己过期，不是被测对象退步。所以时间类用例只判"有没有调时间工具"。
 
 用法
 ----
@@ -42,6 +61,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -166,28 +186,144 @@ def _repeat_summary(step_log: Any) -> list[dict]:
     ]
 
 
-def _judge(turn: dict, called: list[str], answer: str) -> tuple[bool, str, bool]:
-    """判一轮。返回 ``(通过, 失败原因, 是不是软判定)``。"""
-    seen = set(called)
+def _squash(text: str) -> str:
+    """去掉千分位与空白再比 —— ``75,680`` 与 ``75680`` 是同一个数。
 
+    ⚠️ 这条是被实测逼出来的：模型答对了（**75,680 元**），判据却因为千分位逗号判红。
+    结果层是这份评测里**唯一**能发现"算错数"的判据；它一旦误报，整层就会被当成噪音
+    忽略 —— 那比没有这一层更糟，因为人会更相信那个假信号。
+    """
+    return re.sub(r"[,\uFF0C\s]", "", text or "")
+
+
+def _judge(turn: dict, called: list[str], answer: str) -> dict:
+    """判一轮，返回**分层的**结论，不是一个布尔。
+
+    ``{"selected": bool, "result": bool | None, "reason": str, "soft": bool,
+       "checks": {"tools": bool, "result": bool, "soft": bool}}``
+
+    为什么非要分层（2026-10-31 实测教训）
+    ------------------------------------
+    最先只有"选没选对"。第一次跑就 12/12 全过，而三个专家**每次都失败** —— 于是加了
+    "执行层"（工具调用成功了几次）。再往下还有一层没被看见：**工具跑通了，模型却
+    没用它的返回值**，把自己心算的数写进了答复。三层混成一个 ``passed`` 时，
+    后两种失败都会被报成"模型选错了工具"，于是所有人跑去改工具描述 —— 改错了地方。
+
+    ⚠️ ``checks`` 记的是**这一轮到底测了哪几层**，而不是"这条用例属于哪一桶"。
+    曾经按用例分桶（带软文本判据的整条算"软"），结果一条**真的调了禁用工具**的
+    用例整个从 ① 选择指标里消失，屏幕上还是 16/16。判据是逐层的，分母也必须逐层。
+    """
+    seen = set(called)
+    text = answer or ""
+    flat = _squash(text)     # 数字比对走这一份（去千分位/空白）
+
+    # -- 第一层：选了没有 --
+    selected, reason = True, ""
     if turn.get("expect_no_tools"):
         if called:
-            return False, f"不该调工具却调了：{called}", False
-        return True, "", False
+            selected, reason = False, f"不该调工具却调了：{called}"
+    else:
+        missing = [t for t in turn.get("expect_tools", []) if t not in seen]
+        any_of_tools = turn.get("expect_tools_any") or []
+        if missing:
+            selected, reason = False, f"漏了 {missing}（实际：{called or '无'}）"
+        elif any_of_tools and not (set(any_of_tools) & seen):
+            # 有不止一条合理路径时不能硬要求某一个 —— 那会把"更好的做法"判成错误
+            selected, reason = False, f"这几个里一个都没调 {any_of_tools}（实际：{called or '无'}）"
+        else:
+            hit_forbidden = [t for t in turn.get("forbid_tools", []) if t in seen]
+            if hit_forbidden:
+                selected, reason = False, f"调了不该调的 {hit_forbidden}（实际：{called}）"
 
-    missing = [t for t in turn.get("expect_tools", []) if t not in seen]
-    if missing:
-        return False, f"漏了 {missing}（实际：{called or '无'}）", False
+    def _joined(extra: str) -> str:
+        return f"{reason}；{extra}" if reason else extra
 
-    hit_forbidden = [t for t in turn.get("forbid_tools", []) if t in seen]
-    if hit_forbidden:
-        return False, f"调了不该调的 {hit_forbidden}（实际：{called}）", False
+    # 这一轮**到底测了哪几层** —— 逐层记，不按用例分桶（见 docstring）。
+    checks = {
+        "tools": bool(
+            "expect_no_tools" in turn
+            or turn.get("expect_tools")
+            or turn.get("expect_tools_any")
+            or turn.get("forbid_tools")
+        ),
+        "result": bool(
+            turn.get("expect_answer_all")
+            or turn.get("expect_answer_any")
+            or turn.get("forbid_text_any")
+        ),
+        "soft": bool(turn.get("expect_text_regex")),
+    }
 
-    wanted = turn.get("expect_text_any") or []
-    if wanted and not any(word in (answer or "") for word in wanted):
-        return False, f"答案里没有承认做不到（期望含 {wanted} 之一）", True
+    def _verdict(result: bool | None, soft: bool, why: str) -> dict:
+        return {"selected": selected, "result": result, "soft": soft,
+                "reason": why, "checks": checks}
 
-    return True, "", bool(wanted)
+    # -- 第二层：结果是你要的那个吗 --
+    # 先查**负向**：声称"已经做到了"比"没做到"严重得多，而且它不会被任何正向
+    # 关键词表抓住（话术无穷），只能用"这几句绝不许出现"来兜。
+    banned = [word for word in (turn.get("forbid_text_any") or []) if _squash(word) in flat]
+    if banned:
+        return _verdict(False, False, _joined(f"答案里出现了'已完成'的说法 {banned}"))
+
+    must = turn.get("expect_answer_all") or []
+    if must:
+        lack = [word for word in must if _squash(word) not in flat]
+        if lack:
+            return _verdict(False, False, _joined(f"答案缺少 {lack}"))
+        return _verdict(True, False, reason)
+
+    any_of = turn.get("expect_answer_any") or []
+    if any_of:
+        if not any(_squash(word) in flat for word in any_of):
+            return _verdict(False, False, _joined(f"答案里没有正确结果（期望含 {any_of} 之一）"))
+        return _verdict(True, False, reason)
+
+    # -- 软判定：只用于"该承认做不到"这一类（没有对应工具，硬判工具名判不出来）--
+    # ⚠️ 这里**只有正则**这一档，没有"字面词表"那一档 —— 曾经有过，2026-10-31 一天里
+    # 被它误报四次（做不到/做不了、无法访问/无法打开、不能发送/不能帮你发送…）。
+    # 字面词表要穷举措辞，而措辞是无穷的；正则描述的是"否定词 + 动作词"这个句法，
+    # 覆盖的是同一类说法而不是某一个说法。纯字面词写成正则行为完全一样，所以不必并存。
+    patterns = turn.get("expect_text_regex") or []
+    if patterns:
+        if not any(re.search(pattern, text) for pattern in patterns):
+            return _verdict(False, True, f"答案里没有承认做不到（没命中 {patterns} 任一）")
+        return _verdict(True, True, "")
+
+    return _verdict(None, False, reason)
+
+
+def _passed(verdict: dict) -> bool:
+    """通过 = 选对了 **且** 结果没错。``result is None``（无答案判据）不算失败。"""
+    return bool(verdict["selected"]) and verdict["result"] is not False
+
+
+def _layers(rows: list[dict]) -> dict[str, list[dict]]:
+    """把逐轮结果切成三层的分子分母 —— **每一层的分母都由 ``checks`` 决定**。
+
+    ★ 分母是"这一轮测了这一层"，不是"这条用例属于哪一桶"。
+    早先按用例分桶（带软文本判据的整条算"软"），代价是：一条**真的调了禁用工具**
+    的用例整个从 ① 选择指标里消失，屏幕上还是 16/16 —— 而它确实违规了，只是
+    违规记录在了一个没人看的桶里。判据是逐层的，分母就必须逐层。
+
+    软判定（"该承认做不到"）也自成一档：它没有工具名可硬判，混进选择层会拉低
+    选择通过率、混进结果层会拉高结果通过率，两个数同时失真。
+    """
+    def _has(row: dict, key: str) -> bool:
+        return bool((row.get("checks") or {}).get(key))
+
+    tools = [r for r in rows if _has(r, "tools")]
+    result = [r for r in rows if _has(r, "result")]
+    soft = [r for r in rows if _has(r, "soft")]
+    return {
+        "tool": tools,
+        "tool_ok": [r for r in tools if r["selected"]],
+        "result": result,
+        "result_ok": [r for r in result if r["result"]],
+        "soft": soft,
+        "soft_ok": [r for r in soft if r["result"]],
+        "passed": [r for r in rows if r["passed"]],
+        "all": rows,
+    }
 
 
 async def _run_turn(
@@ -234,7 +370,7 @@ async def _run_turn(
     # 整个评测是假绿 —— 它证明的只是"模型点了那个按钮"，不证明按钮连着东西。
     failed = [s.tool for s in ctx.steps.steps if s.status == "failed"]
     succeeded = [s.tool for s in ctx.steps.steps if s.status == "ok"]
-    ok, reason, soft = _judge(turn, called, answer)
+    verdict = _judge(turn, called, answer)
     # ★ 打转的判据是"**同一动作**做了几次"，不是"工具被调了几次"：同一个 kb_search
     #   用不同关键词查十次是正常检索，用同一个关键词查十次才是绕圈（口径见
     #   ``StepLog.repeat_counts``）。没有这一列时，一轮里 14 次模型调用到底是在
@@ -247,14 +383,26 @@ async def _run_turn(
         # 指纹留在明细里（不上终端）：判断"三次失败是原样撞墙还是改一版再试"，只能看它。
         "fingerprints": [s.fingerprint for s in ctx.steps.steps],
         "failed_tools": failed,
+        # 失败**档位**（bad_args / timeout / error）与摘要。只报工具名时，"calc 失败了"
+        # 既可能是模型把表达式写错（改工具描述），也可能是实现抛异常（改代码）——
+        # 两种处置相反，而名字一模一样。
+        "failures": [
+            {"tool": s.tool, "reason": s.reason, "detail": s.detail}
+            for s in ctx.steps.steps
+            if s.status == "failed"
+        ],
         "repeats": repeats,
         "max_repeat": ctx.steps.max_repeat,
         # 空转 = 有动作、但一个都没成。它不是"选错工具"，也不是"模型不会用"，
         # 而是**工具这一侧坏了** —— 处置完全不同（改工具 / 换模型 / 查上游）。
         "dead": bool(called) and not succeeded,
-        "passed": ok,
-        "reason": reason,
-        "soft": soft,
+        # 三层分开记：选择 / 结果各一档，混在一起就归不了因（见 ``_judge`` 的说明）。
+        "selected": verdict["selected"],
+        "result": verdict["result"],
+        "checks": verdict["checks"],
+        "passed": _passed(verdict),
+        "reason": verdict["reason"],
+        "soft": verdict["soft"],
         "exit_reason": exit_reason,
         "error": error,
         "answer": (answer or "")[:400],
@@ -304,16 +452,28 @@ async def main_async(args: argparse.Namespace) -> int:
                 max_turns=args.max_turns,
             )
             rows.append(row)
-            mark = "PASS" if row["passed"] else "FAIL"
-            tag = " [soft]" if row["soft"] else ""
+            # 失败要标**哪一层**：`选择` 与 `结果` 的处置完全不同（改工具描述 vs 改
+            # 提示词/看它有没有用返回值），混成一句 "FAIL" 就等于没归因。
+            if row["passed"]:
+                mark = "PASS"
+            elif not row["selected"]:
+                mark = "FAIL·选择"
+            else:
+                mark = "FAIL·结果"
+            tag = " [soft]" if row["checks"]["soft"] else ""
             dead = " ⚠️空转" if row["dead"] else ""
             print(
                 f"[{mark}] {case['id']} 第{index}轮{tag}  "
                 f"工具={row['tools'] or '无'}  {row['seconds']}s  "
                 f"{row['model_calls']}次模型调用{dead}"
             )
-            if row["failed_tools"]:
-                print(f"       ↳ 调用失败：{row['failed_tools']}")
+            if row["failures"]:
+                # 带上**档位**：`bad_args` 要改工具描述，`error` 要改实现，`timeout` 要
+                # 调预算 —— 三种处置相反，只报工具名等于什么都没说。
+                brief = "；".join(
+                    f"{f['tool']}({f['reason'] or '?'}) {f['detail'][:60]}" for f in row["failures"]
+                )
+                print(f"       ↳ 调用失败：{brief}")
             if row["repeats"]:
                 detail = "、".join(f"{r['tool']}×{r['count']}" for r in row["repeats"])
                 print(f"       ↳ 同一动作重复：{detail}")
@@ -324,9 +484,14 @@ async def main_async(args: argparse.Namespace) -> int:
         reports.append({"id": case["id"], "note": case.get("note", ""), "turns": rows})
 
     all_rows = [r for c in reports for r in c["turns"]]
-    hard = [r for r in all_rows if not r["soft"]]
-    soft = [r for r in all_rows if r["soft"]]
-    passed = [r for r in hard if r["passed"]]
+    layers = _layers(all_rows)
+    passed = layers["passed"]
+    tool_rows = layers["tool"]
+    tool_ok = layers["tool_ok"]
+    result_rows = layers["result"]
+    result_ok = layers["result_ok"]
+    soft_rows = layers["soft"]
+    soft_ok = layers["soft_ok"]
     tools = [t for r in all_rows for t in r["tools"]]
     seconds = sum(r["seconds"] for r in all_rows)
     tokens_in = sum(r["input_tokens"] for r in all_rows)
@@ -336,16 +501,24 @@ async def main_async(args: argparse.Namespace) -> int:
     dead = [r for r in all_rows if r["dead"]]
 
     print("-" * 78)
-    print(
-        f"工具选择：{len(passed)}/{len(hard)} 通过"
-        f"（{len(passed) / len(hard) * 100:.0f}%）"
-        f"｜软判定：{sum(1 for r in soft if r['passed'])}/{len(soft)}"
-    )
+    if tool_rows:
+        print(
+            f"① 工具选择：{len(tool_ok)}/{len(tool_rows)} 通过"
+            f"（{len(tool_ok) / len(tool_rows) * 100:.0f}%）"
+        )
     if calls_total:
         print(
-            f"工具执行：{calls_ok}/{calls_total} 次成功"
+            f"② 工具执行：{calls_ok}/{calls_total} 次成功"
             f"（{calls_ok / calls_total * 100:.0f}%）"
         )
+    if result_rows:
+        print(
+            f"③ 答案结果：{len(result_ok)}/{len(result_rows)} 轮给出正确结果"
+            f"（{len(result_ok) / len(result_rows) * 100:.0f}%）"
+            f"｜其余 {len(all_rows) - len(result_rows)} 轮无答案判据"
+        )
+    if soft_rows:
+        print(f"④ 软判定（该承认做不到）：{len(soft_ok)}/{len(soft_rows)}")
     if dead:
         # 这一行是**这份评测最重要的输出**：选择全对、执行全失败，只看通过率是满分。
         print(f"⚠️ 空转（有动作、无一成功）：{len(dead)} 轮 -> " + "、".join(
@@ -380,10 +553,16 @@ async def main_async(args: argparse.Namespace) -> int:
             "model": args.model,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "summary": {
-                "hard_total": len(hard),
-                "hard_passed": len(passed),
-                "soft_total": len(soft),
-                "soft_passed": sum(1 for r in soft if r["passed"]),
+                # 三层分开落盘：只有选择层全绿、而结果层掉下来，才是"工具在跑、
+                # 但模型没用它的返回值"这个最难看的形态。
+                "turns_total": len(all_rows),
+                "turns_passed": len(passed),
+                "tool_total": len(tool_rows),
+                "tool_ok": len(tool_ok),
+                "result_total": len(result_rows),
+                "result_ok": len(result_ok),
+                "soft_total": len(soft_rows),
+                "soft_ok": len(soft_ok),
                 "calls_total": calls_total,
                 "loop_turns": len(looped),
                 "calls_ok": calls_ok,
@@ -403,7 +582,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     # 退出码把"空转"也算作失败：选择全对、执行全崩时，只看通过率是满分 ——
     # 而那正是最需要有人看一眼的状态。
-    return 0 if (len(passed) == len(hard) and not dead) else 1
+    return 0 if (len(passed) == len(all_rows) and not dead) else 1
 
 
 def main() -> int:

@@ -275,6 +275,17 @@ _CONSTS = {"pi": math.pi, "e": math.e}
 _MAX_EXPR_CHARS = 300
 """表达式长度上界。防的是"把一整段文字当表达式喂进来"那类误用，不是安全边界。"""
 
+_DATE_LIKE = re.compile(
+    r"\d{4}\s*[-/年]\s*\d{1,2}\s*[-/月]\s*\d{1,2}"      # 2027-01-01 / 2027/1/1 / 2027年1月1日
+    r"|\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{4}"              # 01/01/2027
+)
+"""像日期的写法。
+
+⚠️ 年份必须四位。第一版写成 ``\\d{1,4}-\\d{1,2}-\\d{1,2}``，结果把 ``1-2-3``
+（一道合法的减法，等于 -4）也当成了日期拒掉 —— 判据宽度没对准，
+就会开始拒绝用户真正想算的东西。
+"""
+
 _MAX_POW_EXPONENT = 64
 """指数的绝对值上界。``9**9**9`` 是合法的 Python 表达式，但它是**算不完**的：
 求值会占满一个线程，而工具线程池是共享的（见 ``toolpool``）—— 一个表达式就能让
@@ -375,6 +386,10 @@ def calculate(ctx: RunContextWrapper[TaskContext], expression: str) -> str:
     凡是要给出的数字结论（合计、占比、增长率、换算）都用它算一遍，
     不要心算 —— 心算错了从结果上看不出来。
 
+    ⚠️ **只算数值，不支持日期**。``2027-01-01 - 2026-10-31`` 这类写法会被当成
+    三个数字相减（甚至直接报语法错），不要这样用；要算两个日期差几天，先用
+    ``get_current_time`` 确认起点，再把天数拆成整月 + 零头自己相加。
+
     Args:
         expression: 算术表达式，例如 ``(1200-350)*0.8``。
             支持 ``+ - * / // % **``、括号，以及 abs/round/min/max/sqrt/log/log10/exp/
@@ -388,11 +403,24 @@ def calculate(ctx: RunContextWrapper[TaskContext], expression: str) -> str:
             f"表达式有 {len(text)} 字符，超过上界 {_MAX_EXPR_CHARS}："
             "这看起来不是一道算式。请只传算式本身。"
         )
+    # ★ 日期写法要在**解析之前**拦，并且单独给一句人话。
+    # 实测（2026-10-31 三次评测、每次一条）：模型问"离元旦还有多少天"时会写
+    # ``2027-01-01 - 今天``，两种错误文案都出现过 ——
+    #   ``不支持这种写法（Attribute）``（它写成 datetime(...)）与
+    #   ``leading zeros in decimal integer literals…``（``01`` 被当八进制）。
+    # 后者是 Python 解析器的英文内部错误，对模型零可操作性，它只能盲改。
+    if _DATE_LIKE.search(text):
+        raise ToolContractError(
+            "calculate 只算数值，不支持日期（像 2027-01-01 这样的写法会被当成减法）。"
+            "要算两个日期相差几天：先用 get_current_time 确认起点，"
+            "再按整月天数 + 零头天数相加，最后用本工具做一次纯数字加法。"
+        )
     try:
         tree = ast.parse(text, mode="eval")
     except SyntaxError as e:
         raise ToolContractError(
             f"这不是一个合法的算术表达式：{e.msg}。请检查括号与运算符。"
+            "（若写的是日期，本工具不支持日期运算。）"
         ) from e
     try:
         value = _eval_node(tree)
