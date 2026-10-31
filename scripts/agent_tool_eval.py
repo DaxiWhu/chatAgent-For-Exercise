@@ -108,9 +108,15 @@ def memory_session_for(session_id: str) -> Any:
     return session
 
 
-def _build_model(which: str) -> Any:
-    """按名字装配模型（两条都是 OpenAI 兼容协议，走同一个官方实现）。"""
+def _build_model(which: str, structured_output: str = "") -> Any:
+    """按名字装配模型（两条都是 OpenAI 兼容协议，走同一个官方实现）。
+
+    ``structured_output`` 为空时交给 ``build_model`` 去读环境变量 —— 命令行显式值
+    优先，这样同一份 .env 下可以不改配置就跑两个档位做对照。
+    """
     from src.agents.model import build_model
+
+    extra = {"structured_output": structured_output} if structured_output else {}
 
     if which == "deepseek":
         key = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -121,6 +127,7 @@ def _build_model(which: str) -> Any:
             api_key=key,
             base_url=os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com"),
             timeout=60.0,
+            **extra,
         )
 
     key = os.environ.get("AGNES_API_KEY", "")
@@ -131,6 +138,7 @@ def _build_model(which: str) -> Any:
         api_key=key,
         base_url=os.environ.get("AGNES_API_BASE", ""),
         timeout=60.0,
+        **extra,
     )
 
 
@@ -139,6 +147,23 @@ def _turns_of(case: dict) -> list[dict]:
     if "turns" in case:
         return list(case["turns"])
     return [case]
+
+
+def _repeat_summary(step_log: Any) -> list[dict]:
+    """把"同一动作做了几次"压成人能读的形态：``[{"tool": ..., "count": n}]``。
+
+    口径直接复用 ``StepLog.repeat_counts()``（按**指纹** = 工具名 + 规范化参数），
+    不在这里另数一遍 —— 另数一定与反思闸门/指标播报的判定漂，而漂了的判据比没有更糟。
+    指纹是短哈希、反查不出工具名，所以用"指纹 -> 工具名"的映射翻回可读的名字。
+    """
+    counts = step_log.repeat_counts()
+    if not counts:
+        return []
+    name_by_fp = {s.fingerprint: s.tool for s in step_log.steps if s.fingerprint}
+    return [
+        {"tool": name_by_fp.get(fp, "?"), "count": n}
+        for fp, n in sorted(counts.items(), key=lambda kv: -kv[1])
+    ]
 
 
 def _judge(turn: dict, called: list[str], answer: str) -> tuple[bool, str, bool]:
@@ -210,11 +235,20 @@ async def _run_turn(
     failed = [s.tool for s in ctx.steps.steps if s.status == "failed"]
     succeeded = [s.tool for s in ctx.steps.steps if s.status == "ok"]
     ok, reason, soft = _judge(turn, called, answer)
+    # ★ 打转的判据是"**同一动作**做了几次"，不是"工具被调了几次"：同一个 kb_search
+    #   用不同关键词查十次是正常检索，用同一个关键词查十次才是绕圈（口径见
+    #   ``StepLog.repeat_counts``）。没有这一列时，一轮里 14 次模型调用到底是在
+    #   反复取证还是在分治，只能靠猜 —— 而这两种情况的处置完全相反。
+    repeats = _repeat_summary(ctx.steps)
     return {
         "prompt": turn["prompt"],
         "tools": called,
         "status": [s.status for s in ctx.steps.steps],
+        # 指纹留在明细里（不上终端）：判断"三次失败是原样撞墙还是改一版再试"，只能看它。
+        "fingerprints": [s.fingerprint for s in ctx.steps.steps],
         "failed_tools": failed,
+        "repeats": repeats,
+        "max_repeat": ctx.steps.max_repeat,
         # 空转 = 有动作、但一个都没成。它不是"选错工具"，也不是"模型不会用"，
         # 而是**工具这一侧坏了** —— 处置完全不同（改工具 / 换模型 / 查上游）。
         "dead": bool(called) and not succeeded,
@@ -245,7 +279,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     runner.session_for = memory_session_for
 
-    model = _build_model(args.model)
+    model = _build_model(args.model, args.structured_output)
     # 每次评测一个独立子目录：``list_assets`` 那条用例判的是"当前有哪些文件"，
     # 与上一批跑剩的文件混在一起时，它会列出几十个 —— 用例仍然通过，但输出没法看，
     # 而"没法看的输出"最后就没人看。
@@ -280,6 +314,9 @@ async def main_async(args: argparse.Namespace) -> int:
             )
             if row["failed_tools"]:
                 print(f"       ↳ 调用失败：{row['failed_tools']}")
+            if row["repeats"]:
+                detail = "、".join(f"{r['tool']}×{r['count']}" for r in row["repeats"])
+                print(f"       ↳ 同一动作重复：{detail}")
             if not row["passed"]:
                 print(f"       ↳ {row['reason']}")
                 if row["exit_reason"] not in ("passed", "unreviewed", "review_failed"):
@@ -314,6 +351,13 @@ async def main_async(args: argparse.Namespace) -> int:
         print(f"⚠️ 空转（有动作、无一成功）：{len(dead)} 轮 -> " + "、".join(
             f"{r['prompt'][:12]}…" for r in dead
         ))
+    looped = [r for r in all_rows if r["repeats"]]
+    if looped:
+        # 与空转并列的第二类"看板看不出来"的浪费：每一步都成功、通过率满分，
+        # 但同一个动作被重复做了 N 次 —— 成本全在模型调用上（每轮 1 次调用 + 反思）。
+        print(f"⚠️ 重复动作（同一动作 ≥2 次）：{len(looped)} 轮 -> " + "、".join(
+            f"{r['prompt'][:12]}…" for r in looped
+        ))
     print(f"工具调用合计 {len(tools)} 次｜耗时 {seconds:.1f}s｜token 入 {tokens_in} / 出 {tokens_out}")
     if tools:
         from collections import Counter
@@ -341,6 +385,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 "soft_total": len(soft),
                 "soft_passed": sum(1 for r in soft if r["passed"]),
                 "calls_total": calls_total,
+                "loop_turns": len(looped),
                 "calls_ok": calls_ok,
                 "dead_turns": len(dead),
                 "tool_calls": len(tools),
@@ -370,6 +415,16 @@ def main() -> int:
     parser.add_argument("--assets", default="var/eval_assets")
     parser.add_argument("--docs-dir", default="", help="语料目录（给了才会做引用校验）")
     parser.add_argument("--max-turns", type=int, default=8)
+    parser.add_argument(
+        "--structured-output",
+        default="",
+        choices=["", "json_schema", "json_object", "none"],
+        help=(
+            "传输层怎么表达 output_type。留空 = 读 AGENT_STRUCTURED_OUTPUT（默认 json_schema）。"
+            "DeepSeek 不支持 response_format=json_schema，跑它请给 json_object"
+            "（否则三个 as_tool 专家会 400 全废，而通过率看起来照样满分）。"
+        ),
+    )
     return asyncio.run(main_async(parser.parse_args()))
 
 

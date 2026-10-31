@@ -11,6 +11,40 @@
 
 ## [Unreleased]
 
+### 修复 — 网关不支持 `json_schema` 时三个专家静默全废（2026-10-31）
+
+**现象**（真模型实测，DeepSeek `deepseek-chat`）：工具选择 12/12 全过，工具执行只有
+**9/19 成功（47%）**。5 次 `research`、3 次 `make_illustration`、2 次 `build_slide_deck`
+**全部失败**，报错一致：`400 This response_format type is unavailable now`。
+
+这不是"模型选错工具"，也不是编排问题：三个 `as_tool` 专家带
+`output_type=<Pydantic 模型>`，SDK 因此发 `response_format={"type":"json_schema", ...}`，
+而该网关只支持 `json_object`。真正危险的是形态 —— **主链路照样"成功"**：模型会道歉、
+给一个看起来合理的替代方案，看板上这一轮是 pass。
+
+- `src/agents/model.py`：新增 `AGENT_STRUCTURED_OUTPUT`（三档，默认 `json_schema`）。
+  `json_object` / `none` 两档把请求体里的 `response_format` 换掉、把 schema 写进
+  instructions。**不动 `output_type`**：SDK 对响应做的是"取文本 → `validate_json`"
+  （`run_internal/turn_resolution.py`），与请求体发哪种 `response_format` 无关 ——
+  这条已由端到端用例钉住（`test_structured_output_survives_without_response_format`）。
+- 覆写点是 `get_response` / `stream_response`（官方**公开**接口），不是私有的
+  `_fetch_response`。两种传法都要接：非流式全关键字，流式前七个是**位置**参数，
+  只改关键字会漏掉流式（表现为"非流式好了、流式照旧 400"）。
+- 非法取值**拒绝启动**（装配期抛 → `build_failed`），不静默回落默认档：静默回落的
+  表现是"配置改了、专家照旧 400"，排查的人会去查网关。
+- 提示词里那句「**不再调用工具时**才输出 JSON」不能省：带 `output_type` 的专家第一轮
+  通常要先调工具，只说"输出 JSON"会诱导它一上来就吐空壳 JSON —— 请求成功、结构化成功、
+  一次检索都没做，比 400 隐蔽得多。
+- `scripts/agent_tool_eval.py`：新增 `--structured-output`（显式档位优先于环境变量）、
+  **同一动作重复**一列（判据复用 `StepLog.repeat_counts`，按"工具名 + 参数"指纹）与
+  每步指纹明细。「模型调了 3 次同一个工具」到底是在分治还是在绕圈，只能靠这一列区分：
+  实测同一轮里两次失败调用的指纹并不相同（模型改写了描述再试），所以那是重试不是死循环。
+
+**验证**：新增 14 条测试；变异 8/8 全红（含"只改关键字、漏掉位置传参"与"流式漏降档"）；
+`AGENT_STRUCTURED_OUTPUT=json_object` 下重跑同一份评测，工具执行 **30/31（97%）**、
+三个专家全部成功；同一条 `illustration` 用例做 A/B 对照：默认档 0/2 成功且空转，
+降档后 2/2 成功。
+
 ### 新增 — 四个确定性工具 + 工具选择评测（2026-10-30）
 
 前台原先只有 5 个工具（三个 `as_tool` 专家、评审、`save_text_asset`、`deliver`），

@@ -859,6 +859,27 @@ ModelInputData（真正发给模型）
 放之四海皆准的"完成用户的任务"—— 那句会让第一项变成废话，而它正是后面判断"还在不在
 解题"的唯一依据。
 
+### 网关不支持 `response_format: json_schema` 时
+
+三个 `as_tool` 专家（`researcher` / `slides_maker` / `visual_artist`）带
+`output_type=<Pydantic 模型>`，SDK 因此发 `response_format={"type":"json_schema", ...}`。
+支持它的网关（OpenAI / Agnes）结构由 provider 强制，最可靠；**不支持的网关**（实测
+DeepSeek）直接回 `400 This response_format type is unavailable now`。
+
+危险的不是 400，而是它的形态：**三个专家静默全废**，主链路照样"成功"——模型会道歉、
+给一个看起来合理的替代方案。评测里 `illustration` 那条因此是
+「工具选择 1/1 通过」配「工具执行 0/2、空转」。
+
+修法是 `AGENT_STRUCTURED_OUTPUT` 三档：`json_schema`（默认，官方原样）/
+`json_object`（只声明"输出是 JSON"，schema 写进 instructions）/ `none`（连声明都不发）。
+**只改请求体怎么表达，不改 `output_type`**：SDK 拿到响应后是自己对**文本**做
+`validate_json`，与请求体里发哪种 `response_format` 无关。所以
+`output_type`、`final_output_as`、校验与整轮重试全部原样。
+
+代价说清楚：降档之后结构不再由 provider 强制，缺字段只能在 SDK 校验那一步暴露
+（失败形态从 400 变成 `bad_args`）。所以它是**适配网关的开关**，不是"更好的默认值"——
+默认档必须保持 `json_schema`。
+
 ### 工具侧的两道上界
 
 - **单次返回的字符上界**（`AGENT_TOOL_RESULT_MAX_CHARS`，默认 8000，0 = 不限）：
