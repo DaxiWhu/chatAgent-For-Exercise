@@ -863,8 +863,8 @@ ModelInputData（真正发给模型）
 
 三个 `as_tool` 专家（`researcher` / `slides_maker` / `visual_artist`）带
 `output_type=<Pydantic 模型>`，SDK 因此发 `response_format={"type":"json_schema", ...}`。
-支持它的网关（OpenAI / Agnes）结构由 provider 强制，最可靠；**不支持的网关**（实测
-DeepSeek）直接回 `400 This response_format type is unavailable now`。
+支持它的网关（OpenAI 官方等）结构由 provider 强制，最可靠；**不支持的网关**直接回
+`400 This response_format type is unavailable now`（实测 DeepSeek 如此）。
 
 危险的不是 400，而是它的形态：**三个专家静默全废**，主链路照样"成功"——模型会道歉、
 给一个看起来合理的替代方案。评测里 `illustration` 那条因此是
@@ -879,6 +879,19 @@ DeepSeek）直接回 `400 This response_format type is unavailable now`。
 代价说清楚：降档之后结构不再由 provider 强制，缺字段只能在 SDK 校验那一步暴露
 （失败形态从 400 变成 `bad_args`）。所以它是**适配网关的开关**，不是"更好的默认值"——
 默认档必须保持 `json_schema`。
+
+**配哪一档不要靠查文档，要实测**（同一家网关不同模型的支持面不一样，文档也常滞后）：
+
+```bash
+python scripts/probe_provider.py                 # 探 .env 里配的所有网关
+python scripts/probe_provider.py --json before.json   # 换 key 前后各存一份便于对比
+```
+
+它先验 key 是否有效，有效才逐档探，最后打印建议值。**凭证失效不等于"这档不支持"**：
+key 401 时三档都会返回 401，把 401 记成"网关拒绝"就会得出"三档全废、该换网关"的
+假结论 —— 所以四类结果（凭证坏了 / 明确拒绝 / 连不上 / 通过）必须分开看，脚本也是
+这么分流的。三档是**单调**的（`json_schema` 是 `json_object` 的超集要求），所以
+「能不能用 json_object」永远不比默认档更差，唯一损失是 schema 不再由 provider 强制。
 
 ### 工具评测：三层判据，分母各算
 
