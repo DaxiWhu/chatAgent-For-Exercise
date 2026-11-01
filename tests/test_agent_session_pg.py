@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import uuid
 
 import pytest
@@ -47,6 +48,19 @@ def _sid() -> str:
 
 
 def _run(coro):
+    """跑一个协程；**Windows 上必须用 Selector 事件循环**。
+
+    ⚠️ 2026-11-01 之前这里就是裸 ``asyncio.run(coro)``，于是这 6 条用例在
+    Windows 上**全部 error**（``Psycopg cannot use the 'ProactorEventLoop'``）——
+    而 CI 跑在 Linux（默认 Selector），本地又因为没配 ``AGENT_SESSION_TEST_DSN``
+    一直 skip。两头都没有红过，"真库集成测试"这台机器上等于不存在。
+
+    用 ``Runner(loop_factory=...)`` 而不是 ``set_event_loop_policy``：
+    后者是全局副作用，会泄漏到同进程里其它用例（它们可能正依赖 Proactor）。
+    """
+    if sys.platform == "win32":
+        with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+            return runner.run(coro)
     return asyncio.run(coro)
 
 
@@ -244,7 +258,7 @@ def test_session_for_wires_to_the_real_database(monkeypatch):
                 await reader.clear_session()
                 await engine.dispose()
 
-        items = asyncio.run(write_then_read())
+        items = _run(write_then_read())
     finally:
         S.reset_sessions()
 

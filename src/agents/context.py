@@ -51,6 +51,27 @@ from typing import Any
 from .reflection import ReflectionState
 from .steps import StepLog
 
+
+def _jsonable(value: Any) -> Any:
+    """产出物 → 只含 JSON 原生类型的结构（dict / list / str / 数字 / None）。
+
+    为什么用 ``mode="json"`` 而不是裸 ``model_dump()``：后者会把 ``datetime`` /
+    ``Enum`` / ``UUID`` / ``Path`` 原样留在 dict 里 —— 那只是把"序列化会炸"
+    推迟到更远的地方，而那时现场信息更少。
+
+    为什么用 duck typing 而不是 ``isinstance(value, BaseModel)``：本模块不 import
+    pydantic（它在 agent 链路里是**可选依赖**，缺了要走 ``missing_sdk`` 那条明确的
+    降级，不能因为一个类型判断就在导入期把它拉进来）。
+    """
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump(mode="json")
+        except TypeError:
+            # 老版本 pydantic 的 model_dump 没有 mode 参数
+            return dump()
+    return value
+
 __all__ = ["AgentStats", "TaskContext"]
 
 
@@ -308,9 +329,26 @@ class TaskContext:
     """
 
     def record(self, kind: str, value: Any) -> None:
-        """登记一项产出。幂等：同种产出只保留最新一次。"""
-        self.delivered[kind] = value
+        """登记一项产出。幂等：同种产出只保留最新一次。
+
+        ⚠️ 存进来之前**必须**转成 JSON 可序列化的 dict（见 `_jsonable`）。
+        这个字典会被 ``TaskOutcome.delivered`` 原样带出本模块，再被落库 / 发事件 /
+        trace 导出各自序列化一次 —— 只要里面躺着一个 pydantic 对象，**哪一处先
+        序列化就在哪一处炸**，而且炸得和"模型网关挂了"长得一模一样。
+
+        2026-11 实测：约 5% 的检索型运行整轮 `exit_reason=error`，错误就是
+        ``Object of type ResearchDigest is not JSON serializable``，追了两次
+        都没抓到栈 —— 因为根本不知道是哪一处序列化先碰上的。边界放在这里之后，
+        "谁序列化"就不再重要了。
+        """
+        self.delivered[kind] = _jsonable(value)
 
     def recall(self, kind: str) -> Any:
-        """取回一项产出；没有则返回 None。"""
+        """取回一项产出；没有则返回 None。
+
+        ⚠️ 拿到的是 **dict，不是对象**。以前这里是 pydantic 实例，
+        所以 ``getattr(verdict, "score", "")`` 能取到值；现在要写
+        ``verdict.get("score", "")``。改这一处时最危险的不是 AttributeError
+        （那个会立刻红），而是 ``getattr`` 的默认值把缺失**静默变成空串**。
+        """
         return self.delivered.get(kind)

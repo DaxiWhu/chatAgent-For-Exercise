@@ -66,11 +66,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from collections import OrderedDict
 from typing import Any
 
 from .. import observability
-from ..envutil import env_int
+from ..envutil import env_float, env_int
 
 __all__ = [
     "clear_session",
@@ -95,6 +96,13 @@ _engine: Any = None
 _backend_ok: bool | None = None
 #: 首次失败已经打过完整日志了吗（防日志放大：后端起不来时每条请求都会走到这里）。
 _failure_logged = False
+#: 会话后端进入"冷却"的截止时刻（``time.monotonic()``）。在此之前不再尝试连库。
+#:
+#: 为什么需要它：只加连接超时不够。后端**确定**不可达时（端口写错、PG 没起），
+#: 每个请求都要先付一遍连接超时，才轮到自己降级 —— 用户看到的仍是"每次都要等十秒
+#: 才出字"。冷却把"确定坏的这段时间"变成零等待，代价是后端恢复后最多要等一个
+#: 冷却周期才重新接上，且这段时间的历史**静默丢失**（这是降级，不是失败）。
+_retry_after = 0.0
 
 
 def _db_url() -> str:
@@ -151,6 +159,61 @@ def _ping_timeout() -> float:
         return 5.0
 
 
+def _connect_timeout() -> int:
+    """连库超时（秒）；``AGENT_SESSION_CONNECT_TIMEOUT``，默认 5。
+
+    ⚠️ **这个值是"每个地址"的，不是总时长**：``localhost`` 会解析出 ``::1`` 和
+    ``127.0.0.1`` 两个地址，psycopg 对每个地址各等一次 ⇒ 设 5 实际最多等 10 秒
+    （实测：设 3 等 6.05s）。要总时长就别在这里调小，改 ``_op_timeout()``。
+
+    为什么必须有它：不设时 psycopg 等到操作系统放弃（没有上界）。实测把
+    ``DB_URL`` 指向一个没人监听的端口，``get_items`` 挂到 20 秒时仍停在
+    ``selectors.select`` —— 既没有报错也没有超时，因为**驱动没有把失败的 socket
+    结束掉**，谁都不会返回。请求就这么一直挂着，而调用方看到的只是"很慢"。
+    """
+    return env_int("AGENT_SESSION_CONNECT_TIMEOUT", 5, lo=1, hi=120)
+
+
+def _op_timeout() -> float:
+    """单次会话读写的总超时（秒），``AGENT_SESSION_OP_TIMEOUT``。
+
+    默认按连接超时的 3 倍推导：连接阶段最坏要花 2 倍（两个地址），再留一倍给
+    真正执行。推导而不是另配一个数 —— 只让用户配"连接多久算超时"，两个数各自
+    独立配置时必然有人配出"操作超时比连接超时还短"，那种组合下驱动永远没机会
+    按自己的超时正常失败，日志里只会看到被取消。
+
+    它的作用与 ``connect_timeout`` 不重叠：**驱动能返回时靠连接超时，驱动不返回
+    时靠它**。上一个函数注释里那次"20 秒还停在 select"的现场，就是后者。
+    """
+    return env_float("AGENT_SESSION_OP_TIMEOUT", float(_connect_timeout() * 3), lo=1.0, hi=600.0)
+
+
+def _error_cooldown() -> float:
+    """连接类失败后的冷却秒数，``AGENT_SESSION_RETRY_COOLDOWN``，默认 15。
+
+    0 = 关掉冷却（每次请求都重试连库）。
+    """
+    return env_float("AGENT_SESSION_RETRY_COOLDOWN", 15.0, lo=0.0, hi=600.0)
+
+
+def _is_connectivity_error(exc: BaseException) -> bool:
+    """这次失败是"连不上/断了"，还是"连上了但这条语句有问题"？
+
+    只有前者该触发冷却：一条 SQL 写错了（列名、类型、约束），把整个会话后端
+    停 15 秒是把局部问题放大成全局故障 —— 期间所有用户的跨轮历史都会静默丢失。
+
+    判据用**类名**而不是 ``isinstance``：本模块刻意不 import psycopg /
+    sqlalchemy（它们在这里是可选的，缺了要走 ``missing_sdk`` 那条降级），
+    为了判异常类型而在导入期拉进来的代价比收益大。
+    """
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    return bool(names & {"OperationalError", "ConnectionTimeout", "ConnectionError",
+                         "InterfaceError", "DBAPIError",
+                         # 本模块自己判定的"操作超时"也归到这里：它唯一的来源就是
+                         # 驱动没返回（`_op_timeout` 兜底），不是某条 SQL 写得慢。
+                         "TimeoutError"})
+
+
 def session_backend_intent() -> str:
     """**打算**用哪个后端（纯配置，不做任何 I/O）。
 
@@ -186,6 +249,10 @@ def _engine_or_raise() -> Any:
             pool_pre_ping=True,
             # 连接最长活 30 分钟，配合 PG/代理侧的 idle 超时，避免拿到已关闭的连接。
             pool_recycle=1800,
+            # ⚠️ 没有这一行，连接失败**没有上界**：psycopg 会一直等，且失败时
+            # 不把 socket 结束掉，`get_items` 就永远停在 select 上（见
+            # `_connect_timeout` 的注释）。注意它按"每个解析地址"计时。
+            connect_args={"connect_timeout": _connect_timeout()},
         )
     return _engine
 
@@ -225,8 +292,19 @@ def _note_failure(exc: BaseException) -> None:
     全量打日志就是一次自我制造的日志放大（几百 QPS 下能把日志盘打满，
     而排查所需信息第一条就有了）。计数去重报，日志去首条。
     """
-    global _failure_logged
+    global _failure_logged, _retry_after, _backend_ok
     observability.counter("agent_session_errors_total", kind=type(exc).__name__)
+    cooldown = _error_cooldown()
+    if _is_connectivity_error(exc):
+        # ★ 连不上 ⇒ 后端**不可用**，必须翻掉这个标志。
+        # 不翻的话 `/health/ready` 会一直报"历史就绪"，而实际每轮都在丢上文 ——
+        # 原因很简单：`session_for` 只**构造**对象（懒连接，不碰库）就把标志置了
+        # True，真正的失败发生在之后的 `get_items`，那里以前只记日志、不改状态。
+        _backend_ok = False
+        if cooldown > 0:
+            # 只对"连不上"上冷却。SQL 写错也冷却的话，一条坏语句就能让所有人的
+            # 跨轮历史静默丢 15 秒，局部问题被放大成全局故障。
+            _retry_after = time.monotonic() + cooldown
     if _failure_logged:
         logging.debug("会话后端仍不可用：%s", exc)
         return
@@ -240,6 +318,34 @@ def _note_failure(exc: BaseException) -> None:
         session_backend_intent(),
         exc,
     )
+
+
+def _drop_engine() -> None:
+    """丢弃当前引擎与会话缓存，下次请求重新建（**不阻塞当前请求**）。
+
+    为什么超时之后必须丢：被 ``wait_for`` 取消的那一次取连接，在池里的状态是
+    "不确定"的 —— 它可能还占着一个正在建立的 socket。把池留着，下一个请求会
+    拿到同一个池，同一个问题跟着被复用，看起来就像"只有第一次慢"。
+    """
+    global _engine
+    engine, _engine = _engine, None
+    _sessions.clear()
+    if engine is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 没有运行中的事件循环（同步调用路径）：丢掉引用即可，进程退出由 OS 回收。
+        return
+    loop.create_task(_dispose_quietly(engine))
+
+
+async def _dispose_quietly(engine: Any) -> None:
+    """释放一个被丢弃的引擎；失败只记 debug 级（已经在降级路径上了）。"""
+    try:
+        await engine.dispose()
+    except Exception as e:  # noqa: BLE001  降级路径上的清理失败不该再抛
+        logging.debug("丢弃会话引擎时释放失败（已忽略）：%s", e)
 
 
 def session_for(session_id: str) -> Any:
@@ -260,6 +366,12 @@ def session_for(session_id: str) -> Any:
         # 被兜住 —— 结果一样，但**当引擎已经被建过**（另一个 DSN）时，那一步会拿到
         # 一个缓存的引擎并"成功"返回一个连不上任何库的会话对象，降级发生在更晚、
         # 更难解释的地方。这条分支在测试里就抓到过一次。
+        return None
+
+    if time.monotonic() < _retry_after:
+        # 冷却中。这里**故意不连库**：后端确定不可达的这段时间里，连一次要等
+        # 满连接超时，而结果一定是降级 —— 白白让每个请求多等十几秒才出字。
+        # 恢复探测交给冷却到期后的第一个请求（它成功就会把 `_backend_ok` 翻回 True）。
         return None
 
     hit = _sessions.get(sid)
@@ -297,8 +409,15 @@ async def load_items(session_id: str) -> list[Any]:
     session = session_for(sid)
     if session is None:
         return []
+    timeout = _op_timeout()
     try:
-        items = await session.get_items()
+        # 兜底超时，与 `connect_timeout` 分工不同：驱动能自己超时的时候用不上它，
+        # 驱动**不返回**的时候只有它能救（实测连一个死端口，20 秒后仍停在 select）。
+        items = await asyncio.wait_for(session.get_items(), timeout)
+    except TimeoutError:
+        _note_failure(TimeoutError(f"读会话历史超过 {timeout:.0f}s 未返回"))
+        _drop_engine()
+        return []
     except Exception as e:  # noqa: BLE001  后端不可用 ⇒ 按"没有历史"处理
         _note_failure(e)
         return []
@@ -329,8 +448,13 @@ async def clear_session(session_id: str) -> bool:
     session = session_for(sid)
     if session is None:
         return False
+    timeout = _op_timeout()
     try:
-        await session.clear_session()
+        await asyncio.wait_for(session.clear_session(), timeout)
+    except TimeoutError:
+        _note_failure(TimeoutError(f"清空会话历史超过 {timeout:.0f}s 未返回"))
+        _drop_engine()
+        return False
     except Exception as e:  # noqa: BLE001  后端不可用时按"没清掉"记
         _note_failure(e)
         return False
@@ -380,11 +504,14 @@ def reset_sessions() -> None:
     环境变量建出来的引擎**（测试里就是上一个用例的），于是"没配 ``DB_URL`` 应该
     降级"这类断言会被一个陈旧引擎骗过去。
     """
-    global _engine, _backend_ok, _failure_logged
+    global _engine, _backend_ok, _failure_logged, _retry_after
     _engine = None
     _sessions.clear()
     _backend_ok = None
     _failure_logged = False
+    # 冷却也要清：不清的话"上一个用例把后端弄挂了"会让后面每个用例都在
+    # 冷却窗口里直接降级 —— 现象是"后面全绿"，比红更坏。
+    _retry_after = 0.0
 
 
 async def dispose_session_backend() -> None:
@@ -393,11 +520,12 @@ async def dispose_session_backend() -> None:
     为什么必须显式释放：uvicorn 的关闭不碰第三方连接池，PG 侧会一直挂着这些连接
     直到它自己超时 —— 滚动发布时几个副本叠起来就是"连接数莫名逼近上限"。
     """
-    global _engine, _backend_ok, _failure_logged
+    global _engine, _backend_ok, _failure_logged, _retry_after
     engine, _engine = _engine, None
     _sessions.clear()
     _backend_ok = None
     _failure_logged = False
+    _retry_after = 0.0
     if engine is None:
         return
     try:

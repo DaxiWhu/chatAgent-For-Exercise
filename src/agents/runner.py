@@ -85,6 +85,7 @@ docstring。本文件负责"把它接上"：``run_agent(session_id=...)`` 取会
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field, replace
@@ -441,10 +442,22 @@ def _flush_deterministic_steps(ctx: TaskContext) -> None:
     """
     deck = ctx.recall("slides")
     if deck is not None and "slides" not in ctx.rendered:
-        path = render_slide_deck(deck.model_dump_json(), ctx.asset_dir)
+        # `recall` 现在给的是 dict（见 `TaskContext.record`），不再是 pydantic 对象 ——
+        # 所以这里用 `json.dumps` 而不是 `model_dump_json()`。
+        path = render_slide_deck(json.dumps(deck, ensure_ascii=False), ctx.asset_dir)
         ctx.assets.append(path)
         ctx.stats.assets += 1
         ctx.rendered.add("slides")
+
+
+def _score_of(context: TaskContext) -> str:
+    """本次运行的评审得分；没评审过就是空串。
+
+    与 ``_verdict_of`` 共用一处取法：两处都在从 ``evaluation`` 里取 ``score``，
+    各写一遍时"一处改成 dict、另一处还在 getattr"几乎必然发生 ——
+    而那种错**不会报错**，只会让得分永远是空串。
+    """
+    return (context.recall("evaluation") or {}).get("score", "") or ""
 
 
 def _verdict_of(context: TaskContext) -> str:
@@ -468,7 +481,10 @@ def _verdict_of(context: TaskContext) -> str:
     verdict = context.recall("evaluation")
     if verdict is None:
         return "unreviewed"
-    return "passed" if getattr(verdict, "score", "") == "pass" else "review_failed"
+    # ⚠️ 是 dict 不是对象。写成 `getattr(verdict, "score", "")` 不会报错 ——
+    # 它会**静默**返回空串，于是每一次评审都被判成 `review_failed`，
+    # 而指标上看起来只是"评审通过率 0%"，没人会想到是取字段的方式错了。
+    return "passed" if _score_of(context) == "pass" else "review_failed"
 
 
 def _bypass_slice(
@@ -907,7 +923,7 @@ async def run_agent(
     # 累计而不是覆盖：一次请求跑 N 个节点，state 里那个 duration 要能回答
     # "整轮一共花了多久"。单次运行的耗时另有直方图（见 _report_run_metrics）。
     stats.duration_seconds += duration
-    stats.last_score = getattr(context.recall("evaluation"), "score", "") or ""
+    stats.last_score = _score_of(context)
 
     # 上报"能力"指标：跑成没跑成、跑得多慢、花了多少次模型调用与工具调用。
     # 传**这一次运行**的切片（见 _report_run_metrics 的说明）。
