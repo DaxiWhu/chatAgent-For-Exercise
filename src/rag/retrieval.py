@@ -159,6 +159,26 @@ EMBEDDING_BATCH = max(1, _env_int("EMBEDDING_BATCH", 10))
 #: 一个"正常"的 embedding 请求是几百毫秒级，20 秒已足够宽容（含冷启动与批量）。
 EMBEDDING_TIMEOUT = max(1, _env_int("EMBEDDING_TIMEOUT", 20))
 
+#:
+#: embedding 不可用后的**冷却窗口**（秒，0 = 关闭冷却、每次照试）。
+#:
+#: 为什么需要它：`embedding_configured()` 只判"key/model 填没填"，**不验连通性**
+#: —— 余额为零、网关熔断、配额耗尽时它一律返回 True。而这些故障的恢复时间是分钟级，
+#: 不是毫秒级，于是"每次都试一遍"的代价是**每次检索都白等一个上游往返**：
+#: 实测 402 时单次 0.25~1.0 秒，而 `kb_search` 一次 run 里会被调十几次。
+#:
+#: 更隐蔽的后果在 agent 侧：工具返回"检索失败"之后模型会换措辞重试，
+#: 每次重试又撞一次同样的失败 —— 一次运行就这样耗掉 23 步 / 31341 token 而产出 0 字
+#: （2026-11-01 实测）。冷却把"每次都撞"变成"一分钟撞一次"，模型的重试才可能
+#: 落到真的能返回东西的稀疏路上。
+#:
+#: 取 60 秒而不是几秒：上游余额/配额这类故障不会在秒级恢复，而冷却过短等于没冷却；
+#: 也不能太长，否则用户充值后要等很久才恢复（改这个值或重启即可）。
+RAG_EMBED_RETRY_COOLDOWN = max(0, _env_int("RAG_EMBED_RETRY_COOLDOWN", 60))
+
+#: embedding 冷却的到期时刻（`time.monotonic()` 口径）。0 表示当前不在冷却期内。
+_EMBED_DOWN_UNTIL = 0.0
+
 # 查询侧指令前缀：BGE 系模型的检索效果对前缀敏感（文档侧不加，只加在 query 上）。
 # 实测（bge-m3，8 条中文查询 / 6 篇语料）Top1 准确率：
 #   无前缀 38% ｜ 中文指令 25% ｜ 英文指令 62% ｜ "检索：" 38%
@@ -1495,6 +1515,44 @@ class HybridRetriever:
         self.pool = pool or HYBRID_POOL
         self.last_rerank_ok = None
 
+    def _recall_both(self, query):
+        """跑两路召回，**单路失败只降级、不扩散**。
+
+        query: 查询文本，原样传给两路。
+
+        返回 ``(sparse_hits, dense_hits)``；失败的那一路是空列表。
+
+        为什么要单独抽出来：原来是两行顺序调用，稠密路一抛异常就冒到
+        ``kb_search``，那里把整个检索判成"失败"——于是"embedding 欠费"
+        表现为"知识库不可用"，而同一批语料上的 BM25 明明是好的。
+        稀疏路是本地的（微秒级、不依赖网络），它没有理由跟着一起挂。
+
+        两路**都**失败才抛：那时确实拿不到任何东西，让它诚实地失败，
+        而不是伪造一个空结果让模型以为"知识库里没有"。
+        """
+        results = []
+        failures = []
+        for name, side in (("sparse", self.sparse), ("dense", self.dense)):
+            try:
+                results.append(side.search(query, top_k=self.pool))
+            except Exception as e:  # noqa: BLE001  单路失败只降级
+                failures.append((name, e))
+                results.append([])
+
+        if len(failures) == 2:
+            raise failures[0][1]
+        if failures:
+            name, e = failures[0]
+            observability.counter(
+                "rag_retrieval_degraded_total", stage=f"hybrid_{name}_failed")
+            logging.warning("hybrid %s 路检索失败，本次只用另一路：%s", name, e)
+            if name == "dense":
+                # 稠密路不可用 = 这一轮的 `embedding_down()` 该亮起来了；
+                # 不记的话，下一轮 `build_retriever` 还会照常重建稠密路、
+                # 再白撞一次上游（见 RAG_EMBED_RETRY_COOLDOWN 的说明）。
+                _note_embed_failure(e)
+        return results[0], results[1]
+
     def search(self, query, top_k=TOP_K):
         """双路召回 → RRF 融合 →（可选）rerank，返回 top_k 命中。
 
@@ -1506,9 +1564,18 @@ class HybridRetriever:
         self.last_rerank_ok 置为 False —— 该字段是给调用方/测试观察
         "这次到底有没有精排生效"用的（初始为 None 表示从未尝试）。
         """
-        sparse_hits = self.sparse.search(query, top_k=self.pool)
-        dense_hits = self.dense.search(query, top_k=self.pool)
-        fused = rrf_fuse([sparse_hits, dense_hits])
+        sparse_hits, dense_hits = self._recall_both(query)
+        # 只有一路有货时不融合：RRF 会把分数改写成 1/(k+rank) 这种名次分
+        # （两路并存时是对的，单路时是纯噪声），而这一路的先后顺序本来
+        # 就是最终顺序，"融合"做不出任何排序改进。保留原始分数，下游
+        # 若要按阈值过滤才有意义。注意**不能**在这里直接 return ——
+        # rerank 是独立于召回路数的一道，单路场景照样该生效。
+        if sparse_hits and not dense_hits:
+            fused = sparse_hits
+        elif dense_hits and not sparse_hits:
+            fused = dense_hits
+        else:
+            fused = rrf_fuse([sparse_hits, dense_hits])
 
         if self.reranker is not None:
             candidates = [c for c, _ in fused[: max(top_k * 3, 10)]]
@@ -1545,8 +1612,45 @@ def embedding_configured() -> bool:
 
     无参数。只查这两项是否非空，**不验证连通性** —— 真连不通会在构造
     EmbeddingRetriever 时报错。
+
+    ⚠️ 正因为它不验连通性，**不能**用它来决定"要不要走稠密路"：
+    余额不足 / 网关熔断 / 配额耗尽时它照样返回 True。运行期的可用性由
+    ``embedding_down()`` 与 ``_note_embed_failure()`` 那一对负责。
     """
     return bool(EMBEDDING_API_KEY and EMBEDDING_MODEL)
+
+
+def embedding_down() -> bool:
+    """embedding 是否处在失败冷却期内（纯读，无副作用、不发请求）。
+
+    冷却期内调用方应当**跳过**稠密检索、只用稀疏路，而不是再试一次。
+    见 ``RAG_EMBED_RETRY_COOLDOWN`` 的说明。
+    """
+    return time.monotonic() < _EMBED_DOWN_UNTIL
+
+
+def _note_embed_failure(exc: BaseException) -> None:
+    """记一次"embedding 真的用不了"，并开启冷却窗口。
+
+    exc: 触发失败的原异常（只用于日志，不改变行为）。
+
+    ⚠️ 只对**调用失败**（连不通、4xx/5xx、超时）调这个，别对"SQL 写错"那类局部错误用 ——
+    后者冷却掉会造成"某一次写坏了，所有人的检索都静默降级一分钟"。
+    """
+    global _EMBED_DOWN_UNTIL
+    if RAG_EMBED_RETRY_COOLDOWN > 0:
+        _EMBED_DOWN_UNTIL = time.monotonic() + RAG_EMBED_RETRY_COOLDOWN
+    observability.counter("rag_retrieval_degraded_total", stage="embedding_down")
+    logging.warning(
+        "embedding 不可用（%s: %s），%d 秒内跳过稠密检索、只用稀疏路",
+        type(exc).__name__, str(exc)[:160], RAG_EMBED_RETRY_COOLDOWN,
+    )
+
+
+def reset_embedding_cooldown() -> None:
+    """清掉冷却状态（**测试用**；也用于运维"充值后立刻恢复"的脚本）。"""
+    global _EMBED_DOWN_UNTIL
+    _EMBED_DOWN_UNTIL = 0.0
 
 
 def _check_index_identity(store, backend):
@@ -1641,9 +1745,26 @@ def _make_dense_retriever(chunks, tenant=None):
     qdrant / pg 后端**失败自动回退**内存后端并告警 —— 与项目其它配置项"降级不崩"
     的口径一致：服务连不上、扩展没装、python 包缺失，都不该让整个服务起不来。
 
+    ⚠️ **返回 ``NullRetriever`` 表示"稠密路这次不可用"，不是"没有语料"**：冷却期内
+    或内存后端构造失败（典型是 embedding 402 / 超时）都走这条。调用方拿到它必须
+    当成"只剩稀疏路"，而不是当成"检索器就是它、结果为空很正常"。
+
+    ⚠️ 为什么构造失败**不能**往外抛：这条链的调用方是 ``build_retriever`` 与
+    ``pool.get_retriever``，两者上面都没有兜底 —— 抛出去等于"embedding 欠费"
+    直接变成"知识库整个不可用"，而同一批语料上的 BM25 明明是好的。2026-11-01
+    实测：402 时 `build_retriever` 直接抛，`kb_search` 拿到异常返回"检索失败"，
+    模型反复换措辞重试（23 步 / 31341 token 产出 0 字）。
+
     注意：qdrant 这里只取它的**稠密**适配器（`r.dense`）；hybrid 双路后端会在
     `build_retriever` 里另取 `r.sparse`，此处仅在 semantic 单路模式下被调用。
     """
+    if embedding_down():
+        logging.warning(
+            "embedding 处于失败冷却期（剩余约 %.0f 秒），本次跳过稠密检索、只用稀疏路",
+            max(0.0, _EMBED_DOWN_UNTIL - time.monotonic()),
+        )
+        return NullRetriever()
+
     if VECTOR_STORE == "qdrant":
         try:
             r = QdrantRetriever(chunks, tenant=tenant)
@@ -1660,7 +1781,14 @@ def _make_dense_retriever(chunks, tenant=None):
             return r
         except Exception as e:  # noqa: BLE001  （任何失败都回退，不让服务崩）
             logging.warning("pgvector 后端不可用（%s），回退内存向量检索。", e)
-    return EmbeddingRetriever(chunks)
+    try:
+        return EmbeddingRetriever(chunks)
+    except Exception as e:  # noqa: BLE001  内存后端也起不来 ⇒ 稠密路整体不可用
+        # 走到这里说明连"进程内 numpy 余弦"都没构造成功 —— 唯一会抛的就是
+        # `EmbeddingRetriever.__init__` 里的批量 embed_documents（构造即调 API）。
+        # 典型原因：余额不足 / 配额耗尽 / 网关熔断 / 超时。
+        _note_embed_failure(e)
+        return NullRetriever()
 
 
 def build_retriever(chunks, tenant=None):
@@ -1717,7 +1845,10 @@ def build_retriever(chunks, tenant=None):
 
         # Qdrant 后端：稀疏（BM25）与稠密（embedding）**同库**，两路都走它。
         # 失败自动回退到「进程内 BM25 + 按 RAG_VECTOR_STORE 的稠密后端」，与其余降级一致。
-        if VECTOR_STORE == "qdrant":
+        # ⚠️ 冷却期内直接不走 Qdrant：它的构造要灌库（调 embedding），而查询侧的稠密路
+        # 也要 embed —— embedding 用不了时这条分支只会白撞一次上游，再回退。
+        # 这时代价更低的替代是进程内 BM25（微秒级、纯本地）。
+        if VECTOR_STORE == "qdrant" and not embedding_down():
             try:
                 qr = QdrantRetriever(chunks, tenant=tenant)
                 logging.info("hybrid 双路后端：Qdrant（集合=%s，租户=%s）",
@@ -1727,13 +1858,28 @@ def build_retriever(chunks, tenant=None):
             except Exception as e:  # noqa: BLE001
                 logging.warning("Qdrant 后端不可用（%s），回退 BM25 + %s 稠密检索。",
                                 e, VECTOR_STORE)
-        return HybridRetriever(
-            chunks, dense=_make_dense_retriever(chunks, tenant), reranker=reranker
-        )
+        dense = _make_dense_retriever(chunks, tenant)
+        if isinstance(dense, NullRetriever):
+            # 冷却 / embedding 不可用：sparse 仍然建得起来（进程内 BM25，微秒级），
+            # 所以返回的仍是 HybridRetriever —— 只是稠密那一路恒返回 []。
+            # **不要**在这时退成纯 BM25Retriever：类型一变，外部按 `last_rerank_ok`
+            # 之类字段观察的地方就要跟着改，而这只是暂时的降级。
+            logging.warning("稠密检索不可用，本次 hybrid 只用稀疏路（BM25 关键词）")
+            observability.counter("rag_retrieval_degraded_total", stage="hybrid_sparse_only")
+        return HybridRetriever(chunks, dense=dense, reranker=reranker)
 
     if backend in ("semantic", "openai"):
+        dense = _make_dense_retriever(chunks, tenant)
+        if isinstance(dense, NullRetriever):
+            # 单路稠密时没有"另一路"可兜 —— 但 BM25 在同一批语料上是好的，
+            # 退成关键词检索比"返回空结果、让模型说检索不到"诚实得多：
+            # 后者的表现是"知识库里没有这个内容"，而实际是"embedding 欠费了"。
+            logging.warning(
+                "RAG_EMBEDDING=%s 的稠密检索不可用，本次降级为 BM25（关键词）", backend)
+            observability.counter("rag_retrieval_degraded_total", stage="semantic_to_bm25")
+            return BM25Retriever(chunks)
         logging.info("RAG 检索后端：semantic（embedding 模型=%s）", EMBEDDING_MODEL)
-        return _make_dense_retriever(chunks, tenant)
+        return dense
 
     return BM25Retriever(chunks)
 

@@ -11,6 +11,37 @@
 
 ## [Unreleased]
 
+### 修复 — embedding 不可用时检索整条挂掉；单路失败不再拖垮两路（2026-11-01）
+
+起因是一次真跑：SiliconFlow 返 `402 balance insufficient`，于是**所有**检索都变成
+「检索失败」。表面上像"知识库坏了"，实际是"稠密路欠费了、稀疏路（本地 BM25）好得很"。
+四处一起改，口径统一成"能降级就降级、降不了才诚实失败"。
+
+- **`HybridRetriever._recall_both`**：原来两路顺序调用，稠密路一抛异常就冒到
+  `kb_search`，那里把整次检索判成失败。现在逐路 `try/except`，**单路失败只降级**
+  （空列表 + `rag_retrieval_degraded_total{stage=hybrid_<name>_failed}` + WARNING）；
+  两路**都**失败才抛 —— 那时确实什么都拿不到，伪造空结果会让模型以为"知识库里没有"，
+  然后拿记忆编一段没有出处的结论。
+- **单路有货时不做 RRF 融合**：融合会把分数改写成 `1/(k+rank)` 的名次分（两路并存时
+  是对的，单路时是纯噪声），且这一路的先后顺序本来就是最终顺序。改成直通并保留原始
+  分数，下游按阈值过滤才有意义；rerank 不跳过（它是独立于召回路数的一道）。
+- **`_make_dense_retriever`（新）**：稠密路的**构造**失败（连不通、维度对不上、
+  欠费）与查询期失败走同一条降级路线 —— semantic 退回纯关键词、
+  hybrid 退回只用稀疏路；`build_retriever` 的两个稠密分支都改用它，不再整条抛错。
+- **冷却窗口 `RAG_EMBED_RETRY_COOLDOWN`（默认 60 秒，0 = 关闭）**：
+  `embedding_configured()` 只判"key/model 填没填"、不验连通性，而余额/配额这类故障
+  是分钟级恢复。原来每个请求都重撞一次上游：实测单次 0.25~1.0 秒、刷 5 行 WARNING；
+  更糟的是模型看到"检索失败"会换措辞重试，一次运行就这样耗掉 23 步 / 31341 token
+  而产出 0 字。现在失败后冷却期内**零等待**直接判稠密路不可用，到期自动重试
+  （上游恢复即自愈，不必重启）。Qdrant 分支同样受它约束 —— 那条路构造时要灌库（调
+  embedding），embedding 用不了时只会白撞一次。
+- **守卫**：`tests/test_rag_embedding_degrade.py`（12 条：hybrid 降级 / semantic 回退 /
+  冷却缓存与 `=0` 关闭 / 两路全挂仍抛 / 反方向单路 / 指标计数），
+  `tests/conftest.py` 新增 autouse fixture 在用例间还原进程级冷却状态
+  —— 否则一条降级用例点亮的 60 秒冷聚会把**之后**所有走稠密路的用例变成
+  `NullRetriever`，且单跑该文件是绿的、只在全量里红。
+- 全量 2367 passed / 14 skipped（含 RAG 相关 245 条）。
+
 ### 破坏性变更 — 主网关换成 DeepSeek，变量名 `AGNES_*` → `LLM_*`（2026-11-01）
 
 不再使用 Agnes（那把 key 一直 401，且该网关不支持 `json_schema`）。同时把变量名的厂商
@@ -323,6 +354,67 @@ LangChain 那层脚本（如 `scripts/eval_generation.py`）有记录，而真�
 - **`tests/test_trace_probe.py`（新，10 条）**：树重建（乱序到达 / 孤儿）、六条判据
   各自的红绿、一次真跑 SDK 的端到端（确认官方处理器确实收下了 `kb_search` 的工具
   节点）、缺密钥必须显式失败。变异 **5/5 守住**。
+
+### 新增 — 接入 MCP 外部工具，补上内容转换层（2026-10-23）
+
+官方 SDK 已经把"MCP 工具 → 模型可调的函数工具"这步做完（塞 `Agent(mcp_servers=[...])`
+即可），所以这次**没有重造转换层**，补的是官方刻意没做的三件事。
+
+- **`src/agents/mcp_bridge.py`（新）**：转换层插在 `MCPServer.call_tool` 这个协议层，
+  不包工具外壳 —— 工具调用的最外层就是失败处理本身，包在外面抛异常会绕过它、整轮崩。
+  - **内容块收进可预期的形状**：文本按 `AGENT_MCP_RESULT_MAX_CHARS`（默认 8000，
+    是**合计**而非每块一份）截断并附"原文多长"；图片默认降级成一句说明
+    （`AGENT_MCP_IMAGES=keep` 可保留，但仍受同一上界约束）；装不下截断说明时整块丢弃
+    并补一句"另有 N 块未展示"；`structuredContent` 超限置空，堵住
+    `use_structured_content` 那条绕过裁剪的路。
+  - **`isError=true` 转成 `MCPToolError`**：MCP 把"工具内部报错"表达成**正常响应**，
+    官方照此处理 ⇒ 在 Agent 侧是一次**成功**的调用（步骤清单记 `ok`、失败计数不增、
+    到线劝退永不触发）。不转的话，一个永远报错的外部工具能被无限重试。
+    异常消息是服务器给的原文，模型看到的诊断信息没减少。
+  - **配置解析**：`AGENT_MCP_SERVERS`（JSON 数组）格式错误一律抛错、**一个都不接**
+    （不跳过坏的接好的 —— 那会把一次手误表现成"某个工具时有时无"）；
+    `env` 值支持 `${VAR}` 引用进程环境变量，让密钥留在 `.env` 不进配置文本；
+    变量未设置 / 名字不合法 / 缺右括号三种写错都报错。
+- **`app/main.py`**：启动钩子 `_install_mcp_servers`。SDK **不会**自动连接，而 stdio 的
+  connect/cleanup 必须同一个 task ⇒ 用 `MCPServerManager` 压进 lifespan 的
+  `AsyncExitStack`，只把**连接成功**的挂给入口 agent（没连上的留着会让每轮
+  `list_tools` 抛异常）。启动日志打印每个服务器实际暴露的工具清单。三种结局都只记日志、
+  不阻止启动：没配 / 配置坏 / 全部连不上。
+- **工具名强制带服务器前缀**（`mcp_fs__read_file`）：不加前缀的话，MCP 里一个叫
+  `deliver` 的工具能顶掉本项目自己的 `deliver`，而模型只看描述、看不出来。
+  同时打开 `convert_schemas_to_strict`（"多给参数"唯一的官方等价物，best-effort）。
+- **`requirements.txt` / `requirements.lock`**：显式声明并锁定 `mcp`（此前只是
+  `openai-agents` 的传递依赖，而 `mcp_bridge` 直接 `import mcp.types`）。
+- 守卫：`tests/test_agent_mcp_bridge.py`（29 条，含真起子进程的端到端）；
+  测试服务器 `tests/fixtures/mcp_test_server.py`；变异 `tmp_probe/mutation_mcp_bridge.py`
+  **15/15 全红**。
+
+### 变更 — 会话归属改为"只按用户比"；删用户时清干净他名下的会话（2026-10-22）
+
+两条都是同一个口径的落地：**本 agent 不要求用户有租户**（`users.tenant` 允许空串，
+且"还没有租户"是合法状态 —— 自助注册就落在这里）。
+
+- **归属判据抽成 `sessions.same_owner`**，读路径（`_assert_session_readable`）与
+  `claim()` 共用这一份。规则：两边 `user` 都非空 ⇒ **只比 `user`**；任一边为空 ⇒
+  退回按 `(tenant, user)` 整体比。改之前一律整体比，后果是**同一个人换租户之后，
+  他所有旧会话都变成 403**，而报错只说"属于其他主体" —— 看起来像被别人占了。
+  机器调用方（`owner_user` 为空）**仍按租户隔离**：只比 `user` 的话它们全都相等，
+  等于跨租户串会话。即"人靠用户隔离，机器靠租户隔离"，边界是 `user` 空不空。
+- **`DELETE /v1/admin/users/{username}` 现在真的清会话**：它的 docstring 一直写着
+  "清掉他的全部会话"，实际只删了用户行并撤销令牌 —— `session_owners`、
+  `agent_sessions` / `agent_messages`、运行现场、待审记录一个都没动。现在先按
+  `owner_user` 列出他的 thread，逐个走与 `DELETE /v1/sessions/{id}` **同一套**
+  `_purge_thread`，最后 `release_owner` 兜底。响应新增 `threads_purged` 与
+  `purge`（每个会话的清分明细）。
+  为什么必须清：`users.username` 是主键，删掉之后能再建**同名**账号，而归属键就是
+  这个用户名 —— 不清的话同名新账号**直接继承**旧账号的会话，静默无报错。
+- **顺序是"先列会话、再删用户行"**：列不出来时回 503，此时还没动任何数据，
+  不会出现"账号没了、会话一条没清"这种只能手工补的半成品状态。
+- `tests/test_admin_guard.py` 的静态守卫补上一种调用形态：`_off(store.delete_user, ...)`
+  把被调函数从 `Call.func` 挪到了参数位，原来只认前者 ⇒ 该守卫会**静默失效**
+  （失效后测试仍是绿的）。
+- 守卫：`tests/test_session_owner_key.py`（20 条）+ 变异脚本
+  `tmp_probe/mutation_owner_key.py`（7 组，全红）。
 
 ### 变更 — trace 现在能按 `request_id` / 会话反查；`TaskOutcome.decision` 删除（2026-10-21）
 

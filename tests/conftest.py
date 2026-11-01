@@ -281,6 +281,26 @@ def _restore_observability_sink_each_test():
     observability.set_sink(saved)
 
 
+@pytest.fixture(autouse=True)
+def _reset_rag_embedding_cooldown_each_test():
+    """每个用例前后：清掉 RAG 的"embedding 不可用"冷却。
+
+    与上面两条同一个理由（**跨文件静默污染**），只是被污染的对象换成了
+    ``retrieval._EMBED_DOWN_UNTIL`` —— 它是进程级状态，而且冷却窗口有 60 秒。
+
+    触发它很容易：任何一条造出"embedding 构造失败"的用例（那正是新加的降级
+    测试要验的事）都会点亮冷却，于是**之后**所有走 ``_make_dense_retriever``
+    的用例都拿到 ``NullRetriever``，连 ``test_vector_store`` 里"默认走内存后端"
+    那种断言都会红 —— 而单跑那个文件又是绿的。出错地点与原因离得太远，
+    所以由框架兜住，不靠每个文件自觉。
+    """
+    from src.rag import retrieval
+
+    retrieval.reset_embedding_cooldown()
+    yield
+    retrieval.reset_embedding_cooldown()
+
+
 class FakeRetriever:
     """假检索器：可指定返回值，避免测试真的去读语料 / 跑 TF-IDF。"""
 
