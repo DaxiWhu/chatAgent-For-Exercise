@@ -490,8 +490,13 @@ def _bypass_slice(
         was = before.get(source) or {}
         delta_in = int(entry.get("input", 0) or 0) - int(was.get("input", 0) or 0)
         delta_out = int(entry.get("output", 0) or 0) - int(was.get("output", 0) or 0)
-        if delta_in or delta_out:
-            out[source] = {"input": delta_in, "output": delta_out}
+        delta_cached = int(entry.get("cached", 0) or 0) - int(was.get("cached", 0) or 0)
+        # ⚠️ ``cached`` 必须跟着切、也必须进这个条件（2026-11-01）：它是**新增键**，
+        # 漏切的话 ``out[source]`` 里就没有它，于是旁路的命中量在报告里恒为 0 ——
+        # 而"旁路从没命中"和"忘了传"在指标上一模一样。只判 input/output 会漏掉
+        # "输入没变但命中变了"这种情形（上游重算 cache 时会出现）。
+        if delta_in or delta_out or delta_cached:
+            out[source] = {"input": delta_in, "output": delta_out, "cached": delta_cached}
     return out
 
 
@@ -726,6 +731,12 @@ async def run_agent(
         stats.review_rounds,
         stats.input_tokens,
         stats.output_tokens,
+        # ⚠️ 命中量必须一起切（2026-11-01）。``replace()`` 会把没点名的字段**原样搬过去**
+        # —— 少切一个，这一次运行报出来的就是**累计**命中量配**本次**输入量，
+        # 于是命中率虚高（甚至被 ``cache_hit_rate`` 的 min(1.0) 悄悄截断成 100%）。
+        # 这正是"两次 replace 迟早有一处忘了减 before"那个坑的当场重演：零报错、
+        # 数字看着还挺漂亮。加新字段时请一并检查这份元组与下面的 slice。
+        stats.cached_input_tokens,
     )
     # 旁路（反思 / 压缩）那笔同样要切：它的写入是**异步**的（后台任务、工作线程），
     # 只按"结束时读一次"切片的话，第二个节点会把第一个节点的旁路成本也报进去。
@@ -907,6 +918,7 @@ async def run_agent(
         review_rounds=stats.review_rounds - before[2],
         input_tokens=stats.input_tokens - before[3],
         output_tokens=stats.output_tokens - before[4],
+        cached_input_tokens=stats.cached_input_tokens - before[5],
         bypass_tokens=_bypass_slice(before_bypass, stats.bypass_tokens),
         duration_seconds=duration,
     )

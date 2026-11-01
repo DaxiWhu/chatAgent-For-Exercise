@@ -102,6 +102,25 @@ class AgentStats:
     output_tokens: int = 0
     """本次运行**主链路**累计的输出 token。"""
 
+    cached_input_tokens: int = 0
+    """上面 ``input_tokens`` 里**命中上游前缀缓存**的那部分（是它的子集）。
+
+    为什么要单独记（2026-11-01）
+    ---------------------------
+    它不改预算、不改任何判定 —— 它只回答"这个部署的缓存到底在不在工作"。
+    在此之前没人看得见这个数，于是"缓存省了多少钱"只能靠感觉；而配错的形态
+    恰好是**零报错**的：网关不返回命中字段、或前缀每次都被打断，两种情况都
+    只表现为"账单比预期高"，没有任何一处会报错。
+
+    ⚠️ **不许把它加进 ``agent_run_tokens_total{kind="input"}``**：它是 input 的
+    子集，并进去以后 ``sum(rate(...))`` 就翻倍，而那条曲线正是成本口径。上报走
+    独立的 ``agent_cache_hit_tokens_total``。
+
+    ⚠️ 口径是"上游回报的命中数"，不是"我们推断应该命中多少"。网关不回这个字段时
+    它是 0，与"确实一次没命中"不可区分 —— 所以看它的**同时**要看 ``input_tokens``：
+    后者为 0 说明压根没量到 usage，此时命中率无意义。
+    """
+
     bypass_tokens: dict[str, dict[str, int]] = field(default_factory=dict)
     """**旁路**模型调用的 token，按来源分开：``{"reflection": {"input":…, "output":…}}``。
 
@@ -136,6 +155,19 @@ class AgentStats:
         """所有旁路调用的输出 token 合计。"""
         return sum(int(v.get("output", 0) or 0) for v in self.bypass_tokens.values())
 
+    @property
+    def cache_hit_rate(self) -> float:
+        """主链路输入里命中缓存的比例（``0.0`` ～ ``1.0``）。
+
+        分母是 ``input_tokens``（不是"命中 + 未命中"）：两者是同一个量，用 input
+        做分母才不会被"旁路漏记"污染。没有输入 token 时返回 ``0.0`` —— 此时它
+        没有意义，读的人应当先去看 ``input_tokens`` 是否为 0（= 上游没回 usage）。
+        """
+        total = int(self.input_tokens or 0)
+        if total <= 0:
+            return 0.0
+        return min(1.0, max(0.0, int(self.cached_input_tokens or 0) / total))
+
     # -- 检索（agent 链路上的检索由 researcher 工具发起）--
     retrieval_calls: int = 0
     retrieved_chunks: int = 0
@@ -159,6 +191,8 @@ class AgentStats:
             "duration_seconds": round(self.duration_seconds, 6),
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "cache_hit_rate": round(self.cache_hit_rate, 4),
             "bypass_tokens": {k: dict(v) for k, v in self.bypass_tokens.items()},
             "retrieval_calls": self.retrieval_calls,
             "retrieved_chunks": self.retrieved_chunks,

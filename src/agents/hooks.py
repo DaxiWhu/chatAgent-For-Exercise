@@ -85,6 +85,35 @@ def _tool_names(agent: Any) -> list[str]:
     return out
 
 
+def _cached_input_tokens(usage: Any) -> int:
+    """这次调用里命中**上游前缀缓存**的输入 token 数；读不到就是 0。
+
+    字段位置：官方 ``Usage.input_tokens_details.cached_tokens``
+    （``agents/usage.py`` 的 ``InputTokensDetails``）。OpenAI 系网关把它放在
+    ``usage.prompt_tokens_details.cached_tokens``，SDK 的
+    ``openai_chatcompletions`` 会转过来（源码 ``_normalize_input_tokens_details``）。
+
+    ⚠️ DeepSeek 是两个字段都给（2026-11-01 实测：
+    ``prompt_tokens_details.cached_tokens`` 与顶层的
+    ``prompt_cache_hit_tokens`` 同为 512），所以**不需要**自己解原始 payload、
+    也不需要打开 ``preserve_raw_usage``。这一点与"顶层字段只有 DeepSeek 认识"
+    的猜测相反，别照猜测改。
+
+    ⚠️ 读不到时返回 0 而**不估**：估出来的命中数会让"缓存省了多少钱"变成编的，
+    且看不出是编的。0 与"真没命中"分不开 —— 这正是要同时看 ``input_tokens``
+    的原因（后者也为 0 ⇒ 上游压根没回 usage）。
+    """
+    details = getattr(usage, "input_tokens_details", None)
+    try:
+        # 这里**不**先判 ``details is None``：``getattr(None, "cached_tokens", 0)``
+        # 本来就走默认值。多写一层判空只会让人以为"没有它就会炸"，而变异验证
+        # 证明它删掉以后行为完全一样（2026-11-01 实测：判空版被删，测试全绿）。
+        # 真正必要的是下面那个 except：上游把字段写成字符串时会抛。
+        return max(0, int(getattr(details, "cached_tokens", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 class AgentRunHooks(RunHooks[TaskContext]):
     """把 SDK 的生命周期事件累计进 ``TaskContext``（统计 + 动作清单）。"""
 
@@ -113,6 +142,9 @@ class AgentRunHooks(RunHooks[TaskContext]):
             # 缺字段时按 0 算是安全的 —— 少算只会"晚一点触发预算"，不会拦错。
             stats.input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
             stats.output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
+            # 命中量必须在**同一处**累加：拆到别的地方写就会出现"input 记了、
+            # cached 忘记"，而那种漂移的表现只是命中率偏低，没有任何东西报错。
+            stats.cached_input_tokens += _cached_input_tokens(usage)
         if not steps_enabled():
             return
         log = steps_of(context)

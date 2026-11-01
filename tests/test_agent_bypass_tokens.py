@@ -180,7 +180,9 @@ def test_the_reflection_gate_wires_the_sink(monkeypatch):
 
     asyncio.run(R._run(ctx, "证据", "oscillation"))
 
-    assert ctx.stats.bypass_tokens == {"reflection": {"input": 321, "output": 7}}
+    assert ctx.stats.bypass_tokens == {
+        "reflection": {"input": 321, "output": 7, "cached": 0}
+    }
 
 
 def test_the_trim_path_wires_compaction_into_the_run_stats(monkeypatch):
@@ -215,7 +217,9 @@ def test_the_trim_path_wires_compaction_into_the_run_stats(monkeypatch):
 
     assert got["on_usage"] is not None, "压缩那一路没拿到回调 ⇒ 这笔钱不会进预算"
     got["on_usage"](Usage(input_tokens=1200, output_tokens=60))
-    assert ctx.stats.bypass_tokens == {"compaction": {"input": 1200, "output": 60}}
+    assert ctx.stats.bypass_tokens == {
+        "compaction": {"input": 1200, "output": 60, "cached": 0}
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -301,8 +305,8 @@ def test_bypass_slice_only_counts_this_run():
     before = {"compaction": {"input": 1000, "output": 20}}
     current = {"compaction": {"input": 1300, "output": 25}, "reflection": {"input": 80, "output": 4}}
     assert _bypass_slice(before, current) == {
-        "compaction": {"input": 300, "output": 5},
-        "reflection": {"input": 80, "output": 4},
+        "compaction": {"input": 300, "output": 5, "cached": 0},
+        "reflection": {"input": 80, "output": 4, "cached": 0},
     }
 
 
@@ -324,7 +328,7 @@ def test_no_usage_means_nothing_is_recorded():
     stats = AgentStats()
     budget.note_bypass(stats, "reflection", None)
     budget.note_bypass(stats, "compaction", SimpleNamespace(input_tokens=0, output_tokens=0))
-    assert stats.bypass_tokens == {"compaction": {"input": 0, "output": 0}}
+    assert stats.bypass_tokens == {"compaction": {"input": 0, "output": 0, "cached": 0}}
     assert stats.bypass_input_tokens == 0
 
 
@@ -339,8 +343,8 @@ def test_note_bypass_accumulates_per_source():
     budget.note_bypass(stats, "reflection", Usage(input_tokens=5, output_tokens=1))
     budget.note_bypass(stats, "compaction", Usage(input_tokens=100, output_tokens=9))
     assert stats.bypass_tokens == {
-        "reflection": {"input": 15, "output": 3},
-        "compaction": {"input": 100, "output": 9},
+        "reflection": {"input": 15, "output": 3, "cached": 0},
+        "compaction": {"input": 100, "output": 9, "cached": 0},
     }
     assert stats.bypass_input_tokens == 115
     assert stats.bypass_output_tokens == 12

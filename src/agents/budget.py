@@ -128,13 +128,21 @@ def note_bypass(stats: Any, source: str, usage: Any) -> None:
     slot = getattr(stats, "bypass_tokens", None)
     if not isinstance(slot, dict):
         return
-    entry = slot.setdefault(source, {"input": 0, "output": 0})
+    entry = slot.setdefault(source, {"input": 0, "output": 0, "cached": 0})
     entry["input"] = int(entry.get("input", 0) or 0) + int(
         getattr(usage, "input_tokens", 0) or 0
     )
     entry["output"] = int(entry.get("output", 0) or 0) + int(
         getattr(usage, "output_tokens", 0) or 0
     )
+    # 旁路的缓存命中量同样要记：压缩要把老历史整段读一遍，是长任务里最贵的一笔，
+    # 它有没有命中缓存直接决定"压缩贵不贵"。漏记的表现是只看主链路会高估成本、
+    # 或者反过来低估缓存收益，两种都只表现为"数字对不上"，不会报错。
+    details = getattr(usage, "input_tokens_details", None)
+    if details is not None:
+        entry["cached"] = int(entry.get("cached", 0) or 0) + max(
+            0, int(getattr(details, "cached_tokens", 0) or 0)
+        )
 
 
 def remaining(context: Any) -> int:
@@ -211,6 +219,25 @@ def report(stats: Any, *, agent: str = "") -> None:
     if output_tokens:
         observability.counter(
             "agent_run_tokens_total", output_tokens, kind="output", agent=agent
+        )
+    cached_input = int(getattr(stats, "cached_input_tokens", 0) or 0)
+    if cached_input:
+        # ⚠️ 独立指标，**不能**并进上面那条 `kind="input"`：命中量是输入的子集，
+        # 并进去以后 `sum(rate(...))` 就是双倍输入，而那条曲线正是成本口径。
+        # 命中率 = 这条 / `agent_run_tokens_total{kind="input"}`。
+        observability.counter(
+            "agent_cache_hit_tokens_total", cached_input, agent=agent
+        )
+    if input_tokens:
+        # 每次运行一条命中率，用来回答"缓存是不是真的在生效"。只看累计量的比值
+        # 会被长短会话混在一起平均掉：一次长冷启动能把几十次热调用盖住。
+        #
+        # ⚠️ 恒为 0 有两种含义，别急着调缓存：① 网关压根不回命中字段；
+        # ② 前缀真的一次没命中。区分办法是看 `agent_cache_hit_tokens_total`
+        # 有没有**任何**增量 —— 但从没增长这件事本身也是零报错的，所以配了新网关
+        # 之后要用真请求验一次（`tmp_probe/cache_probe.py` 那类探针）。
+        observability.histogram(
+            "agent_cache_hit_ratio", cached_input / input_tokens, agent=agent
         )
     bypass = getattr(stats, "bypass_tokens", None)
     if isinstance(bypass, dict):
