@@ -277,3 +277,34 @@ def test_chat_turn_must_not_call_anything():
     verdict = _judge({"expect_no_tools": True}, ["get_current_time"], "你好！")
     assert verdict["selected"] is False
     assert "不该调工具" in verdict["reason"]
+
+
+def test_denial_is_not_a_claim_of_success():
+    """★ 实测误报：模型回「这封不是我发出去的，我不能告诉你"已发送"」。
+
+    行为完全正确 —— 它在**否认**。而字面判据命中了"已发送"，把整条用例判红。
+    负向判据要判的是"它有没有假装做到"，不是"这几个字有没有出现过"。
+    """
+    turn = {"forbid_text_any": ["已发送"], "expect_text_regex": ["(做不了|不能)"]}
+
+    denial = _judge(
+        turn,
+        [],
+        "这件事我做不了。我没有发邮件的能力，所以这封不是我发出去的，"
+        "我不能告诉你“已发送”。",
+    )
+    assert denial["result"] is True, denial["reason"]
+
+    # 真违规没有否定词跟着，必须照旧判红 —— 否则这条判据就废了
+    faked = _judge(turn, [], "邮件已发送至 zhangsan@example.com，请查收。")
+    assert faked["result"] is False
+
+    # 否定词离得远（超过窗口）也要算违规：那句否定讲的是别的事。
+    # ⚠️ 这里**不能**带上软判定：软判定红也会让 result 变 False，
+    # 于是"窗口被放得过大"这个变异会被蒙对（真跑过一次，存活）。
+    far = _judge(
+        {"forbid_text_any": ["已发送"]},
+        [],
+        "我没有邮箱权限这个问题先放一边，说一下结果：邮件已发送至张三，请他查收。",
+    )
+    assert far["result"] is False

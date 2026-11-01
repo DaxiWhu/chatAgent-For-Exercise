@@ -128,6 +128,75 @@ def memory_session_for(session_id: str) -> Any:
     return session
 
 
+def _bigrams(text: str) -> set[str]:
+    """字符二元组（去掉空白）。
+
+    桩检索器要判"这两句话是不是在讲同一件事"，而项目里没有中文分词依赖。
+    单字重合不行：「怎」「么」「的」在任意两句中文里都会撞上，等于没有相关性；
+    双字组能挡住这类误命中，又不引入新依赖。
+    """
+    chars = [ch for ch in text if not ch.isspace()]
+    if len(chars) < 2:
+        return set(chars)
+    return {a + b for a, b in zip(chars, chars[1:], strict=False)}
+
+
+def _stub_factory(corpus: list[dict]) -> Any:
+    """把评测集里的固定语料包成检索器工厂（接口同 ``TaskContext.retriever_factory``）。"""
+
+    class StubRetriever:
+        """评测专用的**桩检索器**。
+
+        为什么需要它
+        ------------
+        ``retriever_factory=None`` 时 ``kb_search`` 恒返回"检索不可用"，``research``
+        因此拿不到任何素材 ⇒ 所有靠取证的专家（``build_slide_deck`` 等）每次都在走
+        **降级路径**，而"拿到素材之后怎么做"这段一次也没被测到。
+        上一轮 ``slide-outline`` 掉到 17/18 正是如此：检索为空后模型自己手写大纲，
+        评测分不出这是"模型偏好"还是"环境逼的"。
+
+        ⚠️ 它**不是**知识库：不切分、不向量化、不重排，只按字符重合度排序。
+        所以报告必须标 ``retrieval=stub`` —— "检索通了"不等于 RAG 链路通了。
+        """
+
+        def __init__(self, rows: list[dict]) -> None:
+            self._rows = [dict(r) for r in rows if (r.get("content") or "").strip()]
+
+        def search(self, query: str, top_k: int = 4) -> list[tuple[dict, float]]:
+            needle = _bigrams(query or "")
+            if not needle:
+                return []
+            # 命中门槛：**两个不同的双字组**（查询本身更短时降为全中）。
+            # 只按单字重合判会把"今天天气怎么样"和"限流是怎么算的"连起来 ——
+            # 它们共用了"怎""么"两个字。中文的高频字太多，单字重合等于没有相关性；
+            # 而桩一旦对任何查询都给素材，"检索不到时会不会如实说"就再也测不出来。
+            need = min(2, len(needle))
+            scored: list[tuple[dict, float]] = []
+            for index, row in enumerate(self._rows):
+                hit = len(needle & _bigrams(row["content"]))
+                if hit < need:
+                    continue
+                scored.append((self._fill(row, index), hit / len(needle)))
+            scored.sort(key=lambda pair: -pair[1])
+            return scored[: max(1, int(top_k or 4))]
+
+        @staticmethod
+        def _fill(row: dict, index: int) -> dict:
+            return {
+                "content": row["content"],
+                "text": row.get("text") or row["content"],
+                "source": row.get("source") or "eval_stub.md",
+                "source_path": row.get("source_path") or "eval_stub.md",
+                "section": row.get("section") or "",
+                "kind": row.get("kind") or "text",
+                "parser": row.get("parser") or "stub",
+                "chunk_id": row.get("chunk_id") or f"stub::{index}",
+            }
+
+    retriever = StubRetriever(corpus)
+    return lambda: retriever
+
+
 def _build_model(which: str, structured_output: str = "") -> Any:
     """按名字装配模型（两条都是 OpenAI 兼容协议，走同一个官方实现）。
 
@@ -196,6 +265,32 @@ def _squash(text: str) -> str:
     return re.sub(r"[,\uFF0C\s]", "", text or "")
 
 
+#: 中文否定词。判断"是不是在**否认**做过"靠它。
+_NEGATION = re.compile(r"[不没无未别非]")
+
+#: 往前看几个字。8 个字够覆盖"我不能告诉你『已发送』""我并没有真的已发送"这类句式，
+#: 又不至于把"发不了。邮件已发送至…"这种**真违规**也放过（那是漏报方向，可以接受：
+#: 误报比漏报贵 —— 一次误报就会让人去改一个没坏的东西）。
+_DENIAL_WINDOW = 8
+
+
+def _claims_done(flat: str, word: str) -> bool:
+    """``word`` 是否以"断言已经做到"的语气出现（前面 ``_DENIAL_WINDOW`` 字内没有否定词）。
+
+    ⚠️ 实测踩过：模型回「这封不是我发出去的，我不能告诉你"已发送"」—— **正确否认**，
+    而字面判据命中了"已发送"，整条用例判红。判据要判的是"它有没有假装做到"，
+    不是"这几个字有没有出现过"。
+    """
+    target = _squash(word)
+    if not target:
+        return False
+    for match in re.finditer(re.escape(target), flat):
+        prefix = flat[max(0, match.start() - _DENIAL_WINDOW) : match.start()]
+        if not _NEGATION.search(prefix):
+            return True
+    return False
+
+
 def _judge(turn: dict, called: list[str], answer: str) -> dict:
     """判一轮，返回**分层的**结论，不是一个布尔。
 
@@ -261,7 +356,7 @@ def _judge(turn: dict, called: list[str], answer: str) -> dict:
     # -- 第二层：结果是你要的那个吗 --
     # 先查**负向**：声称"已经做到了"比"没做到"严重得多，而且它不会被任何正向
     # 关键词表抓住（话术无穷），只能用"这几句绝不许出现"来兜。
-    banned = [word for word in (turn.get("forbid_text_any") or []) if _squash(word) in flat]
+    banned = [word for word in (turn.get("forbid_text_any") or []) if _claims_done(flat, word)]
     if banned:
         return _verdict(False, False, _joined(f"答案里出现了'已完成'的说法 {banned}"))
 
@@ -335,12 +430,15 @@ async def _run_turn(
     asset_dir: Path,
     docs_dir: str,
     max_turns: int,
+    retriever_factory: Any = None,
 ) -> dict:
     """跑一轮，返回这一轮的观测结果。每轮新建上下文（与真实服务一致：一轮一请求）。"""
     from src.agents.context import TaskContext
     from src.agents.runner import ENTRY_AGENT, run_agent
 
-    ctx = TaskContext(docs_dir=docs_dir, asset_dir=asset_dir, retriever_factory=None)
+    ctx = TaskContext(
+        docs_dir=docs_dir, asset_dir=asset_dir, retriever_factory=retriever_factory
+    )
     started = time.perf_counter()
     try:
         outcome = await asyncio.wait_for(
@@ -428,6 +526,14 @@ async def main_async(args: argparse.Namespace) -> int:
     runner.session_for = memory_session_for
 
     model = _build_model(args.model, args.structured_output)
+    # 检索默认走**桩**（评测集里 `_stub_corpus` 那段固定语料）。关掉的话，凡是依赖
+    # 取证的用例就只剩"检索不可用"这一条降级路径 —— 通过率看着正常，实际没测到
+    # "拿到素材之后怎么做"。两种状态都必须能从输出第一屏看出来。
+    corpus = data.get("_stub_corpus") or []
+    retriever_factory = None
+    if corpus and not args.no_stub_retrieval:
+        retriever_factory = _stub_factory(corpus)
+    retrieval_mode = "stub" if retriever_factory is not None else "off"
     # 每次评测一个独立子目录：``list_assets`` 那条用例判的是"当前有哪些文件"，
     # 与上一批跑剩的文件混在一起时，它会列出几十个 —— 用例仍然通过，但输出没法看，
     # 而"没法看的输出"最后就没人看。
@@ -435,6 +541,13 @@ async def main_async(args: argparse.Namespace) -> int:
     asset_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"模型：{args.model}｜用例：{len(cases)} 条｜资产目录：{asset_dir}")
+    if retriever_factory is not None:
+        print(
+            f"检索：桩（{len(corpus)} 条固定语料）—— 测的是「拿到素材之后怎么做」，"
+            "**不是** RAG 检索质量"
+        )
+    else:
+        print("检索：关闭 —— 依赖取证的用例只会走到「检索不可用」这一条降级路径")
     print("-" * 78)
 
     reports: list[dict] = []
@@ -450,6 +563,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 asset_dir=asset_dir,
                 docs_dir=args.docs_dir,
                 max_turns=args.max_turns,
+                retriever_factory=retriever_factory,
             )
             rows.append(row)
             # 失败要标**哪一层**：`选择` 与 `结果` 的处置完全不同（改工具描述 vs 改
@@ -551,6 +665,8 @@ async def main_async(args: argparse.Namespace) -> int:
     if args.json:
         out = {
             "model": args.model,
+            # 检索来自桩还是真关着 —— 少了这一格，"检索通了"会被读成 RAG 链路也通了。
+            "retrieval": retrieval_mode,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "summary": {
                 # 三层分开落盘：只有选择层全绿、而结果层掉下来，才是"工具在跑、
@@ -594,6 +710,14 @@ def main() -> int:
     parser.add_argument("--assets", default="var/eval_assets")
     parser.add_argument("--docs-dir", default="", help="语料目录（给了才会做引用校验）")
     parser.add_argument("--max-turns", type=int, default=8)
+    parser.add_argument(
+        "--no-stub-retrieval",
+        action="store_true",
+        help=(
+            "关掉桩检索（默认开）。关掉后 retriever_factory=None，依赖取证的用例只会走"
+            "「检索不可用」那条降级路径；要复现旧数据时用它。"
+        ),
+    )
     parser.add_argument(
         "--structured-output",
         default="",

@@ -3,6 +3,27 @@
   "_note_on_false_positives": "这份评测最贵的错误不是漏报，是**误报**：判据写得太死 → 正确行为被判红 → 有人跑去改一个没坏的工具或提示词。2026-10-31 一次实跑就撞到两例：模型回『这件事我做不了』而词表里只有『做不到』；另一例它先 list_assets 查清目录再回答（比直接读更好），被判成漏调 read_asset。所以新增用例时先问一句：**它有没有第二条同样合理的走法？** 有就用 expect_tools_any，不要硬指定一个。",
   "_note_on_soft_checks": "expect_text_regex 是**软判定**（答案里命中任一正则即算过）。它只用于『模型该承认做不到』这一类——那种能力本来就没有对应的工具，硬判工具名判不出来。这类用例在汇总里单独标 [soft]，不要和硬判定混在一起看通过率。⚠️ 这里刻意**不接受字面词表**：2026-10-31 一天里，字面词表在四条用例上误报四次（做不到/做不了、无法访问/无法打开、不能发送/不能帮你发送），每次都是行为正确而被判红。正则写的是句法（否定词 + 动作词），不是某一个说法。",
   "_note_on_answer_checks": "expect_answer_any（出现任一即过）/ expect_answer_all（全部都要出现）是**第三层**判据：它问的不是『调了没有』也不是『跑通了没有』，而是『最后给出的数字/正文对不对』。前两层全绿而这一层红，是最危险的状态——模型点了 calculate、工具也确实返回了，但它没用那个返回值，而是把自己心算的结果写进了答复。⚠️ 答案判据**不许依赖运行日期**（比如断言『今天是 31 号』）：那种用例今天过、明天红，是评测自己过期，不是被测对象退步。所以时间类用例刻意不加答案判据。",
+  "_note_on_stub_retrieval": "评测默认给一个**桩检索器**（下面的 _stub_corpus）。原因是 retriever_factory=None 时 kb_search 恒返回『检索不可用』，research 拿不到素材，于是所有靠取证的专家每次都在走降级路径——『拿到素材之后怎么做』这段一次也没测到。桩**不是**知识库：不切分、不向量化、不重排，只按字符重合度排序，所以它验证的是『有素材时模型会不会用』，**不能**用来评价 RAG 检索质量。语料内容抄自本仓库文档（PRODUCTION_CONFIG / PIPELINE），不是编的。报告第一屏与 JSON 的 retrieval 字段都会标 stub/off。",
+  "_stub_corpus": [
+    {
+      "content": "限流按两个维度分别计数：按来源 IP 与按会话，各自每分钟 120 次（RATE_LIMIT_PER_MINUTE / RATE_LIMIT_SESSION_PER_MINUTE）。两个维度分别由 RATE_LIMIT_ENABLED 与 RATE_LIMIT_BY_SESSION 开关控制，默认都打开。计数跨端点累计，/v1/chat 与 /v1/chat/stream 共用同一份额度，不是每个端点各算一份。",
+      "source": "PRODUCTION_CONFIG.md",
+      "source_path": "PRODUCTION_CONFIG.md",
+      "section": "服务层配置 > 限流"
+    },
+    {
+      "content": "检索流程：查询先过 retriever.search(top_k=3)，返回完整块记录（26 个字段）。这份记录分流两处——送模型时用 context_block()，取值优先级是父窗 > 保真内容 > 检索文本；给用户时用 build_citations()，每条带 n / source / score / chunk_id / kind / parser / section / page / where。RAG_EMBEDDING 默认 hybrid（向量 + 关键词混合召回），RAG_PARENT_CHILD 默认开（子块召回、父块供上下文）。",
+      "source": "PIPELINE.md",
+      "source_path": "PIPELINE.md",
+      "section": "检索 → 生成 → 引用"
+    },
+    {
+      "content": "引用必须可回溯：snippet 取 content（保真原文）而不是 text（表格文字化之后的加工品），否则用户拿引用去核对原文件会对不上。where 字段拼成人话位置，形如『年报.pdf · 第 1 页 · 第三章 > 出口情况』。原图返图规则：扫描件返回整页原图；表格、图表、图片、公式按 bbox 并集裁区域；电子版纯文字块不返图。",
+      "source": "PIPELINE.md",
+      "source_path": "PIPELINE.md",
+      "section": "检索 → 生成 → 引用"
+    }
+  ],
   "cases": [
     {
       "id": "chat-no-tools",

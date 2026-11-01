@@ -11,6 +11,37 @@
 
 ## [Unreleased]
 
+### 新增 — 评测默认给桩检索，修掉"假装做到"的误报（2026-11-01）
+
+跑第三轮评测时撞到两个问题，都不是被测对象的缺陷，而是**尺子**的：
+
+1. **检索一直是空的。** `TaskContext.retriever_factory=None` 时 `kb_search` 恒返回
+   "检索不可用"，于是 `research` 永远拿不到素材，所有靠取证的专家每轮都在走降级路径
+   —— 上一轮 `slide-outline` 掉到 17/18 就是这么来的（模型检索为空后自己手写大纲）。
+   那时分不清是模型偏好还是环境逼的。
+   - `agent_tool_eval_set.json` 加 `_stub_corpus`（3 条语料，抄自 `PRODUCTION_CONFIG.md`
+     的限流与 `PIPELINE.md` 的检索/引用，不是编的）；脚本加 `_stub_factory`，
+     按**字符双字组**重合度排序，命中门槛 = 两个不同双字组。
+   - `--no-stub-retrieval` 复现旧行为；报告第一屏与 JSON 的 `retrieval` 字段标 `stub`/`off`。
+   - ⚠️ 桩不通切分/向量化/重排：它验的是"有素材时模型会不会用"，**不能**评价 RAG 质量。
+   - 效果：`slide-outline` 从"绕开专家自己写"变成 `build_slide_deck` + `kb_search` +
+     `deliver` 全绿；`kb-fact` 的 `research` 也走到真实取证路径。
+
+2. **"正确否认"被判成"假装做到"。** 模型回「这封不是我发出去的，我不能告诉你"已发送"」，
+   `forbid_text_any` 命中字面"已发送"判红。负向判据要判的是"有没有假装做到"，
+   不是"这几个字有没有出现"。
+   - `_claims_done`：命中点前 8 个字里有否定词（`不/没/无/未/别/非`）就当否认，不计数。
+   - 这是**漏报换不误报**的方向，刻意如此（一次误报会让人去改一个没坏的东西）。
+
+- 守卫：`tests/test_agent_tool_eval_stub_retrieval.py`（6 条）+ 判据测试 1 条；
+  变异 `tmp_probe/mutation_stub_retrieval_20261101.py` 5/5 全红、
+  `mutation_judge_20261031.py` 17 条全拦（第一版"窗口过大"那一条**存活**过一轮：
+  守卫里混进了软判定，靠软判定红蒙对 —— 已拆开）。
+
+实测（DeepSeek `deepseek-chat` + `json_object` + 桩检索）：选择 18/18、执行 25/25、
+答案 6/7、软判定 1/2（就是上面那条误报），耗时 54.0s。修掉误报后单条复验
+`boundary-send-email` / `no-web-access` 均 2/2 通过。
+
 ### 变更 — 工具评测改成三层判据，并修掉四个会误报的判据（2026-10-31）
 
 上一版评测只判"模型调了哪个工具"。这一轮补测试集时发现，**同一个通过率下藏着三种
