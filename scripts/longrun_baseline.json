@@ -1,0 +1,164 @@
+{
+  "cases": 5,
+  "delivered_rate": 0.4,
+  "partial_rate": 0.4,
+  "fallback_rate": 0.2,
+  "transfer_rate": 0.2,
+  "drifting_rate": 0.0667,
+  "looping_rate": 0.1333,
+  "stuck_rate": 0.3333,
+  "avg_steps": 6.2,
+  "avg_unfinished": 0.0,
+  "avg_tokens": 11880.2,
+  "avg_seconds": 11.4,
+  "short_cases": [],
+  "repeat": 3,
+  "cases_detail": [
+    {
+      "name": "分段调研后成文（先查再写，不许边查边写）",
+      "outcome": "partial",
+      "reason": "stuck",
+      "exit_reason": "unreviewed",
+      "error": "",
+      "settled": false,
+      "steps": 10,
+      "steps_range": [
+        10,
+        11
+      ],
+      "token": 14723,
+      "token_range": [
+        11653,
+        15041
+      ],
+      "cached": 11776,
+      "answer_chars": 469,
+      "problems": {
+        "stuck": 6
+      },
+      "outcome_mix": {
+        "partial/stuck/unreviewed": 2,
+        "failed/guard_stop/guard_stop": 1
+      },
+      "answer_head": "三次检索都没有返回任何结果，所以这件事我做不下去了。原因说明一下：检索工具在这三个问题上（限流算法与配额、超时的配置项与默认值、重试退避参数）**都返回空结果集，没有一条带编号的出处**，任务本身也因重复检索被判为卡住。  你明确要求过“不要在没有检索的情况下直接作答”，而你的格式又要求每段末尾标 [n]。现在没有任何编号可引，我只能两条路选一条，都不该我自己替你定：  1. **你提供资料**：把限流、超时、重试这三块的文档、配置说明或代码片段贴给我（哪怕只是片段关键词），我按你给的材料写，标注就指向你给的段落。 2. **授权换路**：如果你同意我改用通用工程实践来写，我可以按“是什么—为"
+    },
+    {
+      "name": "带硬约束的长产出（五条约束同时成立）",
+      "outcome": "manual",
+      "reason": "off_track",
+      "exit_reason": "guard_stop",
+      "error": "APIConnectionError: Connection error.",
+      "settled": false,
+      "steps": 9,
+      "steps_range": [
+        9,
+        13
+      ],
+      "token": 12334,
+      "token_range": [
+        11476,
+        21167
+      ],
+      "cached": 9856,
+      "answer_chars": 0,
+      "problems": {
+        "off_track": 3,
+        "stuck": 2
+      },
+      "outcome_mix": {
+        "manual/off_track/guard_stop": 1,
+        "manual/guardrail/output_guardrail": 1,
+        "failed/error/error": 1
+      },
+      "answer_head": ""
+    },
+    {
+      "name": "自查后再补漏（典型的多轮自我修正）",
+      "outcome": "partial",
+      "reason": "loop",
+      "exit_reason": "passed",
+      "error": "",
+      "settled": false,
+      "steps": 10,
+      "steps_range": [
+        6,
+        15
+      ],
+      "token": 18546,
+      "token_range": [
+        16651,
+        32876
+      ],
+      "cached": 15360,
+      "answer_chars": 578,
+      "problems": {
+        "loop": 4
+      },
+      "outcome_mix": {
+        "partial/loop/passed": 1,
+        "partial/loop/unreviewed": 1,
+        "delivered/none/unreviewed": 1
+      },
+      "answer_head": "上线前检查要点 1. 变更范围：明确改动内容、影响面与负责人，冻结无关变更。 2. 代码与配置：代码评审通过，配置项与依赖版本二次核对，敏感信息不入库。 3. 测试与验收：关键路径用例通过，无阻断缺陷，验收方书面确认。 4. 数据与备份：数据变更脚本先在预发演练，并做全量备份与可恢复验证。 5. 发布方式：优先灰度或小流量，设定观察窗口与放量/中止阈值。 6. 监控与告警：核心指标、错误率、日志与告警通道提前配好并演练通知到位。 7. 回滚方案〔补入〕：明确回滚触发条件、操作步骤、执行人和所需时长；确认版本可回退、数据结构兼容，且回滚本身演练过。 8. 容量评估〔补入〕：估算上线后峰值流量、连"
+    },
+    {
+      "name": "跨轮：先记约束，下一句按约束改",
+      "outcome": "delivered",
+      "reason": "none",
+      "exit_reason": "unreviewed",
+      "error": "",
+      "settled": true,
+      "steps": 1,
+      "steps_range": [
+        1,
+        10
+      ],
+      "token": 8334,
+      "token_range": [
+        8323,
+        20287
+      ],
+      "cached": 7552,
+      "answer_chars": 163,
+      "problems": {},
+      "outcome_mix": {
+        "delivered/none/unreviewed": 3
+      },
+      "answer_head": "结论：先压测，再上线。  压测暴露的是系统承载能力，这个数在上线前拿不到，上线后就会被真实流量替你验证，代价通常更大。压测结果也能反向确定容量水位和限流阈值，让上线有个可退的边界。  但压测不等于拖延上线。可先对核心链路做一轮有目标的压测，边缘功能边跑边补。压测环境与生产总有差距，它的作用是排除明显的容量风险，而不是给出上线许可。  把压测当成上线流程里的一步，而不是与之竞争的另一件事。"
+    },
+    {
+      "name": "转交类长任务（文学创作）",
+      "outcome": "",
+      "reason": "",
+      "exit_reason": "transfer",
+      "error": "",
+      "settled": true,
+      "steps": 1,
+      "steps_range": [
+        1,
+        1
+      ],
+      "token": 5464,
+      "token_range": [
+        5294,
+        5569
+      ],
+      "cached": 4224,
+      "answer_chars": 408,
+      "problems": {},
+      "outcome_mix": {
+        "-/-/transfer": 3
+      },
+      "answer_head": "最后一班地铁  23:47，站台只剩三个人。陈默站在黄线后，听见隧道深处传来风声——先是空穴的嗡鸣，接着是铁轨的震颤。  23:51，列车进站，车门开了。他没有上。  他要等的人没来。手机屏幕亮着，最后一条消息停在23:40：“我在B口，穿红大衣。”可他跑遍四个出口，只看见一个卖关东煮的老人。  23:55，车门将合。他忽然听到广播：“请最后一位乘客尽快上车。”声音很熟——是他自己。  他转身看站台另一头，那里站着一个穿红大衣的女人，正低头看手机。她抬起头，两人的目光对上。  “你是……陈默？”  “你等我？”  “我等了二十年。”她说，“每天末班车，每天这个点。”  车门开始滴滴作响。他往前"
+    }
+  ],
+  "env": {
+    "model": "deepseek-chat",
+    "api_base": "https://api.deepseek.com",
+    "session": "memory",
+    "kb": false,
+    "max_tokens": 10000000,
+    "guard": "on",
+    "spent_tokens": 207738
+  }
+}

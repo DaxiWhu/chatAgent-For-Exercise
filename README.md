@@ -692,22 +692,36 @@ python scripts/eval_scorecard.py --baseline scripts/scorecard.json   # 与上次
 本来只能靠感觉。
 
 ```bash
-python scripts/eval_longrun.py --out scripts/longrun_baseline.json        # 首次：生成基线
-python scripts/eval_longrun.py --baseline scripts/longrun_baseline.json   # 之后：与基线比
+# 首次：生成基线（每条跑 3 次取中位数 —— 单次读数不可比，见下）
+python scripts/eval_longrun.py --repeat 3 --out scripts/longrun_baseline.json
+# 之后：与基线比（退化退出码 1）
+python scripts/eval_longrun.py --repeat 3 --baseline scripts/longrun_baseline.json
+# 本地没起 PG 时（跨轮行为一致，只是不验持久化）
+python scripts/eval_longrun.py --session memory --repeat 3
+# 只想确认闸门真的会停（会掐断第一条，几乎不花钱）
+python scripts/eval_longrun.py --max-tokens 5000
 ```
 
-量的是：**完成率**（`delivered`）/ 部分结果率 / 兜底率 / **偏离率**（反思报过
-`off_track`）/ 打转率 / 卡住率 / 平均步数 / 未完成步数 / 平均 token 与耗时。
-退化判据是可解释的（完成率掉 5 个点、偏离率涨 5 个点、平均 token 涨 30%），
-有退化时退出码 1，可以当发布前的手动门禁。
+量的是：**完成率**（有可交付内容，含转交）/ 部分结果率 / 兜底率 / 转交率 /
+**偏离率**（反思报过 `off_track`）/ 打转率 / 卡住率 / 平均步数 / 未完成步数 /
+平均 token 与耗时。退化判据是可解释的（完成率掉 5 个点、偏离率涨 5 个点、
+平均 token 涨 30%），有退化时退出码 1，可以当发布前的手动门禁。
 
-三点必须知道：
+几点必须知道：
 
 - **它真花钱**（调上游模型）。用例 5 条、每条限篇幅 —— 这是能力画像，不是压测。
+  `--max-tokens`（默认 1000 万）是累计上限，到线立刻停且**不写**基线（退出码 3）；
+  实际超支恒等于**最后一跳**（闸门只能在下次模型调用之前看到已花了多少）。
 - **基线必须自己先跑一次生成**，没有出厂数字：基线取决于你用的模型、提示词版本、
   语料。任何"预设一个合理基线"的说法都不成立。
+- **单次读数不可比。** 同一份配置连跑三次，同一条用例的结局会在
+  `manual` / `failed` / `partial` 之间跳，token 差 8 倍（实测 9516 ~ 76310）。
+  所以用 `--repeat 3`：数值取中位数、结局取多数，各次的分布留在 `outcome_mix`；
+  三次全不相同时该行标 `?`（"无多数"，结局列只是其中一个样本）。
 - 脚本**强制打开** `AGENT_MULTISTEP_GUARD`：偏离率/打转率/卡住率全部来自反思闸门，
   闸门关着时那三行恒为 0 —— 那是"没测"，不是"没问题"。
+- 基线文件里存了 `env`（模型 / 会话后端 / 有没有检索 / 上限）与逐条读数：
+  这几项任何一项不同，两份数字都不可比。
 
 ### 口径必须钉死——否则同一份代码给出两套结论
 
