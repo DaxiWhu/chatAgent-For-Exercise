@@ -56,7 +56,7 @@
 
 调一次模型，把"压缩段"交给它，要它输出一段**事实性**摘要（发生过什么、定过什么结论、用户提过哪些约束），并明确要求**不许编造压缩段里没有的信息**。
 
-- **模型**：主链路那一份配置（`app/config.py` 的 `MODEL_NAME` / `AGNES_API_BASE`），两处同一来源 —— 两处用不同模型，摘要口径就会漂。
+- **模型**：主链路那一份配置（`app/config.py` 的 `MODEL_NAME` / `LLM_API_BASE`），两处同一来源 —— 两处用不同模型，摘要口径就会漂。
 - **摘要写成 `role="system"`**（图里那份就是 `SystemMessage`）。三条理由：
   1. `system` 是转换器明确支持的角色 —— 判据原文是
      `if role not in ("user", "assistant", "system", "developer")`（`agents/models/chatcmpl_converter.py`），一路走到 `ChatCompletionSystemMessageParam`；
@@ -266,7 +266,7 @@
 | 保留轮数 | **5** | `AGENT_HISTORY_KEEP_ROUNDS` | 下限 1（打回轮靠它），配 0 会被夹到 1 |
 | 触发窗口压缩的阈值 | **预算的 85%**（默认 `0.85`，可配） | `AGENT_HISTORY_COMPACT_RATIO` | 预算 = `AGENT_HISTORY_TOKEN_LIMIT`（10 万）⇒ 85,000 |
 | 计数方式 | `history_budget.count_tokens` | —— | 与 `app/quota.py` 同一口径，不引入第二套 |
-| 摘要的模型 | 主链路那一份配置 | `AGNES_MODEL` / `AGNES_API_KEY` / `AGNES_API_BASE` | 两处用不同模型会让摘要口径漂 |
+| 摘要的模型 | 主链路那一份配置 | `LLM_MODEL` / `LLM_API_KEY` / `LLM_API_BASE` | 两处用不同模型会让摘要口径漂 |
 | 摘要调用超时 | 30 秒 | `AGENT_HISTORY_COMPACT_TIMEOUT` | 它是**额外**的一次调用，独立可调 |
 | 交给摘要的正文上限 | 20 万字符 | `AGENT_HISTORY_COMPACT_MAX_CHARS` | 超出**从最老的开始丢**；不设上限 ⇒ 开关刚打开时那次注定失败、于是永远压不动 |
 | 摘要的角色 | `system`（图里是 `SystemMessage`） | —— | 见 §1.2 |

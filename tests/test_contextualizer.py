@@ -37,7 +37,7 @@ def test_on_without_key_is_explicit(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "CONTEXTUAL", True)
     monkeypatch.setattr(C, "CTX_API_KEY", "")
     ok, why = C.enabled()
-    assert ok is False and "AGNES_API_KEY" in why
+    assert ok is False and "LLM_API_KEY" in why
 
 
 def test_prefix_goes_to_the_front_of_text(enabled, tmp_path):

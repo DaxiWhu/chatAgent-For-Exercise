@@ -13,7 +13,7 @@ Anthropic 的实测结论（`contextual-retrieval`）：仅加**上下文前缀*
 
 配置
   RAG_CONTEXTUAL      off（默认）| on
-  CONTEXTUAL_MODEL    默认 agnes-2.0-flash（只做"定位与主题"，不需要强模型）
+  CONTEXTUAL_MODEL    默认 deepseek-chat（只做"定位与主题"，不需要强模型）
   RAG_CTX_MAX_CHUNKS  单次运行上限（默认 500）
   RAG_CTX_DOC_CHARS   给模型的文档全文上限（默认 20000，超出只取头部+命中块附近）
   RAG_CTX_CACHE_DIR   缓存目录（默认 data/.ctx_cache）
@@ -54,12 +54,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-CONTEXTUAL_MODEL = os.getenv("CONTEXTUAL_MODEL", "").strip() or "agnes-2.5-pro"
-# ⚠️ 为什么不用更便宜的 flash：实测本账号的 `agnes-2.0-flash` 直接 429
-# （"reached the API rate limit for free users"），一次都调不通；
-# 而 `agnes-2.5-pro` 可用。默认值必须是**在当前凭证下真能跑通**的那个。
-CTX_API_BASE = os.getenv("AGNES_API_BASE", "https://apihub.agnes-ai.com/v1").strip()
-CTX_API_KEY = os.getenv("AGNES_API_KEY", "").strip()
+CONTEXTUAL_MODEL = os.getenv("CONTEXTUAL_MODEL", "").strip() or "deepseek-chat"
+# ⚠️ 默认值必须是**在当前凭证下真能跑通**的那个模型，不是"看起来该用的"那个。
+#    历史（2026-10，旧网关）：当时的 flash 档在本账号直接 429（免费档限流），一次都
+#    调不通，只能退到 pro 档。2026-11-01 起主网关换成 DeepSeek，该限制不再适用 ——
+#    但**这条经验的形状有效**：换网关后要先用最小请求验一次，再把默认值改过去。
+CTX_API_BASE = os.getenv("LLM_API_BASE", "https://api.deepseek.com").strip()
+CTX_API_KEY = os.getenv("LLM_API_KEY", "").strip()
 CTX_MAX_CHUNKS = max(1, _env_int("RAG_CTX_MAX_CHUNKS", 500))
 CTX_DOC_CHARS = max(2000, _env_int("RAG_CTX_DOC_CHARS", 20000))
 CTX_CACHE_DIR = os.getenv("RAG_CTX_CACHE_DIR", "data/.ctx_cache").strip() or "data/.ctx_cache"
@@ -73,7 +74,8 @@ CTX_CACHE_DIR = os.getenv("RAG_CTX_CACHE_DIR", "data/.ctx_cache").strip() or "da
 #: 这里还**不设 `max_retries`**（SDK 默认为 2）：切分是离线批量任务，
 #: 失败重试比"立刻放弃"更划算，且它不在请求热路径上，重试不会拖慢任何用户请求。
 CTX_TIMEOUT = max(5, _env_int("RAG_CTX_TIMEOUT", 60))
-# 输出上限。**实测教训（两次）**：agnes-2.5-pro 是推理型模型，先花推理 token 再出正文。
+# 输出上限。**实测教训（两次，当时的模型是推理型）**：推理型模型先花推理
+# token 再出正文。
 #   一次简单请求：46 推理 + 16 正文；
 #   一次带"文档全文"的真实请求：**404 推理 + 0 正文**（finish_reason=length）→ 只得到空串且不报错。
 # 所以上限必须按"推理开销"而不是"一句话有多长"来给。1200 足够，代价是每题约 400~900
@@ -117,7 +119,7 @@ def enabled() -> tuple[bool, str]:
     if not getattr(retrieval, "CONTEXTUAL", False):
         return False, "RAG_CONTEXTUAL=off（默认关闭：每块一次 LLM 调用，先算量再开）"
     if not CTX_API_KEY:
-        return False, "RAG_CONTEXTUAL=on 但未配置 AGNES_API_KEY"
+        return False, "RAG_CONTEXTUAL=on 但未配置 LLM_API_KEY"
     return True, "RAG_CONTEXTUAL=on"
 
 
@@ -378,7 +380,7 @@ def apply(chunks: list, *, call: Callable[[str], str] | None = None,
             "Contextual Retrieval 被限流打断（%d 块未做，来源：%s）。已成功的前缀**已写入缓存**，"
             "补齐后重跑即可只跑缺的那些。建议：调小 RAG_CTX_WORKERS（当前 %d）分多次跑，"
             "或升级 API 套餐 / 换一个不受限的 OpenAI 兼容服务（CONTEXTUAL_MODEL 与 "
-            "AGNES_API_BASE 可分别指定）。", stats["failed"], shown, n_workers)
+            "LLM_API_BASE 可分别指定）。", stats["failed"], shown, n_workers)
     return stats
 
 

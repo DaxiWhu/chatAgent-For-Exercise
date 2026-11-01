@@ -23,7 +23,7 @@ OpenInference 的 OTel 插桩 `OpenAIAgentsInstrumentor`。为什么是它、而
    根本不产生 span，插桩收不到任何东西。
 2. **没配** ⇒ 这里必须显式 `set_tracing_disabled(True)`。不做的话默认处理器还活着，
    它会拿环境里的 `OPENAI_API_KEY` 往 api.openai.com 发 span（含 prompt 与回复
-   全文）。本项目用自建 `AsyncOpenAI` 客户端、配置项叫 `AGNES_*`，所以那条上报
+   全文）。本项目用自建 `AsyncOpenAI` 客户端、配置项叫 `LLM_*`，所以那条上报
    要么失败被吞（白跑线程），要么用错 key 把对话内容发给第三方。
 
 LangSmith 那一支（2026-10-30 起**已接入 agent 链路**）：用官方

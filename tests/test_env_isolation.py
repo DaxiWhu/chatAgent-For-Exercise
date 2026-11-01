@@ -57,7 +57,7 @@ _MUST_SCRUB = (
     "RATE_LIMIT_ENABLED",
     "APP_VERSION",        # 空串会让 FastAPI(version="") 直接断言失败
     "DB_URL",             # 非空 ⇒ 测试会去连真库
-    "AGNES_API_KEY",      # 非空 ⇒ 测试会真调模型
+    "LLM_API_KEY",      # 非空 ⇒ 测试会真调模型
     # RAG 链路侧（由 `src/rag/*` 读取）：非空会换掉检索后端 / 去连真实向量库，
     # 实测 `RAG_VECTOR_STORE=qdrant` 会改掉 test_eval_answer 的门禁结论。
     "RAG_VECTOR_STORE",
@@ -282,7 +282,7 @@ def test_hostile_ambient_env_cannot_reach_config():
         "AUTH_ALLOW_SELF_REGISTER": "1",
         "APP_VERSION": "",
         "DB_URL": "postgresql://u:p@127.0.0.1:1/none",
-        "AGNES_API_KEY": "sk-attacker",
+        "LLM_API_KEY": "sk-attacker",
     }
     code = (
         "import os, tests.conftest, app.main as M, app.config as c, json;"
@@ -298,7 +298,7 @@ def test_hostile_ambient_env_cannot_reach_config():
         "'auth_on': c.AUTH_ENABLED, 'secret': c.AUTH_SESSION_SECRET,"
         "'seed_users': len(c.AUTH_USERS), 'admins': list(c.AUTH_ADMIN_ROLES),"
         "'self_reg': c.AUTH_ALLOW_SELF_REGISTER,"
-        "'version': c.APP_VERSION, 'db': c.DB_URL, 'agnes': c.API_KEY,"
+        "'version': c.APP_VERSION, 'db': c.DB_URL, 'main_key': c.API_KEY,"
         "'app_version': M.app.version}))"
     )
     out = subprocess.run(
@@ -339,10 +339,10 @@ def test_hostile_ambient_env_cannot_reach_config():
     # （agent 链路是唯一作答路径，没配 Key 时 `app.main` 拒绝启动 ⇒
     # `tests/conftest.py` 注入了一个假 Key）。所以这里断言的是"敌意值没进来"，
     # 而不是"是空串" —— 后者在"必须给 Key"之后就不再成立。
-    assert got["agnes"] == CONF._TEST_AUTH_ENV["AGNES_API_KEY"], (
-        "隔离失效：AGNES_API_KEY 落在了敌意值上（应为测试专用值）"
+    assert got["main_key"] == CONF._TEST_AUTH_ENV["LLM_API_KEY"], (
+        "隔离失效：LLM_API_KEY 落在了敌意值上（应为测试专用值）"
     )
-    assert got["agnes"] != "sk-attacker"
+    assert got["main_key"] != "sk-attacker"
     # 版本号只要求"非空"：它的默认值会随发布调整，但**绝不能是空串**
     # （FastAPI 的 version 不接受空值，会在建 app 时直接 AssertionError）
     assert got["version"], "APP_VERSION 落到了空串 —— FastAPI 会因此起不来"

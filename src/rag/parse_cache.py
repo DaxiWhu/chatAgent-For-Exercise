@@ -47,7 +47,7 @@ CACHE_VERSION = 1
 #
 # 收录判据：**只要它可能改变产出的 chunks 就算**（解析器选择、切分口径、token 预算、
 # 模型与端点、各类上限、内容护栏）。刻意**不收**两类：
-#   ① 密钥（如 `AGNES_API_KEY`）—— 它决定"能不能调通"，不决定"产出什么"；
+#   ① 密钥（如 `LLM_API_KEY`）—— 它决定"能不能调通"，不决定"产出什么"；
 #      把一个凭证哈希进缓存**文件名**是没有必要的暴露，且轮换一次密钥会让整份
 #      缓存（分钟级重算）白白作废。
 #   ② 缓存自身的行为开关（`RAG_PARSE_CACHE` / `RAG_PARSE_CACHE_DIR`）——
@@ -65,8 +65,11 @@ _ENV_KEYS = (
     "DOCLING_ARTIFACTS_PATH", "DOCLING_DEVICE", "DOCLING_FORMULA",
     "DOCLING_IMAGES_SCALE", "BGE_TOKENIZER", "EMBEDDING_MODEL",
     # --- 图片描述（VLM）---
+    # `VLM_API_BASE` 要收：2026-11-01 起 VLM 是**独立的一家网关**（主网关没有视觉
+    # 模型），换 base 就等于换模型 ⇒ 产出会变。`LLM_API_BASE` 也要留：上下文前缀那条
+    # 链路仍在用它。凭证（`VLM_API_KEY` / `LLM_API_KEY`）按上面第 ① 条不收。
     "VLM_MODEL", "VLM_MAX_IMAGES", "VLM_MAX_SIDE", "VLM_TIMEOUT",
-    "RAG_VLM_DESC", "AGNES_API_BASE",
+    "RAG_VLM_DESC", "LLM_API_BASE", "VLM_API_BASE",
     # --- Contextual Retrieval 前缀 ---
     "CONTEXTUAL_MODEL",
     "RAG_CTX_MAX_CHUNKS", "RAG_CTX_DOC_CHARS", "RAG_CTX_PREFIX_MAX",

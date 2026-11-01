@@ -80,7 +80,7 @@ chatAgent/
 
 ```bash
 # 1) 准备配置
-cp .env.example .env      # 填入 AGNES_API_KEY 等
+cp .env.example .env      # 填入 LLM_API_KEY 等
 
 # 2) 安装依赖
 pip install -r requirements.txt
@@ -491,16 +491,16 @@ request_review → END
 
 ## 环境变量
 
-**LLM 与 embedding 是两套独立配置**：模型生成走 `AGNES_*`，RAG 检索的 embedding 走 `EMBEDDING_*`
-（因为 agnes 后端不提供 `/v1/embeddings` 接口，必须另指一个服务）。
+**LLM 与 embedding 是两套独立配置**：模型生成走 `LLM_*`，RAG 检索的 embedding 走 `EMBEDDING_*`
+（因为对话网关不提供 `/v1/embeddings` 接口，必须另指一个服务）。
 
 **模型与存储**
 
 | 变量 | 必填 | 说明 |
 |------|------|------|
-| `AGNES_API_KEY` | 是 | **LLM** API Key（生成用） |
-| `AGNES_API_BASE` | 否 | 默认 `https://apihub.agnes-ai.com/v1` |
-| `AGNES_MODEL` | 否 | 默认 `agnes-2.0-flash` |
+| `LLM_API_KEY` | 是 | **LLM** API Key（生成用） |
+| `LLM_API_BASE` | 否 | 默认 `https://api.deepseek.com` |
+| `LLM_MODEL` | 否 | 默认 `deepseek-chat` |
 | `DB_URL` | 否 | PG 连接串。**跨轮历史 + 运行现场 + pgvector + 审核队列 + 会话归属共用**；留空则历史不可用、运行现场落内存（重启丢现场） |
 | `DOCS_DIR` | 否 | RAG 语料目录，默认 `data` |
 
@@ -571,7 +571,7 @@ AUTH_SESSION_SECRET=...                # 用户鉴权：本服务会话签名（
 RAG_TENANT=public                      # 公共租户（无租户身份能读到的唯一分区；留空=搜不到）
 AUTH_ADMIN_ROLES=admin                 # 谁能管用户与租户（默认就是 admin）
 DB_URL=postgresql://user:pwd@host:5432/db
-AGNES_API_KEY=...                      # LLM（生成）
+LLM_API_KEY=...                      # LLM（生成）
 EMBEDDING_API_BASE/KEY/MODEL=...       # 检索 embedding，与 LLM 分开配
 ```
 
@@ -777,7 +777,7 @@ Top1/Top3/MRR 回答「**对不对**」（第一条准不准），集合指标�
 
 ```bash
 python scripts/eval_generation.py              # 离线：对人工参考答案跑指标（CI 用，零密钥）
-python scripts/eval_generation.py --live       # 现场调模型，量真实答案（需 AGNES_API_KEY）
+python scripts/eval_generation.py --live       # 现场调模型，量真实答案（需 LLM_API_KEY）
 python scripts/eval_generation.py --show-miss  # 看是哪条判据没过
 ```
 

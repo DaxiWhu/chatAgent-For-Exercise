@@ -454,7 +454,7 @@ def task_clean(args: list[str]) -> int:
 # ⚠️ 密文的名字**必须以 `.env` 结尾**，这不是风格问题：sops 靠**后缀**推断输入
 #    输出格式（`cmd/sops/formats.FormatForPath` 只认 `.yaml/.yml/.json/.env/.ini`，
 #    其余一律落到 Binary）。实测过的差别是**粒度**不是"能不能解"：
-#      app.sops.env（Dotenv） → `AGNES_API_KEY=ENC[...]` 逐键一个信封；
+#      app.sops.env（Dotenv） → `LLM_API_KEY=ENC[...]` 逐键一个信封；
 #      app.env.enc（Binary）  → `{"data": "ENC[...]", "sops": {...}}` 整块一坨，
 #                               **也能解回来**，但看不到有哪些键、没法按单键增删改。
 #    不以 `.env.` 打头则是有意的：那样它才不会被 `.gitignore` 的 `.env.*` 吃掉。

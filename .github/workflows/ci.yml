@@ -118,7 +118,7 @@ jobs:
         env:
           # 明确清空外部依赖配置：确保测试走"降级/内存"路径，不偷偷连任何服务
           DB_URL: ""
-          AGNES_API_KEY: ""
+          LLM_API_KEY: ""
           EMBEDDING_API_KEY: ""
         run: pytest tests/ -q -p no:cacheprovider
 
@@ -181,7 +181,7 @@ jobs:
           AGENT_SESSION_TEST_DSN: postgresql://sess:sess@127.0.0.1:5432/sessdb?sslmode=disable
           # 其余外部依赖一律清空：这个 job 只验数据库那条链路。
           DB_URL: ""
-          AGNES_API_KEY: ""
+          LLM_API_KEY: ""
           EMBEDDING_API_KEY: ""
         run: pytest tests/test_agent_session_pg.py -q -p no:cacheprovider
 
@@ -220,7 +220,7 @@ jobs:
         env:
           DB_URL: ""
           EMBEDDING_API_KEY: ""
-          AGNES_API_KEY: ""
+          LLM_API_KEY: ""
         run: python scripts/eval_retrieval.py --only bm25 --fail-under 0.55
 
       # 答案质量门禁：测的是**喂给模型的材料**（引用覆盖 / 关键点覆盖 / 可回溯），
@@ -236,7 +236,7 @@ jobs:
         env:
           DB_URL: ""
           EMBEDDING_API_KEY: ""
-          AGNES_API_KEY: ""
+          LLM_API_KEY: ""
         run: python scripts/eval_answer.py
 
       # 生成侧质量门禁：测的是**答案本身**（编造标识符 / 该拒答时拒答）。
@@ -250,7 +250,7 @@ jobs:
         env:
           DB_URL: ""
           EMBEDDING_API_KEY: ""
-          AGNES_API_KEY: ""
+          LLM_API_KEY: ""
         run: python scripts/eval_generation.py
 
   # ------------------------------------------------------------------
@@ -318,7 +318,7 @@ jobs:
       - name: 热路径不变量门禁（规模 + 内存）
         env:
           DB_URL: ""
-          AGNES_API_KEY: ""
+          LLM_API_KEY: ""
           EMBEDDING_API_KEY: ""
         run: python scripts/bench_local.py --check --n 10000
 
@@ -356,7 +356,7 @@ jobs:
         env:
           # 与 test job 同口径：清空外部依赖配置，确保走降级/离线路径
           DB_URL: ""
-          AGNES_API_KEY: ""
+          LLM_API_KEY: ""
           EMBEDDING_API_KEY: ""
           HF_ENDPOINT: https://hf-mirror.com
         run: pytest tests/ -q -p no:cacheprovider
@@ -483,7 +483,7 @@ jobs:
 
       # 栈从 .env 读配置。**这里刻意让栈"要求用户鉴权"**：
       #
-      #   · AGNES_API_KEY 是**非空占位符** ⇒ /health/ready 的 llm 检查通过
+      #   · LLM_API_KEY 是**非空占位符** ⇒ /health/ready 的 llm 检查通过
       #     （它只查"配置在不在"，不发请求）。真去调 LLM 会失败并回 `error` 事件，
       #     而 SSE 用例接受的正是"合法帧"—— 见 tests/test_e2e_stack.py 的说明。
       #   · 配 AUTH_*（会话签名密钥 + 一个服务账号）⇒ 栈要求鉴权，于是：

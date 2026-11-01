@@ -14,9 +14,13 @@
 配置（全部走环境变量）
   RAG_VLM_DESC      off（默认）| auto | on
                     off  = 完全不调用，`needs_vlm` 原样保留
-                    auto = 有 AGNES_API_KEY 才调，没有则告警并保留 `needs_vlm`
-                    on   = 强制调；缺 key/地址直接报错，避免"以为跑了其实没跑"
-  VLM_MODEL         默认 agnes-2.5-pro（实测支持视觉输入；agnes-image-* 是生图模型）
+                    auto = 三项 VLM_* 配齐才调，否则告警并保留 `needs_vlm`
+                    on   = 强制调；缺任一项直接报错，避免"以为跑了其实没跑"
+  VLM_MODEL         默认空。主网关（DeepSeek）**没有视觉模型**，必须另指一家有视觉
+                    能力的网关并填它的模型名
+  VLM_API_BASE      默认空。同上，**不跟随** LLM_API_BASE（跟随会把图发给一个不支持
+                    图片输入的模型，报错信息和"网关不对"完全不像）
+  VLM_API_KEY       默认空。同上，**不跟随** LLM_API_KEY
   VLM_MAX_IMAGES    单次运行最多描述几张（默认 50，防误开时刷爆账单）
   VLM_TIMEOUT       单次请求超时秒数（默认 120）
   RAG_VLM_CACHE_DIR 缓存目录（默认 data/.vlm_cache）
@@ -62,9 +66,16 @@ def _env_int(name: str, default: int) -> int:
 
 
 VLM_DESC = os.getenv("RAG_VLM_DESC", "off").strip().lower()
-VLM_MODEL = os.getenv("VLM_MODEL", "agnes-2.5-pro").strip() or "agnes-2.5-pro"
-VLM_API_BASE = os.getenv("AGNES_API_BASE", "https://apihub.agnes-ai.com/v1").strip()
-VLM_API_KEY = os.getenv("AGNES_API_KEY", "").strip()
+# ⚠️ VLM 是**独立的一家网关**，不跟随主网关。2026-11-01 起主网关是 DeepSeek，它没有
+#    视觉模型；以前这三个值复用 `LLM_*`，现在必须各自显式配置。
+#
+#    为什么不给回落默认值：base 为空时 SDK 会拼出畸形 URL，报出来的错误与"这个模型
+#    不支持图片输入"完全不是一个样子，排查会被带偏；更糟的是有些客户端在 base 为空
+#    时回落到默认的 api.openai.com —— 那等于把图片发给一个你没打算用的服务。
+#    宁可让 `enabled()` 直接说"没配 VLM_API_BASE"，也不要打一个注定失败的请求。
+VLM_MODEL = os.getenv("VLM_MODEL", "").strip()
+VLM_API_BASE = os.getenv("VLM_API_BASE", "").strip()
+VLM_API_KEY = os.getenv("VLM_API_KEY", "").strip()
 VLM_MAX_IMAGES = max(1, _env_int("VLM_MAX_IMAGES", 50))
 VLM_TIMEOUT = max(10, _env_int("VLM_TIMEOUT", 120))
 VLM_CACHE_DIR = os.getenv("RAG_VLM_CACHE_DIR", "data/.vlm_cache").strip() or "data/.vlm_cache"
@@ -83,24 +94,40 @@ VECTOR_EXTS = (".emf", ".wmf", ".svg")
 # ---------------------------------------------------------------------------
 # 开关与算量（先算量再决定，见 §9.3）
 # ---------------------------------------------------------------------------
+def _vlm_missing() -> list[str]:
+    """启用 VLM 前必须齐的三项；返回缺的那些（空列表 = 齐了）。
+
+    为什么要逐项点名：`enabled()` 返回的原因会直接进日志，用来回答"为什么一张都
+    没描述"。只说"未配置"，人还得自己去翻是哪一项 —— 三项分属不同服务（地址、
+    凭证、模型），猜错的代价是多跑一轮批处理。
+    """
+    missing: list[str] = []
+    if not VLM_API_KEY:
+        missing.append("VLM_API_KEY")
+    if not VLM_API_BASE:
+        missing.append("VLM_API_BASE")
+    if not VLM_MODEL:
+        missing.append("VLM_MODEL")
+    return missing
+
+
 def enabled() -> tuple[bool, str]:
     """是否要真的调用 VLM。返回 (是否启用, 原因)。
 
     无参数。读环境变量 RAG_VLM_DESC 的三个取值：
         off（默认）→ 恒 False；
-        on        → 缺 AGNES_API_KEY 时 False；
-        auto      → 有 key 才 True，没有则 False 并给出原因。
+        on        → 三项 VLM_* 没配齐时 False（点名缺哪个）；
+        auto      → 同上，配齐才 True。
     原因文案会直接进日志，用来回答"为什么一张都没描述"。
     """
     if VLM_DESC in ("off", "false", "0", "no", ""):
         return False, "RAG_VLM_DESC=off（默认关闭：按图计费，请先 estimate 再开）"
+    missing = _vlm_missing()
+    if missing:
+        return False, f"RAG_VLM_DESC={VLM_DESC} 但未配置 {'/'.join(missing)}"
     if VLM_DESC in ("on", "true", "1", "yes"):
-        if not VLM_API_KEY:
-            return False, "RAG_VLM_DESC=on 但 AGNES_API_KEY 未配置"
         return True, "RAG_VLM_DESC=on"
     # auto
-    if not VLM_API_KEY:
-        return False, "RAG_VLM_DESC=auto 但未配置 AGNES_API_KEY"
     return True, "RAG_VLM_DESC=auto 且已配置 API Key"
 
 

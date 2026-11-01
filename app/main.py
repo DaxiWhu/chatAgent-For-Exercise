@@ -88,9 +88,9 @@ from .sessions import SessionError, build_session_registry
 # ---------------------------------------------------------------------------
 # 配置（全部来自环境变量；集中读一次，模块级名字保持与旧版一致以免破坏引用）
 # ---------------------------------------------------------------------------
-AGNES_API_KEY = config.API_KEY
-AGNES_API_BASE = config.API_BASE
-AGNES_MODEL = config.MODEL_NAME
+LLM_API_KEY = config.API_KEY
+LLM_API_BASE = config.API_BASE
+LLM_MODEL = config.MODEL_NAME
 # 与 chatAgent.ipynb / .env 统一使用 DB_URL（原先此处叫 PG_CHECKPOINT_URI，导致 .env 取不到值、静默回退内存）
 DB_URL = config.DB_URL
 # ⚠️ 共享密钥（`SERVE_API_KEY` / `X-API-Key`）已于 2026-10-05 整体删除，
@@ -141,7 +141,7 @@ agent 链路不可用（{reason}）⇒ 拒绝启动。
 本服务只有这一条作答路径（官方 openai-agents 的 Agent + Runner），没有备用实现：
 
   · `missing_sdk`  ⇒ 镜像里没装 `openai-agents`（装：`pip install openai-agents`）；
-  · `missing_api_key` ⇒ 没配 `AGNES_API_KEY`；
+  · `missing_api_key` ⇒ 没配 `LLM_API_KEY`；
   · `build_failed` / 其它 ⇒ 见上面那条 warning 的具体异常。
 
 "能起来但每个请求都答不出来"不是一个可接受的部署状态，所以这里直接退出。
@@ -176,10 +176,10 @@ logging.info(
 from langchain_openai import ChatOpenAI  # noqa: E402
 
 # 这里不再有空 Key 的占位值：`_assert_agents_ready()` 已经保证 Key 非空，
-# 走不到这一行时 `AGNES_API_KEY` 必然有值。
+# 走不到这一行时 `LLM_API_KEY` 必然有值。
 _MODEL = ChatOpenAI(
-    model=AGNES_MODEL, api_key=AGNES_API_KEY,
-    base_url=AGNES_API_BASE, timeout=30, max_retries=3,
+    model=LLM_MODEL, api_key=LLM_API_KEY,
+    base_url=LLM_API_BASE, timeout=30, max_retries=3,
 )
 
 

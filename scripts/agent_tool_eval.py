@@ -49,8 +49,8 @@
 
 用法
 ----
-    python scripts/agent_tool_eval.py                    # 用 .env 里的 AGNES 模型
-    python scripts/agent_tool_eval.py --model deepseek   # 换 DeepSeek（同一套 OpenAI 兼容协议）
+    python scripts/agent_tool_eval.py                    # 走主网关配置（LLM_*，当前 DeepSeek）
+    python scripts/agent_tool_eval.py --model deepseek    # 走评测对照线（DEEPSEEK_*）
     python scripts/agent_tool_eval.py --only time-today
     python scripts/agent_tool_eval.py --json tmp_probe/tool_eval.json
 """
@@ -219,13 +219,13 @@ def _build_model(which: str, structured_output: str = "") -> Any:
             **extra,
         )
 
-    key = os.environ.get("AGNES_API_KEY", "")
+    key = os.environ.get("LLM_API_KEY", "")
     if not key:
-        raise SystemExit("缺少 AGNES_API_KEY（.env 里没有配）")
+        raise SystemExit("缺少 LLM_API_KEY（.env 里没有配）")
     return build_model(
-        model_name=os.environ.get("AGNES_MODEL", "agnes-2.5-flash"),
+        model_name=os.environ.get("LLM_MODEL", "deepseek-chat"),
         api_key=key,
-        base_url=os.environ.get("AGNES_API_BASE", ""),
+        base_url=os.environ.get("LLM_API_BASE", ""),
         timeout=60.0,
         **extra,
     )
@@ -703,7 +703,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="agent 工具选择评测")
-    parser.add_argument("--model", default="agnes", choices=["agnes", "deepseek"])
+    parser.add_argument("--model", default="main", choices=["main", "deepseek"])
     parser.add_argument("--set", default=str(DEFAULT_SET))
     parser.add_argument("--only", default="", help="只跑这些用例 id（逗号分隔）")
     parser.add_argument("--json", default="", help="把明细写到这个路径")

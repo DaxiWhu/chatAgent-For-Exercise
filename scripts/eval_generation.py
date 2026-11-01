@@ -29,7 +29,7 @@
 两种运行模式
 ------------
     python scripts/eval_generation.py        # 默认：离线（CI 用，零密钥）
-    python scripts/eval_generation.py --live # 现场调模型（需 AGNES_API_KEY）
+    python scripts/eval_generation.py --live # 现场调模型（需 LLM_API_KEY）
 
 **默认（离线）**：对评测集里**人工写的 `reference_answer`** 跑指标，context 取
 `expect_sources` 对应的语料。它回答的是「**忠实答案会不会被这套指标误报**」——
@@ -145,9 +145,9 @@ def _make_model():
     from langchain_openai import ChatOpenAI
 
     return ChatOpenAI(
-        model=os.getenv("AGNES_MODEL") or "agnes-2.0-flash",
-        api_key=os.getenv("AGNES_API_KEY") or "",
-        base_url=os.getenv("AGNES_API_BASE") or None,
+        model=os.getenv("LLM_MODEL") or "deepseek-chat",
+        api_key=os.getenv("LLM_API_KEY") or "",
+        base_url=os.getenv("LLM_API_BASE") or None,
         timeout=60, max_retries=2,
     )
 
@@ -224,7 +224,7 @@ def main():
     ap.add_argument("--set", default=DEFAULT_SET, help="评测集路径")
     ap.add_argument("--top-k", type=int, default=None, help="检索条数（默认取评测集 top_k，--live 用）")
     ap.add_argument("--live", action="store_true",
-                    help="现场调模型（需 AGNES_API_KEY）；不传则跑离线指标回归")
+                    help="现场调模型（需 LLM_API_KEY）；不传则跑离线指标回归")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出（便于留档/对比）")
     ap.add_argument("--save-json", default=None, help="把本次 scorecard 写进文件")
     ap.add_argument("--show-miss", action="store_true", help="打印未通过/有疑点的明细")

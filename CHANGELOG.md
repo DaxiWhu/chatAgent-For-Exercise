@@ -11,6 +11,54 @@
 
 ## [Unreleased]
 
+### 破坏性变更 — 主网关换成 DeepSeek，变量名 `AGNES_*` → `LLM_*`（2026-11-01）
+
+不再使用 Agnes（那把 key 一直 401，且该网关不支持 `json_schema`）。同时把变量名的厂商
+字样去掉：名字写着 A 家、值指向 B 家，出问题时第一眼就被带偏 —— 探针输出当时就是
+`agnes → https://api.deepseek.com` 这种自相矛盾的行。
+
+**升级必做（漏一处就是静默失败）：**
+
+```
+LLM_API_KEY=<你的 key>            # 原来叫 AGNES_API_KEY
+LLM_API_BASE=https://api.deepseek.com
+LLM_MODEL=deepseek-chat
+CONTEXTUAL_MODEL=deepseek-chat    # ★ 有自己的默认值，最容易漏
+AGENT_STRUCTURED_OUTPUT=json_object   # DeepSeek 不支持 json_schema，必须降档
+```
+
+`CONTEXTUAL_MODEL` 漏了不会报错：它拿新 key 去打旧模型名，而分块补全是**旁路调用**，
+失败可能只落日志。降档漏了更隐蔽：三个 `as_tool` 专家每次 400，主链路照样"成功"。
+
+**VLM 变成独立网关。** 以前 `VLM_API_BASE` / `VLM_API_KEY` 复用 `LLM_*`，而 DeepSeek
+没有视觉模型。现在三项 `VLM_API_BASE` / `VLM_API_KEY` / `VLM_MODEL` 必须各自配置、
+默认全空。为什么默认不给值：base 为空时 SDK 拼出畸形 URL，报错和"模型不支持图片"
+完全不像；有的客户端还会在 base 为空时回落到 `api.openai.com`。`enabled()` 改成逐项
+点名缺哪个（`_vlm_missing`）。
+
+改名共 179 处 / 54 个文件，包含 `deploy/`（compose 注释、告警 runbook）、CI 的空占位符、
+`.sops.yaml` 的注释举例。`.sops.yaml` 只是注释，**不涉及密钥重新加密**。
+`PLAN_*.md` 与本文档的历史条目**刻意不改**：那里的 `agnes-2.5-pro` 与"Agnes 401"是
+当时的实测记录，改了就是伪造数据；两份 PLAN 已加"历史文档"提示头。
+
+### 变更 — 切换后实测：三层全绿，但抓出第五次判据误报（2026-11-01）
+
+用切完的生产配置（`LLM_*` → DeepSeek）跑完整评测：
+
+```
+① 工具选择 17/18（94%）  ② 执行 37/37（100%）
+③ 答案结果 7/7（100%）   ④ 软判定 1/2
+```
+
+`no-web-access` 那一轮要**分开看**：选择层判红是**对的**（模型真调了被禁用的
+`research`），软判定判红是**误报** —— 它答的是「我这边检索不到这个页面的内容，返回
+结果是空的，没有任何可用资料或出处」，行为完全正确。
+
+修法：`expect_text_regex` 从"否定词+动作词"扩到也覆盖"我拿到的结果为空"。
+模型承认拿不到有两种说法（"我打不开" / "查出来是空的"），只覆盖前者的正则会在模型
+换一种说法时把正确行为判成退步。加反向守卫：编一段页面内容仍然必须判红（否则
+"把正则写成恒真"也能过）。变异 3/3（只留旧正则 / 恒真 / 恒假）。
+
 ### 新增 — `scripts/probe_provider.py`：把"配哪一档"从猜变成探（2026-11-01）
 
 `AGENT_STRUCTURED_OUTPUT` 该写哪个值，一直靠"某家网关大概支持"的推断。这不可靠：
@@ -363,7 +411,7 @@ LangChain 那层脚本（如 `scripts/eval_generation.py`）有记录，而真�
 - **没配任何后端时显式 `set_tracing_disabled(True)`**。不这么做，`get_trace_provider()`
   第一次被访问会自动注册 `BatchTraceProcessor(BackendSpanExporter())`：拿环境里可能
   残留的 OpenAI 平台密钥，把每一轮的 prompt 与回复全文发往 `api.openai.com` ——
-  失败被吞、不报错、不体现在任何指标上。本项目模型走自建客户端（配置项 `AGNES_*`），
+  失败被吞、不报错、不体现在任何指标上。本项目模型走自建客户端（配置项 `LLM_*`），
   所以它要么用错 key，要么根本发不出去。
 - **配了但缺依赖 ⇒ 如实回落 `none`**，启动日志写清缺哪个包；不再有"日志说接上了、
   面板里一条都没有"。Langfuse 分支**不做启动期连通性校验**（不调 `auth_check`）：那是

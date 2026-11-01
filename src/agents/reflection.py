@@ -91,8 +91,8 @@ to the model"）。所以"提醒模型"只能表现为"在下一次模型调用�
 
 旁路模型
 --------
-配置**复用** ``compaction.py`` 那一套（同 ``AGNES_MODEL`` / ``AGNES_API_KEY`` /
-``AGNES_API_BASE``，读的是 ``compaction._model_config()``），但**自己建 client**：
+配置**复用** ``compaction.py`` 那一套（同 ``LLM_MODEL`` / ``LLM_API_KEY`` /
+``LLM_API_BASE``，读的是 ``compaction._model_config()``），但**自己建 client**：
 超时必须独立（``AGENT_REFLECT_TIMEOUT``），而 client 的超时是构造期参数 ⇒ 没法
 和摘要共用同一个实例。走旁路 ⇒ **不计入 ``AGENT_MAX_TURNS``、也不进 SDK tracing**
 ⇒ 超时必须自己设（见 ``_reflect_sync``）。

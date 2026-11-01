@@ -169,7 +169,7 @@ def main():
             stats = contextualizer.apply(chunks)
             print(f"[Contextual] {contextualizer.format_stats(stats)}")
             if not stats["prefixed"]:
-                print("  ⚠️ 一块都没加上前缀，检查 RAG_CONTEXTUAL / AGNES_API_KEY；"
+                print("  ⚠️ 一块都没加上前缀，检查 RAG_CONTEXTUAL / LLM_API_KEY；"
                       "下面测的仍是基线。")
         print("=" * 92)
         print(f"评测集 {args.set} | 切分策略={R.CHUNK_STRATEGY} "

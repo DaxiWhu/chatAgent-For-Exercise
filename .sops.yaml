@@ -38,7 +38,7 @@ creation_rules:
   #    `.env` / `.ini`，**其余一律落到 Binary**）。实测两种后缀的差别：
   #
   #      `app.sops.env`（后缀 .env ⇒ Dotenv）：
-  #          AGNES_API_KEY=ENC[AES256_GCM,data:...]      ← 逐键一个信封
+  #          LLM_API_KEY=ENC[AES256_GCM,data:...]      ← 逐键一个信封
   #      `app.env.enc`（后缀 .enc ⇒ Binary）：
   #          { "data": "ENC[AES256_GCM,data:...]", "sops": { ... } }   ← 整块一坨
   #

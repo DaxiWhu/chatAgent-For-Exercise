@@ -624,7 +624,7 @@ token（chunk ≠ token）；② **不要**把跨模型调用的等待算进去�
    `answer` / `revise` 高 ⇒ **用户直接拿不到答案**（最急）；`step_get` / `step_stream`
    ⇒ agent 链路。
 2. 看 `llm_call_duration_seconds` 的分布：失败集中在**超时附近**（≈ `REQUEST_TIMEOUT_SECONDS`）
-   说明上游变慢；否则更可能是 4xx / 协议错（查 `AGNES_API_BASE` 与模型名是否被换掉）。
+   说明上游变慢；否则更可能是 4xx / 协议错（查 `LLM_API_BASE` 与模型名是否被换掉）。
 3. 同时看 `llm_budget_exceeded_total`，排除"预算被顶掉被误记成失败"。
 4. agent 链路的话，对照 `agent_runs_total{exit_reason}` 的分档：
    `error` 会把限流(429)/超时/协议错/代码 bug 压成同一桶，**要看日志里的 `error` 字段**
@@ -1301,7 +1301,7 @@ curl -s --noproxy '*' localhost:8000/metrics | grep 'agent_runs_total'
 docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=300 app-stable | grep -E 'agent 链路执行异常|评审链路失败'
 ```
 - `error` 且消息含 `RateLimitError` ⇒ **上游限流，不是链路缺陷**：等额度或退避重试；
-- `error` 且为超时 / 协议错 ⇒ 查 `AGNES_API_BASE` 连通性与 `AGENT_TIMEOUT_SECONDS`；
+- `error` 且为超时 / 协议错 ⇒ 查 `LLM_API_BASE` 连通性与 `AGENT_TIMEOUT_SECONDS`；
 - `evaluator_error` ⇒ 评审的结构化输出不稳定，可提高 `AGENT_EVALUATOR_TRIES`；
 - `max_turns` ⇒ 单任务步数耗尽，见下下条的处置。
 

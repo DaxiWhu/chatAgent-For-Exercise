@@ -81,7 +81,7 @@ regexes = [
 # 刻意**没有**为 SOPS 密文（`secrets/app.sops.env`）加放行 —— 这是实测结论，不是遗漏
 # ---------------------------------------------------------------------------
 # 直觉上应该放行：那里面每个值都是 `ENC[AES256_GCM,data:...]` 这种高熵字符串，
-# 而键名就叫 `AGNES_API_KEY` / `POSTGRES_PASSWORD`，看着正是 generic-api-key 的靶子。
+# 而键名就叫 `LLM_API_KEY` / `POSTGRES_PASSWORD`，看着正是 generic-api-key 的靶子。
 #
 # 但实测（gitleaks 8.30.1，配置=本文件、只摘掉 `^tmp_probe/` 那条无关的路径放行）：
 #

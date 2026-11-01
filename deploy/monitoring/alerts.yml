@@ -152,7 +152,7 @@ groups:
         annotations:
           summary: "SSE 流式生成频繁报错（kind={{ $labels.kind }}）"
           description: "chat/review 流在中途抛异常。典型成因：检查点后端故障、模型超时或配额被拒。"
-          runbook: "查日志里的 '流异常' 与堆栈；重点看 DB_URL 连通性与 AGNES_API_* 是否可用。"
+          runbook: "查日志里的 '流异常' 与堆栈；重点看 DB_URL 连通性与 LLM_API_* 是否可用。"
 
       - alert: ExternalProbeFailing
         # 黑盒探活：blackbox-exporter 从**外部**请求入口（见 prometheus.yml 的
@@ -330,7 +330,7 @@ groups:
         annotations:
           summary: "模型调用失败率超过 10%"
           description: "当前失败率 {{ $value | humanizePercentage }}。stage=evaluate 高 ⇒ 评审环节（有重试兜底，会推高返工）；stage=answer/revise 高 ⇒ 用户直接拿不到答案；stage=step_* ⇒ agent 链路。"
-          runbook: "1) 按 stage 定位环节；2) 看 `llm_call_duration_seconds` 的分布 —— 失败集中在超时（≈timeout 上限）说明上游变慢，否则更可能是 4xx/协议错误（查 `AGNES_API_BASE` 与模型名）；3) 同时看 `llm_budget_exceeded_total` 排除「预算被顶掉被误记成失败」；4) 若为 agent 链路，对照 `agent_runs_total{exit_reason}` 的分档。"
+          runbook: "1) 按 stage 定位环节；2) 看 `llm_call_duration_seconds` 的分布 —— 失败集中在超时（≈timeout 上限）说明上游变慢，否则更可能是 4xx/协议错误（查 `LLM_API_BASE` 与模型名）；3) 同时看 `llm_budget_exceeded_total` 排除「预算被顶掉被误记成失败」；4) 若为 agent 链路，对照 `agent_runs_total{exit_reason}` 的分档。"
 
       - alert: RunStatePersistFailed
         # 被中断的那次运行**没能把现场存下来**（`_hold_for_review` 失败）。
@@ -1243,7 +1243,7 @@ groups:
         annotations:
           summary: "agent 链路异常收尾比例过高（> 20%）"
           description: "当前比例 {{ $value | humanizePercentage }}。exit_reason 为 error（上游抖动 / 真实故障）/ evaluator_error（评审解析失败）/ max_turns（步数耗尽）—— 三者都代表流程没跑完。⚠️ 2026-10-03 起 error **不再**被兜成一句得体话术：节点会抛 AgentRunFailed，接口返回 incomplete（客户端看得到失败），所以它可能同时抬高 5xx / 失败占比。"
-          runbook: "按 exit_reason 分头查：error 多为上游超时/协议错误，看 AGNES_API_BASE 连通性；evaluator_error 看评审的结构化输出是否稳定（可提 AGENT_EVALUATOR_TRIES）；max_turns 看单任务模型调用分布（agent_model_calls），必要时提 AGENT_MAX_TURNS。⚠️ 链路已拆成前台 / 文学两个节点，**一次请求 = N 次运行**，所以先看 agent_* 的 agent 标签定位是哪一段在失败，再动手。"
+          runbook: "按 exit_reason 分头查：error 多为上游超时/协议错误，看 LLM_API_BASE 连通性；evaluator_error 看评审的结构化输出是否稳定（可提 AGENT_EVALUATOR_TRIES）；max_turns 看单任务模型调用分布（agent_model_calls），必要时提 AGENT_MAX_TURNS。⚠️ 链路已拆成前台 / 文学两个节点，**一次请求 = N 次运行**，所以先看 agent_* 的 agent 标签定位是哪一段在失败，再动手。"
 
       - alert: AgentReworkRateHigh
         # 返工率 = 未一次通过的**请求** / 总请求。这是"agent 能力"最直接的代理指标：

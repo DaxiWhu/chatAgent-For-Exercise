@@ -333,7 +333,7 @@ async def _collect(model, *, group_id: str, workflow_name: str,
 
 async def run_live(*, group_id: str, workflow_name: str,
                    send: bool = False) -> dict | None:
-    """真模型跑一次：额外验证 llm 节点。需要 AGNES_* 已配置。
+    """真模型跑一次：额外验证 llm 节点。需要 LLM_* 已配置。
 
     为什么这一步不能用假模型替代：generation span 是**真实 model 实现内部**创建的
     （`models/openai_chatcompletions.py` 里 `with generation_span(...)`），
@@ -342,15 +342,15 @@ async def run_live(*, group_id: str, workflow_name: str,
     """
     from src.agents.model import build_model
 
-    api_key = os.getenv("AGNES_API_KEY", "")
+    api_key = os.getenv("LLM_API_KEY", "")
     if not api_key:
-        print("AGNES_API_KEY 为空：--live 需要真实模型。只跑自检的话去掉 --live。")
+        print("LLM_API_KEY 为空：--live 需要真实模型。只跑自检的话去掉 --live。")
         return None
 
     model = build_model(
-        model_name=os.getenv("AGNES_MODEL", ""),
+        model_name=os.getenv("LLM_MODEL", ""),
         api_key=api_key,
-        base_url=os.getenv("AGNES_API_BASE", ""),
+        base_url=os.getenv("LLM_API_BASE", ""),
         timeout=float(os.getenv("AGENT_TIMEOUT_SECONDS", "30") or 30),
     )
     return await _collect(model, group_id=group_id, workflow_name=workflow_name,

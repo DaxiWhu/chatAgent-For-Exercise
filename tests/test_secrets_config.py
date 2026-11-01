@@ -371,7 +371,7 @@ def test_no_shared_secret_knob_can_change_authz_outcome():
     """服务端**没有**任何"共享密钥 / 开关"形态的配置能改变鉴权结果。
 
     为什么逐个点名而不是按后缀扫：`config` 里合法地存在着**别的** `*_API_KEY`
-    （模型与链路追踪的上游凭证，如 `AGNES_API_KEY` / `LANGSMITH_API_KEY`），
+    （模型与链路追踪的上游凭证，如 `LLM_API_KEY` / `LANGSMITH_API_KEY`），
     它们不参与本服务鉴权。所以这里点名的是**已删除的那几个**：
       · `SERVE_API_KEY`  —— 共享密钥通行证（`X-API-Key`）；
       · `TENANT_KEYS`     —— "租户 ↔ API Key"对照表；

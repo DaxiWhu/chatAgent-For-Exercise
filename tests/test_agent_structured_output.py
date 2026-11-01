@@ -96,8 +96,8 @@ def test_default_mode_keeps_official_json_schema():
     """不配 ``AGENT_STRUCTURED_OUTPUT`` 时，请求体必须**逐字**是官方形态。
 
     这条守的是"修一个 provider 兼容问题，不要顺手改掉默认行为"：默认档由
-    provider 强制结构，比提示词可靠；支持 json_schema 的网关（生产用的 Agnes）
-    必须继续走这一档。
+    provider 强制结构，比提示词可靠；换成支持 json_schema 的网关时，这一档必须
+    仍然可用（当前主网关 DeepSeek 不支持它，靠 .env 显式降档，代码默认不动）。
     """
     seen: list[dict] = []
     _call(_model_with_capture("json_schema", seen), schema=AgentOutputSchema(ResearchDigest))

@@ -179,7 +179,7 @@ _TEST_AUTH_ENV = {
     # 会**拒绝启动**（`_assert_agents_ready`）—— 也就是说"裸环境"在这一点上不再
     # 可导入。"拒绝启动"本身由 `tests/test_startup_guard.py` 用**子进程**验证
     # （那才测得到真正的导入期行为，而不是 monkeypatch 出来的替身）。
-    "AGNES_API_KEY": "sk-test-not-a-real-key",
+    "LLM_API_KEY": "sk-test-not-a-real-key",
 }
 
 

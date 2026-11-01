@@ -98,7 +98,7 @@ def test_payload_holds_model_and_keeps_it_short():
 
 
 def test_endpoint_tolerates_both_base_styles():
-    """.env 里两家 base 写法不同（agnes 带 /v1、deepseek 不带），两种都合法。"""
+    """.env 里不同网关的 base 写法可能不同（有的带 /v1、有的不带），两种都合法。"""
     assert P._endpoint("https://a.example/v1") == "https://a.example/v1/chat/completions"
     assert P._endpoint("https://a.example/v1/") == "https://a.example/v1/chat/completions"
     assert P._endpoint("https://a.example") == "https://a.example/chat/completions"
@@ -151,8 +151,57 @@ def test_healthy_key_measures_every_mode(monkeypatch):
 
 def test_rows_skip_providers_without_key(monkeypatch):
     """没配 key 的网关不出现在表里 —— 表里每一行都该有可执行的结论。"""
-    monkeypatch.setenv("AGNES_API_KEY", "")
+    monkeypatch.setenv("LLM_API_KEY", "")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     names = [row["name"] for row in P._provider_rows("")]
     assert names == ["deepseek"]
-    assert P._provider_rows("agnes") == []
+    assert P._provider_rows("main") == []
+
+
+def test_same_gateway_is_only_probed_once(monkeypatch):
+    """★ 主网关与对照线指向同一家时，只探一次并标注"与 X 相同"。
+
+    2026-11-01 起两者就是同一家（DeepSeek）。表里出现两行相同结论不只是浪费额度：
+    名字不同会让人以为"两家都验过了"，而这恰好是"变量名指向与实际不符"最容易骗人的
+    地方 —— 那次的第一版输出就是 `agnes → https://api.deepseek.com`。
+    """
+    for name in ("LLM_API_KEY", "DEEPSEEK_API_KEY"):
+        monkeypatch.setenv(name, "sk-same")
+    for name in ("LLM_API_BASE", "DEEPSEEK_API_BASE", "LLM_MODEL", "DEEPSEEK_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+
+    rows = P._provider_rows("")
+    assert [row["name"] for row in rows] == ["main", "deepseek"]
+    assert rows[0].get("duplicate_of") is None
+    assert rows[1]["duplicate_of"] == "main"
+
+
+def test_different_gateways_are_both_probed(monkeypatch):
+    """地址或模型不同就不能合并 —— 去重键是 (base, model)，不是"有没有配 key"。"""
+    monkeypatch.setenv("LLM_API_KEY", "sk-a")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-b")
+    monkeypatch.setenv("LLM_API_BASE", "https://a.example/v1")
+    monkeypatch.setenv("DEEPSEEK_API_BASE", "https://b.example/v1")
+
+    rows = P._provider_rows("")
+    assert all("duplicate_of" not in row for row in rows)
+
+
+def test_same_base_but_different_model_is_not_merged(monkeypatch):
+    """★ 去重键必须**同时**含 base 与 model。
+
+    同一地址上换模型就是换能力，档位结论可能完全不同（正是这次踩的坑：
+    同一个 DeepSeek 网关，chat 档只支持 json_object）。只按 base 去重会把这个
+    差异吞掉，报告上看着"验过了"，实际有一个模型从没探。
+
+    这条是补上的：第一版只有"base 不同"的用例，于是"键里漏掉 model"的变异存活了。
+    """
+    monkeypatch.setenv("LLM_API_KEY", "sk-a")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-a")
+    monkeypatch.setenv("LLM_API_BASE", "https://same.example/v1")
+    monkeypatch.setenv("DEEPSEEK_API_BASE", "https://same.example/v1")
+    monkeypatch.setenv("LLM_MODEL", "model-a")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "model-b")
+
+    rows = P._provider_rows("")
+    assert all("duplicate_of" not in row for row in rows), "同地址不同模型不能合并"

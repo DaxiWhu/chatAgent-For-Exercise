@@ -717,11 +717,15 @@ CIRCUIT_FAIL_THRESHOLD = max(1, _env_int("CIRCUIT_FAIL_THRESHOLD", 5))
 CIRCUIT_RESET_SECONDS = max(1, _env_int("CIRCUIT_RESET_SECONDS", 30))
 
 # --------------------------------------------------------------------------
-# 模型与数据库（沿用既有变量名，集中在此以便一处看全）
+# 模型与数据库（集中在此以便一处看全）
+#
+# 默认值指向**当前主网关**（DeepSeek，OpenAI 兼容协议）。换网关时这三行要一起改，
+# 并且别忘了 `CONTEXTUAL_MODEL`（`src/rag/contextualizer.py` 有独立默认值，漏了它
+# 分块补全那一步会用旧模型名去打新网关 —— 那是旁路调用，可能只落日志不报错）。
 # --------------------------------------------------------------------------
-MODEL_NAME = _env_str("AGNES_MODEL", "agnes-2.0-flash")
-API_KEY = _env_str("AGNES_API_KEY", "")
-API_BASE = _env_str("AGNES_API_BASE", "https://apihub.agnes-ai.com/v1")
+MODEL_NAME = _env_str("LLM_MODEL", "deepseek-chat")
+API_KEY = _env_str("LLM_API_KEY", "")
+API_BASE = _env_str("LLM_API_BASE", "https://api.deepseek.com")
 DB_URL = _env_str("DB_URL", "")
 DOCS_DIR = _env_str("DOCS_DIR", "data")
 

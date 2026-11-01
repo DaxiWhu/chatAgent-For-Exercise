@@ -109,10 +109,10 @@ def main() -> int:
 
     # 自检脚本的目的就是真调一次，所以要显式打开开关（生产默认是关的）
     if not D.enabled()[0]:
-        print("  （当前开关为关，本次自检临时打开：RAG_VLM_DESC=on + 复用 AGNES_API_KEY）")
+        print("  （当前开关为关，本次自检临时打开：RAG_VLM_DESC=on + 复用 LLM_API_KEY）")
         D.VLM_DESC = "on"
         if not D.VLM_API_KEY:
-            print("[失败] 未配置 AGNES_API_KEY，无法调用。请在 .env 里填好再试。")
+            print("[失败] 未配置 LLM_API_KEY，无法调用。请在 .env 里填好再试。")
             return 1
 
     ctx = D.context_for(chunks, 1)
@@ -127,8 +127,9 @@ def main() -> int:
     if desc.get("error"):
         print(f"[失败] {desc['error']}（耗时 {elapsed:.1f}s）")
         print("排查方向：")
-        print("  - 模型是否支持视觉输入（agnes-2.5-pro；agnes-image-* 是生图模型）")
-        print("  - AGNES_API_KEY / AGNES_API_BASE 是否正确")
+        print("  - 模型是否支持视觉输入（当前的 LLM_* 主网关**没有**视觉模型，")
+        print("    必须用 VLM_API_BASE / VLM_API_KEY / VLM_MODEL 另指一家）")
+        print("  - LLM_API_KEY / LLM_API_BASE 是否正确")
         print("  - 是否为代理/网络问题")
         return 1
     print(f"  耗时 {elapsed:.1f}s｜usage={desc.get('usage')}｜cached={desc.get('cached')}")

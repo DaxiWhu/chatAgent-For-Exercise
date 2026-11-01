@@ -14,6 +14,17 @@ from src.rag import image_describer as D
 from src.rag.knowledge_chunk import KIND_DIAGRAM
 
 
+def _enable_vlm(monkeypatch, model: str = "vision-model") -> None:
+    """把三项 ``VLM_*`` 配齐 —— 缺任一项 ``enabled()`` 都会拒绝。
+
+    为什么不复用一个"VLM 已启用"的 fixture：这几条用例要验的正是**开关与统计**，
+    把配置藏进 fixture 会让"到底开了什么"看不出来。所以显式写一行。
+    """
+    monkeypatch.setattr(D, "VLM_API_KEY", "sk-x")
+    monkeypatch.setattr(D, "VLM_API_BASE", "https://vlm.example/v1")
+    monkeypatch.setattr(D, "VLM_MODEL", model)
+
+
 @pytest.fixture
 def png(tmp_path):
     """一张真位图（VLM 读得了的那种）。"""
@@ -57,21 +68,36 @@ def test_disabled_by_default(monkeypatch):
     assert ok is False and "off" in why
 
 
-def test_auto_requires_api_key(monkeypatch):
+def test_auto_requires_all_three_vlm_values(monkeypatch):
+    """★ 三项缺**任一**项都必须拒绝启动。
+
+    2026-11-01 起 VLM 不再复用 ``LLM_*``（主网关换成 DeepSeek，它没有视觉模型），
+    所以旧口径"配了 key 就算开"必须一起改：只配 key 会让 base 为空，SDK 拼出畸形
+    URL，而报错和"模型不支持图片输入"完全不像 —— 排查的人会去改模型名。
+    """
     monkeypatch.setattr(D, "VLM_DESC", "auto")
-    monkeypatch.setattr(D, "VLM_API_KEY", "")
-    assert D.enabled()[0] is False
-    monkeypatch.setattr(D, "VLM_API_KEY", "sk-xxx")
+    _enable_vlm(monkeypatch)
     assert D.enabled()[0] is True
 
+    for missing in ("VLM_API_KEY", "VLM_API_BASE", "VLM_MODEL"):
+        monkeypatch.setattr(D, missing, "")
+        ok, why = D.enabled()
+        assert ok is False, f"缺 {missing} 时不该启用"
+        assert missing in why, f"原因要点名缺的那一项：{why}"
+        monkeypatch.setattr(D, missing, "x")
 
-def test_on_without_key_reports_reason_instead_of_silently_doing_nothing(monkeypatch):
-    """RAG_VLM_DESC=on 缺 key 时必须报错方向明确 ——
-    "以为在跑其实没跑"是这类批处理最贵的坑。"""
+
+def test_on_reports_each_missing_item_instead_of_silently_doing_nothing(monkeypatch):
+    """RAG_VLM_DESC=on 却缺配置时，原因必须点名缺哪几项 ——
+    "以为在跑其实没跑"是这类批处理最贵的坑，而三项分属不同服务，猜错要白跑一轮。"""
     monkeypatch.setattr(D, "VLM_DESC", "on")
     monkeypatch.setattr(D, "VLM_API_KEY", "")
+    monkeypatch.setattr(D, "VLM_API_BASE", "")
+    monkeypatch.setattr(D, "VLM_MODEL", "")
     ok, why = D.enabled()
-    assert ok is False and "AGNES_API_KEY" in why
+    assert ok is False
+    for name in ("VLM_API_KEY", "VLM_API_BASE", "VLM_MODEL"):
+        assert name in why, why
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +237,7 @@ def test_enrich_disabled_still_counts_candidates(monkeypatch):
 
 def test_enrich_writes_description_without_overwriting_caption(png, monkeypatch):
     monkeypatch.setattr(D, "VLM_DESC", "auto")
-    monkeypatch.setattr(D, "VLM_API_KEY", "sk-x")
+    _enable_vlm(monkeypatch)
     c = _chunk(source_image=png, content="图3 出口额变化",
                retrieval_text="第三章 > 出口情况；图3 出口额变化")
     stats = D.enrich([c], describer=lambda path, ctx: _fake_result())
@@ -225,7 +251,7 @@ def test_enrich_writes_description_without_overwriting_caption(png, monkeypatch)
 
 def test_enrich_marks_unverified_with_tag(png, monkeypatch):
     monkeypatch.setattr(D, "VLM_DESC", "auto")
-    monkeypatch.setattr(D, "VLM_API_KEY", "sk-x")
+    _enable_vlm(monkeypatch)
     c = _chunk(source_image=png)
     D.enrich([c], describer=lambda path, ctx: _fake_result(desc="约 999 万元"))
     assert "VLM待核对" in c.tags
@@ -233,7 +259,7 @@ def test_enrich_marks_unverified_with_tag(png, monkeypatch):
 
 def test_enrich_respects_max_images_and_says_so(png, monkeypatch):
     monkeypatch.setattr(D, "VLM_DESC", "auto")
-    monkeypatch.setattr(D, "VLM_API_KEY", "sk-x")
+    _enable_vlm(monkeypatch)
     chunks = [_chunk(source_image=png, source="a.pdf") for _ in range(3)]
     stats = D.enrich(chunks, describer=lambda p, c: _fake_result(), max_images=1)
     assert stats["described"] == 1 and stats["skipped_limit"] == 2
@@ -244,7 +270,7 @@ def test_enrich_keeps_needs_vlm_for_unsendable_images(emf, tmp_path, monkeypatch
     """无图可取 / 矢量图 / 文件丢失：必须留下**可筛选**的标记，
     否则"这张图其实没被描述"永远查不出来。"""
     monkeypatch.setattr(D, "VLM_DESC", "auto")
-    monkeypatch.setattr(D, "VLM_API_KEY", "sk-x")
+    _enable_vlm(monkeypatch)
     chunks = [_chunk(source_image=""), _chunk(source_image=emf),
               _chunk(source_image=str(tmp_path / "gone.png"))]
     stats = D.enrich(chunks, describer=lambda p, c: pytest.fail("不该被调用"))
@@ -257,7 +283,7 @@ def test_enrich_keeps_needs_vlm_for_unsendable_images(emf, tmp_path, monkeypatch
 
 def test_enrich_counts_failures(png, monkeypatch):
     monkeypatch.setattr(D, "VLM_DESC", "auto")
-    monkeypatch.setattr(D, "VLM_API_KEY", "sk-x")
+    _enable_vlm(monkeypatch)
     c = _chunk(source_image=png)
     stats = D.enrich([c], describer=lambda p, ctx: {"error": "限流"})
     assert stats["failed"] == 1 and c.needs_vlm is True

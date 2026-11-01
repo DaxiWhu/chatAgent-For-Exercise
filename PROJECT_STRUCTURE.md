@@ -47,7 +47,7 @@
 | 新增 `tests/test_retrieval.py`、`tests/test_pdf_parser.py` | 检索层与 PDF 解析的离线回归测试（PDF 由测试现场生成） |
 | `src/retrieval.py` 新增 `load_chunks()` | 统一语料入口，按扩展名分派：`.txt/.md` 递归切分、`.pdf` 走教程链路 |
 | `src/graph.py` 的 `get_retriever()` | 改调 `load_chunks()`，PDF 因此进入 RAG |
-| embedding 与 LLM 解耦 | 新增 `EMBEDDING_API_BASE/KEY/MODEL` 三个环境变量，LLM 仍走 `AGNES_*` |
+| embedding 与 LLM 解耦 | 新增 `EMBEDDING_API_BASE/KEY/MODEL` 三个环境变量，LLM 仍走 `LLM_*` |
 | 修 bug | TF-IDF 中文检索失效（改字符 n-gram）、`build_prompt` 解包错误、`retrieval.py` 缺 `load_dotenv` |
 
 ---
@@ -107,8 +107,8 @@
 | 文件 | 作用 | 状态 / 问题 |
 |------|------|-------------|
 | `requirements.txt` | 13 行依赖：langgraph / checkpoint-postgres / langchain-openai / psycopg / pydantic / fastapi / uvicorn / sse-starlette / scikit-learn / numpy | ⚠️ 后半段 RAG 原型用的 `langchain-chroma`、`chromadb`、`pdfminer.six`、`nltk`、`langchain-tavily` **未列入**；若不删原型则缺依赖 |
-| `.env` | 真实配置。键：`AGNES_API_KEY`/`AGNES_API_BASE`/`AGNES_MODEL`/`DB_URL`/`DOCS_DIR`/`DEEPSEEK_API_KEY`/`DEEPSEEK_API_BASE`/`TAVILY_API_KEY` | ⚠️ `DB_URL` 与 `serve.py` 的 `PG_CHECKPOINT_URI` 不一致；`DEEPSEEK_*`/`TAVILY_API_KEY` 当前代码未使用 |
-| `.env.example` | 模板：`AGNES_*`/`PG_CHECKPOINT_URI`/`SERVE_API_KEY`/`RAG_EMBEDDING` | ⚠️ **缺 `DOCS_DIR`**（notebook 需要） |
+| `.env` | 真实配置。键：`LLM_API_KEY`/`LLM_API_BASE`/`LLM_MODEL`/`DB_URL`/`DOCS_DIR`/`DEEPSEEK_API_KEY`/`DEEPSEEK_API_BASE`/`TAVILY_API_KEY` | ⚠️ `DB_URL` 与 `serve.py` 的 `PG_CHECKPOINT_URI` 不一致；`DEEPSEEK_*`/`TAVILY_API_KEY` 当前代码未使用 |
+| `.env.example` | 模板：`LLM_*`/`PG_CHECKPOINT_URI`/`SERVE_API_KEY`/`RAG_EMBEDDING` | ⚠️ **缺 `DOCS_DIR`**（notebook 需要） |
 | `.gitignore` | Python/venv/Jupyter/IDE/`*.db`/`.env`/日志/测试缓存/`.workbuddy/` | ✅ 完善；⚠️ 未忽略 `.verify.out` |
 
 ### F. 临时产物与缓存（可清理）

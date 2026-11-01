@@ -347,7 +347,7 @@ def test_no_configured_backend_means_no_trace_at_all(monkeypatch):
     ⚠️ 为什么必须钉住：SDK 的 trace provider 在**第一次访问时**会自动注册
     `default_processor()` —— 那是 `BatchTraceProcessor(BackendSpanExporter())`，
     会拿环境里的 `OPENAI_API_KEY` 往 api.openai.com 发 span（**含 prompt 与
-    回复全文**）。本项目模型走自建 `AsyncOpenAI` 客户端（配置项叫 `AGNES_*`），
+    回复全文**）。本项目模型走自建 `AsyncOpenAI` 客户端（配置项叫 `LLM_*`），
     所以那条上报要么用错 key 把对话发给第三方、要么失败被吞 —— 两种都不报错、
     也不体现在任何指标上。
 

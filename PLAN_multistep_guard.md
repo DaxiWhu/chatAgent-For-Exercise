@@ -167,7 +167,7 @@
 与 `app/main.py::_spawn_history_compaction` 里那条坑同源。
 
 **反思本身**：一次旁路模型调用，复用 `compaction.py::_client_or_none` 那套
-（同 `AGNES_MODEL` / `AGNES_API_KEY` / `AGNES_API_BASE`）。
+（同 `LLM_MODEL` / `LLM_API_KEY` / `LLM_API_BASE`）。
 ⚠️ 走旁路 ⇒ **不计入 `AGENT_MAX_TURNS`，也不进 SDK tracing** ⇒ **必须自己设超时**
 （`compaction.py::_summarize_timeout` 是现成先例）。
 

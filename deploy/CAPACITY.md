@@ -81,7 +81,7 @@ python scripts/bench_local.py --baseline scripts/bench_baseline.json     # 下�
 
 需要：一个运行中的实例 + 真实模型密钥 + 一笔**被批准过的**模型花费。
 
-> 2026-10-04 复核：**密钥这一项已经就位** —— `.env` 里的 `AGNES_API_KEY` 与 `.env.example`
+> 2026-10-04 复核：**密钥这一项已经就位** —— `.env` 里的 `LLM_API_KEY` 与 `.env.example`
 > 不同（已填过值，不是占位符）。还差的是"把实例起起来"（`DB_URL` 指向 `localhost:5433`）
 > 与"批准这笔花费"。所以这一节仍是**待办**，不是结论 —— 但障碍已经从"三件"缩到
 > "两件"，且两件都在人手上，不在技术侧。

@@ -22,7 +22,7 @@
 ⚠️ 这会**真的调用上游模型**（消耗额度）。用例刻意压到 5 条、每条都带明确产出
 约束（限篇幅），目的是在可控成本下拿到能力画像，不是压测。
 
-它**只读**配置（`AGNES_*` 环境变量 / `.env`），不写任何配置、不改任何状态。
+它**只读**配置（`LLM_*` 环境变量 / `.env`），不写任何配置、不改任何状态。
 """
 
 from __future__ import annotations
@@ -309,11 +309,11 @@ async def main() -> int:
 
     from src.agents import runtime
 
-    model_name = os.getenv("AGNES_MODEL", "")
-    api_key = os.getenv("AGNES_API_KEY", "")
-    base_url = os.getenv("AGNES_API_BASE", "")
+    model_name = os.getenv("LLM_MODEL", "")
+    api_key = os.getenv("LLM_API_KEY", "")
+    base_url = os.getenv("LLM_API_BASE", "")
     if not api_key:
-        print("❌ AGNES_API_KEY 为空：无法探测真实能力。请在 .env 里配置后重试。")
+        print("❌ LLM_API_KEY 为空：无法探测真实能力。请在 .env 里配置后重试。")
         return 2
 
     ok = runtime.configure(model_name=model_name, api_key=api_key, base_url=base_url,

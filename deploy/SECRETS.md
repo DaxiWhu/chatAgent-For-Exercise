@@ -11,7 +11,7 @@
 
 | 用途 | 传递方式 | 谁在用 |
 |---|---|---|
-| 应用密钥（`AGNES_API_KEY`、`EMBEDDING_API_KEY`、`LANGSMITH_API_KEY`） | compose 的 `env_file: ../../.env` → 容器环境变量 | `app/config.py` 读取 |
+| 应用密钥（`LLM_API_KEY`、`EMBEDDING_API_KEY`、`LANGSMITH_API_KEY`） | compose 的 `env_file: ../../.env` → 容器环境变量 | `app/config.py` 读取 |
 | ~~共享密钥 `SERVE_API_KEY`~~ | **已于 2026-10-05 整体删除** | 不再是"应用密钥"：它不是本服务的任何凭证。⚠️ 环境里**存在**该键（留空也算）会让服务拒绝启动，见 4.2 |
 | 用户鉴权（`AUTH_SESSION_SECRET`、`AUTH_USERS`） | 同上 | `app/config.py` 读取 → `app/auth.py` 消费。⚠️ `AUTH_USERS` 已降级为"只在账号表为空时建出第一个管理员"的**种子**；用户与口令哈希真正住在 PG 的 `users` 表里 |
 | 基础设施口令（`POSTGRES_PASSWORD`、`REDIS_PASSWORD`、`GRAFANA_PASSWORD`） | compose 的 `${VAR}` 插值（从项目根 `.env`） | compose 自己，用于拼 `DB_URL` / 容器参数 |

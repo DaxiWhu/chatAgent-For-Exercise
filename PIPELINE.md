@@ -77,9 +77,9 @@
 
 | 用途 | 模型 | 备注 |
 |---|---|---|
-| 生成 / 评审 | `agnes-2.0-flash`（`AGNES_MODEL`） | 走 OpenAI 兼容接口 |
-| 图片结构化描述 | `agnes-2.5-pro`（`VLM_MODEL`） | 实测能读图表数值；默认**关闭**（按图计费） |
-| 上下文前缀（Contextual Retrieval） | `agnes-2.5-pro` | ⚠️ 推理型模型，`max_tokens` 给小了会返回空正文；默认关 |
+| 生成 / 评审 | `deepseek-chat`（`LLM_MODEL`） | 走 OpenAI 兼容接口 |
+| 图片结构化描述 | 无默认（`VLM_MODEL`） | ⚠️ 主网关**没有**视觉模型，必须另配一家（`VLM_API_BASE` / `VLM_API_KEY` / `VLM_MODEL`）；默认**关闭**（按图计费） |
+| 上下文前缀（Contextual Retrieval） | `deepseek-chat`（`CONTEXTUAL_MODEL`） | 有自己的默认值，换网关时要一起改；默认关 |
 | embedding | `BAAI/bge-m3`（硅基流动） | 与上面完全分离的凭证 |
 
 ### 1.4 服务与编排
@@ -202,7 +202,7 @@
 
 **两个刻意的设计**：
 
-- **embedding 与 LLM 完全分离**（`EMBEDDING_*` vs `AGNES_*`）：agnes 不提供 embeddings 接口。
+- **embedding 与 LLM 完全分离**（`EMBEDDING_*` vs `LLM_*`）：对话网关不提供 embeddings 接口。
 - **不引向量数据库**：语料规模（< 1 万块）用 numpy 暴力算余弦足够；引入向量库是等到规模证明它值得再说。
 
 ---

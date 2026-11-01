@@ -27,7 +27,7 @@ compose、CI 与 RUNBOOK 的启动命令时再一起做**，单独删这一个�
 可用环境变量：APP_HOST / APP_PORT / APP_WORKERS / APP_LOG_LEVEL / APP_RELOAD /
 GRACEFUL_SHUTDOWN_TIMEOUT（命令行参数优先于环境变量）
 
-上述变量与 `AGNES_*` 等**都可以写在 `.env` 里**：本模块在导入期就把 `.env` 灌进
+上述变量与 `LLM_*` 等**都可以写在 `.env` 里**：本模块在导入期就把 `.env` 灌进
 环境（理由见 `import` 之后那段注释），而 argparse 的默认值是在 `main()` 里才读的。
 
 worker 数：`APP_WORKERS` 优先，其次 `WEB_CONCURRENCY`（容器/PaaS 的惯例名，很多平台
@@ -51,7 +51,7 @@ import sys
 # ---------------------------------------------------------------------------
 # 真实事故（2026-10-30 实测）：只配 `.env` 时，`python -m app.serve` 报
 #   RuntimeError: agent 链路不可用（missing_api_key）⇒ 拒绝启动
-# 而 `.env` 里 `AGNES_API_KEY` 明明有值。
+# 而 `.env` 里 `LLM_API_KEY` 明明有值。
 #
 # 成因是**加载顺序**，不是配置写错：
 #   1. `main()` 调 `resolve_graceful_timeout()`，它经 `_default_graceful_timeout()`
@@ -66,7 +66,7 @@ import sys
 # 为什么不放到 `app/config.py` 顶部（看起来更"一劳永逸"）
 # -----------------------------------------------------
 # 那样会破坏 `tests/conftest.py` 的环境隔离机制：它在导入 `app.config` **之前**
-# 把测试身份（`AUTH_SESSION_SECRET` / `AGNES_API_KEY`）注入环境，而它包装的
+# 把测试身份（`AUTH_SESSION_SECRET` / `LLM_API_KEY`）注入环境，而它包装的
 # `load_dotenv` 会在加载后调用 `scrub_behavior_env()` 把**所有**行为变量删掉 ——
 # 于是 config 读到的会话密钥变成空串，全量用例集体 401。顺序是那边刻意设计并
 # 写进注释的，不能为省一行把它挪走。

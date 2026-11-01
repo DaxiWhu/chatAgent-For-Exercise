@@ -95,7 +95,7 @@ def test_bench_reports_the_environment_with_every_run(bench):
     import sys
 
     env = dict(os.environ)
-    env.update({"DB_URL": "", "AGNES_API_KEY": "", "EMBEDDING_API_KEY": ""})
+    env.update({"DB_URL": "", "LLM_API_KEY": "", "EMBEDDING_API_KEY": ""})
     r = subprocess.run([sys.executable, "scripts/bench_local.py", "--n", "500", "--json"],
                        capture_output=True, text=True, encoding="utf-8",
                        errors="replace", env=env, cwd=str(ROOT))

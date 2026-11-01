@@ -9,7 +9,7 @@
 * 要自己处理 tool_calls 的双向映射、流式事件、usage 统计 —— 每一处都是差异来源；
 * 网关换一个（OpenAI 兼容 → 别的协议）就得再改一遍。
 
-而本项目的主链路本来就走 **OpenAI 兼容网关**（``AGNES_API_BASE``），
+而本项目的主链路本来就走 **OpenAI 兼容网关**（``LLM_API_BASE``），
 ``OpenAIChatCompletionsModel`` 正是为这个协议写的官方实现。所以这里读**同一份**
 配置（同一个 base_url / api_key / model 名），走**官方**的请求构造 —— 两个链路
 发出去的请求体一致，行为差异只可能来自编排，不会来自协议适配。

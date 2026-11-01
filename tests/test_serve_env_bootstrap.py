@@ -6,7 +6,7 @@
 
     RuntimeError: agent 链路不可用（missing_api_key）⇒ 拒绝启动
 
-而 `.env` 里 `AGNES_API_KEY` 是有值的。成因不是配置写错，是顺序：
+而 `.env` 里 `LLM_API_KEY` 是有值的。成因不是配置写错，是顺序：
 
   1. `main()` 里 `resolve_graceful_timeout()` → `_default_graceful_timeout()`
      → `from app import config`，这一步在 `uvicorn.run()` **之前**；
@@ -53,7 +53,7 @@ _seen = {}
 
 def _probe(*args, **kwargs):
     _seen["before_config"] = "app.config" not in sys.modules
-    os.environ["AGNES_API_KEY"] = "sk-sentinel-from-dotenv-probe"
+    os.environ["LLM_API_KEY"] = "sk-sentinel-from-dotenv-probe"
     return True
 
 
@@ -82,7 +82,7 @@ def _run(tmp_path: Path) -> subprocess.CompletedProcess:
     env = {**os.environ}
     # 本文件验的是"`.env` 里的值能不能到达 config"，所以进程里**不能**预先有它，
     # 否则哨兵值不生效，用例就变成"环境里本来就有 Key"的假绿。
-    for key in ("AGNES_API_KEY", "AGENTS_ENABLED"):
+    for key in ("LLM_API_KEY", "AGENTS_ENABLED"):
         env.pop(key, None)
     env["APP_ENV"] = "development"
     env["DB_URL"] = ""

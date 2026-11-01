@@ -28,7 +28,7 @@
 用法
 ----
     python scripts/probe_provider.py                    # 探 .env 里配置的所有网关
-    python scripts/probe_provider.py --provider agnes   # 只探一家
+    python scripts/probe_provider.py --provider main    # 只探主网关
     python scripts/probe_provider.py --json out.json    # 留证（换 key 前后各存一份）
 
 ⚠️ 只读：发 4 次以内最小请求（max_tokens=32），不写任何配置。建议值只打印，
@@ -64,13 +64,14 @@ except Exception:  # noqa: BLE001  .env 缺失时照常跑（用真实环境变�
 
 MODES = ("json_schema", "json_object", "none")
 
-#: 每家网关的默认 base/model。**与代码里的默认值保持一致**，否则探出来的结论
-#: 描述的是另一个模型：``app/config.py``（agnes）与 ``scripts/agent_tool_eval.py``
-#: （deepseek）。agnes 的默认模型两处不同（config 是 2.0-flash、评测脚本是 2.5-flash），
-#: 这里取 config 那一份 —— 探针要答的是"生产会用到的那个模型"。
-_DEFAULTS: dict[str, dict[str, str]] = {
-    "agnes": {"base": "https://apihub.agnes-ai.com/v1", "model": "agnes-2.0-flash"},
-    "deepseek": {"base": "https://api.deepseek.com", "model": "deepseek-chat"},
+#: 要探的网关。**默认 base/model 必须与代码里的默认值一致**，否则探出来的结论描述
+#: 的是另一个模型：主网关看 ``app/config.py``，评测对照线看 ``scripts/agent_tool_eval.py``。
+#:
+#: ``main`` 取代了原来的 ``agnes`` 一项：变量名已从 ``LLM_*`` 中性化，网关可以换，
+#: 所以这里按"它在系统里的角色"命名，而不是按某一家厂商命名。
+_GATEWAYS: dict[str, dict[str, str]] = {
+    "main": {"prefix": "LLM", "base": "https://api.deepseek.com", "model": "deepseek-chat"},
+    "deepseek": {"prefix": "DEEPSEEK", "base": "https://api.deepseek.com", "model": "deepseek-chat"},
 }
 
 #: 探针提示词。两个约束都不能省：含 "JSON"（json_object 的硬要求）、极短（只关心
@@ -199,7 +200,7 @@ def _post(url: str, key: str, body: dict[str, Any], timeout: float, *,
 def _endpoint(base: str) -> str:
     """把 base 拼成 chat/completions 端点。
 
-    ``.env`` 里两家的 base 写法不同（agnes 带 ``/v1``、deepseek 不带），两者都合法，
+    ``.env`` 里不同网关的 base 写法可能不同（有的带 ``/v1``、有的不带），两者都合法，
     所以这里只补尾部、不猜前缀：已经以 ``/chat/completions`` 结尾就原样返回。
 
     base: 网关根地址。
@@ -216,23 +217,30 @@ def _endpoint(base: str) -> str:
 # 主流程
 # ---------------------------------------------------------------------------
 def _provider_rows(only: str) -> list[dict[str, str]]:
-    """按 ``--provider`` 收集要探的网关（只收配置了 key 的）。"""
+    """按 ``--provider`` 收集要探的网关（只收配置了 key 的）。
+
+    同一地址 + 同一模型只留第一行：主网关（``LLM_*``）与评测对照线（``DEEPSEEK_*``）
+    可能指向同一家（2026-11 起就是如此）。探两遍既费额度，又会让表里出现两行相同
+    结论 —— 更糟的是名字不同会让人以为"两家都验过了"。
+    """
     rows: list[dict[str, str]] = []
-    for name, defaults in _DEFAULTS.items():
+    seen: dict[tuple[str, str], str] = {}
+    for name, spec in _GATEWAYS.items():
         if only and name != only:
             continue
-        prefix = name.upper()
+        prefix = spec["prefix"]
         key = (os.getenv(f"{prefix}_API_KEY", "") or "").strip()
         if not key:
             continue
-        rows.append(
-            {
-                "name": name,
-                "key": key,
-                "base": (os.getenv(f"{prefix}_API_BASE", "") or "").strip() or defaults["base"],
-                "model": (os.getenv(f"{prefix}_MODEL", "") or "").strip() or defaults["model"],
-            }
-        )
+        base = (os.getenv(f"{prefix}_API_BASE", "") or "").strip() or spec["base"]
+        model = (os.getenv(f"{prefix}_MODEL", "") or "").strip() or spec["model"]
+        row = {"name": name, "key": key, "base": base, "model": model}
+        first = seen.get((base, model))
+        if first:
+            row["duplicate_of"] = first
+        else:
+            seen[(base, model)] = name
+        rows.append(row)
     return rows
 
 
@@ -317,7 +325,7 @@ def _print_row(result: dict[str, Any], index: int, total: int) -> None:
 def main(argv: list[str] | None = None) -> int:
     """命令行入口。返回 0 = 至少一家探明，1 = 全部未探明（凭证/网络）。"""
     parser = argparse.ArgumentParser(description="探模型网关的 key 有效性与结构化输出档位支持面")
-    parser.add_argument("--provider", choices=list(_DEFAULTS), help="只探一家（默认全部）")
+    parser.add_argument("--provider", choices=list(_GATEWAYS), help="只探一家（默认全部）")
     parser.add_argument("--timeout", type=float, default=30.0, help="单请求超时秒数")
     parser.add_argument("--use-proxy", action="store_true", help="让系统代理生效（默认直连）")
     parser.add_argument("--json", metavar="PATH", help="把结果写成 JSON（换 key 前后各存一份便于对比）")
@@ -325,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rows = _provider_rows(args.provider or "")
     if not rows:
-        print("没有可探的网关：.env 里没找到 AGNES_API_KEY / DEEPSEEK_API_KEY。")
+        print("没有可探的网关：.env 里没找到 LLM_API_KEY / DEEPSEEK_API_KEY。")
         return 1
 
     print("模型网关能力探针（只读，每家最多 3 次最小请求，max_tokens=32）")
@@ -333,6 +341,12 @@ def main(argv: list[str] | None = None) -> int:
 
     results = []
     for index, row in enumerate(rows, start=1):
+        if row.get("duplicate_of"):
+            # 同一地址 + 同一模型：再说一遍结论没有信息量，反而让人以为验了两家。
+            print(f"[{index}/{len(rows)}] {row['name']}  与 {row['duplicate_of']} 同一地址"
+                  f"与模型（{row['base']} / {row['model']}），跳过")
+            print()
+            continue
         result = probe(row, timeout=args.timeout, use_proxy=args.use_proxy)
         results.append(result)
         _print_row(result, index, len(rows))

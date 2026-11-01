@@ -315,7 +315,7 @@ services:
     volumes:
       - ../../data:/app/data
     env_file:
-      - ../../.env                       # 机密（AGNES_API_KEY / EMBEDDING_* / AUTH_SESSION_SECRET）
+      - ../../.env                       # 机密（LLM_API_KEY / EMBEDDING_* / AUTH_SESSION_SECRET）
     environment:
       APP_RELEASE: stable
       # 部署场景默认 production：**未启用用户鉴权（AUTH_*）就拒绝启动**，

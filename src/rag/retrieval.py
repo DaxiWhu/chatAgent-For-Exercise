@@ -4,7 +4,7 @@ RAG 检索层（检索增强生成）
 - 语料：txt/md/log/csv/tsv/json/html/docx/xlsx/pptx（见 src/loaders.py）、pdf（见 src/pdf_parser.py）
 - 切分：结构感知（按 Markdown 标题切并把「标题路径」写进块）/ 递归字符切分 二选一
 - 检索：bm25（纯本地关键词，Apache Lucene 的 BM25Similarity 口径）| semantic（embedding 向量）| hybrid（双路 RRF 融合 + 可选 rerank）
-- 生成：复用 chatAgent 的 ChatOpenAI + agnes 后端
+- 生成：复用 chatAgent 的 ChatOpenAI + OpenAI 兼容后端
 
 运行（在项目根目录执行）：
     python -m src.rag.retrieval --docs data --question "你的提问"
@@ -24,8 +24,8 @@ RAG 检索层（检索增强生成）
     QDRANT_URL/_API_KEY/_COLLECTION/_DIM  仅 RAG_VECTOR_STORE=qdrant 需要
 
 说明：
-- **embedding 与 LLM 分开配置**：LLM 走 AGNES_*，embedding 走 EMBEDDING_*。
-  （agnes 后端不提供 embeddings 接口，必须另指一个服务）
+- **embedding 与 LLM 分开配置**：LLM 走 LLM_*，embedding 走 EMBEDDING_*。
+  （对话网关不提供 embeddings 接口，必须另指一个服务）
 - 配置缺失时一律「降级 + 告警」，不让服务崩。
 - 本文件原名 rag.py，为消除与教程目录 rag/ 的同名冲突而迁入 src/ 并改名。
 """
@@ -103,10 +103,10 @@ def _env_float(name, default, lo, hi):
     return value
 
 
-# ---------- LLM 配置（生成用，走 agnes）----------
-MODEL_NAME = os.getenv("AGNES_MODEL", "agnes-2.0-flash")
-API_KEY = os.getenv("AGNES_API_KEY", "")
-BASE_URL = os.getenv("AGNES_API_BASE", "https://apihub.agnes-ai.com/v1")
+# ---------- LLM 配置（生成用，走 OpenAI 兼容网关）----------
+MODEL_NAME = os.getenv("LLM_MODEL", "deepseek-chat")
+API_KEY = os.getenv("LLM_API_KEY", "")
+BASE_URL = os.getenv("LLM_API_BASE", "https://api.deepseek.com")
 
 #: 生成调用的单次超时（秒）。**2026-10-05 补** —— 此前本文件的 demo 分支
 #: `ChatOpenAI(model=..., api_key=..., base_url=...)` **没传 timeout**，SDK 默认
@@ -116,7 +116,7 @@ BASE_URL = os.getenv("AGNES_API_BASE", "https://apihub.agnes-ai.com/v1")
 #: 默认 30 与主链路 `app/main.py` 的 `ChatOpenAI(timeout=30)` 对齐 ——
 #: 两处取值不一致会导致"换了链路但没人知道超时变了"（见 `src/agents/model.py`
 #: 里同样的对齐说明）。
-GEN_TIMEOUT = max(1, _env_int("AGNES_TIMEOUT", 30))
+GEN_TIMEOUT = max(1, _env_int("LLM_TIMEOUT", 30))
 
 
 # ---------- Embedding 配置（检索用，与 LLM 解耦）----------
@@ -1940,7 +1940,7 @@ def main():
     """命令行入口：`python -m src.rag.retrieval --docs data --question "..."`。
 
     无参数（全部走 argparse 的命令行开关）。
-    语料为空时会自动生成示例文档并重载；未配 AGNES_API_KEY 直接 SystemExit。
+    语料为空时会自动生成示例文档并重载；未配 LLM_API_KEY 直接 SystemExit。
     """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 
@@ -1955,7 +1955,7 @@ def main():
         print(f"已生成示例文档：{p}")
 
     if not API_KEY:
-        raise SystemExit("请先设置环境变量 AGNES_API_KEY（生成用的 LLM Key）")
+        raise SystemExit("请先设置环境变量 LLM_API_KEY（生成用的 LLM Key）")
 
     chunks = load_chunks(args.docs)
     if not chunks:

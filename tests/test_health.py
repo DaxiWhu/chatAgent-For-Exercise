@@ -51,7 +51,7 @@ def test_readiness_reports_missing_llm_key(monkeypatch):
 
     ok, body = health.readiness()
     assert not ok
-    assert "AGNES_API_KEY" in body["checks"]["llm"]["detail"]
+    assert "LLM_API_KEY" in body["checks"]["llm"]["detail"]
 
 
 def test_db_check_skipped_without_db_url(monkeypatch):

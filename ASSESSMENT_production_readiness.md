@@ -200,7 +200,7 @@
 
 `CAPACITY.md` 第二节标题就是"端到端压测（**尚未执行**）"。
 
-2026-10-04 复核后要修正其中一句：原文写"需要运行中的实例 + 真实密钥，本机两者都没有"，**密钥这一项已经不是障碍** —— `.env` 里的 `AGNES_API_KEY` 与 `SERVE_API_KEY` 都与 `.env.example` 不同（即已填过值，非占位符）。剩下的是两件只有机器主人能拍板的事：**把实例起起来**（`DB_URL` 指向 `localhost:5433`）与**批准那笔真实的模型花费**。技术产物（`scripts/load_test.py`、留档模板、断连止损要看的两个指标）都是现成的。
+2026-10-04 复核后要修正其中一句：原文写"需要运行中的实例 + 真实密钥，本机两者都没有"，**密钥这一项已经不是障碍** —— `.env` 里的 `LLM_API_KEY` 与 `SERVE_API_KEY` 都与 `.env.example` 不同（即已填过值，非占位符）。剩下的是两件只有机器主人能拍板的事：**把实例起起来**（`DB_URL` 指向 `localhost:5433`）与**批准那笔真实的模型花费**。技术产物（`scripts/load_test.py`、留档模板、断连止损要看的两个指标）都是现成的。
 
 所以现在的并发闸门阈值、`APP_WORKERS` 建议值、连接池配置都来自推算与文档口径，没有实测支撑。脚本已经写好（`scripts/load_test.py`，含"断连止损"那一项），缺的只是一次带真实密钥的执行。
 
@@ -325,7 +325,7 @@ CI 只跑离线门禁（bm25 检索 + 人工参考答案的生成指标）。带
 
 ### 3.11 单一上游，挂了只能降级
 
-只有一个 `AGNES_API_BASE` / `AGNES_API_KEY` / `AGNES_MODEL`。断路器是有的（`circuit_open` / `circuit_opened_total` / `circuit_rejected_total`），降级路径也有（退回问答链路）。
+只有一个 `LLM_API_BASE` / `LLM_API_KEY` / `LLM_MODEL`。断路器是有的（`circuit_open` / `circuit_opened_total` / `circuit_rejected_total`），降级路径也有（退回问答链路）。
 
 但没有第二供应商或跨供应商切换 —— 所以断路器开路时的行为是"这轮 agent 答不出来"，而不是"换一家继续"。是否值得补取决于对上游可用性的判断（若上游本身有 SLA，这个缺口可以不补）。
 

@@ -287,11 +287,11 @@ async def main() -> int:
     # 用 setdefault 会被 .env 里的 0 覆盖，所以这里是**直接赋值**并打印出来。
     os.environ["AGENT_MULTISTEP_GUARD"] = "1"
 
-    model_name = os.getenv("AGNES_MODEL", "")
-    api_key = os.getenv("AGNES_API_KEY", "")
-    base_url = os.getenv("AGNES_API_BASE", "")
+    model_name = os.getenv("LLM_MODEL", "")
+    api_key = os.getenv("LLM_API_KEY", "")
+    base_url = os.getenv("LLM_API_BASE", "")
     if not api_key:
-        print("❌ AGNES_API_KEY 为空：长任务基线需要真实模型。请在 .env 里配置后重试。")
+        print("❌ LLM_API_KEY 为空：长任务基线需要真实模型。请在 .env 里配置后重试。")
         return 2
 
     ok = runtime.configure(

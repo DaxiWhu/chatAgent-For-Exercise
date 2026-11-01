@@ -48,7 +48,7 @@ def _timed(fn, *args, **kwargs):
 def _check_llm() -> tuple[bool, str]:
     """检查 LLM 关键配置是否就位（只查配置，不发请求）。"""
     if not config.API_KEY:
-        return False, "AGNES_API_KEY 未配置"
+        return False, "LLM_API_KEY 未配置"
     return True, f"model={config.MODEL_NAME}"
 
 

@@ -357,9 +357,9 @@ def _model_config() -> tuple[str, str, str]:
     刻意不引入第二套模型配置：两处用不同模型会让摘要口径漂，而"同一个服务里两个
     模型变量"是运维事故的常见来源（``src/agents/runtime.py`` 里同一条理由）。
     """
-    model = (os.getenv("AGNES_MODEL", "") or "").strip() or "agnes-2.0-flash"
-    key = (os.getenv("AGNES_API_KEY", "") or "").strip()
-    base = (os.getenv("AGNES_API_BASE", "") or "").strip()
+    model = (os.getenv("LLM_MODEL", "") or "").strip() or "deepseek-chat"
+    key = (os.getenv("LLM_API_KEY", "") or "").strip()
+    base = (os.getenv("LLM_API_BASE", "") or "").strip()
     return model, key, base
 
 

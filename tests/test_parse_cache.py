@@ -112,7 +112,10 @@ _PARSE_CHAIN_MODULES = (
 _NOT_IN_FINGERPRINT = {
     "RAG_PARSE_CACHE",       # 用不用缓存
     "RAG_PARSE_CACHE_DIR",   # 缓存放哪
-    "AGNES_API_KEY",         # 凭证：不决定产出什么，且不该被哈希进文件名
+    "LLM_API_KEY",         # 凭证：不决定产出什么，且不该被哈希进文件名
+    # 2026-11-01 VLM 拆成独立网关后同样只收 base、不收 key：换凭证不该让缓存作废
+    # （那是一整轮分钟级重算），而换 base 等于换模型，已经收进 `_ENV_KEYS`。
+    "VLM_API_KEY",
 }
 
 

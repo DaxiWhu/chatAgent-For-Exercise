@@ -12,7 +12,7 @@ reload 出来的是一个**混合体**，它的行为与"部署时真的拉起�
 -----------------------------------------------------
 `app.main` 在导入期调 `load_dotenv()`，而 python-dotenv 的 `find_dotenv()` 是
 **从调用方那个文件**（`app/main.py`）开始往上找 —— 也就是说它与 cwd 无关，本仓库
-根目录的 `.env` 一定会被找到（开发机用它跑服务，里面通常写着 `AGNES_API_KEY`）。
+根目录的 `.env` 一定会被找到（开发机用它跑服务，里面通常写着 `LLM_API_KEY`）。
 不屏蔽的话，无论怎么清环境变量，`.env` 都会把 Key 灌回来，用例变成一条**永远绿的
 空断言**（"没配 Key 也起得来"恒成立）。
 
@@ -39,8 +39,8 @@ _BASE_ENV = {
     # 不要连真库：这些用例只验"导入期的那道闸门"，连接类自检越少越干净。
     "DB_URL": "",
     # 模型地址给个占位即可（构造 client 不需要网络）。
-    "AGNES_API_BASE": "http://127.0.0.1:9/v1",
-    "AGNES_MODEL": "test-model",
+    "LLM_API_BASE": "http://127.0.0.1:9/v1",
+    "LLM_MODEL": "test-model",
 }
 
 #: 屏蔽 `.env` 的前置代码（理由见模块 docstring）。
@@ -55,7 +55,7 @@ _NO_DOTENV = "import dotenv; dotenv.load_dotenv = lambda *a, **k: False;"
 def _run(code: str, cwd: Path, env_overrides: dict) -> subprocess.CompletedProcess:
     env = {**os.environ, **_BASE_ENV}
     # 先清掉所有可能"救活"这条链路的键，再按用例需要加回去。
-    for key in ("AGNES_API_KEY", "AGENTS_ENABLED"):
+    for key in ("LLM_API_KEY", "AGENTS_ENABLED"):
         env.pop(key, None)
     env.update(env_overrides)
     env["PYTHONPATH"] = str(ROOT)
@@ -77,7 +77,7 @@ def test_refuses_to_start_without_api_key(tmp_path):
     assert got.returncode != 0, "没配 Key 却启动成功了（兜底路径还在？）"
     blob = got.stdout + got.stderr
     assert "拒绝启动" in blob
-    assert "AGNES_API_KEY" in blob
+    assert "LLM_API_KEY" in blob
     assert "missing_api_key" in blob
 
 
@@ -87,7 +87,7 @@ def test_starts_when_api_key_is_present(tmp_path):
     这条是上面那条的**反向对照**：少了它，一个"无论配不配 Key 都退出"的实现
     会让上面那条照样绿。
     """
-    got = _run("import app.main", tmp_path, {"AGNES_API_KEY": "sk-test-not-a-real-key"})
+    got = _run("import app.main", tmp_path, {"LLM_API_KEY": "sk-test-not-a-real-key"})
 
     assert got.returncode == 0, f"配了 Key 仍然起不来：\n{got.stdout}\n{got.stderr}"
 
