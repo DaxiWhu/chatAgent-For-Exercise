@@ -83,7 +83,7 @@ from .ratelimit import build_rate_limiter
 from .review_queue import build_review_queue
 from .run_control import build_run_control
 from .runs import build_run_store
-from .sessions import SessionError, build_session_registry
+from .sessions import SessionError, build_session_registry, same_owner
 
 # ---------------------------------------------------------------------------
 # 配置（全部来自环境变量；集中读一次，模块级名字保持与旧版一致以免破坏引用）
@@ -266,6 +266,77 @@ def _report_index_identity():
         metrics.inc("rag_index_identity_mismatch_total")
 
 
+async def _install_mcp_servers(stack: AsyncExitStack) -> None:
+    """按配置接入 MCP 服务器，**只把连接成功的那批**挂到入口 agent 上。
+
+    为什么生命周期必须在这里（而不是 agent 模块里 import 时就连）：
+      - SDK **不会**自动连接，`agent.py` 的字段说明写得很明确：调用方负责
+        `connect()` 与 `cleanup()`；
+      - stdio 的 connect 与 cleanup 必须在**同一个 task** 里，否则 anyio 的
+        退出栈会跨 task 释放 —— 这正是 `MCPServerManager` 的职责。
+      所以用 `enter_async_context` 压进 lifespan 已有的 stack：关闭时由
+      `stack.aclose()` 统一释放，不在关闭路径上再写一遍。
+
+    为什么只挂 `active_servers`：把没连上的留在 agent 的 `mcp_servers` 里，
+    `list_tools` 会在**每一轮运行**里抛异常 ⇒ 整轮崩，而不是"少一个工具"。
+
+    三种结局都只记日志、不阻止启动（与其它自检同一口径：能起来优先）：
+      * 没配 ⇒ 什么都不做，行为与接入前逐字节一致；
+      * 配置格式错 ⇒ 一条 error，**一个都不挂**（不做"跳过坏的、挂好的"半接状态）；
+      * 单个服务器连不上 ⇒ 记结果，其余照常（manager 的 `drop_failed_servers`）。
+    """
+    from src.agents import mcp_bridge
+
+    try:
+        servers = mcp_bridge.build_servers()
+    except ValueError as e:
+        logging.error(
+            "MCP 配置有误，本次**不接入任何** MCP 服务器（AGENT_MCP_SERVERS）：%s", e)
+        return
+    if not servers:
+        logging.info("未配置 MCP 服务器（AGENT_MCP_SERVERS 为空）：只用本项目自有工具")
+        return
+
+    from agents.mcp import MCPServerManager
+
+    manager = await stack.enter_async_context(
+        MCPServerManager(servers, connect_in_parallel=True)
+    )
+    active = manager.active_servers
+    if not active:
+        logging.error(
+            "MCP 服务器**全部连接失败**（配了 %d 个）：本次运行没有任何 MCP 工具。"
+            "失败原因见上文的 MCP 客户端日志。", len(servers))
+        return
+
+    # 工具清单在这里**主动列一次**，三个理由：
+    #   ① 把"实际暴露了哪些工具"写进启动日志 —— 白名单写错一个名字，那个工具
+    #      就静默消失，没有这份日志就只能靠猜；
+    #   ② 数量超阈值时提前告警（工具过多会分散模型注意力，该收窄的是服务器）；
+    #   ③ 开缓存后这次就是唯一一次往返，之后每轮运行都读缓存。
+    threshold = mcp_bridge.tools_warn_threshold()
+    for server in active:
+        try:
+            tools = await server.list_tools()
+        except Exception as e:  # noqa: BLE001  拿不到清单不该影响启动
+            logging.warning("MCP 服务器 %s 的工具清单获取失败（不影响启动）：%s",
+                            server.name, e)
+            continue
+        names = ", ".join(t.name for t in tools) or "（无）"
+        logging.info("MCP 服务器 %s 已连接，暴露 %d 个工具：%s",
+                     server.name, len(tools), names)
+        if threshold and len(tools) > threshold:
+            logging.warning(
+                "MCP 服务器 %s 暴露了 %d 个工具（超过 %d）：工具过多会分散模型注意力，"
+                "建议用 tools_allow 收窄", server.name, len(tools), threshold)
+
+    from src.agents.runner import ENTRY_AGENT
+
+    mcp_bridge.attach(ENTRY_AGENT, active)
+    logging.info("MCP 接入完成：%d/%d 个服务器已挂到入口 agent（工具名带服务器前缀）",
+                 len(active), len(servers))
+
+
 @asynccontextmanager
 async def lifespan(_app):
     """应用生命周期：启动时做各项自检，关闭时释放资源。
@@ -322,6 +393,12 @@ async def lifespan(_app):
     # 指标永远为空而没有任何别的症状。守卫见
     # `tests/test_event_loop_lag.py::test_probe_registration_is_awaited`（AST 判据）。
     await stack.enter_async_context(loopwatch.watching())
+    # MCP 服务器接入。连不上**不拦住启动**（与其它自检同一口径），但结论必须留在
+    # 日志里 —— 它决定"这个实例到底有没有外部工具可用"。
+    try:
+        await _install_mcp_servers(stack)
+    except Exception as e:  # noqa: BLE001  接入失败不该改变能否启动
+        logging.error("MCP 接入失败（不影响启动，本次没有 MCP 工具）：%s", e)
     try:
         yield
     finally:
@@ -1525,10 +1602,12 @@ def _assert_session_readable(thread_id: str, tenant: str, user: str = "") -> Non
         raise _session_http_error(e) from e
     if owner is None:
         raise HTTPException(status_code=404, detail="会话不存在")
-    # ⚠️ 比的是 **(tenant, user) 元组**，不是拼接后的字符串。
-    # 拼接会让 (tenant="a/b", user="") 与 (tenant="a", user="b") 相等 ——
-    # 一个"用字符串做权限比较"的经典缺陷，且没有任何运行时症状。
-    if owner != (tenant, user):
+    # ⚠️ 判据走 `same_owner`（`app/sessions.py`），**不在这里自己写一份**。
+    # 读路径与 `claim()` 必须共用同一个"同一主体"定义：写成两处，就会出现
+    # "写进去能认、读出来不认"这类只在租户变更后才显形的错。
+    # 元组仍是元组、不拼字符串 —— 拼接会让 (tenant="a/b", user="") 与
+    # (tenant="a", user="b") 相等，一个"用字符串做权限比较"的经典缺陷。
+    if not same_owner(owner, (tenant, user)):
         metrics.inc("session_owner_mismatch_total")
         logging.warning("会话归属不符，拒绝读取：session=%s owner=%s/%s requester=%s/%s",
                         thread_id, owner[0], owner[1], tenant, user)
@@ -3869,10 +3948,21 @@ def admin_user_patch_v1(username: str, req: UserPatchReq, request: Request,
 
 
 @v1.delete("/admin/users/{username}")
-def admin_user_delete_v1(username: str, request: Request,
+async def admin_user_delete_v1(username: str, request: Request,
                                x_tenant_id: str = Header(default=""),
                                authorization: str = Header(default="")):
-    """DELETE /v1/admin/users/{username}：删除用户，并清掉他的全部会话。
+    """DELETE /v1/admin/users/{username}：删除用户，并清掉他名下**全部**数据。
+
+    清的不只是账号行与令牌，还有**会话**：运行现场、agent 侧跨轮历史、待审记录、
+    归属登记行，逐个走与 `DELETE /v1/sessions/{id}` **同一套** `_purge_thread`。
+
+    为什么非清不可（2026-10-22 补）：`users.username` 是主键，删掉之后可以再建一个
+    **同名**账号，而会话归属与长期记忆的隔离键都是这个用户名 —— 不清的话，
+    同名新账号会**直接继承**旧账号的会话与记忆。静默、无报错、看起来一切正常。
+
+    顺序为什么是"先列会话、再删用户行"：`threads_of_owner` 在存储不可用时抛 503，
+    此时**还没有任何改动**，"删了一半"的状态根本不会出现。反过来先删用户行的话，
+    一旦列不出来，账号已经没了、会话一条没清，接口只能报错，剩下手工补。
 
     ⚠️ **不能删自己**：把自己删掉之后，如果系统里没有别的管理员，就再也没人能
     管理账号了（只能改配置重启——而那需要能登进服务器的人）。
@@ -3881,24 +3971,45 @@ def admin_user_delete_v1(username: str, request: Request,
     "管理员 A 删管理员 B"以及两个管理员**并发**互删）：由存储层在同一个事务里
     带锁判定，见 `AccountStore._guard_last_admin`。
 
-    删除会**同批清掉他的会话**。只删用户行的话，他手上那个未过期的 access token
-    仍然带着有效的签名与 jti —— 而会话白名单里那条记录还在，于是它继续可用
-    直到自然过期。这类"删了用户却还能用"的窗口不报错、不告警，只能靠这里封住。
+    ⚠️ 令牌白名单也要清：只删用户行的话，他手上那个未过期的 access token 仍然带着
+    有效的签名与 jti —— 而会话白名单里那条记录还在，于是它继续可用直到自然过期。
+    这类"删了用户却还能用"的窗口不报错、不告警，只能靠这里封住。
     """
-    ident = _admin_ident(request, x_tenant_id, authorization)
+    ident = await _off(_admin_ident, request, x_tenant_id, authorization)
     if username == ident.user:
         raise HTTPException(status_code=409,
                             detail="不能删除当前登录的管理员账号（先让另一个管理员操作）")
     try:
-        deleted = _ACCOUNTS.delete_user(username, keep_active_admins=True,
-                                        admin_roles=config.AUTH_ADMIN_ROLES)
+        threads = await _off(_SESSIONS.threads_of_owner, username)
+    except SessionError as e:
+        metrics.inc("session_registry_errors_total", code=e.code)
+        raise _session_http_error(e) from e
+    try:
+        deleted = await _off(_ACCOUNTS.delete_user, username,
+                             keep_active_admins=True,
+                             admin_roles=config.AUTH_ADMIN_ROLES)
     except AccountError as e:
         raise _account_http_error(e) from e
     if not deleted:
         raise HTTPException(status_code=404, detail=f"用户不存在：{username}")
-    n = _AUTH.logout_all(username)
-    logging.info("管理员删用户：by=%s user=%s 清除会话数=%s", ident.user, username, n)
-    return {"deleted": True, "sessions_revoked": n}
+
+    purge = {}
+    for tid in threads:
+        purge[tid] = await _purge_thread(tid)
+    # 兜底再清一遍归属行：`threads_of_owner` 有条数上限（2000），超出的部分上面
+    # 没清到；而且归属行留着就是"同名重建能继承会话"的入口，必须无条件删。
+    leftover = await _off(_SESSIONS.release_owner, username)
+
+    # ⚠️ 长期记忆（`agent_memories`）落地时**必须在这里补一行按 `owner_key` 删**。
+    # 现在表还不存在，没有可删的；但不补的后果与上面会话那条一模一样：
+    # 同名重建的账号 `owner_key` 与旧账号完全相同 ⇒ 直接继承死者的记忆。
+    # 口径见 `PLAN_long_term_memory.md` §3.6。
+
+    n = await _off(_AUTH.logout_all, username)
+    logging.info("管理员删用户：by=%s user=%s 清除令牌=%s 清理会话=%d 残留归属=%s",
+                 ident.user, username, n, len(threads), leftover)
+    return {"deleted": True, "sessions_revoked": n,
+            "threads_purged": len(threads), "purge": purge}
 
 
 # ---- 加入申请的审批 ----
@@ -4391,6 +4502,40 @@ async def session_stop_v1(thread_id: str, request: Request,
     return {"thread_id": thread_id, "stopped": True, "run_id": run_id}
 
 
+async def _purge_thread(thread_id: str) -> dict:
+    """清掉一个会话的**全部**四类数据，返回每类到底删掉没有。
+
+    四类（缺一类都算不上"删干净"，与 `delete_session_v1` 的 docstring 同一份理由）：
+
+      1. 运行现场（`RunState` 快照，含整段历史与未交付正文）；
+      2. agent 侧跨轮历史（`agent_sessions` / `agent_messages`，下一轮模型会读到的东西）；
+      3. 待审队列记录（草稿正文与审核意见，独立存表）；
+      4. 归属登记行（不删会让这个 id 永久挂在旧主体名下）。
+
+    外加进程内那份"补充"增量索引（不落盘，但仍是用户内容的副本）。
+
+    为什么抽成函数：**删会话**与**删用户**必须走同一套清理。写成两份的后果不是
+    "代码重复"，而是两份会漂 —— 一边补了第五类、另一边没补，症状只会在某一类
+    数据的删除路径上出现，而两条路径看起来都"成功"了。
+
+    单项失败**不上抛**：删除是幂等的，明细里如实回报比让整个请求失败有用。
+    """
+    deleted = {
+        "run_state": await _delete_thread_state(thread_id),
+        # agent 侧那份跨轮历史（另一份数据，见 _delete_agent_session）。
+        "agent_history": await _delete_agent_session(thread_id),
+        "review": await _off(_REVIEW_QUEUE.remove, thread_id),
+        "ownership": await _off(_SESSIONS.release, thread_id),
+    }
+    # 进程内那份"任务执行中补充"的增量索引也要丢：它不落盘，但不丢的话，
+    # 同一个 thread_id 被复用时会带着上一段对话的补充 —— 而那份内容刚刚被承诺
+    # 删除过（合规口径里"删干净"包含它，它虽然只是副本，但仍是用户内容）。
+    from src.agents import supplements
+    supplements.clear(thread_id)
+    metrics.inc("session_deleted_total")
+    return deleted
+
+
 @v1.delete("/sessions/{thread_id}")
 async def session_delete_v1(thread_id: str, request: Request,
                             x_tenant_id: str = Header(default=""),
@@ -4432,19 +4577,7 @@ async def session_delete_v1(thread_id: str, request: Request,
     await _off(_rate_limit, request, thread_id)
     await _off(_assert_session_readable, thread_id, ident.tenant, ident.user)
 
-    deleted = {
-        "run_state": await _delete_thread_state(thread_id),
-        # agent 侧那份跨轮历史（另一份数据，见 _delete_agent_session）。
-        "agent_history": await _delete_agent_session(thread_id),
-        "review": await _off(_REVIEW_QUEUE.remove, thread_id),
-        "ownership": await _off(_SESSIONS.release, thread_id),
-    }
-    # 进程内那份"任务执行中补充"的增量索引也要丢：它不落盘，但不丢的话，
-    # 同一个 thread_id 被复用时会带着上一段对话的补充 —— 而那份内容刚刚被承诺
-    # 删除过（合规口径里"删干净"包含它，它虽然只是副本，但仍是用户内容）。
-    from src.agents import supplements
-    supplements.clear(thread_id)
-    metrics.inc("session_deleted_total")
+    deleted = await _purge_thread(thread_id)
     logging.info("会话已删除：session=%s tenant=%s deleted=%s",
                  thread_id, ident.tenant, deleted)
     return {"thread_id": thread_id, "deleted": deleted}

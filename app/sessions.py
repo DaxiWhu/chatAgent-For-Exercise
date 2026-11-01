@@ -76,6 +76,33 @@ class SessionError(Exception):
         self.code = code
 
 
+def same_owner(stored, current) -> bool:
+    """判断两个属主是否同一主体。**这是唯一的归属判据，调用方不许自己再写一份。**
+
+    入参都是 `(tenant, user)` 元组（不拼接成字符串 —— 见 `owner_of` 的说明）。
+
+    判据（2026-10-22 起，随"本 agent 不强制有租户"的口径一起改）：
+
+    - **两边 `user` 都非空 ⇒ 只比 `user`，租户不参与。**
+      理由：`users.tenant` 允许空串且那是合法状态（自助注册的账号就是如此），
+      用户还可能后来才加入某个租户。若按 `(tenant, user)` 整体比，同一个人的
+      旧会话会在他换租户那一刻**全部变成 403** —— 而报错信息只会说"属于其他主体"，
+      看起来像被别人占了，实际是被自己的租户变更踢出去的。
+    - **任一边 `user` 为空 ⇒ 退回按 `(tenant, user)` 整体比。**
+      空 `user` 的是机器调用方（API Key 时代的老行 `owner_user` 默认是空串，
+      现在仍是机器调用方的形态）。这条**不能省**：只比 `user` 的话，
+      所有机器调用方的 `user` 都是空串 ⇒ 互相相等 ⇒ 跨租户串会话。
+
+    也就是说：**人靠用户隔离，机器靠租户隔离**。两种主体混在一条规则里，
+    但边界是"user 空不空"，不是"是不是人"。
+    """
+    stored_tenant, stored_user = (stored[0] or ""), (stored[1] or "")
+    current_tenant, current_user = (current[0] or ""), (current[1] or "")
+    if stored_user and current_user:
+        return stored_user == current_user
+    return (stored_tenant, stored_user) == (current_tenant, current_user)
+
+
 class SessionRegistry:
     """会话属主登记表：`claim()` 登记并校验。"""
 
@@ -210,27 +237,32 @@ class SessionRegistry:
                             "VALUES (%s, %s, %s) ON CONFLICT (thread_id) DO NOTHING",
                             (thread_id, me[0], me[1]),
                         )
-                        # 刷新"最后活动时间"。数据保留脚本按它判超期 ——
-                        # 若按 `created_at`，一个创建于 100 天前、今天还在用的会话
-                        # 会被清掉，那是不可接受的破坏（对话还在继续）。
-                        #
-                        # ⚠️ 条件必须是**完整归属**（tenant + owner_user），不能只写
-                        # tenant：否则同租户的**另一个用户**就能拿别人的 thread_id
-                        # 去刷新时间戳，把这个 id 永久钉在保留期内 ——
-                        # 等价于让攻击者掌握清理的开关。
-                        cur.execute(
-                            "UPDATE session_owners SET updated_at = now() "
-                            "WHERE thread_id = %s AND tenant = %s AND owner_user = %s",
-                            (thread_id, me[0], me[1]),
-                        )
                         cur.execute(
                             "SELECT tenant, owner_user FROM session_owners "
                             "WHERE thread_id = %s",
                             (thread_id,),
                         )
                         row = cur.fetchone()
-                owner = (row[0], row[1]) if row else me
-                return owner == me, owner
+                        owner = (row[0], row[1]) if row else me
+                        allowed = same_owner(owner, me)
+                        # 刷新"最后活动时间"。数据保留脚本按它判超期 ——
+                        # 若按 `created_at`，一个创建于 100 天前、今天还在用的会话
+                        # 会被清掉，那是不可接受的破坏（对话还在继续）。
+                        #
+                        # ⚠️ 只在**归属相符**时刷新。判据走 `same_owner`，不写在 SQL 的
+                        # `WHERE` 里：一是"同一主体"的定义必须与读路径共用一份（写两处
+                        # 必然漂），二是否则同租户的另一个用户拿别人的 thread_id 请求
+                        # 一次就能把这个 id 永久钉在保留期内 —— 等价于让攻击者掌握
+                        # 清理的开关。
+                        #
+                        # 提前返回不会留下未提交的 INSERT：能走到"归属不符"这一步，
+                        # 说明 thread_id 本来就有主，那条 `ON CONFLICT DO NOTHING`
+                        # 什么都没插。
+                        if allowed:
+                            cur.execute(
+                                "UPDATE session_owners SET updated_at = now() "
+                                "WHERE thread_id = %s", (thread_id,))
+                return allowed, owner
             except SessionError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -256,7 +288,7 @@ class SessionRegistry:
                         status_code=503, code="session_registry_full")
                 self._mem[thread_id] = me
                 return True, me
-            return owner == me, owner
+            return same_owner(owner, me), owner
 
     def owner_of(self, thread_id: str):
         """读会话属主；**未登记**返回 None（供排障与测试）。
@@ -327,6 +359,80 @@ class SessionRegistry:
         """已登记会话数（内存模式；供 /metrics 或排障）。"""
         with self._lock:
             return len(self._mem)
+
+    def threads_of_owner(self, user: str, *, limit: int = 2000) -> list[str]:
+        """列出某个用户名下的全部 thread_id（**只读**，不删任何东西）。
+
+        用途：删用户前先把他的会话全找出来，逐个走与 `DELETE /v1/sessions/{id}`
+        **同一套**清理（运行现场 / SDK 历史 / 待审 / 归属行）。不这么做的话，
+        删号只清 `users` 行，而同名重建的账号会通过 `owner_user` **继承旧会话** ——
+        静默、无报错，且旧对话里可能什么都有。
+
+        `user` 为空时**返回空列表**而不是"所有人的会话"：空 `owner_user` 是机器
+        调用方的形态，按空值筛会把整个租户的机器会话一起交出去。
+
+        `limit` 是防守性上限（默认 2000）：只用它防"某个账号异常攒了几十万条
+        会话把删号请求拖死"，命中上限会打 warning 而不是静默截断 ——
+        静默截断的后果是"部分会话没清干净"，而调用方以为清干净了。
+        """
+        user = (user or "").strip()
+        if not self.enabled or not user:
+            return []
+        if self.dsn:
+            try:
+                with self._connect() as conn:
+                    self._ensure_schema(conn)
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT thread_id FROM session_owners "
+                            "WHERE owner_user = %s ORDER BY updated_at DESC "
+                            "LIMIT %s", (user, int(limit)))
+                        rows = cur.fetchall()
+            except Exception as e:  # noqa: BLE001
+                # 列不出来 ⇒ 抛，不返回空列表：返回空会让调用方以为"他没有会话"，
+                # 于是删号的响应里写"清干净了"，而实际一条都没清。
+                logging.error("按用户列会话失败（user=%s）：%s", user, e)
+                raise SessionError(
+                    "会话归属校验暂时不可用，请稍后重试",
+                    status_code=503, code="session_store_unavailable") from e
+            if len(rows) >= int(limit):
+                logging.warning(
+                    "用户 %s 名下的会话达到查询上限 %d，可能有会话未被清理",
+                    user, limit)
+            return [r[0] for r in rows]
+        with self._lock:
+            return [tid for tid, owner in self._mem.items()
+                    if (owner[1] or "") == user]
+
+    def release_owner(self, user: str) -> int:
+        """注销某个用户名下的全部会话归属，返回删掉的行数。
+
+        ⚠️ 必须先调 `threads_of_owner` 把内容清掉**再**调这个：归属行一删，
+        那些 thread_id 就变成"未登记"，`owner_of` 查不到 ⇒ 读路径直接 404，
+        但 SDK 里的对话原文还在库里。反过来（先删归属、内容清理失败）就会变成
+        "看不到但还在"，合规上最难受。
+        """
+        user = (user or "").strip()
+        if not self.enabled or not user:
+            return 0
+        if self.dsn:
+            try:
+                with self._connect() as conn:
+                    self._ensure_schema(conn)
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "DELETE FROM session_owners WHERE owner_user = %s",
+                            (user,))
+                        return cur.rowcount
+            except Exception as e:  # noqa: BLE001
+                logging.warning("按用户注销会话归属失败（user=%s）：%s", user, e)
+                return 0
+        with self._lock:
+            doomed = [tid for tid, owner in self._mem.items()
+                      if (owner[1] or "") == user]
+            for tid in doomed:
+                self._mem.pop(tid, None)
+            return len(doomed)
 
 
 def build_session_registry() -> SessionRegistry:

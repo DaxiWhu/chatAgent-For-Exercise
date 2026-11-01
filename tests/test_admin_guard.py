@@ -251,6 +251,11 @@ def test_admin_endpoints_enable_the_guard():
     那些"：PATCH 端点是用 `**fields` 展开传参的，按关键字筛会把唯一那个调用点漏掉
     （这正是本条守卫的第一版写法，实测它的 `seen` 是空的）。
     改密码走 `set_password`（只写 `password_hash`，动不了角色），因此不受此约束。
+
+    ⚠️ 两种调用形态都要扫（2026-10-22 补）：`store.delete_user(...)` 与
+    `_off(store.delete_user, ...)`。后者是"在事件循环里跑同步 DB 调用"的正确写法，
+    但它把 `delete_user` 从 `Call.func` 变成了 `Call.args[0]` —— 只认前者的话，
+    这个守卫会**静默失效**，而失效后测试仍是绿的（看起来守卫还在）。
     """
     src = pathlib.Path(__file__).resolve().parents[1] / "app" / "main.py"
     tree = ast.parse(src.read_text(encoding="utf-8"))
@@ -260,14 +265,21 @@ def test_admin_endpoints_enable_the_guard():
         if not isinstance(node, ast.Call):
             continue
         fn = node.func
-        if not (isinstance(fn, ast.Attribute) and fn.attr in ("update_user", "delete_user")):
+        target = None
+        if isinstance(fn, ast.Attribute) and fn.attr in ("update_user", "delete_user"):
+            target = fn.attr
+        elif (isinstance(fn, ast.Name) and fn.id == "_off" and node.args
+              and isinstance(node.args[0], ast.Attribute)
+              and node.args[0].attr in ("update_user", "delete_user")):
+            target = node.args[0].attr
+        if target is None:
             continue
         kwargs = {k.arg: ast.unparse(k.value) for k in node.keywords}
-        seen.append((node.lineno, fn.attr))
+        seen.append((node.lineno, target))
         assert kwargs.get("keep_active_admins") == "True", (
-            f"第 {node.lineno} 行的 {fn.attr} 没打开最后管理员守卫：{kwargs}")
+            f"第 {node.lineno} 行的 {target} 没打开最后管理员守卫：{kwargs}")
         assert kwargs.get("admin_roles") == "config.AUTH_ADMIN_ROLES", (
-            f"第 {node.lineno} 行的 {fn.attr} 没把管理员角色集合传下去：{kwargs}")
+            f"第 {node.lineno} 行的 {target} 没把管理员角色集合传下去：{kwargs}")
     assert sorted(a for _l, a in seen) == ["delete_user", "update_user"], seen
 
 

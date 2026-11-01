@@ -67,24 +67,26 @@ def test_release_is_a_noop_when_disabled():
     assert SessionRegistry(enabled=False).release("t") is False
 
 
-def test_claim_refreshes_activity_only_for_the_matching_tenant(monkeypatch):
-    """刷新"最后活动时间"的 SQL **必须带租户条件**。
+def test_claim_refreshes_activity_only_for_the_matching_owner(monkeypatch):
+    """刷新"最后活动时间"的 UPDATE **只在归属相符时发出**。
 
-    数据保留脚本按 `updated_at` 判超期。若这句 UPDATE 不限定租户，
-    任何人拿自己的租户名请求一次别人的 thread_id（哪怕会被判 403），
-    都能把那条会话的时间戳刷新 —— 等于把"什么时候清理"的开关交给了攻击者，
-    被盯上的会话可以永久免于清理。
+    数据保留脚本按 `updated_at` 判超期。若归属不符也刷新，任何人拿别人的
+    thread_id 请求一次（哪怕会被判 403），都能把那条会话的时间戳刷新 ——
+    等于把"什么时候清理"的开关交给了攻击者，被盯上的会话可以永久免于清理。
 
-    这里断言的是**发出去的 SQL 文本**：这条约束只存在于语句里，
-    没有任何返回值的差异能反映它（`claim` 照常返回 False）。
+    2026-10-22 起判据**不在 SQL 里**（原先写 `WHERE tenant=%s AND owner_user=%s`），
+    而是先算 `same_owner` 再决定发不发这条 UPDATE。原因是"同一主体"的定义必须与
+    读路径共用一份（`app/main.py::_assert_session_readable`），写进 SQL 就必然漂成
+    两套。所以这里断言的是**有没有发 UPDATE** —— 这比"SQL 文本里有没有 tenant"
+    更直接地守住同一件事，且不随判据搬家而失效。
 
-    ⚠️ 桩件返回的是 **2 元组**（真实表的 `SELECT tenant, owner_user` 就是两列）。
+    ⚠️ 桩件返回 **2 元组**（真实表的 `SELECT tenant, owner_user` 就是两列）。
     此前它返回 1 元组 `("acme",)`，而 `claim` 里 `row[0], row[1]` 会 IndexError ——
     这个错误当时被"存储异常一律放行"的 fail-open 吞掉了，于是用例**靠 bug 通过**。
-    2026-10-05 归属校验改成 fail-closed 之后，桩件的缺陷立刻暴露成
-    `SessionError`。修桩件而不是放宽断言：它本来就该长得像真实返回。
+    修桩件而不是放宽断言：它本来就该长得像真实返回。
     """
     executed: list[str] = []
+    stored = {"row": ("acme", "alice")}
 
     class _Cur:
         rowcount = 0
@@ -93,7 +95,7 @@ def test_claim_refreshes_activity_only_for_the_matching_tenant(monkeypatch):
             executed.append(" ".join(sql.split()))
 
         def fetchone(self):
-            return ("acme", "")
+            return stored["row"]
 
         def __enter__(self):
             return self
@@ -117,15 +119,22 @@ def test_claim_refreshes_activity_only_for_the_matching_tenant(monkeypatch):
     monkeypatch.setattr(pg, "connect", lambda dsn: _Conn())
 
     reg = SessionRegistry(dsn="postgresql://fake", enabled=True)
-    reg.claim("t-1", "acme")
 
+    # ① 归属相符（同一个人，换了个租户）⇒ 放行，并刷新活动时间
+    ok, owner = reg.claim("t-1", "globex", "alice")
+    assert ok is True, "同一个人换租户后归属被判成别人的"
+    assert owner == ("acme", "alice"), "属主不该被后来的请求改写"
     updates = [s for s in executed if s.upper().startswith("UPDATE")]
-    assert updates, "claim 没有刷新 updated_at —— 清理会按「创建时间」误判超期"
-    assert any("updated_at" in s for s in updates), (
-        f"claim 没有刷新最后活动时间，实际执行：{updates}"
-    )
-    assert all("tenant" in s for s in updates), (
-        f"刷新活动时间的语句没有限定租户：{updates}\n"
+    assert updates, "归属相符却没刷新 updated_at —— 清理会按「创建时间」误判超期"
+    assert any("updated_at" in s for s in updates), updates
+
+    # ② 归属不符（另一个用户）⇒ 一条 UPDATE 都不能发
+    executed.clear()
+    ok2, _ = reg.claim("t-1", "acme", "bob")
+    assert ok2 is False
+    leaked = [s for s in executed if s.upper().startswith("UPDATE")]
+    assert not leaked, (
+        f"归属不符仍然刷新了活动时间：{leaked}\n"
         "任何人都能借一次被拒的请求给别人的会话续命，"
         "被盯上的会话将永久免于清理。"
     )

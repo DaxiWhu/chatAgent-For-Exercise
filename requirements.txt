@@ -61,6 +61,12 @@ langsmith[openai-agents]>=0.9.1
 # 而跨轮对话历史的后端（官方 SQLAlchemySession）就在这个 SDK 的扩展里 ——
 # 少了它，历史一份也不会有。
 openai-agents>=0.20
+# MCP 客户端：`agents.mcp` 的运行时依赖（stdio 子进程传输、ClientSession、内容块类型）。
+# ⚠️ 它本来是 openai-agents 的**传递依赖**，这里显式列出有两个理由：
+#   ① `src/agents/mcp_bridge.py` 直接 `from mcp.types import ...`（转换层按内容块类型
+#      分支），依赖一个只存在于传递关系里的包，等于上游调整依赖树时我们会静默失去类型；
+#   ② 直接 import 的包必须有显式版本约束，否则"这次构建装到哪个版本"是不可复现的。
+mcp>=1.0
 # 官方 SQLAlchemySession 用它建异步引擎（PG 的 agent_sessions / agent_messages 两张表）。
 # SDK 把它列为可选 extra（`pip install "openai-agents[sqlalchemy]"`），这里显式列出：
 # **选了 PostgreSQL 会话后端它就必需**。漏装的症状是运行期才炸（`session_for` 建不起来

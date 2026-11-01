@@ -99,5 +99,8 @@ lupa==2.8
 # ---- agent 链路 ----
 # 官方 Agents SDK：Runner / 跨轮历史会话 / 护栏 / handoff。
 openai-agents==0.20.0
+# MCP 客户端（agents.mcp 的依赖，mcp_bridge 直接 import mcp.types）。
+# 版本来自本机实测（2026-10-23）：SDK 0.20.0 配套的就是这一版。
+mcp==1.27.0
 # 官方 SQLAlchemySession 的异步引擎（PG 会话表）。
 sqlalchemy==2.0.48
