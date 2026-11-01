@@ -35,12 +35,38 @@
   而产出 0 字。现在失败后冷却期内**零等待**直接判稠密路不可用，到期自动重试
   （上游恢复即自愈，不必重启）。Qdrant 分支同样受它约束 —— 那条路构造时要灌库（调
   embedding），embedding 用不了时只会白撞一次。
-- **守卫**：`tests/test_rag_embedding_degrade.py`（12 条：hybrid 降级 / semantic 回退 /
-  冷却缓存与 `=0` 关闭 / 两路全挂仍抛 / 反方向单路 / 指标计数），
+- **`_is_embedding_fault`（新）区分"库挂了"与"embedding 挂了"**：`QdrantRetriever` /
+  `PgVectorRetriever` 的构造是"连库 → 灌库（调 embedding）"两段，异常从**同一个**
+  `except` 冒出来。接上真 Qdrant 之后实测到代价：一次 402 在 hybrid 路径上被撞了
+  **三次**（Qdrant 分支 → `_make_dense_retriever` 的 qdrant 分支 → 内存后端），
+  首次构建 12.9 秒。判据只看异常的**来源模块根**：OpenAI SDK 会把 httpx 的错包成
+  自己的 `APIStatusError` / `APIConnectionError`，模块名是 `openai.*`；qdrant 抛的是
+  `qdrant_client.http.exceptions.*`。不看状态码、不看 message 文案（文案会随网关变）。
+  反过来也守住了：Qdrant 抖一下**不会**白冷却 60 秒，把别人的向量路一起拖下水。
+- **缓存不再把降级状态钉住（`src/rag/pool.py`）**：检索器是按租户缓存的单例，而
+  `reset_retrievers` 在生产代码里**没有任何调用点**。于是"embedding 欠费时建出来的那一份"
+  （稠密路是 `NullRetriever`）会被缓存到进程结束 —— 充值之后日志不再报错、检索质量
+  却没回来，也没有任何报错可查。现在 `_build_tracked` 记下"这一份是在降级状态下建的"，
+  冷却过期后的第一次 `get_retriever` 重建一次：成功即永久恢复，失败则冷却重新点亮
+  （重建频率上限 = 冷却窗口，不会退化成"每次请求白撞上游"）。
+- **`tests/conftest.py` 打开 huggingface 离线模式**（`HF_HUB_OFFLINE` /
+  `TRANSFORMERS_OFFLINE`）：`parse_pdf` 里的 `AutoTokenizer.from_pretrained` 每次都会
+  先去 hub 要一次模型元数据；本机开着 `http_proxy`（端口每次会话都变）时这一步卡在
+  TLS 握手上 —— 不抛错、不超时、CPU 为 0，全量套件停在
+  `test_cite_images.py::test_table_chunk_gets_a_cropped_image` **二十分钟**不动，
+  而同一份代码在代理活着时 4 分半跑完。看起来像"改动导致卡死"，实际与代码无关。
+- **守卫**：`tests/test_rag_embedding_degrade.py`（19 条：hybrid 降级 / semantic 回退 /
+  冷却缓存与 `=0` 关闭 / 两路全挂仍抛 / 反方向单路 / 指标计数 / 两种故障不混淆 /
+  过期自愈 / 冷却期内不自愈），
   `tests/conftest.py` 新增 autouse fixture 在用例间还原进程级冷却状态
   —— 否则一条降级用例点亮的 60 秒冷聚会把**之后**所有走稠密路的用例变成
-  `NullRetriever`，且单跑该文件是绿的、只在全量里红。
-- 全量 2367 passed / 14 skipped（含 RAG 相关 245 条）。
+  `NullRetriever`，且单跑该文件是绿的、只在全量里红。变异 8/8 被守住
+  （`tmp_probe/mutate_embed_fault.py`）。
+- 实测（本机 Qdrant 1.20.1-dev 起着、embedding 仍 402）：首次构建 5.04 秒
+  （一次 402 往返）→ 第二三次 0.041 / 0.043 秒，检索 0.001 秒，Top1 命中且分数是
+  真实 BM25 分 34.17（不再是被 RRF 改写的 0.016）。`rag_chunks` 集合能建出来
+  （1024 维），**但灌不进向量** —— 灌库本身要调 embedding。
+- 全量 2373 passed / 14 skipped。
 
 ### 破坏性变更 — 主网关换成 DeepSeek，变量名 `AGNES_*` → `LLM_*`（2026-11-01）
 

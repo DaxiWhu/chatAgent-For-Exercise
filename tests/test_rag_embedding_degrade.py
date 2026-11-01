@@ -19,6 +19,7 @@
 
 import pytest
 
+import src.rag.pool as P
 import src.rag.retrieval as R
 from src import observability
 
@@ -271,3 +272,176 @@ def test_null_dense_does_not_count_as_failure(sink):
 
     assert r.search("限流")
     assert sink.stages("rag_retrieval_degraded_total") == []
+
+
+# ---------------- "库挂了" 与 "embedding 挂了" 不能混 ----------------
+def _fault(module, msg="boom"):
+    """造一个"看起来来自某个模块"的异常。
+
+    为什么要伪造模块名而不是真去构造 `openai.APIStatusError`：它需要
+    message/response/body 一整套参数，而 `_is_embedding_fault` 的判据**只有**
+    "异常来自哪个模块"这一条。真构造只会把测试绑死在 SDK 的构造签名上。
+    """
+    cls = type("Boom", (RuntimeError,), {})
+    cls.__module__ = module
+    return cls(msg)
+
+
+class _OkDense:
+    """能用的内存稠密后端替身：只为证明"回退继续往下走"。"""
+
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    def search(self, query, top_k=3):
+        return [(_chunks()[0], 0.5)][:top_k]
+
+
+def test_embedding_fault_from_qdrant_stops_the_retries(monkeypatch):
+    """★ Qdrant 构造失败若来自 embedding，后面两个分支不许再各撞一次。
+
+    2026-11-01 实测：一次 402 在 hybrid 路径上被撞了**三次**
+    （Qdrant 分支 → `_make_dense_retriever` 的 qdrant 分支 → 内存后端），
+    首次构建 12.9 秒。接上 Qdrant 之后这条路径才真正跑得到，之前测不出来。
+    """
+    attempts = []
+
+    class _QdrantBoom:
+        def __init__(self, *a, **k):
+            attempts.append("qdrant")
+            raise _fault("openai", "Error code: 402 - insufficient balance")
+
+    _BoomEmbedding.calls = 0
+    monkeypatch.setattr(R, "EMBEDDING_BACKEND", "hybrid")
+    monkeypatch.setattr(R, "VECTOR_STORE", "qdrant")
+    monkeypatch.setattr(R, "embedding_configured", lambda: True)
+    monkeypatch.setattr(R, "QdrantRetriever", _QdrantBoom)
+    monkeypatch.setattr(R, "EmbeddingRetriever", _BoomEmbedding)
+
+    r = R.build_retriever(_chunks())
+
+    assert isinstance(r, R.HybridRetriever)
+    assert r.search("限流"), "稠密路挂了，稀疏路必须照常出货"
+    assert len(attempts) == 1, f"Qdrant 被撞了 {len(attempts)} 次"
+    assert _BoomEmbedding.calls == 0, "已经确认 embedding 用不了，不该再试内存后端"
+    assert R.embedding_down() is True
+
+
+def test_vector_store_fault_does_not_open_the_cooldown(monkeypatch):
+    """反方向：**库连不上**不等于 embedding 挂了，白冷却 60 秒会连累别人。
+
+    这条防的是"判据写成 `except Exception` 就顺手冷却"——
+    症状是 Qdrant 抖一下，整个服务 60 秒内所有检索都失去向量那一路，且零报错。
+    """
+    monkeypatch.setattr(R, "EMBEDDING_BACKEND", "semantic")
+    monkeypatch.setattr(R, "VECTOR_STORE", "qdrant")
+    monkeypatch.setattr(R, "embedding_configured", lambda: True)
+    monkeypatch.setattr(
+        R, "QdrantRetriever",
+        type("_QdrantDown", (), {
+            "__init__": lambda self, *a, **k: (_ for _ in ()).throw(
+                _fault("qdrant_client.http.exceptions", "Connection refused"))
+        }),
+    )
+    monkeypatch.setattr(R, "EmbeddingRetriever", _OkDense)
+
+    dense = R._make_dense_retriever(_chunks())
+
+    assert R.embedding_down() is False
+    assert isinstance(dense, _OkDense), "库挂了要回退到内存后端，不能直接判稠密路不可用"
+
+
+def test_error_module_root_is_the_only_judgement():
+    """判据只看模块根，不看 message 文案（文案会随网关变，不能当契约）。"""
+    assert R._is_embedding_fault(_fault("openai", "anything")) is True
+    assert R._is_embedding_fault(_fault("openai._exceptions", "anything")) is True
+    assert R._is_embedding_fault(_fault("qdrant_client.http.exceptions", "402")) is False
+    assert R._is_embedding_fault(RuntimeError("Error code: 402")) is False
+
+def test_semantic_qdrant_embedding_fault_also_stops(monkeypatch):
+    """单路 semantic 同理：Qdrant 那一步撞在 embedding 上，就别退到内存后端再撞一次。"""
+    _BoomEmbedding.calls = 0
+    monkeypatch.setattr(R, "EMBEDDING_BACKEND", "semantic")
+    monkeypatch.setattr(R, "VECTOR_STORE", "qdrant")
+    monkeypatch.setattr(R, "embedding_configured", lambda: True)
+    monkeypatch.setattr(
+        R, "QdrantRetriever",
+        type("_Qdrant402", (), {
+            "__init__": lambda self, *a, **k: (_ for _ in ()).throw(
+                _fault("openai", "Error code: 402"))
+        }),
+    )
+    monkeypatch.setattr(R, "EmbeddingRetriever", _BoomEmbedding)
+
+    r = R.build_retriever(_chunks())
+
+    assert isinstance(r, R.BM25Retriever), "单路稠密挂了要退成关键词检索"
+    assert _BoomEmbedding.calls == 0
+    assert R.embedding_down() is True
+
+
+# ---------------- 缓存会把降级状态一起钉住（pool 侧）----------------
+@pytest.fixture
+def pool_state(monkeypatch):
+    """清空 `src.rag.pool` 的模块级缓存，并让"构建"与"是否冷却中"可控。
+
+    ⚠️ patch 的目标必须是函数真正读状态的那个模块（`src.rag.pool` 的 `build_retriever`），
+    理由见 `tests/test_tenant_isolation.py::isolated_retriever_state` 的说明。
+    """
+    monkeypatch.setattr(P, "_RETRIEVER", None)
+    monkeypatch.setattr(P, "_CHUNKS", _chunks())
+    monkeypatch.setattr(P, "_TENANT_RETRIEVERS", {})
+    monkeypatch.setattr(P, "_DEGRADED", set())
+    state = {"down": True, "built": 0}
+    monkeypatch.setattr(R, "embedding_down", lambda: state["down"])
+
+    def fake_build(chunks, tenant=None):
+        state["built"] += 1
+        return {"tenant": tenant, "n": state["built"]}
+
+    monkeypatch.setattr(P, "build_retriever", fake_build)
+    return state
+
+
+def test_degraded_retriever_is_revived_after_the_cooldown(pool_state):
+    """★ 冷却过期后必须重建 —— 否则这个进程**永远**只用关键词检索。
+
+    检索器是缓存单例，而 `reset_retrievers` 在生产代码里没有任何调用点。
+    不重建的后果是"充值了、日志也不报错了，检索质量却没回来"，
+    且没有任何报错可查。
+    """
+    first = P.get_retriever("acme")
+    assert pool_state["built"] == 1
+    assert "acme" in P._DEGRADED, "降级时建出来的这一份必须被记下来"
+
+    assert P.get_retriever("acme") is first, "冷却期内必须继续用缓存"
+    assert pool_state["built"] == 1, "冷却期内重建 = 把'每次请求白撞上游'搬回来"
+
+    pool_state["down"] = False
+    revived = P.get_retriever("acme")
+    assert revived is not first, "冷却过期后没有重建"
+    assert pool_state["built"] == 2
+    assert "acme" not in P._DEGRADED
+
+    assert P.get_retriever("acme") is revived, "恢复之后不该再重建"
+    assert pool_state["built"] == 2
+
+
+def test_no_tenant_path_also_revives(pool_state):
+    """无租户语境（CLI/脚本走的那条）用的是另一段分支，同样必须能自愈。"""
+    first = P.get_retriever()
+    assert pool_state["built"] == 1
+
+    pool_state["down"] = False
+    assert P.get_retriever() is not first
+    assert pool_state["built"] == 2
+
+
+def test_healthy_build_is_not_marked_degraded(pool_state):
+    """反方向：正常建出来的不该被标记，否则每次读缓存都白重建一次索引。"""
+    pool_state["down"] = False
+    r = P.get_retriever("acme")
+
+    assert not P._DEGRADED
+    assert P.get_retriever("acme") is r
+    assert pool_state["built"] == 1

@@ -1629,6 +1629,28 @@ def embedding_down() -> bool:
     return time.monotonic() < _EMBED_DOWN_UNTIL
 
 
+def _is_embedding_fault(exc: BaseException) -> bool:
+    """构造期异常到底是"embedding 挂了"还是"向量库挂了"。
+
+    exc: `QdrantRetriever` / `PgVectorRetriever` 构造时抛出的异常。
+
+    为什么要分：这两个后端的构造都是"连库 → 灌库（调 embedding）"两段，异常从
+    **同一个** except 里冒出来。分不清的后果是双向的：
+
+    - 把"库挂了"当成 embedding 挂了 ⇒ 白冷却 60 秒，别人检索跟着降级（本可避免）；
+    - 把"embedding 挂了"当成库挂了 ⇒ 同一次构建里再试一次（下一个分支），
+      又一次 402 往返。2026-11-01 实测：Qdrant 分支 + `_make_dense_retriever`
+      的 qdrant 分支 + 内存后端，**三次各撞一次**，首次构建 12.9 秒。
+
+    判据只看异常的**来源模块**：OpenAI SDK 会把底层 httpx 的错包成自己的
+    `APIStatusError` / `APIConnectionError` / `APITimeoutError`，模块名一律是
+    `openai.*`；而 qdrant_client 抛的是 `qdrant_client.http.exceptions.*`。
+    所以"模块根是 openai"就足以判 embedding —— 不去猜状态码，也不看 message
+    文本（文本会随网关变，而且我们本来就是"尽量别把上游文案当契约"）。
+    """
+    return type(exc).__module__.split(".")[0] == "openai"
+
+
 def _note_embed_failure(exc: BaseException) -> None:
     """记一次"embedding 真的用不了"，并开启冷却窗口。
 
@@ -1773,6 +1795,10 @@ def _make_dense_retriever(chunks, tenant=None):
             return r.dense
         except Exception as e:  # noqa: BLE001  （任何失败都回退，不让服务崩）
             logging.warning("Qdrant 后端不可用（%s），回退内存向量检索。", e)
+            if _is_embedding_fault(e):
+                # 已经证明 embedding 用不了 ⇒ 点亮冷却，让后面的分支别再撞一次。
+                _note_embed_failure(e)
+                return NullRetriever()
     if VECTOR_STORE == "pg":
         try:
             r = PgVectorRetriever(chunks, tenant=tenant)
@@ -1781,6 +1807,9 @@ def _make_dense_retriever(chunks, tenant=None):
             return r
         except Exception as e:  # noqa: BLE001  （任何失败都回退，不让服务崩）
             logging.warning("pgvector 后端不可用（%s），回退内存向量检索。", e)
+            if _is_embedding_fault(e):
+                _note_embed_failure(e)
+                return NullRetriever()
     try:
         return EmbeddingRetriever(chunks)
     except Exception as e:  # noqa: BLE001  内存后端也起不来 ⇒ 稠密路整体不可用
@@ -1858,6 +1887,9 @@ def build_retriever(chunks, tenant=None):
             except Exception as e:  # noqa: BLE001
                 logging.warning("Qdrant 后端不可用（%s），回退 BM25 + %s 稠密检索。",
                                 e, VECTOR_STORE)
+                if _is_embedding_fault(e):
+                    # 灌库那一步就撞在 embedding 上 ⇒ 后面两个分支不必再各撞一次。
+                    _note_embed_failure(e)
         dense = _make_dense_retriever(chunks, tenant)
         if isinstance(dense, NullRetriever):
             # 冷却 / embedding 不可用：sparse 仍然建得起来（进程内 BM25，微秒级），

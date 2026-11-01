@@ -34,6 +34,7 @@ import os
 from typing import Any
 
 from ..envutil import env_int
+from . import retrieval as _retrieval
 from .parse_cache import load_chunks_cached
 from .retrieval import build_retriever, load_chunks, tenant_label
 
@@ -58,6 +59,10 @@ _CHUNKS: list[Any] | None = None
 
 #: 按租户缓存的检索器。**必须有界** —— 理由见模块 docstring。
 _TENANT_RETRIEVERS: dict[str, Any] = {}
+
+#: 哪些缓存键是"在 embedding 不可用时建出来的"（见 `_build_tracked`）。
+#: 只在缓存命中路径上读一次，用来决定要不要趁冷却过期时重建。
+_DEGRADED: set[str] = set()
 
 #: 上限取小值：需要隔离的是**少数租户**，而不是"任意租户字符串"。
 _TENANT_CACHE_MAX = env_int("RAG_TENANT_CACHE_MAX", 8, lo=1)
@@ -96,6 +101,37 @@ def load_chunks_once() -> list[Any]:
     return _CHUNKS
 
 
+def _build_tracked(key: str, chunks, tenant: str | None):
+    """构建检索器，并记下"这一次是在降级状态下建出来的"。
+
+    key: 缓存键（租户串，无租户时是空串）。
+    chunks: 已装配的块列表。
+    tenant: 传给 `build_retriever` 的租户（None = 进程级默认）。
+
+    为什么要记：**缓存会把降级状态一起钉住**。embedding 欠费时建出来的
+    `HybridRetriever` 里，稠密那一路是 `NullRetriever` —— 它被缓存之后，
+    即使冷却到期、上游恢复正常，这个进程也**永远**只用关键词检索，
+    直到有人重启或调 `reset_retrievers`（生产代码里没有任何地方调它）。
+    症状是"充值了、日志里也没报错了，但检索质量没回来"，且没有任何报错。
+    """
+    r = build_retriever(chunks, tenant=tenant)
+    if _retrieval.embedding_down():
+        _DEGRADED.add(key)
+    else:
+        _DEGRADED.discard(key)
+    return r
+
+
+def _needs_revive(key: str) -> bool:
+    """缓存的这一份是不是"上次构建时稠密路不可用"，且冷却已经过期。
+
+    冷却未过期时**不重建** —— 那等于把"每次请求都白撞一次上游"搬回来
+    （`RAG_EMBED_RETRY_COOLDOWN` 存在的理由）。所以重建频率上限就是冷却窗口：
+    一分钟最多试一次，成功就永久恢复，失败就再等一分钟。
+    """
+    return key in _DEGRADED and not _retrieval.embedding_down()
+
+
 def get_retriever(tenant: str | None = None):
     """取检索器，按租户分片缓存（懒加载）。
 
@@ -113,18 +149,18 @@ def get_retriever(tenant: str | None = None):
     if tenant is None:
         # 无租户语境（CLI/脚本/原有调用点）：用进程级默认值，且不占分片缓存，
         # 保持"整个进程只构建一次"的原有语义。
-        if "" not in _TENANT_RETRIEVERS:
-            _TENANT_RETRIEVERS[""] = build_retriever(chunks)
+        if "" not in _TENANT_RETRIEVERS or _needs_revive(""):
+            _TENANT_RETRIEVERS[""] = _build_tracked("", chunks, None)
             logging.info("RAG 检索器构建完成：%d 个片段（DOCS_DIR=%s，租户=%s）",
                          len(chunks), DOCS_DIR, tenant_label(None))
         return _TENANT_RETRIEVERS[""]
 
     key = tenant.strip()
     hit = _TENANT_RETRIEVERS.get(key)
-    if hit is not None:
+    if hit is not None and not _needs_revive(key):
         return hit
 
-    if len(_TENANT_RETRIEVERS) >= _TENANT_CACHE_MAX:
+    if hit is None and len(_TENANT_RETRIEVERS) >= _TENANT_CACHE_MAX:
         # 丢一个最老的（dict 保序，取第一个插入的）。不用 LRU 是有意的：
         # 这里的访问分布是"少数租户长期活跃"，FIFO 足够，而 LRU 要额外维护
         # 访问顺序（并发下还要加锁），复杂度换不来实际收益。
@@ -133,7 +169,7 @@ def get_retriever(tenant: str | None = None):
         logging.warning("检索器租户分片缓存已满（上限 %d），丢弃租户 %s 的分片",
                         _TENANT_CACHE_MAX, evicted or "<默认>")
 
-    r = build_retriever(chunks, tenant=key)
+    r = _build_tracked(key, chunks, key)
     _TENANT_RETRIEVERS[key] = r
     logging.info("RAG 检索器构建完成：%d 个片段（租户=%s）",
                  len(chunks), tenant_label(key))
@@ -156,3 +192,4 @@ def reset_retrievers() -> None:
     _RETRIEVER = None
     _CHUNKS = None
     _TENANT_RETRIEVERS.clear()
+    _DEGRADED.clear()

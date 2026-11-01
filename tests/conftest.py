@@ -13,6 +13,25 @@ if ROOT not in sys.path:
 from tests import _envscan  # noqa: E402
 
 # ===========================================================================
+# 一律离线跑本地模型缓存：否则一次死代理就能让全量"无声挂住"
+# ===========================================================================
+# 实测（2026-11-01）：整机开着 `http_proxy` 指向一个本地代理，而那个代理的端口
+# 每次开会话都可能变。此时 `docling_loader.parse_pdf` → `AutoTokenizer.from_pretrained`
+# → `hf_hub_download` 会**先去 hub 要一次模型元数据**，请求被塞进那个代理后卡在
+# TLS 握手上：不抛错、不超时、CPU 为 0 —— 全量套件停在
+# `test_cite_images.py::test_table_chunk_gets_a_cropped_image` 二十分钟不动。
+#
+# 恶劣之处在于**方向**：它看起来像"代码改动导致测试变慢/卡死"，实际与代码无关；
+# 而且同一份代码在代理活着的时段是 4 分钟跑完的 —— 于是"时快时慢"会被误当成
+# 随机 flaky 而放过。
+#
+# 这几个模型（docling layout / figure classifier / tokenizer）本来就在本地缓存里，
+# 测试也不该依赖网络。`setdefault` 保留外部覆盖的能力（真要联网下载时
+# `HF_HUB_OFFLINE=0 pytest ...` 即可）。
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+# ===========================================================================
 # 测试环境隔离：开发机上的 .env 不得影响测试结论
 # ===========================================================================
 # 真实踩过的坑（2026-09-29）：往 `.env` 里补了一行 `SERVE_API_KEY=…`，全量立刻
