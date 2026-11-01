@@ -15,7 +15,6 @@ sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 
 import numpy as np
-from langchain_openai import OpenAIEmbeddings
 
 import src.rag.retrieval as R
 
@@ -66,11 +65,10 @@ def write_corpus(tmp):
             f.write(d["content"])
 
 
-emb = OpenAIEmbeddings(
-    model=R.EMBEDDING_MODEL, api_key=R.EMBEDDING_API_KEY,
-    base_url=R.EMBEDDING_API_BASE or None,
-    chunk_size=R.EMBEDDING_BATCH, max_retries=3,
-)
+# 走生产同一套构造：以前在这里自己 new 一个，漏了 check_embedding_ctx_length
+# 与 timeout —— 算出来的向量是"被 tiktoken 改写过的文本"的向量，
+# 整份评测结论都建立在错数据上（见 src/rag/retrieval.py::_new_embedder）。
+emb = R._new_embedder()
 
 print("=" * 104)
 print(f"embedding={R.EMBEDDING_MODEL}  查询={len(QUERIES)} 条"

@@ -175,13 +175,18 @@ def test_scanner_actually_finds_the_known_call_sites():
     #   app/main.py              ChatOpenAI ×1
     #   app/review_queue.py      httpx.post ×1
     #   src/agents/model.py      AsyncOpenAI ×1
-    #   src/rag/retrieval.py     OpenAIEmbeddings ×3 + httpx.post ×1
+    #   src/rag/retrieval.py     OpenAIEmbeddings ×1 + httpx.post ×1 + ChatOpenAI ×1
     #   src/rag/qdrant_store.py  QdrantClient ×1
     #   src/rag/contextualizer.py OpenAI ×1
     #   src/rag/image_describer.py OpenAI ×1
+    #
+    # 2026-11-01：下限从 10 降到 9，**不是**扫描面缩小 —— 是 retrieval.py 里三处
+    # `OpenAIEmbeddings(...)` 收成了 `_new_embedder()` 一处（三个稠密后端共用，
+    # 参数漏一处就会有一个后端悄悄返回错向量）。出站点本身确实少了 2 个，
+    # 而"每个出站点都显式带 timeout"这条约束反而更稳了：现在只有一处要守。
     total = sum(len(_scan(ROOT / rel)) for rel in SCANNED_FILES)
-    assert total >= 10, (
-        f"扫描面只找到 {total} 个出站点，少于已知的 10 个 —— "
+    assert total >= 9, (
+        f"扫描面只找到 {total} 个出站点，少于已知的 9 个 —— "
         "守卫已经空跑了（文件改名 / 调用被挪走 / 清单路径写错）。"
         "请先确认出站点还在，再更新这里。"
     )

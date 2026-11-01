@@ -11,6 +11,49 @@
 
 ## [Unreleased]
 
+### 修复 — `check_embedding_ctx_length` 让中文向量张冠李戴（2026-11-01）
+
+embedding 余额恢复后第一次真跑，症状极怪：**检索永远有结果，排序却像随机**。
+根因不在网关、也不在语料，而在 langchain 的一个默认值。
+
+`langchain_openai.OpenAIEmbeddings` 的 `check_embedding_ctx_length` 默认 **True**，
+它先用 tiktoken（OpenAI 的分词器）把文本 encode 成 token id、再 decode 回字符串，
+才发给网关。中文经这一趟就不再是原文 —— 送出去的是另一段文本，拿回来的向量
+自然也属于那段文本。
+
+实测（bge-m3，21 个汉字，同一段文本）：
+
+| 口径 | 与「逐条单独请求」向量的余弦 |
+|---|---|
+| 默认档（`True`） | **0.306** |
+| `False` | **1.000000** |
+
+评测集 28 条（`scripts/eval_set.json`，全新 Qdrant 集合）：
+
+| 组合 | Top1 | 改写 Top1 | MRR |
+|---|---|---|---|
+| semantic（修前 → 修后） | 14% → **89%** | 0% → **92%** | 0.333 → **0.940** |
+| hybrid（修前 → 修后） | 54% → **75%** | 25% → **58%** | 0.607 → **0.875** |
+
+- **三个稠密后端（内存 / pgvector / qdrant）统一走新的 `_new_embedder()`**
+  （`src/rag/retrieval.py`）。不是"顺手抽个函数"：这个参数漏一处就有一个后端
+  悄悄返回错向量，而这种错**不会报错、不会降级**，只是排序变乱。
+- **守卫 `tests/test_rag_embedder_config.py`（6 条）**：一条断言客户端参数、
+  一条断言配置仍然生效（别为了关 tiktoken 把 model/timeout 写死）、
+  一条用 AST 扫描「`OpenAIEmbeddings(` 只许出现在工厂函数里」—— 以后新加后端
+  复制粘贴一段构造代码，这条会直接红并报出行号。变异 2/2 被守住。
+- **纠正一个此前记录的假结论**：`EMBEDDING_QUERY_PREFIX` 对 bge-m3 是**负收益**
+  （Top1 89% → 86%，改写 92% → 83%）。旧注释里「无前缀 38% / 英文指令 62%」
+  是在污染向量下测的 —— 前缀只是在改变那段"错文本"的样子。`.env` / `.env.example`
+  已改为默认留空并写明原因。
+- **集合必须重建**：`QdrantRetriever._sync` 只做增量 upsert，`existing_ids` 只看 id
+  在不在，**旧点不会重算**。修好参数之后若不删集合，向量仍是错的文本算出来的
+  —— 表现为"改了代码但分数没变"。本次已 `DELETE` 后重灌 141 块（4.73 秒）。
+
+为什么此前一直没暴露：离线测试全用假 embedder（拿不到真向量）；402 期间稠密路是
+空的（**空比错更容易看出来**）。教训记在 `PIPELINE_CONSTRAINTS.md §8.4`：
+「网关返回 200」不等于「向量可用」，判据必须落到**排序对不对**。
+
 ### 修复 — embedding 不可用时检索整条挂掉；单路失败不再拖垮两路（2026-11-01）
 
 起因是一次真跑：SiliconFlow 返 `402 balance insufficient`，于是**所有**检索都变成

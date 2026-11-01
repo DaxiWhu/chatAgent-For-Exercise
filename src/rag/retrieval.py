@@ -1033,6 +1033,37 @@ class BM25Retriever:
         return [(self.chunks[i], float(scores[i])) for i in idx]
 
 
+def _new_embedder():
+    """构造 embedding 客户端。**所有稠密后端都走这里**，别各自 new。
+
+    ⚠️ `check_embedding_ctx_length=False` 不是可选优化，是**正确性前提**：
+    langchain_openai 这个参数默认 True，会先用 tiktoken（OpenAI 的分词器）
+    把文本切成 token id、再 decode 成字符串送给网关。中文经这一趟就不再是
+    原文——送出去的是另一段文本，拿回来的向量当然也是另一段文本的向量。
+
+    2026-11-01 实测（bge-m3，21 个汉字）：默认档拿到的向量与原文向量余弦
+    只有 0.306；关掉之后 1.000000。症状极具迷惑性——**检索永远有结果、
+    排序却像随机**：改写型提问 Top1 = 0%（语义检索唯一的存在理由），
+    照抄型也被拉低，而所有用假 embedder 的离线测试全绿，测不出来。
+
+    代价是不再做 token 长度预检，超长输入由网关返回 400。当前块上限
+    300（文本）/800（PDF 降级）字符，离 bge-m3 的 8192 token 很远。
+    """
+    from langchain_openai import OpenAIEmbeddings
+
+    return OpenAIEmbeddings(
+        model=EMBEDDING_MODEL,
+        api_key=EMBEDDING_API_KEY,
+        base_url=EMBEDDING_API_BASE or None,
+        chunk_size=EMBEDDING_BATCH,   # 按各家单次输入上限分批，避免 400
+        # ⚠️ 显式传 timeout：不传时 SDK 默认 600 秒 × 3 次重试 ≈ 最坏 40 分钟
+        # 挂在请求热路径上（见 EMBEDDING_TIMEOUT 的说明）。
+        timeout=EMBEDDING_TIMEOUT,
+        max_retries=3,
+        check_embedding_ctx_length=False,
+    )
+
+
 class EmbeddingRetriever:
     """稠密检索：走独立的 EMBEDDING_* 配置（OpenAI 兼容 /v1/embeddings）。
 
@@ -1046,20 +1077,10 @@ class EmbeddingRetriever:
             大语料下这里是启动耗时的主要来源（无持久化，每次启动全量重算）。
         """
         import numpy as np
-        from langchain_openai import OpenAIEmbeddings
 
         self.chunks = chunks
         self.np = np
-        self.embedder = OpenAIEmbeddings(
-            model=EMBEDDING_MODEL,
-            api_key=EMBEDDING_API_KEY,
-            base_url=EMBEDDING_API_BASE or None,
-            chunk_size=EMBEDDING_BATCH,   # 按各家单次输入上限分批，避免 400
-            # ⚠️ 显式传 timeout：不传时 SDK 默认 600 秒 × 3 次重试 ≈ 最坏 40 分钟
-            # 挂在请求热路径上（见 EMBEDDING_TIMEOUT 的说明）。
-            timeout=EMBEDDING_TIMEOUT,
-            max_retries=3,
-        )
+        self.embedder = _new_embedder()
         # 实例级熔断器（不跨用例共享状态）：embedding 网关整体挂了时快速失败，
         # 而不是每个请求都顶着超时重试三次。
         self.breaker = CircuitBreaker("embedding", CIRCUIT_FAIL_THRESHOLD,
@@ -1132,21 +1153,12 @@ class PgVectorRetriever:
         构造会连库、首次灌库时还会调 embedding API；表已存在且块都在库里时，
         零 embedding 调用（只发一次 `SELECT id`）。
         """
-        from langchain_openai import OpenAIEmbeddings
-
         t = resolve_tenant(tenant)
         self.tenant = t
         self.chunks = chunks
         # 指纹带上租户：多租户下不同租户的同内容块各自入库，不会互相覆盖
         self.by_id = {chunk_fingerprint(c, t): c for c in chunks}
-        self.embedder = OpenAIEmbeddings(
-            model=EMBEDDING_MODEL,
-            api_key=EMBEDDING_API_KEY,
-            base_url=EMBEDDING_API_BASE or None,
-            chunk_size=EMBEDDING_BATCH,
-            timeout=EMBEDDING_TIMEOUT,   # 见 EMBEDDING_TIMEOUT 的说明
-            max_retries=3,
-        )
+        self.embedder = _new_embedder()
         self.breaker = CircuitBreaker("embedding", CIRCUIT_FAIL_THRESHOLD,
                                       CIRCUIT_RESET_SECONDS, CIRCUIT_ENABLED)
         self.store = store if store is not None else PgVectorStore(
@@ -1222,21 +1234,12 @@ class QdrantRetriever:
         tenant: 租户 id。None（默认）时退回模块级 RAG_TENANT；两者都空则落到
             哨兵值（什么都检索不到）。⚠️ 空串**不再**等于"不隔离"。
         """
-        from langchain_openai import OpenAIEmbeddings
-
         t = resolve_tenant(tenant)
         self.tenant = t
         self.chunks = chunks
         # 指纹带租户：多租户下不同租户的同内容块各自成点，不互相覆盖（与 pg 一致）
         self.by_id = {chunk_fingerprint(c, t): c for c in chunks}
-        self.embedder = OpenAIEmbeddings(
-            model=EMBEDDING_MODEL,
-            api_key=EMBEDDING_API_KEY,
-            base_url=EMBEDDING_API_BASE or None,
-            chunk_size=EMBEDDING_BATCH,
-            timeout=EMBEDDING_TIMEOUT,   # 见 EMBEDDING_TIMEOUT 的说明
-            max_retries=3,
-        )
+        self.embedder = _new_embedder()
         self.breaker = CircuitBreaker("embedding", CIRCUIT_FAIL_THRESHOLD,
                                       CIRCUIT_RESET_SECONDS, CIRCUIT_ENABLED)
         self.store = store if store is not None else QdrantStore(
