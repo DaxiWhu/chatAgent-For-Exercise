@@ -298,9 +298,13 @@ def test_window_compaction_strips_the_block_but_does_not_absorb(
 
     在这里也吸一遍的后果是同一段每轮重抽一次，还会把那些记忆的"使用次数"抬起来。
     """
-    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "20")
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "60")
     monkeypatch.setenv("AGENT_HISTORY_COMPACT_RATIO", "1.0")
     monkeypatch.setattr(C.history_budget, "_item_tokens", lambda item: 10)
+    # 摘要成本与最小净收益压到同一刻度（见 test_history_compaction.tiny_budget）：
+    # 真实字号下 600 字的下限会把几十 token 的水位直接撑爆，测到的就不是算法了。
+    monkeypatch.setattr(C, "_summary_max_chars", lambda chars: 2)
+    monkeypatch.setattr(C, "_MIN_WINDOW_GAIN", 1)
     session = _wire(monkeypatch, _reply_with("- [project] 不该在这里落库"))
 
     replacement = asyncio.run(C.compact_for_window(session.items))

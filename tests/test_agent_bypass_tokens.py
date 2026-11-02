@@ -155,9 +155,10 @@ def test_window_compaction_passes_the_sink_down(monkeypatch):
 
     monkeypatch.setattr(C, "history_compact_enabled", lambda: True)
     monkeypatch.setattr(C, "window_compact_trigger", lambda: 1)
+    monkeypatch.setattr(C, "window_target", lambda: 10**6)
     monkeypatch.setattr(C, "_items_tokens_over", lambda *a, **k: True)
-    monkeypatch.setattr(C, "_rounds_that_fit", lambda *a, **k: 1)
-    monkeypatch.setattr(C, "_plan_keep_from", lambda *a, **k: 1)
+    monkeypatch.setattr(C, "_plan_keep_to_target", lambda *a, **k: (1, 1, 10, 100))
+    monkeypatch.setattr(C, "_MIN_WINDOW_GAIN", 1)
     monkeypatch.setattr(C, "_summarize_async", fake_summarize)
 
     rec = lambda u: None  # noqa: E731

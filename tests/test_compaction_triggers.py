@@ -74,6 +74,25 @@ def test_tail_budget_is_sixteen_percent(monkeypatch):
     assert C.tail_budget() == 16000
 
 
+def test_window_target_is_forty_percent_of_the_budget(monkeypatch):
+    """窗口压缩压到预算的 40% 为止（2026-11-02 从"固定保留 16%"改成按水位反推）。
+
+    触发线回答"要不要压"，水位回答"压到哪停"。两者必须分开：共用一个数会让压完
+    刚好贴着触发线，下一轮立刻再触发一次，每轮白花一次调用。
+    """
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "100000")
+    assert C.target_ratio() == pytest.approx(0.40)
+    assert C.window_target() == 40000
+    assert C.window_target() < C.window_compact_trigger(), "水位必须在触发线之下"
+
+
+def test_the_target_can_be_configured(monkeypatch):
+    """换模型只该改配置：水位也是配置项。"""
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "100000")
+    monkeypatch.setenv("AGENT_HISTORY_COMPACT_TARGET_RATIO", "0.25")
+    assert C.window_target() == 25000
+
+
 def test_a_fat_round_shrinks_the_verbatim_tail(monkeypatch):
     """一轮很长时，保留段按 **token** 收敛，不按"轮数"硬留。"""
     items = _rounds(4, size=400)

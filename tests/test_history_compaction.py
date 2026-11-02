@@ -436,13 +436,29 @@ def test_the_entry_uses_the_official_duck_typing_contract():
 # --------------------------------------------------------------------------- #
 @pytest.fixture
 def tiny_budget(monkeypatch):
-    """把预算调到很小，并让每个条目的 token 数固定 ⇒ 判定确定，不依赖分词器。"""
+    """把预算调到很小，并让每个条目的 token 数固定 ⇒ 判定确定，不依赖分词器。
+
+    预算 100 / 触发线 100（``COMPACT_RATIO=1.0``）/ 水位 40，每条 10 token。
+    摘要成本与最小净收益也压到 2 token：``_MIN_SUMMARY_CHARS=600`` 那条下限是
+    "真实字号"下才成立的常量，在几十 token 的尺度上会直接把水位撑爆 —— 换成同一
+    刻度才测得到算法本身，而不是在测那个下限。
+    """
     monkeypatch.setenv("AGENT_HISTORY_COMPACT", "1")
     monkeypatch.setenv("AGENT_HISTORY_KEEP_ROUNDS", "5")
-    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "20")
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "100")
     monkeypatch.setenv("AGENT_HISTORY_COMPACT_RATIO", "1.0")
     monkeypatch.setattr(hb, "_item_tokens", lambda item: 10)
     monkeypatch.setattr(C, "summarize_items", lambda segment, **kw: "摘要")
+
+    async def _fake_summarize(segment, *, on_usage=None, goal=""):
+        return "摘要"
+
+    # ⚠️ 必须连协程入口一起打桩：只桩同步版的话，``compact_for_window`` 仍会去建
+    # client 发一次真请求（conftest 给了假 Key），失败返回空串 ⇒ 每个用例都从
+    # "摘要为空"那条分支退出，**看起来通过，其实一条断言都没走**。
+    monkeypatch.setattr(C, "_summarize_async", _fake_summarize)
+    monkeypatch.setattr(C, "_summary_max_chars", lambda chars: 2)
+    monkeypatch.setattr(C, "_MIN_WINDOW_GAIN", 1)
     C.reset_compaction_state()
     yield
     C.reset_compaction_state()
@@ -450,14 +466,14 @@ def tiny_budget(monkeypatch):
 
 def test_window_compaction_fires_only_above_the_trigger(tiny_budget):
     """低于触发线 ⇒ 一个字都不改（返回 ``None``，调用方原样送模型）。"""
-    items = _rounds(2)  # 4 条 × 10 = 40 > 触发线 20
+    items = _rounds(6)  # 12 条 × 10 = 120 > 触发线 100
 
     async def _go():
         return await C.compact_for_window(items)
 
-    assert asyncio.run(_go()) is not None, "40 > 20，应当触发"
+    assert asyncio.run(_go()) is not None, "120 > 100，应当触发"
 
-    under = items[:2]  # 2 条 × 10 = 20，恰好**不超**（判据是严格大于）
+    under = _rounds(1)  # 2 条 × 10 = 20，远低于触发线
 
     async def _under():
         return await C.compact_for_window(under)
@@ -469,9 +485,9 @@ def test_window_compaction_always_keeps_the_newest_round(tiny_budget):
     """触发时，**最新那一轮无条件保留**。
 
     丢掉它等于模型连用户刚说的话都看不到，而请求照常 200（``history_budget`` 的口径 1
-    同源）。这里把预算调到"最新一轮自己都不够"的极端，看它还在不在。
+    同源）。水位 40 只装得下一轮（20 + 摘要 2 = 22），所以这里就是那个边界。
     """
-    items = _rounds(4)  # 8 条，触发线 20 ⇒ 只装得下 1 轮
+    items = _rounds(6)
 
     async def _go():
         return await C.compact_for_window(items)
@@ -482,19 +498,64 @@ def test_window_compaction_always_keeps_the_newest_round(tiny_budget):
     assert replacement[1:] == items[-2:], "最新那一轮必须原样在"
 
 
-def test_window_compaction_is_a_noop_when_everything_already_fits(tiny_budget, monkeypatch):
-    """最近 ``keep_rounds`` 轮装得下 ⇒ 不压（老的那段由**历史压缩**负责）。
+def test_a_big_old_segment_still_gets_compacted(tiny_budget, monkeypatch):
+    """★★ 老段很大、最近几轮很小时，**仍然要压**。
 
-    两条入口分工不能混：窗口压缩解决的是"这几轮本身就太大"，不是"历史太长"。
-    混在一起的话，窗口压缩会把历史压缩该保留的轮次也压掉。
+    2026-11-02 之前这里返回 ``None``（"最近 keep_rounds 轮本身装得下 ⇒ 老段不归
+    我管"），于是那段老历史一路交给硬截断一条条丢掉 —— **连摘要都没有**。而它恰恰
+    是唯一能压、也该压的东西：最近几轮再小，也不能让它们替老段承担全部压缩量。
     """
-    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "10000")
-    items = _rounds(4)
+    monkeypatch.setattr(hb, "_item_tokens",
+                        lambda item: 10 if "大" in item["content"] else 1)
+    items: list[dict] = []
+    for i in range(10):
+        items.append({"role": "user", "content": f"大{i}"})
+        items.append({"role": "assistant", "content": f"回大{i}"})
+    items += _rounds(2)  # 最近 2 轮很小（每轮 2 token）
+    # 共 204 token > 触发线 100；水位 40。
+    # 逐轮算：留 4 轮 = 44 + 摘要 2 > 40；留 3 轮 = 24 + 2 = 26 ≤ 40 ⇒ 应留 3 轮。
+
+    async def _go():
+        return await C.compact_for_window(items)
+
+    replacement = asyncio.run(_go())
+
+    assert replacement is not None, "老段必须被压，不能因为最近几轮装得下就放弃"
+    assert len(replacement) - 1 == 6, "应留 3 轮（2 小 + 1 大）：按水位尽量多留"
+    assert replacement[-2:] == items[-2:], "最新那一轮原样保留"
+
+
+def test_it_gives_up_when_one_round_alone_exceeds_the_target(tiny_budget, monkeypatch):
+    """唯一该放弃的情形：**最新那一轮自己就超水位**。
+
+    这时压它等于让模型看不到要处理的东西（本轮用户那句 / 最后一次工具结果），
+    所以交给硬截断 —— 那是确定性兜底，不会失效。
+    """
+    monkeypatch.setattr(hb, "_item_tokens", lambda item: 100)  # 一条就超水位 40
+    items = _rounds(3)
 
     async def _go():
         return await C.compact_for_window(items)
 
     assert asyncio.run(_go()) is None
+
+
+def test_it_skips_when_the_gain_is_not_worth_a_model_call(tiny_budget, monkeypatch):
+    """净收益太小就不压：省下的空间下一轮就长回来，而这次调用要付钱还要等。
+
+    构造"差一点点就够"的位置：总量 120，水位 119 ⇒ 挪走 1 轮（20 token）、摘要占
+    15，净收益只剩 5，低于最小收益 10。真实配置里水位（0.40）远低于触发线，走不到
+    这个位置；这里把两者贴近，是为了把那条判断单独逼出来。
+    """
+    monkeypatch.setattr(C, "window_target", lambda: 119)
+    monkeypatch.setattr(C, "_summary_max_chars", lambda chars: 15)
+    monkeypatch.setattr(C, "_MIN_WINDOW_GAIN", 10)
+    items = _rounds(6)  # 12 条 × 10 = 120 token（必须**大于**触发线 100）
+
+    async def _go():
+        return await C.compact_for_window(items)
+
+    assert asyncio.run(_go()) is None, "净收益不足就不该多调一次模型"
 
 
 # --------------------------------------------------------------------------- #

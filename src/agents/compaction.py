@@ -22,7 +22,7 @@
 入口                    触发                                压哪一份            落盘
 ======================  ==================================  ==================  ==========
 **历史压缩**            老历史超过"保留轮数"                会话日志（只读）    **写记录**
-**窗口压缩**            送进模型的输入 > 预算的 80%         本次调用的那一份     否
+**窗口压缩**            送进模型的输入 > 预算的 80%         **压到预算的 40%**   否
 ======================  ==================================  ==================  ==========
 
 * **历史压缩**每轮各判一次（请求开头的后台任务）。它**不改会话日志**，只往
@@ -32,6 +32,12 @@
 * **窗口压缩**判的是**将要送进模型的那一份输入**——它本来就含"本轮新增 + 上一次
   返回的内容"，所以是**提前**判而不是事后发现。它**只改这一次调用**：库里那份由
   历史压缩负责，这里再写一次库既无收益，又要在 SDK 的会话写入之间抢时序。
+
+⚠️ 窗口压缩的**目标水位（0.40）与触发线（0.80）是两个数**，2026-11-02 起分开：
+之前它按"保留固定 16%"反推保留段，那个刻度在两头都错 —— 老段大而最近几轮小时
+会算出"最近几轮装得下"从而**一条不压**（那段老历史正是唯一该压的），老段小而轮次
+均匀时又压得过狠。现在先定"压到多小"，再回头看"这能留几轮"，保留量由水位自然
+决定（详见 ``_plan_keep_to_target``）。
 
 ⚠️ 2026-11-02 之前是"清空会话 + 写回摘要与尾部"，那一步真的删库。改成记录 + 投影
 的理由见 `compaction_store.py` 的模块 docstring：摘要丢的细节要能回查，长期记忆也
@@ -135,6 +141,15 @@ _KEEP_ROUNDS_DEFAULT = 5
 #: 0.85 实测也不是安全边界 —— 它只比硬截断早 15%，一轮里塞进一篇长文档就跨过去了。
 _RATIO_DEFAULT = 0.80
 
+#: 窗口压缩的**目标水位** = 预算 × 这个比例；压到这里就停，不再往下压。
+#: 与触发线分开的理由见 ``target_ratio``：共用一个数会让"压完刚好贴着触发线"，
+#: 下一轮立刻再触发一次。
+_TARGET_RATIO_DEFAULT = 0.40
+
+#: 窗口压缩的最小净收益（token）。低于它就不值得多调一次模型 —— 那一次调用
+#: 要付钱、要等 3~10 秒，而省下的那点空间下一轮就长回来了。
+_MIN_WINDOW_GAIN = 2000
+
 _TRUE = ("1", "on", "true", "yes")
 _FALSE = ("0", "off", "false", "no")
 
@@ -155,7 +170,7 @@ def keep_rounds() -> int:
 
 
 def window_compact_ratio() -> float:
-    """窗口压缩的触发比例（默认 0.85）。做成配置是因为换模型只该改配置。"""
+    """窗口压缩的触发比例（默认 0.80）。做成配置是因为换模型只该改配置。"""
     return env_float("AGENT_HISTORY_COMPACT_RATIO", _RATIO_DEFAULT, lo=0.1, hi=1.0)
 
 
@@ -165,6 +180,27 @@ def window_compact_trigger() -> int | None:
     if budget is None:
         return None
     return max(1, int(budget * window_compact_ratio()))
+
+
+def target_ratio() -> float:
+    """窗口压缩压到多小为止（占预算的比例），默认 0.40。
+
+    为什么不复用触发线：触发线回答"要不要压"，水位回答"压到哪停"。共用一个数
+    只有一种结果 —— 压完刚好贴着触发线，下一轮立刻再触发一次，每轮多花一次调用。
+
+    0.40 是"压一次管几轮"与"别压太狠"之间的落点：离 0.80 的触发线留了一倍的
+    余量，正常增长要过好几轮才回到触发线；而 40% 的预算足够装下最新的若干轮原文。
+    """
+    return env_float("AGENT_HISTORY_COMPACT_TARGET_RATIO", _TARGET_RATIO_DEFAULT,
+                     lo=0.0, hi=1.0)
+
+
+def window_target() -> int | None:
+    """窗口压缩的目标水位（token）；``None`` = 没配总预算。"""
+    budget = history_token_limit()
+    if budget is None:
+        return None
+    return max(1, int(budget * target_ratio()))
 
 
 def retain_ratio() -> float:
@@ -300,41 +336,6 @@ def _plan_keep_from(items: list[Any], *, keep: int) -> int | None:
     return starts[-keep]
 
 
-def _rounds_that_fit(items: list[Any], *, budget: int, cap: int) -> int | None:
-    """在预算内**从最新往回**尽量多留几轮；``None`` = 连 ``cap`` 轮都装得下。
-
-    为什么是"尽量多"而不是固定留 cap 轮：窗口压缩要解决的是"**这几轮本身就
-    太大**"，固定留 cap 轮就压缩不了任何东西（老的那段早被历史压缩清空了）。
-    所以它按 token 从最新往回累加，装不下就停。
-
-    两条口径：
-
-    * **最新那一轮无条件保留**（``k`` 从 0 起也照样加）—— 丢掉它等于模型连用户
-      刚说的话都看不到，而请求照常 200（``history_budget`` 里那条口径 1 同源）。
-    * **一旦攒够 ``cap`` 轮就直接返回 None**：说明历史压缩那一侧的目标已经满足，
-      这里没有可压的东西（老的那段由历史压缩负责，不归这里）。
-    """
-    starts = round_starts(items)
-    if not starts:
-        return None
-    total = 0
-    # ⚠️ ``taken`` 必须在"真正装下这一轮"之后才更新，且**不能用 ``idx + 1`` 代替**：
-    # 从 ``break`` 退出时那一轮没装下，轮数是 ``idx``；正常遍历完才是 ``idx + 1``。
-    # 两种退出路径刻度不同，写成一个式子就会在"预算刚好吃紧"时多留一轮
-    # （= 压缩覆盖范围推不动，且没有任何报错）。
-    taken = 0
-    for idx, start in enumerate(reversed(starts)):
-        end = len(items) if idx == 0 else starts[len(starts) - idx]
-        cost = sum(history_budget._item_tokens(x) for x in items[start:end])
-        if idx and total + cost > budget:
-            break
-        total += cost
-        taken = idx + 1
-        if taken >= cap:
-            return None
-    return max(1, taken)
-
-
 def _keep_from_by_tokens(items: list[Any], *, budget: int, cap: int) -> int | None:
     """按 **token 预算**从最新往回攒保留段，返回它的起点；``None`` = 不需要压。
 
@@ -381,6 +382,54 @@ def _plan_tail(items: list[Any], *, cap: int, budget: int | None = None) -> int 
     if budget is None:
         return _plan_keep_from(items, keep=cap)
     return _keep_from_by_tokens(items, budget=budget, cap=cap)
+
+
+def _plan_keep_to_target(
+    items: list[Any], *, target: int, floor: int = 1
+) -> tuple[int, int, int, int] | None:
+    """按**目标水位**反推保留段起点：``(keep_from, keep, after, total)``；``None`` = 不压。
+
+    与 ``_plan_keep_from``/``_keep_from_by_tokens``（"保留多少"）方向相反：这里先定
+    **压完要多小**，再回头看"这就能留几轮"。差别在于：
+
+    * 保留固定比例（16%）时，**压完剩多少取决于比例，不取决于需要**。总量
+      100699、保留 16% ⇒ 留 3 轮剩 21102；而目标 40000 本可以留 6 轮 —— 白丢了
+      3 轮原文，换来的只是"更小的输入"，可触发线之下再小并不带来任何收益。
+    * 反过来，老段很大而最近几轮很小时，固定比例会算出"最近几轮装得下"，于是
+      判定"没有可压的"直接放弃 —— 而那段老历史恰恰是**唯一能压且该压**的东西。
+
+    所以判据从"留多少"改成"压到多少"，保留量由水位**自然**决定，不加轮数上限：
+    每轮很小时水位能容纳很多轮，本来就该留；上限只在"摘要覆盖边界推不动"时才
+    需要，而那由 ``_MIN_WINDOW_GAIN``（收益太小就不压）挡住。
+
+    ``after`` 含**摘要自身的成本**（按 ``_summary_max_chars`` 的上限估，中文约
+    1 字 = 1 token）。不算它的话，压掉一大段之后实际并没有降下来 —— 摘要上限
+    6000 字，在 40000 的水位里占 15%，不是零头。
+
+    从"保留最多轮"往"保留最少轮"试，**第一个满足水位的**就是最大保留量。
+    ``None`` 的含义只有一种：连只留最后一轮都到不了水位（那一轮自己就超水位），
+    这时压它等于让模型看不到要处理的东西，交给硬截断。
+    """
+    starts = round_starts(items)
+    if not starts:
+        return None
+    per_tokens = [history_budget._item_tokens(x) for x in items]
+    per_chars = [len(_item_text(x)) for x in items]
+    prefix_tokens = [0]
+    prefix_chars = [0]
+    for t, c in zip(per_tokens, per_chars, strict=True):
+        prefix_tokens.append(prefix_tokens[-1] + t)
+        prefix_chars.append(prefix_chars[-1] + c)
+    total = prefix_tokens[-1]
+    if total <= target:
+        return None
+    for keep in range(len(starts), floor - 1, -1):
+        keep_from = starts[-keep]
+        after = (total - prefix_tokens[keep_from]) + _summary_max_chars(
+            prefix_chars[keep_from])
+        if after <= target:
+            return keep_from, keep, after, total
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1134,7 +1183,7 @@ async def compact_for_window(
     items: list[Any], *, instructions: str = "", on_usage: Any = None,
     goal: str = "",
 ) -> list[Any] | None:
-    """**入口二**：将要送进模型的那一份输入超过阈值时，压成「摘要 + 能装下的轮」。
+    """**入口二**：将要送进模型的那一份输入超过触发线时，压到目标水位为止。
 
     返回**替换用**的条目列表；``None`` = 不用压（没开 / 没超 / 压了也没用）。
 
@@ -1153,14 +1202,20 @@ async def compact_for_window(
 
     两条口径：
 
-    * **装不下的轮从最老的开始被压**，最新那一轮无条件保留（同 ``_rounds_that_fit``）；
-    * **压了没用就不压**：如果连"留 1 轮 + 摘要"都还在触发线以上，那这一侧的活
-      已经到头了，交给 ``history_budget`` 的硬截断（那是确定性的兜底，不会失效）。
+    * **压到水位为止，保留量由水位反推**（``_plan_keep_to_target``）。2026-11-02
+      之前是"保留固定 16%"，那个比例的毛病在两头：老段大而最近几轮小时会算出
+      "最近几轮装得下"从而**一条不压**（那段老历史正是唯一该压的）；老段小而轮次
+      均匀时又压得过狠，把本可以留下的原文也丢了 —— 而压到触发线以下之后再小
+      不带来任何收益。
+    * **压了没用就不压**：连"留 1 轮 + 摘要"都到不了水位（那一轮自己就超），
+      或净收益不足 ``_MIN_WINDOW_GAIN``（不值得为它多调一次模型），就交给
+      ``history_budget`` 的硬截断 —— 那是确定性的兜底，不会失效。
     """
     if not history_compact_enabled():
         return None
     trigger = window_compact_trigger()
-    if trigger is None:
+    target = window_target()
+    if trigger is None or target is None:
         return None
     payload = list(items or [])
     if not payload:
@@ -1168,15 +1223,20 @@ async def compact_for_window(
     if not _items_tokens_over(instructions, payload, trigger):
         return None
 
-    # 保留段按**逐字预算**（默认预算的 16%）算，不是按触发线：触发线决定"压不压"，
-    # 保留段决定"留多少"。两者共用一个数的话，触发线一调，保留段跟着变 —— 而它们
-    # 回答的是完全不同的问题。
-    keep = _rounds_that_fit(payload, budget=tail_budget() or trigger, cap=keep_rounds())
-    if keep is None:
-        # 最近 keep_rounds 轮本身装得下 ⇒ 老的那段不归这里管（历史压缩负责）。
+    plan = _plan_keep_to_target(payload, target=target)
+    if plan is None:
+        observability.counter("agent_history_compaction_skipped_total",
+                              reason="cannot_reach_target")
+        logging.info("窗口压缩压不到 %.0f%% 水位（最新那一轮自己就超）⇒ 交给硬截断",
+                     target_ratio() * 100)
         return None
-    keep_from = _plan_keep_from(payload, keep=keep)
-    if keep_from is None:
+    keep_from, keep, after, total = plan
+    gain = total - after
+    if gain < _MIN_WINDOW_GAIN:
+        observability.counter("agent_history_compaction_skipped_total",
+                              reason="no_gain")
+        logging.info("窗口压缩净收益只有 %d token（< %d）⇒ 不值得多调一次模型",
+                     gain, _MIN_WINDOW_GAIN)
         return None
     summary = await _summarize_async(payload[:keep_from], on_usage=on_usage, goal=goal)
     # 只取正文，候选**不在这里吸收**：窗口压缩的产物不落库、它压掉的内容仍在日志里，
@@ -1189,8 +1249,8 @@ async def compact_for_window(
     replacement = _session_replacement(body, tail)
     observability.counter("agent_history_compacted_total", scope="window")
     observability.histogram("agent_history_compacted_items", keep_from)
-    logging.info("窗口压缩完成：%d 条 → 1 条摘要 + %d 条（触发线 %d token）",
-                 keep_from, len(tail), trigger)
+    logging.info("窗口压缩完成：%d 条 → 1 条摘要 + %d 条（%d 轮，%d → 约 %d token）",
+                 keep_from, len(tail), keep, total, after)
     return replacement
 
 

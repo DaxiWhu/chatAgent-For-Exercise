@@ -17,17 +17,15 @@
 
 判据因此必须落在**最终那一份 items 的内容**上，不能停在"函数被调用了"。
 
-⚠️ 关于"压缩后仍超预算"这个场景有多常见（实测口径，别再想当然）
+⚠️ 关于"压缩后仍超预算"（2026-11-02 起这件事不会发生）
 ------------------------------------------------------------------
-压缩替换出来的东西是「摘要 + 装得下的轮」，它天然 ≤ 触发线 + 摘要长度；而裁剪的
-预算是触发线 ÷ 0.85 ≈ 1.18 倍触发线。所以只有当**摘要比触发线的 17% 还长**时，
-裁剪才会继续动手 —— 而 600 字摘要（约 600+ token）在触发线 1700 时正好越线。
-也就是说这条路径不罕见，只是不好构造，所以下面两个用例用**两套预算**分别盯：
+旧算法按"保留固定 16%"反推，压完是「摘要 + 16% 预算」，可能仍贴着甚至越过裁剪预算
+（100% 预算），所以那时真有"压完还得裁"的一档。
 
-* ``test_summary_survives_even_when_only_anchors_remain`` —— 逼出"只剩锚点仍超额"，
-  专守摘要那一条锚点。删掉锚点后摘要是"最老的一条"，第一批就会被丢，这里立刻红。
-* ``test_compaction_replaces_the_old_segment_and_keeps_the_newest_round`` —— 正常比例下
-  压缩真的替换了老段，且最新一轮原文还在。
+现在窗口压缩的目标水位是 40%：替换结果是「摘要 + 保留段」且**按定义 ≤ 0.4 × 预算**，
+而裁剪预算是 1.0 × 预算 —— 所以压完永远不可能再超裁剪预算。那条断言因此改成直接
+构造一份带 system 摘要的输入，去守裁剪侧的锚点（``_trim_sync`` 的锚点 4），不再借
+窗口压缩绕一圈。
 
 另外守住一条分层边界：压缩是**可选优化**，它失败只该退化成"这轮没压"，
 不能让裁剪跟着失效 —— 否则一个摘要超时就能让输入超窗、整轮答不出来。
@@ -52,11 +50,11 @@ FEATURE = "【特征串-只有被压掉的段里才有】"
 
 
 def _rounds(n: int, *, size: int = 500) -> list[dict]:
-    """n 轮 SDK 形态的历史，每轮 = 用户一条 + 助手一条，各约 1000 token。
+    """n 轮 SDK 形态的历史，每轮 = 用户一条 + 助手一条，**每轮约 2000 token**。
 
-    ⚠️ 单条为什么必须这么大：窗口压缩只解决"**最近 ``keep_rounds`` 轮自己就装不下**"，
-    如果最近两轮能装进触发线，它直接返回 ``None``（老的那段归会话侧历史压缩管）。
-    单条太小会让本文件的用例全部走不到压缩那条路径，而断言照样绿 —— 测了个寂寞。
+    ⚠️ 单条为什么必须这么大：水位只有预算的 40%，而压缩要"留下最新一轮 + 一条摘要"
+    才能成立。单条太小会让"一轮 + 摘要"直接顶穿水位 ⇒ 压缩判定"压不到"而一条不压，
+    用例全部走不到压缩那条路径，而断言照样绿 —— 测了个寂寞。
     """
     out: list[dict] = []
     for i in range(n):
@@ -112,35 +110,34 @@ def stub_summary(monkeypatch):
         return "【摘要】覆盖：" + " | ".join(heads)
 
     monkeypatch.setattr(C, "summarize_items", _stub)
+    # 水位算法按 `_summary_max_chars`（被压段字数的 1/5，夹 600~6000）**预估**摘要
+    # 会占多少。真实摘要确实可能到那个上限，但这里的桩只有两三百 token —— 不把估算
+    # 拉到同一刻度，算出来的水位永远装不下"一轮 + 摘要"，压缩压根不会发生，而断言
+    # 会误把裁剪钉住的 r0 原文当成摘要（"摘要里没有 r4"就是这么来的）。
+    monkeypatch.setattr(C, "_summary_max_chars", lambda chars: 300)
     return _stub
 
 
 # --------------------------------------------------------------------------- #
 # ① 白压：压缩之后仍超预算，摘要必须活到最终输入
 # --------------------------------------------------------------------------- #
-def test_summary_survives_even_when_only_anchors_remain(
-    monkeypatch, compact_on, stub_summary
-):
-    """★ 逼出"只剩锚点仍超额"这一档，摘要必须还在第一条。
+def test_summary_survives_even_when_only_anchors_remain(monkeypatch, compact_on):
+    """★ 硬截断不许把第一条 system 摘要当"最老的一条"丢掉。
 
-    这是"白压"最直接的判据。压完超预算 ⇒ 硬截断从**最老的一条**开始丢，而摘要正好
-    被放在最前面。它没被丢，唯一的理由是裁剪侧**专门钉住了它**
-    （``_trim_sync`` 的锚点 4）。删掉那条锚点，本用例立刻变成"摘要消失、模型什么都
-    没看到"，而压缩那边仍然报告"压缩成功"。
-
-    预算 800 / 触发线 680 / 每轮约 833 —— 最新一轮自己就超预算，于是压缩只能留 1 轮、
-    压掉其余，替换结果是「摘要(约 60) + 最新一轮(约 833)」= 893 > 800，裁剪必须动手。
+    2026-11-02 起这条不再借窗口压缩来构造：窗口压缩的目标水位是 0.40，**压完必然
+    小于预算**（保留段 + 摘要 ≤ 0.4 × 预算 < 预算），所以"压完仍超裁剪预算"这个
+    场景在新算法下不可能出现。摘要真正的来源是别处 —— 历史压缩的投影、以及压缩
+    被关掉/失败时留在历史里的那一条 —— 所以这里直接构造一份带摘要的输入。
     """
-    monkeypatch.setenv("AGENT_HISTORY_KEEP_ROUNDS", "2")
     monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "800")
-    items = _rounds(4)
+    items = [{"role": "system", "content": "【摘要】覆盖：r0 | r1 | r2"}] + _rounds(4)
 
     final = _trim(_cd(items))
 
     assert final, "过滤器不该把输入清空"
     assert final[0].get("role") == "system", (
         f"摘要被裁掉了：最终第一条是 {final[0].get('role')!r}。"
-        "压缩白做 —— 模型看到的与没压缩时一样，而日志上写着'压缩成功'。"
+        "模型看到的与没压缩时一样，而日志上写着'压缩成功'。"
     )
     assert "【摘要】" in _text(final[0])
     assert items[-1] in final, "最新一轮的助手回答必须原样在"
@@ -155,7 +152,7 @@ def test_compaction_replaces_the_old_segment_and_keeps_the_newest_round(
     判据是原先的 ``r0-问`` 那条**不再逐字出现**（它只以摘要的形式存在）。
     """
     monkeypatch.setenv("AGENT_HISTORY_KEEP_ROUNDS", "2")
-    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "2000")
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "6000")
     items = _rounds(8)
 
     final = _trim(_cd(items))
@@ -177,9 +174,9 @@ def test_nothing_is_lost_in_the_gap_between_the_two_layers(
     里都算活着，唯独不能彻底消失。
     """
     monkeypatch.setenv("AGENT_HISTORY_KEEP_ROUNDS", "2")
-    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "2000")
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "6000")
     items = _rounds(8)
-    # 埋在第 5 轮 —— 在保留窗（最新 2 轮）之外，必然被压。
+    # 埋在第 5 轮 —— 在保留窗之外，必然被压。
     items[10]["content"] = FEATURE + items[10]["content"]
 
     final = _trim(_cd(items))
@@ -202,7 +199,7 @@ def test_the_whole_old_segment_reaches_the_summary_before_trimming(
     而每一步看起来都成功了。
     """
     monkeypatch.setenv("AGENT_HISTORY_KEEP_ROUNDS", "2")
-    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "2000")
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "6000")
     items = _rounds(8)
 
     final = _trim(_cd(items))
