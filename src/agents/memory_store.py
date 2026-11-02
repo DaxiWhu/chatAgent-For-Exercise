@@ -316,9 +316,39 @@ class MemoryStore:
                     "INSERT INTO agent_memories"
                     " (id, owner_key, tenant, kind, content, content_hash,"
                     "  source_thread, pinned, superseded_by)"
-                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL)",
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL)"
+                    # 交给唯一索引裁决，而不是"先查一次没有再插"。
+                    # 后者在并发下必然翻车：两个事务都查不到已有行、都去插，
+                    # 后到的那个撞上部分唯一索引直接抛 UniqueViolation。
+                    # 2026-11-02 之后这条路**真的会并发** —— 压缩在后台顺手写记忆，
+                    # 同一轮里模型也可能在写同一条。
+                    # ⚠️ 谓词必须与索引定义**逐字一致**（都是 invalid_at IS NULL），
+                    # 否则 PG 推断不到那个部分索引，报"没有匹配的约束"。
+                    " ON CONFLICT (owner_key, content_hash) WHERE invalid_at IS NULL"
+                    " DO NOTHING RETURNING id",
                     (new_id, owner_key, tenant, kind if kind in KINDS else "project",
                      text, h, source_thread, bool(pinned)))
+                inserted = cur.fetchone()
+                if inserted is None:
+                    # 并发：别的写入方抢先插了同一条。当作"刷新"，别报成失败 ——
+                    # 结果一样是一条生效行，只是使用痕迹记在它身上。
+                    cur.execute(
+                        "SELECT id FROM agent_memories"
+                        " WHERE owner_key = %s AND content_hash = %s"
+                        "   AND invalid_at IS NULL LIMIT 1", (owner_key, h))
+                    row = cur.fetchone()
+                    if row is None:
+                        # 对方在同一瞬间又把它失效了（改口）。不猜，如实回报。
+                        return {"ok": False, "reason": "conflict"}
+                    cur.execute(
+                        "UPDATE agent_memories"
+                        "   SET use_count = use_count + 1, last_used_at = now()"
+                        " WHERE id = %s", (row[0],))
+                    if replaced:
+                        cur.execute(
+                            "UPDATE agent_memories SET superseded_by = %s"
+                            " WHERE id = ANY(%s)", (row[0], replaced))
+                    return {"ok": True, "id": row[0], "action": "refreshed"}
                 if replaced:
                     cur.execute(
                         "UPDATE agent_memories SET superseded_by = %s WHERE id = ANY(%s)",

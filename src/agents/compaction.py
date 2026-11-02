@@ -95,12 +95,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Any
 
 from .. import observability
 from ..envutil import env_float, env_int
-from . import history_budget
+from . import history_budget, memory_store
 from .compaction_store import InMemoryCompactionStore
 from .history_budget import count_tokens, history_token_limit, is_user_item
 
@@ -408,8 +409,17 @@ _SUMMARY_PROMPT = (
     "这些东西极易被「总结得通顺」抹掉，而它们改一个字就失效。\n"
     "硬性要求：**不许编造原文里没有的信息**（看不出成败就写「结果未明」）；"
     "不写建议、评价、客套话；不用「我」或「你」称呼；"
-    "直接输出八个小节，不要额外的标题或前后缀；"
-    "总长控制在 {limit} 字以内。"
+    "八个小节直接开始，不要额外的标题或前后缀；正文总长控制在 {limit} 字以内。\n"
+    "八个小节之后**另起一段**，输出跨会话记忆候选，格式严格照下面：\n"
+    "<memories>\n"
+    "- [preference] 用户明确表达过的偏好\n"
+    "- [project] 这个项目或这套代码的固定事实、约定\n"
+    "</memories>\n"
+    "每行一条，**最多 10 条**；类别只能是 preference / project / feedback / "
+    "persona / reference。判据是「**离开这段对话，照着这一条能不能直接做对**」——"
+    "做不到的别写；「用户希望得到高质量回答」这类放到哪都对的话是废条目，宁缺毋滥。"
+    "候选里的路径、命令、报错串、标识符、数值同样要**逐字照抄**。"
+    "记忆块**不计入**上面那个 {limit} 字上限；没有值得记的就输出一对空标签。"
 )
 
 #: 摘要字数上限的下限。低于这个数，八个小节每节只剩一句，等于把细节压成结论 ——
@@ -429,6 +439,115 @@ def _summary_max_chars(body_chars: int) -> int:
     """这一次摘要的字数上限（按被压段长度定，夹在上下限之间）。"""
     return max(_MIN_SUMMARY_CHARS,
                min(_MAX_SUMMARY_CHARS, int(body_chars * _SUMMARY_CHAR_RATIO)))
+
+
+#: 一次压缩最多吸收多少条记忆候选。
+#: 卡死上限而不是"有多少收多少"：候选是模型顺手写的，给个硬顶才能挡住
+#: "把整段对话复述成二十条"的失控；而记忆每一轮都要注入，条数直接抬升固定成本。
+_MAX_CANDIDATES = 10
+
+#: 记忆候选块。**找不到就整段当正文**（见 ``_split_summary``），不抛错、不丢内容。
+_MEMORY_BLOCK_RE = re.compile(
+    r"<memories>\s*(.*?)\s*</memories>", re.IGNORECASE | re.DOTALL)
+
+#: 一行候选。类别标签只认"3~12 个字母"，**刻意不认别的形状**：
+#: 模型有时会写成 ``- [src/agent/loop.py] 改了重试逻辑``，那里的方括号是路径而不是
+#: 类别 —— 按"任意方括号"解析会把路径吃掉、只剩后半句，而路径恰恰是记忆里最该留住的
+#: 东西。所以这里宁可把 ``[src/agent/loop.py] ...`` 整行留在正文里。
+_MEMORY_LINE_RE = re.compile(r"^[-*]\s*(?:\[([a-z]{3,12})\]\s*)?(.+)$", re.IGNORECASE)
+
+_BLANK_LINES_RE = re.compile(r"\n{3,}")
+
+
+def _split_summary(text: str) -> tuple[str, list[dict]]:
+    """把摘要模型的输出切成「正文」和「记忆候选」，返回 ``(body, candidates)``。
+
+    为什么要切：正文会进入**每一轮**的上下文（投影成一条 system），记忆候选只写进
+    记忆表 —— 两者去处不同。混在一起等于让那几行格式文本白占每轮的位置。
+
+    ⚠️ 找不到 ``<memories>`` 就**整段当正文**：模型的输出格式会飘，而"因为格式不
+    合规就把摘要扔掉"会让这次压缩彻底失效 —— 那比正文里多几句废文本贵得多。
+    """
+    raw = str(text or "")
+    m = _MEMORY_BLOCK_RE.search(raw)
+    if m is None:
+        return raw.strip(), []
+    body = f"{raw[:m.start()]}\n{raw[m.end():]}".strip()
+    return _BLANK_LINES_RE.sub("\n\n", body), _parse_candidates(m.group(1))
+
+
+def _parse_candidates(block: str) -> list[dict]:
+    """把候选块解析成 ``[{"kind": ..., "content": ...}]``。
+
+    不认识的行**跳过**而不是猜：块里混进一句"下面是这次对话的要点"，它一旦成了
+    记忆就会每轮被当成事实注入 —— 而它连事实都不是。
+    """
+    out: list[dict] = []
+    for line in str(block or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _MEMORY_LINE_RE.match(line)
+        if m is None:
+            continue
+        content = (m.group(2) or "").strip()
+        if not content:
+            continue
+        kind = (m.group(1) or "").strip().lower()
+        if kind not in memory_store.KINDS:
+            # 类别不认识就归到 project：宁可分类不准，也别为一个词丢掉一条真事实。
+            kind = "project"
+        out.append({"kind": kind, "content": content})
+        if len(out) >= _MAX_CANDIDATES:
+            break
+    return out
+
+
+async def _absorb_candidates(candidates: list[dict], *, owner_key: str,
+                             thread_id: str = "") -> int:
+    """把这次摘要顺手抽出的候选写进记忆表，返回真正落库的条数。
+
+    为什么由压缩来写、而不是另起一次调用：**这一刻原文还在手里**。压缩是把一段历史
+    变成"模型再也看不到"的唯一动作；错过这一步，那段话就只剩摘要里的几句 —— 而记忆
+    要的恰恰是摘要会抹掉的精确细节（路径、命令、数值、用户的原话）。
+
+    失败**不阻断压缩**（调用方只在返回值上关心条数）：记忆少几条是软损失，
+    压缩停下来是硬故障。
+    """
+    if not candidates:
+        return 0
+    if not owner_key:
+        # 归不到人就不写，也**不能**写进公共桶：别的用户的偏好会被当成这个人的。
+        observability.counter("agent_history_memories_total", result="no_owner")
+        return 0
+    from . import memory  # 惰性：memory 依赖 memory_store，压缩不该被它拖住
+
+    if not memory.enabled():
+        return 0
+
+    written = 0
+    for c in candidates:
+        try:
+            r = await asyncio.to_thread(
+                memory.remember_memory,
+                owner_key=owner_key,
+                content=c["content"],
+                kind=c["kind"],
+                source_thread=thread_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001  数据库抖动 ⇒ 这一批剩下的也不再试
+            observability.counter("agent_history_memories_total", result="error")
+            _note_failure(e, stage="absorb_memory")
+            break
+        if r.get("ok"):
+            written += 1
+    observability.histogram("agent_history_memories_absorbed", written)
+    if written:
+        logging.info("压缩时吸收了 %d 条记忆候选（会话=%s）", written, thread_id or "-")
+    return written
+
 
 _MAX_GOAL_CHARS = 500
 """传给摘要模型的"最初目标"最多多长。
@@ -565,6 +684,10 @@ def summarize_items(
     返回空串有明确含义：**这次压不了**（没配 Key / 建不起 client / 调用失败 /
     模型返回空）。调用方据此原样返回、不做任何替换 —— 摘要为空却照做替换，等于
     把老历史**删掉**，那正好是这套机制最不能出的错。
+
+    ⚠️ 返回的是**模型原文**，可能带着末尾那段 ``<memories>`` 候选块。
+    调用方必须用 ``_split_summary`` 切一次：正文进记录 / 进上下文，候选进记忆表。
+    直接把返回值当"摘要"用，那几行格式文本会跟着每轮进上下文。
 
     on_usage: 拿到这一次的 ``usage`` 时回调一次。**只有窗口压缩那条路会传**
     （它属于某一次运行，成本要进那一次运行的账）；会话写回那条路是后台任务、
@@ -815,7 +938,7 @@ class CompactingSession:
 
 
 async def compact_session_history(session_id: str, *, session: Any = None,
-                                  force: bool = False) -> int:
+                                  force: bool = False, owner_key: str = "") -> int:
     """**入口一（会话侧）**：给某个会话算一次新的覆盖边界。返回这次新覆盖的条数。
 
     ★ 它**不改会话日志**，只追加一条压缩记录。名字保留是因为调用点与语义没变
@@ -830,6 +953,11 @@ async def compact_session_history(session_id: str, *, session: Any = None,
     返回 0 的情形（都不是错误，且都**必须**保持"什么都没做"）：
     开关关闭 / 没有会话 / 会话读不出来 / 需要保留的轮数还没攒够 / 上一代已盖到这里 /
     摘要为空 / 摘要期间历史变了 / **摘要没有比被取代的那段更短**（见 ``_compact_once``）。
+
+    owner_key: 这个会话属于谁。传了它，压缩才会**顺手把记忆候选捞出来**（见
+    ``_absorb_candidates``）；不传就不捞 —— 归不到人的记忆宁可不要，也不能写进公共桶。
+    调用方（``app/main.py`` 的后台任务、``runner`` 的溢出兜底）手里都有身份，
+    只有 SDK 那条 ``run_compaction`` 鸭子类型入口没有（那条路本来就不会被调用）。
     """
     if not history_compact_enabled():
         return 0
@@ -854,12 +982,12 @@ async def compact_session_history(session_id: str, *, session: Any = None,
         lock = asyncio.Lock()
     return await _compact_once(inner, lock, session_id=session_id or "",
                               keep=keep_rounds(), stage="session", store=store,
-                              force=force)
+                              force=force, owner_key=owner_key)
 
 
 async def _compact_once(inner: Any, lock: asyncio.Lock, *, session_id: str,
                         keep: int, stage: str, store: Any = None,
-                        force: bool = False) -> int:
+                        force: bool = False, owner_key: str = "") -> int:
     """读日志 → 摘要（锁外）→ 重读 → **写一条压缩记录**，返回这次新覆盖的条目数。
 
     会话日志**一个字节都不动**。这是 2026-11-02 改造的全部要点：摘要漏掉的细节、
@@ -875,6 +1003,11 @@ async def _compact_once(inner: Any, lock: asyncio.Lock, *, session_id: str,
 
     **摘要必须真的更小**：比被取代的那段（含上一代摘要）还长就放弃。那种替换除了
     丢信息什么也没换来，而且下一轮会反复压同一段、每轮多花一次模型调用。
+
+    **顺手把记忆捞出来**（2026-11-02）：摘要调用要求的输出里，正文之后跟着一段
+    ``<memories>`` 候选。写记忆发生在**判定"这次压不压"之前** —— 因为候选说的是
+    原文里真实存在的东西，与这次压缩是否被采纳无关；而记录一旦落库，这段原文对模型
+    就永久不可见，那时再失败就真的没原料了。``owner_key`` 为空（归不到人）时整段跳过。
     """
     if store is None:
         store = InMemoryCompactionStore()
@@ -897,11 +1030,15 @@ async def _compact_once(inner: Any, lock: asyncio.Lock, *, session_id: str,
         summarized_upto = keep_from
 
     segment = _segment_with_prior(history[baseline:keep_from], prior)
-    summary = await _summarize_async(segment)
+    body, candidates = _split_summary(await _summarize_async(segment))
+    if not body:
+        # 只剩记忆块（或整段空）⇒ 这次没有可用的摘要，不压也不落候选：
+        # 摘要失败说明这次调用不可信，它的候选同样不该进记忆。
+        return 0
+    # 候选先落地，再判断这次压不压（理由见 docstring）。
+    await _absorb_candidates(candidates, owner_key=owner_key, thread_id=session_id)
 
     async with _lock_or_none(lock):
-        if not summary:
-            return 0
         try:
             fresh = list(await inner.get_items() or [])
         except Exception as e:  # noqa: BLE001
@@ -921,7 +1058,7 @@ async def _compact_once(inner: Any, lock: asyncio.Lock, *, session_id: str,
             # 上一代摘要也在被取代之列。不算它的话，"新旧摘要一样大"会被当成有效
             # 压缩，于是每一轮都白压一次，摘要还会一代代变长。
             shadowed += int(prior.get("summary_tokens") or 0)
-        summary_tokens = count_tokens(summary)
+        summary_tokens = count_tokens(body)
         if summary_tokens >= shadowed:
             observability.counter("agent_history_compaction_skipped_total", reason="no_gain")
             logging.warning("摘要没有更短（%d ≥ %d token）⇒ 这轮不压，避免白花一次调用",
@@ -929,7 +1066,7 @@ async def _compact_once(inner: Any, lock: asyncio.Lock, *, session_id: str,
             return 0
         try:
             await store.record(
-                session_id, covered_items=new_keep_from, summary=summary,
+                session_id, covered_items=new_keep_from, summary=body,
                 summary_tokens=summary_tokens, shadowed_tokens=shadowed, scope="history",
             )
         except asyncio.CancelledError:
@@ -1042,10 +1179,14 @@ async def compact_for_window(
     if keep_from is None:
         return None
     summary = await _summarize_async(payload[:keep_from], on_usage=on_usage, goal=goal)
-    if not summary:
+    # 只取正文，候选**不在这里吸收**：窗口压缩的产物不落库、它压掉的内容仍在日志里，
+    # 以后由历史压缩覆盖到那段时再吸收。在这里也吸一遍的后果是同一段每轮重抽一次，
+    # 还会把那些记忆的"使用次数"抬起来 —— 那个数字是用来排注入顺序的，不该被压缩污染。
+    body, _ = _split_summary(summary)
+    if not body:
         return None
     tail = payload[keep_from:]
-    replacement = _session_replacement(summary, tail)
+    replacement = _session_replacement(body, tail)
     observability.counter("agent_history_compacted_total", scope="window")
     observability.histogram("agent_history_compacted_items", keep_from)
     logging.info("窗口压缩完成：%d 条 → 1 条摘要 + %d 条（触发线 %d token）",

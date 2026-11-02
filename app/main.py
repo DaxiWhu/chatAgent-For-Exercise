@@ -2390,8 +2390,11 @@ def _on_compact_done(task) -> None:
         logging.warning("后台历史压缩任务异常结束（已忽略）：%s", exc)
 
 
-def _spawn_history_compaction(thread_id: str) -> None:
+def _spawn_history_compaction(thread_id: str, owner_key: str = "") -> None:
     """请求开头起一个**后台**压缩任务（入口一·会话侧，见 ``src/agents/compaction.py``）。
+
+    owner_key（当前用户名）要一路带到压缩里：压缩会顺手把这段历史的记忆候选捞出来，
+    而记忆**只能按用户名归属**。带不上就只是"不捞"，压缩本身照常跑。
 
     为什么在 ``_stream_run`` 里、而不是端点函数里
     ----------------------------------------------
@@ -2423,7 +2426,8 @@ def _spawn_history_compaction(thread_id: str) -> None:
     except Exception:  # noqa: BLE001  压缩内核装不上（不该发生）
         return
     try:
-        task = asyncio.create_task(compaction.compact_session_history(thread_id))
+        task = asyncio.create_task(
+            compaction.compact_session_history(thread_id, owner_key=owner_key))
     except RuntimeError:  # 没有运行中的事件循环（理论上走不到，见 docstring）
         logging.debug("当前没有事件循环，跳过后台历史压缩")
         return
@@ -2640,7 +2644,7 @@ async def _stream_run(turn, req_kind: str, tenant: str = "",
     # ---- 历史压缩（入口一·会话侧）：起个**后台**任务，不挡本轮 ----
     # 位置在函数体最开头：本函数是异步生成器，函数体要等第一次迭代才执行，而
     # `_sse` 创建它之后**立即** `async for` —— 所以到这一行事件循环一定在。
-    _spawn_history_compaction(thread_id)
+    _spawn_history_compaction(thread_id, subject)
     # 运行登记放在**生成器体内**，而不是端点里：端点先登记的话，配额 429 会让
     # 请求在生成器创建之前就结束，那一行登记永远没人清 —— 于是这个 thread
     # 之后每一次 `/stop` 都会打到一条早已不存在的运行上。

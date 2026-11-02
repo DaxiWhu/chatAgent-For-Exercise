@@ -856,7 +856,8 @@ async def run_agent(
             observability.counter("agent_context_overflow_total", action="compact_retry")
             logging.warning("模型报上下文超限 ⇒ 强制压一次历史后重试（只重试一次）")
             await compaction.compact_session_history(
-                session_id, session=session, force=True)
+                session_id, session=session, force=True,
+                owner_key=str(getattr(context, "owner_key", "") or ""))
             result = await _invoke_once()
     except OutputGuardrailTripwireTriggered as exc:
         # 出口护栏拦下的输出**不会**成为交付物 —— 官方语义：被拒的候选输出不落库。

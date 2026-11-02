@@ -230,3 +230,94 @@ def test_content_is_collapsed_but_never_rewritten():
     long = "字" * (MAX_CONTENT_CHARS + 100)
     assert normalize_content(long).endswith("…")
     assert len(normalize_content(long)) == MAX_CONTENT_CHARS + 1
+
+
+# --------------------------------------------------------------------------- #
+# ⑧ PG 写入：并发撞上唯一索引时的分支
+# --------------------------------------------------------------------------- #
+# 为什么不连真库：``langgraph_app`` 没有建 schema 的权限，往 public 建表又等于
+# 替用户 apply 迁移。真库版本在 ``tests/test_agent_memory_pg.py``（配了
+# ``AGENT_SESSION_TEST_DSN`` 才跑）；这里用假游标盯**分支**，
+# 语法本身已在一次性临时表上实测过（ON CONFLICT 能推断到部分唯一索引）。
+class _FakeCursor:
+    """只记账、只按脚本吐结果的游标。``rows`` 里每项对应一次 ``fetchone()``。"""
+
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.sql: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.sql.append(" ".join(str(sql).split()))
+
+    def fetchone(self):
+        return self.rows.pop(0) if self.rows else None
+
+
+class _FakeConn:
+    def __init__(self, cur):
+        self._cur = cur
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def cursor(self):
+        return self._cur
+
+
+def _wire_pg(monkeypatch, rows):
+    import psycopg
+
+    cur = _FakeCursor(rows)
+    monkeypatch.setattr(psycopg, "connect", lambda *a, **k: _FakeConn(cur))
+    from src.agents.memory_store import MemoryStore
+
+    return MemoryStore("postgresql://fake/db"), cur
+
+
+def test_pg_insert_leans_on_the_unique_index(monkeypatch):
+    """★★ 写入必须写成 ``ON CONFLICT ... DO NOTHING``，不能是"先查后插"。
+
+    先查后插在并发下必然翻车：两个事务都看不到对方未提交的行，后到的那个撞上
+    部分唯一索引。2026-11-02 之后这条路**真的会并发**（压缩在后台写、本轮模型也在写）。
+    """
+    store, cur = _wire_pg(monkeypatch, [None, ("new-id",)])
+
+    result = store.remember("u1", "提交信息用中文")
+
+    assert result["action"] == "added"
+    inserts = [s for s in cur.sql if s.startswith("INSERT")]
+    assert len(inserts) == 1
+    assert "ON CONFLICT (owner_key, content_hash) WHERE invalid_at IS NULL" in inserts[0]
+    assert "DO NOTHING" in inserts[0]
+
+
+def test_pg_losing_the_race_becomes_a_refresh(monkeypatch):
+    """★★ 输掉竞争（INSERT 没插进去）⇒ 回查那条、当刷新，**不报成失败**。
+
+    报失败会让调用方丢掉这条候选 —— 可表里明明已经有同一句话在生效，
+    对使用者来说"记下了"才是事实。
+    """
+    store, cur = _wire_pg(monkeypatch, [None, None, ("existing-id",)])
+
+    result = store.remember("u1", "提交信息用中文")
+
+    assert result == {"ok": True, "id": "existing-id", "action": "refreshed"}
+    assert any("use_count = use_count + 1" in s for s in cur.sql)
+
+
+def test_pg_a_vanished_row_is_reported_not_guessed(monkeypatch):
+    """回查也空（对方插完又立刻失效它）⇒ 如实回报没收下，不编一个 id。"""
+    store, _ = _wire_pg(monkeypatch, [None, None, None])
+
+    result = store.remember("u1", "提交信息用中文")
+
+    assert result == {"ok": False, "reason": "conflict"}
