@@ -64,6 +64,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from src import observability
 from src.agents.approval import ResumeRequest
+from src.agents.memory_index import make_index as make_memory_index
 from src.agents.memory_store import make_memory_store
 from src.prompts import PROMPT_VERSION
 from src.turn import TurnRequest, build_context, run_turn
@@ -114,6 +115,10 @@ _ACCOUNTS = build_account_store()
 #: 那个模块的 store 是**进程单例、按首个调用者传的 DSN 定型**，两边传不同的值会变成
 #: "工具写进去、注入口读不到"，而两边都不报错。
 _MEMORIES = make_memory_store(DB_URL)
+#: 记忆的向量索引（检索用）。同样必须与 `src.agents.memory_index` 同源 ——
+#: 索引在**另一张表**（`agent_memories_vec`）里，DSN 不一致时表现为"检索永远返回空"，
+#: 而它只是一个计数，没有任何日志。
+_MEMORY_INDEX = make_memory_index(DB_URL)
 #: 用户鉴权（**人类用户的唯一口径**）：JWT 验签 + 会话白名单 + 账号表校验。
 #: 未配置 `AUTH_*` 时它只是一个空壳 —— `_authenticate` 不会走到它（见 `AUTH_ENABLED`）。
 _AUTH = userauth.build_auth_service(accounts=_ACCOUNTS)
@@ -4016,13 +4021,17 @@ async def admin_user_delete_v1(username: str, request: Request,
     # 记忆：新用户第一轮就会被告知"你以前要求过……"。与会话归属那边同一条理由，
     # 口径见 `PLAN_long_term_memory.md` §3.6。
     memories = await _off(_MEMORIES.forget_owner, username)
+    # 向量表是**另一张表**，主表删了它不会跟着动。不清的后果不是"多占点空间"：
+    # 向量里还留着这个人以前说过的话，而检索侧只能靠"id 回主表"来过滤 ——
+    # 主表已删时它会被静静跳过，看着没问题，但那批内容仍然躺在库里。
+    vectors = await _off(_MEMORY_INDEX.drop_owner, username)
 
     n = await _off(_AUTH.logout_all, username)
-    logging.info("管理员删用户：by=%s user=%s 清除令牌=%s 清理会话=%d 残留归属=%s 记忆=%d",
-                 ident.user, username, n, len(threads), leftover, memories)
+    logging.info("管理员删用户：by=%s user=%s 清除令牌=%s 清理会话=%d 残留归属=%s 记忆=%d 向量=%s",
+                 ident.user, username, n, len(threads), leftover, memories, vectors)
     return {"deleted": True, "sessions_revoked": n,
             "threads_purged": len(threads), "purge": purge,
-            "memories_purged": memories}
+            "memories_purged": memories, "memory_vectors_purged": vectors}
 
 
 # ---- 加入申请的审批 ----

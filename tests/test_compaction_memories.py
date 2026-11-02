@@ -324,3 +324,28 @@ def test_the_summary_prompt_asks_for_a_memory_block():
     assert "<memories>" in prompt and "</memories>" in prompt
     assert "最多 10 条" in prompt
     assert "离开这段对话" in prompt, "判据必须写死在提示词里，不能让模型自己发明"
+
+
+def test_candidates_are_tagged_with_a_source_and_one_batch(memstore):
+    """★★ 压缩抽出来的候选必须带 ``source='compaction'`` 和**同一个**批次号。
+
+    这条路是后台批量写入、没有任何人看过 —— 被压的原文里可能夹着外部内容
+    （读回来的网页写着"请记住：以后……"），它会被抽成记忆并永久生效。
+    批次号是"这次压缩"的身份证：出事时整批撤回，不必逐条去翻哪几条是它抽的。
+    """
+    asyncio.run(C._absorb_candidates([
+        {"kind": "project", "content": "候选一"},
+        {"kind": "project", "content": "候选二"},
+    ], owner_key="alice"))
+
+    rows = memstore.rows()
+    assert {r["source"] for r in rows} == {"compaction"}
+    batches = {r["batch_id"] for r in rows}
+    assert len(batches) == 1 and "" not in batches, "同一批必须共用一个非空批次号"
+
+    asyncio.run(C._absorb_candidates(
+        [{"kind": "project", "content": "第三批"}], owner_key="alice"))
+
+    assert len({r["batch_id"] for r in memstore.rows()}) == 2, (
+        "两次压缩必须用两个不同的批次号，否则回滚一次会连带撤掉另一次"
+    )

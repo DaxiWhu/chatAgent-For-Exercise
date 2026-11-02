@@ -103,6 +103,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from typing import Any
 
 from .. import observability
@@ -562,6 +563,11 @@ async def _absorb_candidates(candidates: list[dict], *, owner_key: str,
 
     失败**不阻断压缩**（调用方只在返回值上关心条数）：记忆少几条是软损失，
     压缩停下来是硬故障。
+
+    每条都带上 ``source="compaction"`` 与**同一个批次号**：这条路是后台批量写入、
+    没有任何人看过，是记忆污染最短的一条链路（被压的原文里可能夹着外部内容，
+    比如读回来的网页写着"请记住：以后……"）。带上批次号之后，出事能整批撤回
+    （``memory.forget_batch_memories``），不必逐条去翻哪几条是那次抽出来的。
     """
     if not candidates:
         return 0
@@ -574,6 +580,7 @@ async def _absorb_candidates(candidates: list[dict], *, owner_key: str,
     if not memory.enabled():
         return 0
 
+    batch = uuid.uuid4().hex
     written = 0
     for c in candidates:
         try:
@@ -583,6 +590,8 @@ async def _absorb_candidates(candidates: list[dict], *, owner_key: str,
                 content=c["content"],
                 kind=c["kind"],
                 source_thread=thread_id,
+                source="compaction",
+                batch_id=batch,
             )
         except asyncio.CancelledError:
             raise
@@ -594,7 +603,8 @@ async def _absorb_candidates(candidates: list[dict], *, owner_key: str,
             written += 1
     observability.histogram("agent_history_memories_absorbed", written)
     if written:
-        logging.info("压缩时吸收了 %d 条记忆候选（会话=%s）", written, thread_id or "-")
+        logging.info("压缩时吸收了 %d 条记忆候选（会话=%s 批次=%s）",
+                     written, thread_id or "-", batch)
     return written
 
 

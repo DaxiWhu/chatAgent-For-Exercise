@@ -552,3 +552,20 @@ class PgVectorStore:
                 deleted = cur.rowcount
             conn.commit()
         return int(deleted or 0)
+
+    def delete_tenant(self):
+        """删除本租户的**全部**行，返回删除行数。
+
+        ⚠️ ``tenant is None``（= 显式声明"不过滤"）时**拒绝执行**并返回 0。
+        那个组合等价的 SQL 是没有 WHERE 的 ``DELETE FROM`` —— 一个参数漏传就把
+        整张表清空，而调用方拿到的返回值还是"成功"。这类操作宁可多一道硬拦截。
+        """
+        if self.tenant is None:
+            return 0
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"DELETE FROM {self.table} WHERE tenant = %s",
+                            (self.tenant,))
+                deleted = cur.rowcount
+            conn.commit()
+        return int(deleted or 0)

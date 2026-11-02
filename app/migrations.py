@@ -52,7 +52,7 @@ from dataclasses import dataclass
 #: ⚠️ 这里忘了改不会报错：``--status`` 会显示 pending 为空（"可以部署"），
 #: 而老库里 v10/v11 的两张表永远建不出来 —— 上线后第一次压缩/第一次写记忆才炸。
 #: 守卫：``tests/test_retention.py::test_schema_version_matches_the_latest_migration``。
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 #: 迁移元表。**这份 DDL 必须内联**：它是"记录其他迁移的工具"，不能被别的迁移依赖。
 _MIGRATIONS_TABLE = (
@@ -309,6 +309,39 @@ def _m11_long_term_memories(dsn, ctx):
                 cur.execute(statement)
 
 
+def _m12_memory_lifecycle(dsn, ctx):
+    """记忆的来源、批次与淘汰标记（2026-11-02）。
+
+    DDL 出处仍是 `src.agents.memory_store.SCHEMA_STATEMENTS`（本文件不重写）。
+
+    为什么单独占一个版本号：v11 建表时没有这三列，而 ``CREATE TABLE IF NOT
+    EXISTS`` 对已存在的表**一个字都不改**。老库升上来之后会一直少列，症状是
+    "插入失败：column \"source\" does not exist" —— 报错点离真正原因很远。
+
+    三列各自的用途：
+
+    * ``source`` —— ``memory``（模型主动调 remember）/ ``compaction``（压缩时批量抽）。
+      两者可信度不同：前者过了模型一层判断，后者是后台自动写入，是最短的一条污染
+      路径（见 ``心得.md`` 的 Claude Havoc 三段链）。
+    * ``batch_id`` —— 同一次压缩抽出的候选共用一个批次号，出问题时整批撤回，
+      不必逐条找。
+    * ``stale_at`` —— 容量淘汰的标记。**不物理删**：和"改口"用同一套语义，
+      旧数据仍然可查、可恢复，只是不再参与注入。
+
+    这里整份重跑一遍 SCHEMA_STATEMENTS（全部 ``IF NOT EXISTS`` / ``ADD COLUMN IF
+    NOT EXISTS``），所以对已 apply 过 v11 的库是幂等的；真正新增的就是那三列和
+    两个索引。
+    """
+    import psycopg
+
+    from src.agents.memory_store import SCHEMA_STATEMENTS
+
+    with psycopg.connect(dsn, connect_timeout=10, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            for statement in SCHEMA_STATEMENTS:
+                cur.execute(statement)
+
+
 MIGRATIONS: tuple = (
     Migration(1, "rag_chunks 向量表", _m1_rag_chunks),
     Migration(2, "review_queue 审核队列表", _m2_review_queue),
@@ -321,6 +354,7 @@ MIGRATIONS: tuple = (
     Migration(9, "agent_runs 运行登记表（停止任务）", _m9_run_control_table),
     Migration(10, "agent_history_compactions 压缩记录表", _m10_compaction_records),
     Migration(11, "agent_memories 长期记忆表", _m11_long_term_memories),
+    Migration(12, "agent_memories 来源/批次/淘汰标记", _m12_memory_lifecycle),
 )
 
 
