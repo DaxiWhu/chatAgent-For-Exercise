@@ -42,7 +42,7 @@ from .. import observability
 from ..envutil import env_int
 from ..rag import guard
 from ..rag.retrieval import build_citations
-from . import approval, memory
+from . import approval, memory, memory_digest
 from .context import TaskContext
 from .steps import ToolContractError, tool_error_handler
 from .toolpool import run_tool_step
@@ -746,6 +746,10 @@ def remember(ctx: RunContextWrapper[TaskContext], content: str, kind: str = "pro
     写法要求：``content`` 必须是**一句自足的话** —— 离开这段对话也读得懂、
     照着它就能直接做对。要带条件、范围、例外。
 
+    ⚠️ 超过约 200 字（``AGENT_MEMORY_DIGEST_ABOVE``）会先被**提炼**成一句再入库：
+    提炼会丢掉过程描述、只留结论，路径/命令/数值/日期逐字保留。所以不必为了
+    "怕丢细节"把整段原文塞进来 —— 但也别故意写长，长文过一遍提炼有丢信息风险。
+
     Args:
         content: 记忆正文。例如「回答先给结论，正文不超过 5 条，不要列目录」。
             路径、命令、报错原文、数值、日期**逐字照抄**，不要改写成概括。
@@ -760,8 +764,16 @@ def remember(ctx: RunContextWrapper[TaskContext], content: str, kind: str = "pro
     owner = (context.owner_key or "").strip()
     if not owner:
         return "未记住：当前会话没有可归属的用户（匿名或机器调用），记忆无处存放。"
+    raw = (content or "").strip()
+    limit = memory_digest.digest_above()
+    digested = ""
+    if limit and len(raw) > limit:
+        # 放大之前先压：这一步是有意的额外开销（用户 2026-11-02 拍的口径）——
+        # 一条长记忆会吃掉注入预算里七八条的位置，而它读起来还像在照抄对话。
+        digested = memory_digest.digest(
+            raw, kind, stats=getattr(context, "stats", None))
     result = memory.remember_memory(
-        owner_key=owner, content=content, kind=kind,
+        owner_key=owner, content=digested or raw, kind=kind,
         tenant=context.tenant, source_thread=context.thread_id,
         supersedes=supersedes,
     )
@@ -772,11 +784,18 @@ def remember(ctx: RunContextWrapper[TaskContext], content: str, kind: str = "pro
         if reason == "disabled":
             return "未记住：长期记忆功能未开启。"
         return f"未记住：写入失败（{reason}），下一轮不会带上这条。"
+    # 提炼发生了就如实告诉模型：它下次才知道"写长不是问题，但会被压"。
+    if digested:
+        note = f"原文 {len(raw)} 字，已提炼成 {len(digested)} 字再保存。"
+    elif limit and len(raw) > limit:
+        note = f"这条 {len(raw)} 字，本次未能提炼，已按原样保存。"
+    else:
+        note = ""
     if result.get("action") == "refreshed":
         return "这条已经记过，已更新使用记录（不会重复保存）。"
     replaced = result.get("superseded") or []
     tail = f"，同时作废了 {len(replaced)} 条旧记忆" if replaced else ""
-    return f"已记住（编号 {result.get('id')}{tail}）。这条从下一轮起每轮都会带上。"
+    return f"已记住（编号 {result.get('id')}{tail}）。这条从下一轮起每轮都会带上。{note}"
 
 
 @function_tool(failure_error_function=tool_error_handler("forget"))

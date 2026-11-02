@@ -108,8 +108,11 @@ def used_of(context: Any) -> int:
 def note_bypass(stats: Any, source: str, usage: Any) -> None:
     """记一笔**旁路**模型调用的 usage（反思闸门 / 窗口压缩调用它）。
 
-    source: 来源标签，取值只有 ``reflection`` / ``compaction`` —— 它进指标标签，
-        所以必须是有界枚举（写成 ``type(exc).__name__`` 那种会把基数打爆）。
+    source: 来源标签，取值只有 ``reflection`` / ``compaction`` / ``memory_digest`` ——
+        它进指标标签，所以必须是有界枚举（写成 ``type(exc).__name__`` 那种会把基数
+        打爆）。新增一个来源**只**需要在这里补名字：``runner._bypass_slice`` 与
+        ``report`` 都是按 ``bypass_tokens`` 的来源遍历的，没有硬编码清单 ——
+        也正因为没有清单，漏补名字**不会报错**，只会让那个来源在文档里不存在。
 
     为什么要有这**一个**统一入口，而不是让两个模块各自往 ``stats`` 上写：
     两处各写一份一定会漂（一处漏加、一处加错字段），而漂的表现是"预算偶尔偏小"，
