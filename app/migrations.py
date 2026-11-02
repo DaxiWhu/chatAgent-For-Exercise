@@ -49,7 +49,10 @@ import sys
 from dataclasses import dataclass
 
 #: 当前代码期望的结构版本（新增迁移时同步 +1）
-SCHEMA_VERSION = 9
+#: ⚠️ 这里忘了改不会报错：``--status`` 会显示 pending 为空（"可以部署"），
+#: 而老库里 v10/v11 的两张表永远建不出来 —— 上线后第一次压缩/第一次写记忆才炸。
+#: 守卫：``tests/test_retention.py::test_schema_version_matches_the_latest_migration``。
+SCHEMA_VERSION = 11
 
 #: 迁移元表。**这份 DDL 必须内联**：它是"记录其他迁移的工具"，不能被别的迁移依赖。
 _MIGRATIONS_TABLE = (
@@ -263,6 +266,49 @@ def _m9_run_control_table(dsn, ctx):
     RunControl(dsn=dsn).ensure_schema()
 
 
+def _m10_compaction_records(dsn, ctx):
+    """压缩记录表：`agent_history_compactions`（2026-11-02）。
+
+    DDL 出处：`src.agents.compaction_store.SCHEMA_STATEMENTS`（本文件不重写）。
+
+    为什么要有这张表：历史压缩从"清空会话再写回摘要"改成"日志只追加 + 读取时投影"，
+    压缩产物必须有个地方落 —— 落在会话表里就等于又改了一次库。
+    老库上这张表不存在时，`_latest_record()` 会退化成"从来没压过" ⇒ 历史全量返回，
+    功能退级但不报错，正是那种**要跑很久才会被发现**的错。所以单独占一个版本号。
+
+    幂等：全部 `IF NOT EXISTS`。
+    """
+    import psycopg
+
+    from src.agents.compaction_store import SCHEMA_STATEMENTS
+
+    with psycopg.connect(dsn, connect_timeout=10, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            for statement in SCHEMA_STATEMENTS:
+                cur.execute(statement)
+
+
+def _m11_long_term_memories(dsn, ctx):
+    """长期记忆表：`agent_memories`（2026-11-02）。
+
+    DDL 出处：`src.agents.memory_store.SCHEMA_STATEMENTS`（本文件不重写）。
+
+    ⚠️ 那个部分唯一索引（``WHERE invalid_at IS NULL``）是这张表的**语义核心**，
+    不是性能优化：全表唯一会挡住"把设置改回原样"（新行哈希与已失效的旧行相同，
+    插入直接失败），而且只在用户真的改回去时才炸 —— 测不到、也想不到。
+
+    幂等：全部 `IF NOT EXISTS`。
+    """
+    import psycopg
+
+    from src.agents.memory_store import SCHEMA_STATEMENTS
+
+    with psycopg.connect(dsn, connect_timeout=10, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            for statement in SCHEMA_STATEMENTS:
+                cur.execute(statement)
+
+
 MIGRATIONS: tuple = (
     Migration(1, "rag_chunks 向量表", _m1_rag_chunks),
     Migration(2, "review_queue 审核队列表", _m2_review_queue),
@@ -273,6 +319,8 @@ MIGRATIONS: tuple = (
     Migration(7, "agent_sessions / agent_messages 跨轮对话历史表", _m7_agent_session_tables),
     Migration(8, "tenants / users / tenant_join_requests 账号体系表", _m8_account_tables),
     Migration(9, "agent_runs 运行登记表（停止任务）", _m9_run_control_table),
+    Migration(10, "agent_history_compactions 压缩记录表", _m10_compaction_records),
+    Migration(11, "agent_memories 长期记忆表", _m11_long_term_memories),
 )
 
 

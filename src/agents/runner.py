@@ -106,7 +106,17 @@ from agents import (
 from .. import observability
 from ..envutil import env_int
 from ..rag import citation_check
-from . import approval, budget, deadline, fallback, reflection, runtime, supplements
+from . import (
+    approval,
+    budget,
+    compaction,
+    deadline,
+    fallback,
+    memory,
+    reflection,
+    runtime,
+    supplements,
+)
 from .context import TaskContext
 from .frontline import frontline_agent
 from .guards import (
@@ -292,7 +302,13 @@ async def model_input_filter(data: Any) -> Any:
     deadline.check(context)
     budget.check(context)
     trimmed = await trim_model_input(data)
-    injected = await reflection.inject_reflections(trimmed, context=context)
+    # 长期记忆排在裁剪**之后**、反思**之前**：它是一条稳定前缀（放最前），
+    # 但同样不能早于裁剪 —— 否则会被当成"超预算的老历史"裁掉，
+    # 症状是"明明记着、回答时却不知道"，而日志里一切都正常。
+    with_memory = await memory.inject_memories(
+        trimmed, context=getattr(trimmed, "context", None) or context)
+    injected = await reflection.inject_reflections(
+        with_memory, context=getattr(with_memory, "context", None) or context)
     return _inject_supplements(injected, getattr(injected, "context", None) or context)
 
 
@@ -797,23 +813,24 @@ async def run_agent(
     ended_on = ""
 
     try:
-        if on_text is None:
-            result = await Runner.run(
-                agent,
-                run_input,
-                context=context,
-                run_config=run_config,
-                max_turns=max_turns,
-                hooks=AGENT_HOOKS,
-                # 会话负责"取历史 + 与本轮合并 + 写回"；没有它时模型只看得到 input_items。
-                # ⚠️ 它是**这一个** run 的历史口，不是"本轮用什么模型/护栏"那类配置 ——
-                # 后者在 run_config 里（会话对象的构造期参数也在那儿配，见 build_run_config）。
-                session=session,
-            )
-        else:
+        async def _invoke_once() -> Any:
+            """跑一次 run。抽成函数是为了让溢出兜底能**原样再跑一次**。"""
+            if on_text is None:
+                return await Runner.run(
+                    agent,
+                    run_input,
+                    context=context,
+                    run_config=run_config,
+                    max_turns=max_turns,
+                    hooks=AGENT_HOOKS,
+                    # 会话负责"取历史 + 与本轮合并 + 写回"；没有它时模型只看得到
+                    # input_items。⚠️ 它是**这一个** run 的历史口，不是"本轮用什么
+                    # 模型/护栏"那类配置 —— 后者在 run_config 里。
+                    session=session,
+                )
             # 流式：正文边产边交给回调。异常在迭代里抛（见 _run_streamed），
             # 所以下面的 except 分支同样覆盖它 —— 两种形态的收尾口径必须一致。
-            result = await _run_streamed(
+            return await _run_streamed(
                 agent,
                 run_input,
                 context=context,
@@ -822,6 +839,25 @@ async def run_agent(
                 session=session,
                 on_text=on_text,
             )
+
+        try:
+            result = await _invoke_once()
+        except Exception as exc:  # noqa: BLE001  只为识别"上下文超了"
+            # 溢出兜底（对应 DSH 的 ``maxOverflowRetries``）：模型已经明确拒了，
+            # 再拿一个可能同样算错的预算去商量没有意义 —— 直接**只留最后一轮**压一次。
+            #
+            # ⚠️ 只在**非流式**重试。流式下前面推给客户端的正文已经出去了，
+            # 重跑会把同一段再推一遍 —— 用户看到重复内容，比"这一轮失败"更糟。
+            # 流式这条缺口是**已知**的，处置是记指标（能看到它真发生过），
+            # 而不是假装已经覆盖。
+            if (on_text is not None or session is None or not session_id
+                    or not compaction.is_context_overflow(exc)):
+                raise
+            observability.counter("agent_context_overflow_total", action="compact_retry")
+            logging.warning("模型报上下文超限 ⇒ 强制压一次历史后重试（只重试一次）")
+            await compaction.compact_session_history(
+                session_id, session=session, force=True)
+            result = await _invoke_once()
     except OutputGuardrailTripwireTriggered as exc:
         # 出口护栏拦下的输出**不会**成为交付物 —— 官方语义：被拒的候选输出不落库。
         # ⚠️ 但那段产出要"救回来存档"：转人工时它作为草稿带给审核人（见 fallback_draft）。

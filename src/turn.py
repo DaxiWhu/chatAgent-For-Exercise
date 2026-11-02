@@ -75,16 +75,21 @@ class TurnRequest:
     """
 
 
-def build_context(*, tenant: str, asset_dir: str | Path | None = None) -> TaskContext:
+def build_context(*, tenant: str, owner_key: str = "",
+                  asset_dir: str | Path | None = None) -> TaskContext:
     """装配一次运行要用的上下文。
 
     为什么检索器传**工厂**而不是实例：``kb_search`` 是模型自己决定要不要调的
     工具，很多轮根本不会检索。开工就构建等于把"可能用不上"的那次构建
     （pg 后端还要连库、做增量同步）提前做掉。
+
+    owner_key: 用户主体，长期记忆的归属键。空串表示无法归属（匿名/机器调用），
+        此时记忆链路的读与写都会**跳过** —— 这是有意的，不是降级。
     """
     key = (tenant or "").strip()
     ctx = TaskContext(
         tenant=key,
+        owner_key=(owner_key or "").strip(),
         docs_dir=DOCS_DIR,
         retriever_factory=(lambda: get_retriever(key or None)),
     )

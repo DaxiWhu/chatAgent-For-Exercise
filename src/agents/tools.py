@@ -42,7 +42,7 @@ from .. import observability
 from ..envutil import env_int
 from ..rag import guard
 from ..rag.retrieval import build_citations
-from . import approval
+from . import approval, memory
 from .context import TaskContext
 from .steps import ToolContractError, tool_error_handler
 from .toolpool import run_tool_step
@@ -50,11 +50,13 @@ from .toolpool import run_tool_step
 __all__ = [
     "calculate",
     "deliver",
+    "forget",
     "generate_image",
     "get_current_time",
     "kb_search",
     "list_assets",
     "read_asset",
+    "remember",
     "render_deck",
     "render_slide_deck",
     "save_text_asset",
@@ -719,6 +721,89 @@ def deliver(ctx: RunContextWrapper[TaskContext], content: str, needs_review: boo
         "agent_delivery_total", reviewed="true" if needs_review else "false"
     )
     return "已交付（人工已过目）。" if needs_review else "已交付。"
+
+
+# --------------------------------------------------------------------------- #
+# 长期记忆：跨会话的"这个人是谁、定过什么规矩"（2026-11-02）
+#
+# 为什么是**工具**而不是"跑完自动提炼"：官方原语只有 ``FunctionTool``；而且用户说
+# "以后都这样"时，当轮写进去才叫"记住了"，下一轮才生效的那种更像"它后来自己想到的"。
+# 代价是模型可能不调 —— 用指标 ``agent_memory_writes_total`` 盯着，不靠感觉。
+#
+# 为什么两个工具都**不挂审批**：它们只写本项目自己的一张表，撤得回来（标失效即可），
+# 也不落外部资产。审批该落在"撤不回来"的动作上。
+# --------------------------------------------------------------------------- #
+@function_tool(failure_error_function=tool_error_handler("remember"))
+@_isolated("remember")
+def remember(ctx: RunContextWrapper[TaskContext], content: str, kind: str = "project",
+             supersedes: str = "") -> str:
+    """记住一条关于用户的长期事实或规矩，**跨会话有效**。
+
+    什么时候用：用户明确说"记住…/以后都…"，或者他给出了一条以后每轮都该遵守的偏好、
+    一条项目级的事实（技术栈、截止日期、环境限制）、一条明确否定过的做法。
+    **不要**用它记：一次性的对话内容、临时变量、密码/令牌、你自己的推测。
+
+    写法要求：``content`` 必须是**一句自足的话** —— 离开这段对话也读得懂、
+    照着它就能直接做对。要带条件、范围、例外。
+
+    Args:
+        content: 记忆正文。例如「回答先给结论，正文不超过 5 条，不要列目录」。
+            路径、命令、报错原文、数值、日期**逐字照抄**，不要改写成概括。
+        kind: 类别之一 —— persona（这个人是谁）/ preference（怎么答）/
+            project（项目事实与结论）/ feedback（他纠正过的做法+原因）/ reference（索引）。
+        supersedes: 若这条是在**修正**某条旧记忆，填旧记忆的编号或旧内容里的一段，
+            旧的那条会被标成失效（不删，留痕）。不是修正就留空。
+    """
+    context = ctx.context
+    if not isinstance(context, TaskContext):
+        return "未记住：缺少任务上下文。"
+    owner = (context.owner_key or "").strip()
+    if not owner:
+        return "未记住：当前会话没有可归属的用户（匿名或机器调用），记忆无处存放。"
+    result = memory.remember_memory(
+        owner_key=owner, content=content, kind=kind,
+        tenant=context.tenant, source_thread=context.thread_id,
+        supersedes=supersedes,
+    )
+    if not result.get("ok"):
+        reason = result.get("reason") or "unknown"
+        if reason == "empty":
+            return "未记住：content 是空的。"
+        if reason == "disabled":
+            return "未记住：长期记忆功能未开启。"
+        return f"未记住：写入失败（{reason}），下一轮不会带上这条。"
+    if result.get("action") == "refreshed":
+        return "这条已经记过，已更新使用记录（不会重复保存）。"
+    replaced = result.get("superseded") or []
+    tail = f"，同时作废了 {len(replaced)} 条旧记忆" if replaced else ""
+    return f"已记住（编号 {result.get('id')}{tail}）。这条从下一轮起每轮都会带上。"
+
+
+@function_tool(failure_error_function=tool_error_handler("forget"))
+@_isolated("forget")
+def forget(ctx: RunContextWrapper[TaskContext], memory_id: str = "",
+           content: str = "") -> str:
+    """作废一条长期记忆（**标失效，不物理删**）。
+
+    用户说"那个不用管了""以后不用这样了"时用它。作废之后那条不再进上下文，
+    但库里留着 —— 以后要回答"他之前是怎么要求的"还查得到。
+
+    Args:
+        memory_id: 记忆编号（``remember`` 返回过）。知道编号就填它，最准。
+        content: 记不住编号时填那段内容里的一小段，按包含匹配。
+    """
+    context = ctx.context
+    if not isinstance(context, TaskContext):
+        return "未作废：缺少任务上下文。"
+    owner = (context.owner_key or "").strip()
+    if not owner:
+        return "未作废：当前会话没有可归属的用户。"
+    if not memory_id and not content:
+        return "未作废：memory_id 与 content 至少给一个。"
+    n = memory.forget_memory(owner_key=owner, memory_id=memory_id, content=content)
+    if not n:
+        return "没找到匹配的记忆（可能编号不对，或它已经失效了）。"
+    return f"已作废 {n} 条。"
 
 
 def render_slide_deck(deck_json: str, asset_dir: Path | str) -> str:

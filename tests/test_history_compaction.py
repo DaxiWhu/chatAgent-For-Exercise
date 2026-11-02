@@ -184,7 +184,11 @@ def test_cut_point_never_splits_a_tool_call_from_its_output():
 
 
 def test_kept_rounds_come_back_byte_identical(on, fake_summary):
-    """保留段必须**逐条一字不变**（这是"压缩不篡改近期对话"的全部内容）。"""
+    """保留段必须**逐条一字不变**，而且库里那份一个字都不许动。
+
+    改造后"保留"有两层含义，都要断言：库里是原件（压缩只追加记录），模型看到的
+    那一份由投影算出、尾部与原件完全相等。
+    """
     items = _rounds(4)
     keep_from = C._plan_keep_from(items, keep=2)
     assert keep_from == 4
@@ -194,20 +198,21 @@ def test_kept_rounds_come_back_byte_identical(on, fake_summary):
     wrapped = C.CompactingSession(fake)
 
     async def _go():
-        return await C.compact_session_history("s-1", session=wrapped)
+        await C.compact_session_history("s-1", session=wrapped)
+        return await wrapped.get_items()
 
-    asyncio.run(_go())
-    assert fake.items[0] == {"role": "system", "content": fake_summary(items[:4])}
-    assert fake.items[1:] == expected_tail, "保留段必须与原始条目完全相等"
+    view = asyncio.run(_go())
+    assert fake.items == items, "★ 会话日志必须一个字节都不动"
+    assert view[1:] == expected_tail, "投影的尾部必须与原件完全相等"
 
 
 # --------------------------------------------------------------------------- #
-# ③ 会话侧：替换、空摘要、读失败、锁、失败回滚
+# ③ 会话侧：记录 + 投影、空摘要、读失败、锁、写记录失败
 # --------------------------------------------------------------------------- #
-def test_old_history_is_replaced_by_one_system_summary(on, fake_summary):
-    """老历史换成**一条 system 摘要 + 最近 N 轮**；摘要必须是 system 角色。
+def test_old_history_becomes_a_projected_summary(on, fake_summary):
+    """老历史在**视图**里换成一条 system 摘要 + 最近 N 轮；库里仍是全量。
 
-    为什么必须是 ``system``：它**天然不算作"一轮"**（轮按用户条目切），所以下一次
+    为什么摘要必须是 ``system``：它**天然不算作"一轮"**（轮按用户条目切），所以下一次
     压缩不会把上一次的摘要当成新的一轮再压一遍；换成 user/assistant 就会越压越少。
     """
     items = _rounds(4)
@@ -215,13 +220,17 @@ def test_old_history_is_replaced_by_one_system_summary(on, fake_summary):
     wrapped = C.CompactingSession(fake)
 
     async def _go():
-        return await C.compact_session_history("s-1", session=wrapped)
+        dropped = await C.compact_session_history("s-1", session=wrapped)
+        return dropped, await wrapped.get_items()
 
-    dropped = asyncio.run(_go())
-    assert dropped == 4, "4 轮里该压掉前 2 轮（保留 2 轮）"
-    assert fake.items[0]["role"] == "system", "摘要必须是 system 角色"
-    assert fake.items[1:] == items[4:]
-    assert fake.calls.count("clear") == 1, "替换必须是「清空 + 写回」一次，不能分两次"
+    dropped, view = asyncio.run(_go())
+    assert dropped == 4, "4 轮里该新覆盖前 2 轮（保留 2 轮）"
+    assert view[0]["role"] == "system", "摘要必须是 system 角色"
+    assert view[0]["content"] == fake_summary(items[:4])
+    assert view[1:] == items[4:]
+    assert len(fake.items) == len(items), "★ 库里的条数不许变"
+    assert "clear" not in fake.calls, "★ 不许再出现清空会话"
+    assert "add_items" not in fake.calls, "★ 不许再往会话里写摘要"
 
 
 def test_empty_summary_means_no_replacement(on, monkeypatch):
@@ -331,43 +340,58 @@ def test_concurrent_write_during_summary_aborts_this_round(on, monkeypatch):
     assert [_text(x) for x in fake.items][-2:] == ["新问题", "新回答"]
 
 
-def test_replacement_failure_restores_previous_history():
-    """替换失败（写回那一步炸了）⇒ 历史**退回原样**，不能停在"已清空"上。"""
-    items = _rounds(4)
-    fake = FakeSession(items)
-    fake.fail_add = RuntimeError("PG 写失败")
-    fake.fail_add_times = 1
+def test_record_failure_leaves_the_log_untouched(on, fake_summary):
+    """写压缩记录失败 ⇒ 这轮没压。**没有"回滚"这回事**，因为压根没动过日志。
 
-    async def _go():
-        with pytest.raises(RuntimeError):
-            await C._replace_items(fake, summary="摘要", tail=items[4:], previous=items)
-
-    asyncio.run(_go())
-    assert fake.items == items, "替换失败后库里必须退回原历史（不是空会话）"
-
-
-def test_cancellation_during_replacement_also_restores():
-    """**取消**同样要回滚 —— 取消不是"可以不清场"的理由。
-
-    官方把 ``Exception`` 与 ``CancelledError`` 分开写、两种都回滚，理由写在注释里：
-    否则一次取消就会留下一个空会话（用户下一轮失忆）。这里连"回滚本身再被打断"
-    都要扛住（官方 ``_await_restore_despite_cancellation``）。
+    这条取代了原来的"替换失败要恢复到已清空之前"：改造后不存在中间态，
+    所以判据从"能恢复"升级成"根本没发生"。
     """
     items = _rounds(4)
     fake = FakeSession(items)
-    fake.fail_add = asyncio.CancelledError()
-    fake.fail_add_times = 1
+
+    class _BoomStore:
+        async def latest_active(self, thread_id, scope="history"):
+            return None
+
+        async def record(self, *a, **k):
+            raise RuntimeError("记录表写失败")
+
+    wrapped = C.CompactingSession(fake, store=_BoomStore())
 
     async def _go():
-        task = asyncio.create_task(
-            C._replace_items(fake, summary="摘要", tail=items[4:], previous=items)
-        )
+        return await C.compact_session_history("s-1", session=wrapped)
+
+    assert asyncio.run(_go()) == 0
+    assert fake.items == items, "写记录失败时库里必须原样不动"
+    assert "clear" not in fake.calls and "add_items" not in fake.calls
+
+
+def test_cancellation_while_recording_leaves_the_log_untouched(on, fake_summary):
+    """**取消**同样只影响"这一轮压没压成"，不影响库里的内容。
+
+    旧路线这里要处理"清空之后被取消"（会留下空会话），所以有整整一套回滚；
+    现在取消了最坏就是"记录没写进去、下一轮再压"，历史一直是完整的。
+    """
+    items = _rounds(4)
+    fake = FakeSession(items)
+
+    class _CancelStore:
+        async def latest_active(self, thread_id, scope="history"):
+            return None
+
+        async def record(self, *a, **k):
+            raise asyncio.CancelledError()
+
+    wrapped = C.CompactingSession(fake, store=_CancelStore())
+
+    async def _go():
+        task = asyncio.create_task(C.compact_session_history("s-1", session=wrapped))
         with contextlib.suppress(asyncio.CancelledError):
             await task
         return task.cancelled()
 
     assert asyncio.run(_go()) is True, "取消必须原样传播出去"
-    assert fake.items == items, "取消之后库里必须退回原历史"
+    assert fake.items == items, "取消之后库里必须原样不动"
 
 
 def test_decorator_proxies_the_protocol_without_changing_it():
@@ -521,7 +545,9 @@ def test_config_exposes_compaction_for_startup_echo():
 def test_the_summary_prompt_demands_a_step_skeleton():
     prompt = C._SUMMARY_PROMPT
 
-    assert "第 N 步" in prompt, "没要求按步编号 —— 摘要会退化成一段自由文本"
+    # 2026-11-02 从"第 N 步"改成"动作 → 关键结果"：编号本身不承载信息，
+    # 接手者要的是"做过什么、成没成"。八个小节里这一条落在「错误与修复」下。
+    assert "动作 → 关键结果" in prompt, "没要求动作与结果成对 —— 摘要会退化成自由文本"
     assert "动作" in prompt
     assert "关键结果" in prompt
     assert "失败" in prompt and "未完成" in prompt, (
@@ -539,9 +565,20 @@ def test_the_summary_prompt_keeps_its_two_anti_fabrication_rules():
 
     assert "不许编造" in prompt
     assert "结果未明" in prompt, "看不出成败时要允许它说不知道，而不是硬编一个成功"
-    assert "不要写建议" in prompt
+    assert "不写建议" in prompt
 
 
 def test_the_summary_prompt_still_caps_its_length():
-    """上限必须留着：摘要是"更省"，不是"再存一份全文"。"""
-    assert "字以内" in C._SUMMARY_PROMPT
+    """上限必须留着：摘要是"更省"，不是"再存一份全文"。
+
+    ⚠️ 2026-11-02 从固定 600 字改成**按被压段比例**（夹在 600~6000）。固定值必然
+    在两头各错一次：被压段很短时 600 字是一条比原文还长的"摘要"（会被"必须更小"
+    那条校验拒掉，白花一次调用），被压段很长时 600 字只能写成结论。
+    """
+    assert "{limit}" in C._SUMMARY_PROMPT, "提示词自己不许写死数字"
+    assert C._summary_max_chars(100) == C._MIN_SUMMARY_CHARS, "短段要有下限"
+    assert C._summary_max_chars(10_000) == 2_000, "按 1/5 取"
+    assert C._summary_max_chars(10**7) == C._MAX_SUMMARY_CHARS, "长段要有上限"
+
+    rendered = C._summary_system_prompt("", 1234)
+    assert "{limit}" not in rendered and "1234" in rendered, "占位符必须被替换掉"

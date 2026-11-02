@@ -623,10 +623,12 @@ def test_all_tools_that_can_fail_install_a_handler():
     for name in sorted(expected):
         assert installed(on_frontline[name]), f"{name} 没装错误处理函数"
 
-    # 3. 前台工具表里"装了处理函数"的恰好是这十个 —— 将来新增一个能失败的工具
+    # 3. 前台工具表里"装了处理函数"的恰好是这些 —— 将来新增一个能失败的工具
     #    却忘了装，这条立刻红；反过来多装了一个也要有人看一眼。
     #    2026-10-30 加了四个只读小工具（时间 / 算术 / 资产回读）：它们同样可能失败
     #    （非法时区、除零、路径穿越），失败文案同样要能进步骤清单，所以都装了。
+    #    2026-11-02 加了长期记忆的 remember / forget：写库会失败（没 DSN、无归属、
+    #    内容为空），而那几种失败必须能被"这一步成没成"看见。
     assert {n for n, t in on_frontline.items() if installed(t)} == expected | {
         "save_text_asset",
         "deliver",
@@ -634,6 +636,8 @@ def test_all_tools_that_can_fail_install_a_handler():
         "calculate",
         "list_assets",
         "read_asset",
+        "remember",
+        "forget",
     }
 
 

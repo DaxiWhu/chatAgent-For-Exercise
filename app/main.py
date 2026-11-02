@@ -64,6 +64,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from src import observability
 from src.agents.approval import ResumeRequest
+from src.agents.memory_store import make_memory_store
 from src.prompts import PROMPT_VERSION
 from src.turn import TurnRequest, build_context, run_turn
 
@@ -109,6 +110,10 @@ _IDEMPOTENCY = build_idempotency_store()
 #: ⚠️ 这是**运行时**的用户权威 —— `.env` 里的 `AUTH_USERS` 只在库里一个用户都没有时
 #: 用来建出第一个管理员（见 `AccountStore.seed_if_empty`）。管理接口读写的是它。
 _ACCOUNTS = build_account_store()
+#: 长期记忆（跨会话）。DSN 必须与 `src.agents.memory` 那边同源（都是 `DB_URL`）——
+#: 那个模块的 store 是**进程单例、按首个调用者传的 DSN 定型**，两边传不同的值会变成
+#: "工具写进去、注入口读不到"，而两边都不报错。
+_MEMORIES = make_memory_store(DB_URL)
 #: 用户鉴权（**人类用户的唯一口径**）：JWT 验签 + 会话白名单 + 账号表校验。
 #: 未配置 `AUTH_*` 时它只是一个空壳 —— `_authenticate` 不会走到它（见 `AUTH_ENABLED`）。
 _AUTH = userauth.build_auth_service(accounts=_ACCOUNTS)
@@ -2642,9 +2647,11 @@ async def _stream_run(turn, req_kind: str, tenant: str = "",
     # 放这里还顺带保证了"登记成功 ⇒ 确实开始跑了"。
     if run_id:
         await _off(_RUNS.begin, run_id, thread_id, tenant)
-    # 这一轮的运行上下文（租户、语料目录、检索器工厂）。一次请求一份 ——
+    # 这一轮的运行上下文（租户、用户主体、语料目录、检索器工厂）。一次请求一份 ——
     # 不再像图那样"每个节点各建一份、再互相串引用"，因为一次请求**就是**一次运行。
-    context = build_context(tenant=turn.tenant)
+    # `subject` 同时是长期记忆的归属键：它来自已验签凭证，与 `_SESSIONS.claim` 用的
+    # 是同一个值 —— 两处取不同的值会让"会话归属 A、记忆写到 B"。
+    context = build_context(tenant=turn.tenant, owner_key=subject)
     budget = budget if budget is not None else RequestBudget(0)
     deadline = _RequestDeadline(timeout)
     produced: list[str] = []
@@ -4000,16 +4007,18 @@ async def admin_user_delete_v1(username: str, request: Request,
     # 没清到；而且归属行留着就是"同名重建能继承会话"的入口，必须无条件删。
     leftover = await _off(_SESSIONS.release_owner, username)
 
-    # ⚠️ 长期记忆（`agent_memories`）落地时**必须在这里补一行按 `owner_key` 删**。
-    # 现在表还不存在，没有可删的；但不补的后果与上面会话那条一模一样：
-    # 同名重建的账号 `owner_key` 与旧账号完全相同 ⇒ 直接继承死者的记忆。
+    # ⚠️ 长期记忆必须在这里**物理删**（不是标失效）。
+    # `owner_key` 就是用户名，同名重建的账号与旧账号完全相同 ⇒ 不删就直接继承死者的
+    # 记忆：新用户第一轮就会被告知"你以前要求过……"。与会话归属那边同一条理由，
     # 口径见 `PLAN_long_term_memory.md` §3.6。
+    memories = await _off(_MEMORIES.forget_owner, username)
 
     n = await _off(_AUTH.logout_all, username)
-    logging.info("管理员删用户：by=%s user=%s 清除令牌=%s 清理会话=%d 残留归属=%s",
-                 ident.user, username, n, len(threads), leftover)
+    logging.info("管理员删用户：by=%s user=%s 清除令牌=%s 清理会话=%d 残留归属=%s 记忆=%d",
+                 ident.user, username, n, len(threads), leftover, memories)
     return {"deleted": True, "sessions_revoked": n,
-            "threads_purged": len(threads), "purge": purge}
+            "threads_purged": len(threads), "purge": purge,
+            "memories_purged": memories}
 
 
 # ---- 加入申请的审批 ----

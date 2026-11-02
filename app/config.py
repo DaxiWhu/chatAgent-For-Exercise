@@ -822,8 +822,10 @@ AGENT_HISTORY_COMPACT = _env_bool("AGENT_HISTORY_COMPACT", False)
 AGENT_HISTORY_KEEP_ROUNDS = max(1, _env_int("AGENT_HISTORY_KEEP_ROUNDS", 5))
 
 #: **窗口压缩**的触发线 = `AGENT_HISTORY_TOKEN_LIMIT` × 这个比例（默认 85%）。
-#: 做成配置（而不是写死 0.85）：将来网关换成更大窗口的模型时只改配置、不改代码。
-AGENT_HISTORY_COMPACT_RATIO = _env_float("AGENT_HISTORY_COMPACT_RATIO", 0.85)
+#: 做成配置（而不是写死）：将来网关换成更大窗口的模型时只改配置、不改代码。
+#: 2026-11-02 从 0.85 下调到 0.80：心得那条易发问题说的是"窗口没满、注意力和
+#: 任务表现已经开始下降"，0.85 等于等到退化之后才动手。
+AGENT_HISTORY_COMPACT_RATIO = _env_float("AGENT_HISTORY_COMPACT_RATIO", 0.80)
 
 
 

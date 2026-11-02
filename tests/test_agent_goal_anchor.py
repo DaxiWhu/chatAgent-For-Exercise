@@ -5,7 +5,7 @@
 长任务跑到后半程，"目标"只有两个载体：
 
 1. ``history_budget`` 的**锚点**（还没被压过时，就是最初那条用户条目）；
-2. ``compaction`` 生成的**摘要**（压过之后，就是摘要的第一项「任务与约束」）。
+2. ``compaction`` 生成的**摘要**（压过之后，就是摘要的第一项「原始请求与意图」）。
 
 只做第 1 条不够：第一次压缩一旦发生，最初那句原话就只存在于摘要里，而摘要会被
 **逐层再压** —— 靠"摘要提示词请你自己从对话里反推目标"是很软的一条链，尤其当被压
@@ -79,21 +79,29 @@ def test_the_goal_reaches_the_summarizer(monkeypatch):
     system = _system_of(client.calls[0])
     assert "把三份财报对比成一张表" in system
     # 原有要求不能被顶掉：目标那一行是**追加**，不是替换。
-    assert "任务与约束" in system
+    # 锚在第一节的标题上 —— 它正是承载"最初要干什么"的那一格，改提示词小节时
+    # 这里必须跟着改，否则本文守卫的"对齐"就无处可对。
+    assert "原始请求与意图" in system
 
 
 def test_without_a_goal_the_prompt_is_unchanged(monkeypatch):
-    """拿不到目标 ⇒ 提示词逐字节等于原版。
+    """拿不到目标 ⇒ 提示词里一个字的目标段都没有。
 
     这条守的是"别编一个目标":一句放之四海皆准的"完成用户的任务"会让摘要的第一项
     变成废话，而它正是后面判断"还在不在解题"的唯一依据。
+
+    ⚠️ 2026-11-02：提示词从"一段固定文案"改成了带 ``{limit}`` 占位符的模板
+    （摘要上限按被压段长度浮动）。所以"原版"不再是常量本身，而是
+    **模板按本次上限渲染出来的那一份** —— 这里正文只有两个字，上限取到下限 600。
     """
     client = _RecordingClient()
     monkeypatch.setattr(C, "_client_or_none", lambda: client)
 
     C.summarize_items([{"role": "user", "content": "旧话"}])
 
-    assert _system_of(client.calls[0]) == C._SUMMARY_PROMPT
+    system = _system_of(client.calls[0])
+    assert "这件事一开始的目标是" not in system
+    assert system == C._SUMMARY_PROMPT.format(limit=C._MIN_SUMMARY_CHARS)
 
 
 def test_a_long_goal_is_clipped_and_marked(monkeypatch):

@@ -139,11 +139,15 @@ def test_frontline_topology_is_exactly_what_the_design_claims():
     names = {t.name for t in frontline_agent.tools}
     # 2026-10-30 加了四个只读的确定性工具（时间 / 算术 / 资产回读）：
     # 它们的判据与"确定性能力不做成 agent"一致 —— 都是**函数**，不是专家。
+    # 2026-11-02 加了两个长期记忆工具：``remember`` 写、``forget`` 标失效。
+    # 它们**不挂审批**（写的是本用户自己的记忆表，不落交付物），但确实扩大了这个
+    # 模型每轮要挑的选项面 —— 所以仍然走"精确相等"，加一个就必须在这里露一次面。
     # 这份清单刻意保持"精确相等"而不是"包含"：多挂一个工具也要有人看一眼，
     # 因为工具是模型可以忘掉的选项，每多一个都在稀释它的注意力。
     assert names == {"research", "build_slide_deck", "make_illustration",
                      "review_draft", "save_text_asset", "deliver",
-                     "get_current_time", "calculate", "list_assets", "read_asset"}
+                     "get_current_time", "calculate", "list_assets", "read_asset",
+                     "remember", "forget"}
     assert frontline_agent.output_type is None
     assert [h.name for h in frontline_agent.handoffs or []] == ["literary_writer"]
 

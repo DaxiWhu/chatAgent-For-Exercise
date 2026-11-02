@@ -280,9 +280,11 @@ def _build(session_id: str) -> Any:
     from agents.extensions.memory import SQLAlchemySession
 
     from .compaction import CompactingSession
+    from .compaction_store import make_store
 
-    inner = SQLAlchemySession(session_id, engine=_engine_or_raise())
-    return CompactingSession(inner)
+    engine = _engine_or_raise()
+    inner = SQLAlchemySession(session_id, engine=engine)
+    return CompactingSession(inner, store=make_store(engine))
 
 
 def _note_failure(exc: BaseException) -> None:
