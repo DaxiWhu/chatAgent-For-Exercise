@@ -36,8 +36,14 @@ def store(monkeypatch):
 # --------------------------------------------------------------------------- #
 # ① 追加式：改口留痕、改回原样能写进去
 # --------------------------------------------------------------------------- #
-def test_changing_a_setting_keeps_both_rows(store):
-    """改口 ⇒ 两行、只有一行有效。旧行**不删**（要能回答"以前是怎么要求的"）。"""
+def test_changing_a_setting_keeps_both_rows_and_both_stay_injectable(store):
+    """改口 ⇒ 两行都在，**旧版本也照样注入**，但带结束时间。
+
+    为什么旧版本不退出注入（用户 2026-11-03 口径）：它是**历史**，不是垃圾。
+    要答得出"他以前喜欢 A、现在喜欢 B"，两条必须同时在上下文里，否则模型只能
+    看到最新那条，"以前是什么"永远查不到。渲染侧会给它加「已结束，截至 YYYY-MM」
+    （见 ``render``），否则两条并排会变成自相矛盾。
+    """
     first = store.remember("u1", "以后都用中文回答", kind="preference")
     second = store.remember("u1", "以后用英文回答", kind="preference",
                             supersedes=first["id"])
@@ -50,15 +56,34 @@ def test_changing_a_setting_keeps_both_rows(store):
     assert rows[1]["invalid_at"] is None
 
     active = store.active("u1")
-    assert [r["content"] for r in active] == ["以后用英文回答"]
+    assert [r["content"] for r in active] == ["以后用英文回答", "以后都用中文回答"]
+    old = next(r for r in active if r["content"] == "以后都用中文回答")
+    assert old["invalid_at"] is not None, "旧版本要带着结束时间进上下文"
+
+
+def test_a_revoked_memory_leaves_the_context_entirely(store):
+    """「忘掉这条」与「改口」**不是一回事**：前者要彻底退出注入。
+
+    判据是 ``supersede_reason``，不是 ``invalid_at`` 是否为空 —— 只看那个会把
+    三种失效原因压成一种，于是用户说"别再提这个"，系统却继续每轮带着它。
+    """
+    a = store.remember("u1", "这条以后别提了", kind="project")
+    store.forget("u1", memory_id=a["id"])
+
+    assert store.active("u1") == []
+    assert len(store.rows()) == 1, "行还在（可查），只是不再注入"
 
 
 def test_setting_it_back_does_not_hit_the_unique_index(store):
-    """把设置改回原样 ⇒ 必须写得进去。
+    """把设置改回原样 ⇒ 必须写得进去，而不是"复活"那条已失效的旧行。
 
     这条就是"部分唯一索引（只对未失效行生效）"存在的原因：全表唯一时，
     新行的 content_hash 与已失效的旧行相同，插入直接失败 —— 而这只在用户真的
     改回去时才发生，测不到也想不到。
+
+    ⚠️ 另一个坑：去重若扫了**可注入集合**（包含旧版本），写回原样会命中那条
+    superseded 的旧行、走"已记过"分支，于是新值没写进去，旧行还带着失效时间 ——
+    一条既失效又有效、还被当成本轮内容的行。去重只能对"当前有效"的行做。
     """
     a = store.remember("u1", "先给结论", kind="preference")
     store.remember("u1", "先给依据", kind="preference", supersedes=a["id"])
@@ -66,7 +91,9 @@ def test_setting_it_back_does_not_hit_the_unique_index(store):
                           supersedes="先给依据")
 
     assert back["ok"] is True
-    assert [r["content"] for r in store.active("u1")] == ["先给结论"]
+    assert back["action"] == "added", "必须是新写一条，不是刷新那条已失效的"
+    live = [r for r in store.active("u1") if r["invalid_at"] is None]
+    assert [r["content"] for r in live] == ["先给结论"]
     assert len(store.rows()) == 3
 
 
@@ -264,16 +291,32 @@ def test_injection_skips_blank_memory_sets(store):
 # --------------------------------------------------------------------------- #
 # ④ 渲染与清洗
 # --------------------------------------------------------------------------- #
-def test_render_caps_the_total_length():
-    """条数多时按上限截断，并明确告诉模型"还有没列出的"。
+def test_render_does_not_truncate_by_length():
+    """**不按字数截断**（2026-11-03 口径）。
 
-    不截的后果：记得多的用户每轮多付一笔固定成本，而要紧的那几条早就排在最前了。
+    注入的永远是提炼后的短句、条数也有硬顶，长度天然有界；再截一道只会切掉排在
+    后面、本来该给的内容，而排序已经保证了紧要的在前。长度治理放在写入侧
+    （``memory_digest``）与容量侧（``memory_lifecycle``），不在这里。
     """
-    rows = [{"kind": "project", "content": "很长的记忆内容" * 20} for _ in range(50)]
-    text = render(rows, limit_chars=500)
+    rows = [{"kind": "project", "content": f"第{i}条"} for i in range(50)]
+    text = render(rows)
 
-    assert len(text) <= 600
-    assert "因长度上限未列出" in text
+    assert "第49条" in text, "一条都不许丢"
+    assert "未列出" not in text
+
+
+def test_render_marks_the_old_version_with_its_end_time():
+    """旧版本必须带「已结束」和月份，否则同一主题的两条并排会自相矛盾。"""
+    rows = [
+        {"kind": "preference", "content": "喜欢深色主题", "invalid_at": None},
+        {"kind": "preference", "content": "喜欢浅色主题",
+         "invalid_at": "2026-08-15T10:00:00+00:00"},
+    ]
+    text = render(rows)
+
+    assert "（已结束，截至 2026-08）" in text
+    assert text.count("（已结束，截至") == 1, "只有旧版本带标记"
+    assert "以前是什么" in text, "抬头要解释标记的含义"
 
 
 def test_content_is_collapsed_but_never_rewritten():
@@ -377,13 +420,16 @@ def test_pg_a_vanished_row_is_reported_not_guessed(monkeypatch):
     assert result == {"ok": False, "reason": "conflict"}
 
 
-def test_pg_prune_never_lists_a_protected_row_as_a_victim(monkeypatch):
-    """★ PG 分支的受害名单必须与内存版同源（都来自 ``prune_order``）。
+def test_pg_prune_deletes_by_score_and_never_takes_a_pinned_row(monkeypatch):
+    """★ PG 分支：物理 ``DELETE``，且钉住的那条绝不出现在 id 列表里。
 
-    两版各写一遍淘汰逻辑时，最典型的漂移是"内存版加了豁免、PG 版忘了"——
-    本地开发多半走内存降级，一切正常；上生产才丢数据，而且丢的正好是
-    纠错记录那类最贵的。所以这里不验"淘汰了几条"，验的是**UPDATE 的 id 列表里
-    有没有豁免的那条**。
+    为什么验"列表里没有谁"而不是只验"删了几条"：两版各写一遍淘汰逻辑时，最典型
+    的漂移是内存版改了、PG 版忘了 —— 本地开发多半走内存降级，一切正常；上生产才
+    丢数据。而 ``pinned`` 现在是**唯一硬保**的东西（用户显式钉住的，不是我们的
+    推断），丢了它等于把"这条必须一直记着"这个动作悄悄废掉。
+
+    另一件必验的事：这条 SQL 必须是 ``DELETE``。旧的 ``UPDATE ... SET stale_at``
+    会让表只增不减，而读取侧照样跳过它们 —— 那是"假装保留"，比删更难发现。
     """
     from datetime import UTC, datetime, timedelta
 
@@ -420,16 +466,78 @@ def test_pg_prune_never_lists_a_protected_row_as_a_victim(monkeypatch):
 
     old = (datetime.now(UTC) - timedelta(days=400)).isoformat()
 
-    def row(ident: str, kind: str) -> dict:
-        return {"id": ident, "kind": kind, "content": ident, "pinned": False,
-                "use_count": 0, "created_at": old, "last_used_at": old}
+    def row(ident: str, kind: str, *, pinned: bool = False) -> dict:
+        return {"id": ident, "kind": kind, "content": ident, "raw_content": None,
+                "pinned": pinned, "use_count": 0, "hit_count": 0,
+                "created_at": old, "last_used_at": old,
+                "invalid_at": None, "supersede_reason": ""}
 
-    live = [row("fb", "feedback")] + [row(f"p{i}", "project") for i in range(10)]
+    rows = [row("pin", "project", pinned=True)] + [
+        row(f"p{i}", "project") for i in range(10)]
     store = MemoryStore("postgresql://fake/db")
-    monkeypatch.setattr(store, "_live_rows", lambda owner: live)
+    monkeypatch.setattr(store, "_all_rows", lambda owner: rows)
 
     store.prune("u1", keep=5)
 
+    assert "DELETE FROM agent_memories" in captured["sql"], "必须是物理删"
     victims = captured["params"][1]
-    assert "fb" not in victims, "纠错记录不许出现在 UPDATE 里"
-    assert len(victims) == 6, "11 条 - 5（1 条豁免 + 4 条事实）"
+    assert "pin" not in victims, "钉住的不许被删"
+    assert len(victims) == 6, "11 条 - 5，且只从非钉住的那 10 条里取"
+
+
+# --------------------------------------------------------------------------- #
+# ⑦ 阈值 20、频率按"一次运行"去重、原话永不注入
+# --------------------------------------------------------------------------- #
+def test_the_all_in_band_defaults_to_twenty(monkeypatch):
+    """20 条以内全量注入，21 条起走检索（用户 2026-11-03 口径）。
+
+    为什么这个数变小了而不是变大：全量注入的前提是"内容稳定 ⇒ 前缀稳定 ⇒
+    上游缓存命中"。条数一多这个前提就不值钱了（谁也不会为 40 条小句子省那点钱
+    而让每轮多背几千 token），不如早点交给检索。
+    """
+    monkeypatch.delenv("AGENT_MEMORY_RETRIEVE_ABOVE", raising=False)
+    assert memory.retrieve_above() == 20
+
+    monkeypatch.setenv("AGENT_MEMORY_RETRIEVE_ABOVE", "35")
+    assert memory.retrieve_above() == 35
+
+
+def test_hits_are_counted_once_per_run_not_once_per_model_call(store):
+    """★★ 访问频率按**一次运行**去重，不是按"模型调用了几次"。
+
+    一次提问走 5 轮工具循环，注入口就跑 5 次。不去重的话，同一条记忆会被
+    ``touch`` 5 次 —— 频率是卸压分数里占 0.45 的那一项，放大 5 倍不是小事，
+    而且放大的方向恰好是"工具调用多的话题"。
+
+    判据在 ``TaskContext.memory_hit_ids``：同一份上下文里只计一次。
+    """
+    store.remember("u1", "回答先给结论", kind="preference")
+    single = _input([{"role": "user", "content": "第一个问题"}])
+
+    ctx = _context()
+    asyncio.run(memory.inject_memories(single, context=ctx))
+    asyncio.run(memory.inject_memories(single, context=ctx))
+    asyncio.run(memory.inject_memories(single, context=ctx))
+
+    row = store.rows()[0]
+    assert row["hit_count"] == 1, "同一次运行里三次注入只算一次"
+
+    asyncio.run(memory.inject_memories(single, context=_context()))
+    assert store.rows()[0]["hit_count"] == 2, "换一次运行就要各算一次"
+
+
+def test_the_raw_copy_is_never_injected(store):
+    """原话只给用户追溯，注入的永远是提炼后的短句。
+
+    注入了原话的后果不是"多占几行"：它会每轮重复一遍长文，用户看到的上下文
+    突然变长，而模型还得在"提炼版"和"原话"之间自己判断哪个算数。
+    """
+    memory.remember_memory(owner_key="u1", content="回答先给结论",
+                           kind="preference", raw_content="原话" * 200)
+    data = _input([{"role": "user", "content": "你好"}])
+
+    out = asyncio.run(memory.inject_memories(data, context=_context()))
+
+    text = str(out.input[0]["content"])
+    assert "回答先给结论" in text
+    assert "原话原话" not in text

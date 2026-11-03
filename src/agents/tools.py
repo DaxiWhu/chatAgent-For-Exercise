@@ -776,6 +776,9 @@ def remember(ctx: RunContextWrapper[TaskContext], content: str, kind: str = "pro
         owner_key=owner, content=digested or raw, kind=kind,
         tenant=context.tenant, source_thread=context.thread_id,
         supersedes=supersedes,
+        # 提炼成功才留原话：短记忆本来就没被压过，留一份同样的文本是纯浪费。
+        # 原话**不注入**，只在用户要追溯"这条原来是哪段话"时看。
+        raw_content=raw if digested else "",
     )
     if not result.get("ok"):
         reason = result.get("reason") or "unknown"

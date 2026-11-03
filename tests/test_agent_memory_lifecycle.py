@@ -87,6 +87,37 @@ def test_higher_weight_kind_beats_a_lower_one_of_the_same_age():
     assert order == ["高权重", "低权重"]
 
 
+def test_a_correction_outranks_project_facts_of_the_same_age():
+    """★ 纠错记录靠**分数**排在最前，不靠类别白名单（2026-11-03 撤回豁免）。
+
+    撤回豁免时补了两处：``KIND_WEIGHT['feedback']`` 0.5 → 0.8、半衰期 60 → 1095
+    天。两处的作用**不对等**，实测过才敢这么写：
+
+    * **刚写下的**（年龄 0，两条衰减项都是 1）⇒ 只剩权重说话。权重退回 0.5 时
+      纠错记录当场输给 project（0.375 < 0.445）。**这一档是权重的守卫。**
+    * **400 天前写的** ⇒ 权重 0.8 与 0.7 的差值 0.035 仍然大于衰减项能拉开的
+      全部区间，所以即使半衰期退回 60 天它照样赢（0.282 > 0.265）。**这一档
+      抓不到半衰期的变异**，它守的是另一件事："老记忆不会被后来的事实挤掉"。
+
+    ⚠️ 半衰期那个数目前**没有可观测的行为差异**（对 project 永远被权重压过），
+    所以别在这里假装验到它。第一版用例只写了 400 天那一档，变异权重回 0.5 时
+    照样全绿 —— 一条断言同时被两个参数解释，是最典型的假通过。
+    """
+    now = datetime.now(UTC)
+
+    def pair(age_days: int) -> tuple[dict, dict]:
+        base = {"pinned": False, "use_count": 0, "hit_count": 0, "last_used_at": None,
+                "created_at": (now - timedelta(days=age_days)).isoformat()}
+        return (dict(base, id="f", kind="feedback", content="迁移前必须先备份"),
+                dict(base, id="p", kind="project", content="事实"))
+
+    for age in (0, 400):
+        correction, fact = pair(age)
+        assert M._score(correction, now) > M._score(fact, now), \
+            f"年龄 {age} 天：纠错记录的分数应高于同龄项目事实"
+        assert [r["id"] for r in M.rank_memories([fact, correction], now=now)][0] == "f"
+
+
 def test_ranking_is_deterministic_when_scores_tie():
     """同分时顺序必须**确定**，否则注入出去的前缀每轮都在变，上游缓存永远命不中。"""
     rows = [
@@ -105,133 +136,307 @@ def test_ranking_is_deterministic_when_scores_tie():
     assert first == second, "输入顺序一变结果就变 ⇒ 前缀每轮不一样"
 
 
-def test_an_old_memory_that_is_still_used_does_not_decay():
-    """衰减的基准是"最后一次被用到"，不是"创建时间"。"""
+def test_recency_follows_creation_time_not_last_use():
+    """★★ 衰减只看 ``created_at``（不可变）；``last_used_at`` 一格都不许影响它。
+
+    为什么这条最要紧：``last_used_at`` 每轮注入都会被刷成"现在"，拿它当基准等于
+    衰减恒为 1 —— 实测一条十年没动的偏好被注入一次，分数从 0.418 跳到 0.805。
+    而且第一轮到第二轮的排序会翻转一次，注入前缀跟着断、上游缓存全废。
+
+    "被用过几次"由 ``hit_count`` 单独回答（见下一组），两件事不共用一列。
+    """
     now = datetime.now(UTC)
     base = {"kind": "project", "content": "x", "pinned": False, "use_count": 0,
-            "created_at": (now - timedelta(days=365)).isoformat()}
-    stale = dict(base, id="stale", last_used_at=(now - timedelta(days=365)).isoformat())
-    fresh = dict(base, id="fresh", last_used_at=(now - timedelta(days=1)).isoformat())
+            "hit_count": 0, "created_at": (now - timedelta(days=365)).isoformat()}
+    a = dict(base, id="a", last_used_at=(now - timedelta(days=365)).isoformat())
+    b = dict(base, id="b", last_used_at=(now - timedelta(days=1)).isoformat())
 
-    order = [r["id"] for r in M.rank_memories([stale, fresh], now=now)]
+    assert M._recency(a, now) == pytest.approx(M._recency(b, now)), \
+        "last_used_at 不许影响新鲜度"
+    assert M._score(a, now) == pytest.approx(M._score(b, now))
 
-    assert order[0] == "fresh"
+
+def test_frequency_outweighs_importance():
+    """★★ 频率的权重（0.45）压过重要性（0.35）—— 用户 2026-11-03 定的口径。
+
+    一条从没被用过的身份类（importance 1.0）分数 0.55；一条新写但被用过 10 次的
+    项目事实（importance 0.7）分数 ≈ 0.895，排在它前面。
+    "被反复召回"是唯一的行为反馈，其余两项都是写入那一刻就定死的推断。
+    """
+    now = datetime.now(UTC)
+    fresh = (now - timedelta(days=1)).isoformat()
+    persona = {"id": "p", "kind": "persona", "content": "x", "pinned": False,
+               "use_count": 0, "hit_count": 0, "created_at": fresh,
+               "last_used_at": None}
+    used = {"id": "u", "kind": "project", "content": "y", "pinned": False,
+            "use_count": 0, "hit_count": 10, "created_at": fresh,
+            "last_used_at": fresh}
+
+    order = [r["id"] for r in M.rank_memories([persona, used], now=now)]
+
+    assert order == ["u", "p"]
+
+
+def test_the_frequency_factor_saturates_at_ten_hits():
+    """对数封顶：0→1 次的差别比 9→10 次重要得多，而且不许无限增长。
+
+    线性计数的后果是"老资格"永远压住新来的 —— 一条被注入过 200 次的索引类
+    会压过一条刚写的重要偏好，而前者很可能只是当年那个话题聊得久。
+    """
+    row = {"kind": "project", "content": "x", "pinned": False, "use_count": 0,
+           "created_at": datetime.now(UTC).isoformat()}
+
+    def freq(n: int) -> float:
+        return M._frequency(dict(row, hit_count=n))
+
+    assert freq(0) == 0.0
+    assert freq(10) == pytest.approx(1.0)
+    assert freq(200) == pytest.approx(1.0), "封顶后不再增长"
+    assert freq(1) - freq(0) > freq(10) - freq(9)
 
 
 # --------------------------------------------------------------------------- #
-# ② 淘汰：标记而不删
+# ② 卸压：按分数物理删，不是标记过期
 # --------------------------------------------------------------------------- #
-def test_prune_marks_the_tail_stale_instead_of_deleting(monkeypatch):
-    """★ 超上限的标 stale_at：不再注入，但**行还在**。
+def test_prune_deletes_rows_instead_of_marking_them():
+    """★★ 第 3 段卸压是**物理删**（用户 2026-11-03 口径：剔除，不是标记过期）。
 
-    物理删的后果是"用户半年前定过的一条规矩"永久消失，而没人知道自己丢过什么。
+    旧的 ``UPDATE ... SET stale_at`` 有两个问题：表只增不减、备份越来越大；
+    而读取侧照样跳过它们 —— 那是"假装保留"，比删更难发现（谁也不会去查
+    "我是不是有一条看不见的记忆"）。
+
+    注意"标记过期"仍然存在于另一条路径：**改口**（``invalid_at``）。两者的区别是
+    前者是"该消失了"，后者是"变成了历史，还要留在上下文里"。
     """
     store = M.InMemoryMemoryStore()
-    for i in range(30):
+    for i in range(12):
         store.remember("u1", f"事实 {i}", kind="project")
-    _age_all(store, 30)
+    _age_all(store, 400)
 
-    dropped = store.prune("u1", keep=20)
+    dropped = store.prune("u1", keep=5)
 
-    assert dropped == 10
-    assert len(store.rows()) == 30, "淘汰不是删除"
-    assert len(store.active("u1", limit=100)) == 20
-    assert sum(1 for r in store.rows() if r["stale_at"]) == 10
+    assert dropped == 7
+    assert len(store.rows()) == 5, "行真没了，不是打了个标记"
+    assert all(r.get("stale_at") is None for r in store.rows())
 
 
-def test_prune_is_a_noop_below_the_cap():
+def test_prune_is_a_noop_below_both_caps():
     store = M.InMemoryMemoryStore()
     for i in range(5):
-        store.remember("u1", f"事实 {i}")
+        store.remember("u1", f"事实 {i}", kind="project")
+    _age_all(store, 400)
 
     assert store.prune("u1", keep=20) == 0
 
 
-def test_fresh_memories_are_protected_from_pruning():
-    """★ 刚写进来的还没机会被 touch 过，分数天然低 —— 按分数砍尾巴会先砍它。
+def test_prune_triggers_on_total_chars_even_when_the_row_count_is_fine():
+    """★ 两个上限都要管：条数管不住"几条巨兽"，字数管不住"几百条碎片"。
 
-    保护期就是为这件事设的：淘汰要清理的是"长期没在场"的东西，
-    不是"刚写还不够新的东西"。
+    这条只让字数超：5 条 × 100 字 = 500 字，条数上限 200 完全够。
     """
     store = M.InMemoryMemoryStore()
-    for i in range(30):
-        store.remember("u1", f"事实 {i}", kind="project")
+    for i in range(5):
+        store.remember("u1", f"{i}" + "字" * 99, kind="project")
+    _age_all(store, 400)
 
-    assert store.prune("u1", keep=10) == 0, "7 天内写入的不该被淘汰"
-    assert len(store.active("u1", limit=100)) == 30
+    dropped = store.prune("u1", keep=200, max_chars=200)
+
+    assert dropped > 0
+    assert store.measure("u1")["chars"] <= 200
+
+
+def test_fresh_memories_are_protected_from_pruning():
+    """7 天内写的不删：它还没被任何一次检索碰过，砍它等于砍"没机会"。"""
+    store = M.InMemoryMemoryStore()
+    for i in range(10):
+        store.remember("u1", f"刚写的 {i}", kind="project")
+
+    assert store.prune("u1", keep=2) == 0
+    assert len(store.rows()) == 10
+
+
+def test_pinned_is_never_deleted_even_when_it_exceeds_the_cap():
+    """``pinned`` 是**唯一硬保**的东西（用户显式钉住，不是我们的推断）。
+
+    为什么必须让钉住的条数**超过上限**：钉住的条目本来就排在排序最前、分数也最高，
+    只放一条的话，"没被删"可能只是"轮不到它"—— 去掉保护也照样绿，是假通过。
+    两条钉住 + 上限 1 才有区分度：去掉保护会删掉其中一条，留着保护则宁可超限。
+
+    类别豁免（身份 / 纠错记录）已经撤回：那等于给整类开后门，同类里的宝贝和垃圾
+    同命。它们靠分数活（纠错记录权重 0.8、半衰期 1095 天）。
+    """
+    store = M.InMemoryMemoryStore()
+    store.remember("u1", "钉住甲", kind="project", pinned=True)
+    store.remember("u1", "钉住乙", kind="project", pinned=True)
+    for i in range(8):
+        store.remember("u1", f"事实 {i}", kind="project")
+    _age_all(store, 400)
+
+    store.prune("u1", keep=1)
+
+    alive = [r["content"] for r in store.rows()]
+    assert sorted(alive) == ["钉住乙", "钉住甲"], "钉住的一条都不许删，宁可超限"
 
 
 def test_prune_only_touches_its_own_owner():
     store = M.InMemoryMemoryStore()
-    for i in range(30):
-        store.remember("u1", f"事实 {i}")
-        store.remember("u2", f"事实 {i}")
-    _age_all(store, 30)
+    for i in range(10):
+        store.remember("u1", f"甲 {i}", kind="project")
+    for i in range(10):
+        store.remember("u2", f"乙 {i}", kind="project")
+    _age_all(store, 400)
 
-    store.prune("u1", keep=10)
+    store.prune("u1", keep=3)
 
-    assert len(store.active("u1", limit=100)) == 10
-    assert len(store.active("u2", limit=100)) == 30
+    assert len([r for r in store.rows() if r["owner_key"] == "u2"]) == 10
 
 
-# --------------------------------------------------------------------------- #
-# ③ 来源与批次
-# --------------------------------------------------------------------------- #
-def test_batch_revoke_takes_the_whole_batch():
-    """★★ 一次压缩抽出的候选共用一个批次号，出问题能整批撤。
+def test_measure_counts_every_row_including_the_raw_copy():
+    """容量口径：**所有行**（含旧版本、含被忘掉的），字数含 ``raw_content``。
 
-    污染进来时你不知道它抽了几条、都抽了什么；逐条找既慢又容易漏。
+    原话不注入但吃存储与备份，不算它就会"原话越囤越多、永远不触发回收"。
     """
     store = M.InMemoryMemoryStore()
-    store.remember("u1", "候选一", kind="project", source="compaction", batch_id="b1")
-    store.remember("u1", "候选二", kind="project", source="compaction", batch_id="b1")
-    store.remember("u1", "模型自己记的", kind="project", source="memory")
+    store.remember("u1", "短", kind="project", raw_content="原" * 500)
+    a = store.remember("u1", "会被改口的一条", kind="preference")
+    store.remember("u1", "新的一条", kind="preference", supersedes=a["id"])
+    store.forget("u1", memory_id=store.rows()[0]["id"])
 
-    revoked = store.forget_batch("u1", "b1")
+    got = store.measure("u1")
 
-    assert revoked == 2
-    left = [r["content"] for r in store.active("u1", limit=100)]
-    assert left == ["模型自己记的"], "同批次之外的记忆不该被牵连"
-
-
-def test_batch_revoke_does_not_cross_users():
-    store = M.InMemoryMemoryStore()
-    store.remember("u1", "甲的候选", batch_id="b1")
-    store.remember("u2", "乙的候选", batch_id="b1")
-
-    store.forget_batch("u1", "b1")
-
-    assert [r["content"] for r in store.active("u1", limit=10)] == []
-    assert [r["content"] for r in store.active("u2", limit=10)] == ["乙的候选"]
-
-
-def test_source_is_recorded():
-    store = M.InMemoryMemoryStore()
-    store.remember("u1", "来自压缩", source="compaction", batch_id="b9")
-    store.remember("u1", "来自模型", source="memory")
-
-    by_source = {r["content"]: r["source"] for r in store.rows()}
-
-    assert by_source == {"来自压缩": "compaction", "来自模型": "memory"}
+    assert got["rows"] == len(store.rows()) == 3, "失效的、被忘掉的都算"
+    assert got["chars"] >= 500, "原话要算进字数"
 
 
 # --------------------------------------------------------------------------- #
-# ④ touch：只动 last_used_at，不动 use_count
+# ③ 三段卸压：回收原话 → 压缩 → 剔除
 # --------------------------------------------------------------------------- #
-def test_touch_refreshes_recency_but_not_the_emphasis_counter():
-    """★★ ``use_count`` 是"被重复强调几次"，不是"被读了几次"。
+def test_relieve_reclaims_the_raw_copy_before_compressing(monkeypatch):
+    """第 1 段：原话先回收，够用就不花模型调用。
 
-    混在一起就分不清"反复改口的一条"和"每轮都要用的一条"，而它们该有不同的权重。
+    它是唯一零信息损失的动作 —— 正文还在，原话只是"提炼前长什么样"的备份。
+    """
+    from src.agents import memory_lifecycle as L
+
+    monkeypatch.setenv("AGENT_MEMORY_MAX_LIVE", "20")
+    monkeypatch.setenv("AGENT_MEMORY_MAX_CHARS", "2000")
+    store = M.InMemoryMemoryStore()
+    store.remember("u1", "短句", kind="project", raw_content="原" * 3000)
+
+    calls: list = []
+    out = L.relieve("u1", store=store,
+                    digest_fn=lambda *a: calls.append(a) or "压过的句子")
+
+    assert out["reclaimed"] == 1
+    assert calls == [], "回收够了就不该再调模型"
+    assert store.measure("u1")["chars"] <= 2000
+
+
+def test_relieve_compresses_the_longest_until_it_fits(monkeypatch):
+    """第 2 段：字数还超 ⇒ 逐条压最长的，压到不超为止。"""
+    from src.agents import memory_lifecycle as L
+
+    monkeypatch.setenv("AGENT_MEMORY_MAX_LIVE", "200")
+    monkeypatch.setenv("AGENT_MEMORY_MAX_CHARS", "2000")
+    monkeypatch.setenv("AGENT_MEMORY_DIGEST_ABOVE", "50")
+    monkeypatch.setenv("AGENT_MEMORY_DIGEST_PER_ROUND", "20")
+    store = M.InMemoryMemoryStore()
+    for i in range(25):
+        store.remember("u1", f"{i}" + "字" * 99, kind="project")
+
+    out = L.relieve("u1", store=store, digest_fn=lambda *a: "短")
+
+    assert out["digested"] == 6, "2500 字压到 ≤2000 需要 6 条"
+    assert out["deleted"] == 0, "压缩够用就不许删"
+    assert store.measure("u1")["chars"] <= 2000
+
+
+def test_relieve_deletes_when_nothing_is_long_enough_to_compress(monkeypatch):
+    """没有"长到值得压"的条目 ⇒ 压缩不适用，直接进第 3 段。
+
+    关键区别：``pick_longest`` 返回 None 是"压缩不适用"（正常），
+    返回了但压不动才是"链路不可用"（见下一条）。
+    """
+    from src.agents import memory_lifecycle as L
+
+    monkeypatch.setenv("AGENT_MEMORY_MAX_LIVE", "200")
+    monkeypatch.setenv("AGENT_MEMORY_MAX_CHARS", "2000")
+    monkeypatch.setenv("AGENT_MEMORY_DIGEST_ABOVE", "200")
+    store = M.InMemoryMemoryStore()
+    for i in range(25):
+        store.remember("u1", f"{i}" + "字" * 99, kind="project")
+    _age_all(store, 60)          # 绕开 7 天保护期：这里验的是"该删时会删"
+
+    out = L.relieve("u1", store=store, digest_fn=lambda *a: "不该被调用")
+
+    assert out["digested"] == 0
+    assert out["deleted"] > 0
+    assert store.measure("u1")["chars"] <= 2000
+
+
+def test_relieve_refuses_to_delete_when_compression_fails(monkeypatch):
+    """★★ 安全守卫：有该压的、却一条都没压成 ⇒ **不删除**。
+
+    压不动通常意味着整条优化链路不可用（没配 Key、网关 502）。此时按分数删数据
+    是不可逆的伤害，而"超限一会儿"完全可恢复 —— 等下一条记忆写入时再试。
+    少了这条判断，一次网关抖动就能把用户攒了半年的记忆按分数清掉一批。
+    """
+    from src.agents import memory_lifecycle as L
+
+    monkeypatch.setenv("AGENT_MEMORY_MAX_LIVE", "200")
+    monkeypatch.setenv("AGENT_MEMORY_MAX_CHARS", "2000")
+    monkeypatch.setenv("AGENT_MEMORY_DIGEST_ABOVE", "50")
+    store = M.InMemoryMemoryStore()
+    for i in range(25):
+        store.remember("u1", f"{i}" + "字" * 99, kind="project")
+    # ⚠️ 必须把时间推过去：不推的话 7 天保护期会挡住删除，这条用例就变成在验
+    # "保护期有效"而不是"压缩失败时不删" —— 变异（去掉守卫）也能通过，是假绿。
+    _age_all(store, 60)
+    before = len(store.rows())
+
+    out = L.relieve("u1", store=store, digest_fn=lambda *a: "")
+
+    assert out["digested"] == 0
+    assert out["deleted"] == 0, "压缩全败 ⇒ 一条都不许删"
+    assert len(store.rows()) == before
+
+
+def test_relieve_does_nothing_below_both_caps(monkeypatch):
+    from src.agents import memory_lifecycle as L
+
+    monkeypatch.setenv("AGENT_MEMORY_MAX_LIVE", "200")
+    monkeypatch.setenv("AGENT_MEMORY_MAX_CHARS", "20000")
+    store = M.InMemoryMemoryStore()
+    store.remember("u1", "一条", kind="project")
+
+    out = L.relieve("u1", store=store)
+
+    assert out == {"reclaimed": 0, "digested": 0, "deleted": 0}
+
+
+# --------------------------------------------------------------------------- #
+# ④ touch：只累加访问频率，不碰"被强调几次"
+# --------------------------------------------------------------------------- #
+def test_touch_counts_the_frequency_but_not_the_emphasis_counter():
+    """★★ ``hit_count`` 与 ``use_count`` 是两件事，绝不合并。
+
+    ``use_count``：同一句话被**重复说了几遍**（去重分支里 +1），表达"用户特意强调"。
+    ``hit_count``：被**注入进上下文过几次**，表达"这条最近被需要"。
+
+    混在一起的后果：分不清"反复改口的一条"和"每轮都要用的一条"，而它们在
+    卸压分数里该有完全不同的分量（频率占 0.45）。
     """
     store = M.InMemoryMemoryStore()
     got = store.remember("u1", "提交信息用中文")
     _age_all(store, 100)
 
     store.touch("u1", [got["id"]])
+    store.touch("u1", [got["id"]])
 
     row = next(r for r in store.rows() if r["id"] == got["id"])
     assert row["use_count"] == 0, "读一次不等于强调一次"
-    assert row["last_used_at"] is not None
+    assert row["hit_count"] == 2
+    assert row["last_used_at"] is not None, "最近提起时间仍然要记（审计用）"
 
 
 def test_touch_ignores_ids_from_other_owners():
@@ -241,161 +446,58 @@ def test_touch_ignores_ids_from_other_owners():
     assert store.touch("u1", [theirs["id"]]) == 0
 
 
+# --------------------------------------------------------------------------- #
+# ⑤ 配置
+# --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("raw,expect", [("", M._DEFAULT_MAX_LIVE), ("50", 50),
                                         ("1", 20), ("abc", M._DEFAULT_MAX_LIVE)])
 def test_max_live_config(monkeypatch, raw, expect):
-    """上限可配，但**下限 20**：再低就开始删仍在用的记忆，而空间本来就不缺。"""
-    if raw:
-        monkeypatch.setenv("AGENT_MEMORY_MAX_LIVE", raw)
-    else:
-        monkeypatch.delenv("AGENT_MEMORY_MAX_LIVE", raising=False)
-
+    monkeypatch.setenv("AGENT_MEMORY_MAX_LIVE", raw)
     assert M.max_live_per_owner() == expect
 
 
+@pytest.mark.parametrize("raw,expect", [("", M._DEFAULT_MAX_CHARS), ("9000", 9000),
+                                        ("1", 2000), ("abc", M._DEFAULT_MAX_CHARS)])
+def test_max_chars_config(monkeypatch, raw, expect):
+    monkeypatch.setenv("AGENT_MEMORY_MAX_CHARS", raw)
+    assert M.max_chars_per_owner() == expect
+
+
+@pytest.mark.parametrize("raw,expect", [("", 5), ("0", 0), ("12", 12), ("x", 5)])
+def test_digest_per_round_config(monkeypatch, raw, expect):
+    from src.agents import memory_lifecycle as L
+
+    monkeypatch.setenv("AGENT_MEMORY_DIGEST_PER_ROUND", raw)
+    assert L.digest_per_round() == expect
+
+
 # --------------------------------------------------------------------------- #
-# ⑤ 淘汰判据：与"这一轮先放哪条"是两份东西
+# ⑥ 批次与来源
 # --------------------------------------------------------------------------- #
-def test_a_correction_outlives_a_flood_of_project_facts():
-    """★★ 核心：纠错记录即使最老、被几十条项目事实淹没，也不被淘汰。
-
-    为什么这条最要紧：``KIND_WEIGHT`` 里纠错记录只有 0.5，是最低档之一，
-    半衰期又只有 60 天。用**取回分数**砍尾巴时它第一批出局 —— 而它恰恰是
-    "同一个错误别再犯"的唯一记录。丢一条偏好用户会说第二遍；丢一条纠错记录
-    意味着同一个错误再犯一次，而用户会认为"我明明讲过了"。
-    """
-    store = M.InMemoryMemoryStore()
-    store.remember("u1", "迁移前必须先备份", kind="feedback")
-    for i in range(40):
-        store.remember("u1", f"项目事实 {i}", kind="project")
-    _age_all(store, 400)
-
-    dropped = store.prune("u1", keep=20)
-
-    alive = {r["content"] for r in store.active("u1", limit=100)}
-    assert "迁移前必须先备份" in alive, "纠错记录不可淘汰"
-    assert dropped == 21, "41 条 - 20"
-
-
-def test_a_persona_is_never_pruned():
-    """身份类**十年前的**也留着 —— 这条必须让"老"足够极端才有区分度。
-
-    ⚠️ 第一版写成"全部推到 400 天前"，结果是**假通过**：身份类权重 1.0、
-    半衰期 730 天，400 天后分数仍高于项目事实，按任何判据都轮不到它被砍。
-    要证明豁免真的在起作用，被保护的必须**在旧判据下会掉到队尾**：
-    十年老身份（分数 0.46）vs 十天前的事实（分数 0.70）。
-    """
-    store = M.InMemoryMemoryStore()
-    store.remember("u1", "用户是后端工程师", kind="persona")
-    for i in range(30):
-        store.remember("u1", f"事实 {i}", kind="project")
-    _age_all(store, 10)                       # 事实：10 天，已过保护期
-    _age_one(store, "用户是后端工程师", 3650)  # 身份：十年前
-
-    store.prune("u1", keep=10)
-
-    alive = {r["content"] for r in store.active("u1", limit=100)}
-    assert "用户是后端工程师" in alive
-
-
-def test_a_pinned_memory_is_never_pruned():
-    """置顶以前只是"排序恰好排最前"，不是规则 —— 动一次排序键就破，且不报错。
-
-    ⚠️ 钉住的那条要**够老**：第一版让它和其他 30 条同龄，变异后靠 id 的随机
-    顺序侥幸留在前 10 里 —— 那不是守卫，是抽签。十年老的钉住条目在旧判据下
-    必然垫底，才测得出豁免。
-    """
-    store = M.InMemoryMemoryStore()
-    store.remember("u1", "这条钉住", kind="project", pinned=True)
-    for i in range(30):
-        store.remember("u1", f"事实 {i}", kind="project")
-    _age_all(store, 10)
-    _age_one(store, "这条钉住", 3650)
-
-    store.prune("u1", keep=10)
-
-    alive = {r["content"] for r in store.active("u1", limit=100)}
-    assert "这条钉住" in alive
-
-
-def test_reference_goes_before_project_goes_before_preference():
-    """淘汰顺序按可丢弃性：索引 → 项目事实 → 偏好。
-
-    索引类本来就只是"去哪查"的指针，重建成本最低；项目事实会过期
-    （"这版接口已经改成 v2"）；偏好最耐放。
-    """
-    store = M.InMemoryMemoryStore()
-    store.remember("u1", "索引：手册在 docs/", kind="reference")
-    store.remember("u1", "项目事实：接口是 v2", kind="project")
-    store.remember("u1", "偏好：先给结论", kind="preference")
-    _age_all(store, 400)
-
-    store.prune("u1", keep=2)
-
-    alive = {r["content"] for r in store.active("u1", limit=100)}
-    assert "索引：手册在 docs/" not in alive
-    assert "项目事实：接口是 v2" in alive
-    assert "偏好：先给结论" in alive
-
-
-def test_prune_does_nothing_when_the_protected_ones_already_fill_the_cap():
-    """豁免类自己就超上限 ⇒ 一条都不砍，宁可超限。
-
-    照常砍会变成"绕过豁免的后门"：豁免的排在前面占满名额，剩下的照砍，
-    于是"不淘汰"在字面上成立、行为上没有。
-    """
-    store = M.InMemoryMemoryStore()
-    for i in range(5):
-        store.remember("u1", f"纠错 {i}", kind="feedback")
-    for i in range(5):
-        store.remember("u1", f"事实 {i}", kind="project")
-    _age_all(store, 400)
-
-    assert store.prune("u1", keep=3) == 0
-    assert len(store.active("u1", limit=100)) == 10
-
-
-def test_prune_order_disagrees_with_rank_order_on_feedback():
-    """★★ 两份判据在纠错记录上必须给出**相反**结论 —— 这就是它们该分开的证明。
-
-    同一批数据：取回排序把纠错记录垫底（权重 0.5、半衰期 60 天，取回时不优先），
-    淘汰排序把它排到最前（不可淘汰）。
-
-    如果哪天有人"顺手把两个函数合并成一个"，合并后只能满足其中一边，
-    这条会立刻红 —— 而它红的理由不是数字对不上，是**语义被压平了**。
-    """
-    now = datetime.now(UTC)
-    old = (now - timedelta(days=400)).isoformat()
-    rows = [
-        {"id": "fb", "kind": "feedback", "content": "迁移前先备份", "pinned": False,
-         "use_count": 0, "created_at": old, "last_used_at": old},
-        {"id": "pf", "kind": "preference", "content": "先给结论", "pinned": False,
-         "use_count": 0, "created_at": old, "last_used_at": old},
-    ]
-
-    ranked = [r["id"] for r in M.rank_memories(rows, now=now)]
-    pruned = [r["id"] for r in M.prune_order(rows, now=now)]
-
-    assert ranked == ["pf", "fb"], "取回时偏好优先，纠错记录垫底"
-    assert pruned == ["fb", "pf"], "淘汰时纠错记录不可淘汰，偏好可淘汰"
-    assert M.prune_order(rows, now=now)[0] is rows[0], "必须返回原行对象，不是副本"
-
-
-def test_the_protected_ones_take_room_away_from_the_others():
-    """豁免类**占名额**：3 条纠错 + 5 条事实、上限 5 ⇒ 只砍 3 条事实。
-
-    如果切片写成 ``ordered[limit:]``（忘了先减掉豁免的条数），5 条事实里
-    一条都切不出来，总数停在 8 —— 淘汰看起来在跑、实际什么都没做，
-    而日志里 ``dropped=0`` 也完全正常。
-    """
+def test_batch_revoke_takes_the_whole_batch():
     store = M.InMemoryMemoryStore()
     for i in range(3):
-        store.remember("u1", f"纠错 {i}", kind="feedback")
-    for i in range(5):
-        store.remember("u1", f"事实 {i}", kind="project")
-    _age_all(store, 400)
+        store.remember("u1", f"抽出来的 {i}", source="compaction", batch_id="b1")
+    store.remember("u1", "模型自己写的", kind="preference")
 
-    dropped = store.prune("u1", keep=5)
+    assert store.forget_batch("u1", "b1") == 3
+    assert [r["content"] for r in store.active("u1")] == ["模型自己写的"]
 
-    assert dropped == 3
-    assert len(store.active("u1", limit=100)) == 5
+
+def test_batch_revoke_does_not_cross_users():
+    store = M.InMemoryMemoryStore()
+    store.remember("u1", "甲的", source="compaction", batch_id="b1")
+    store.remember("u2", "乙的", source="compaction", batch_id="b1")
+
+    store.forget_batch("u1", "b1")
+
+    assert len(store.active("u2")) == 1
+
+
+def test_source_is_recorded():
+    store = M.InMemoryMemoryStore()
+    store.remember("u1", "压缩抽的", source="compaction", batch_id="b9")
+
+    row = store.rows()[0]
+    assert row["source"] == "compaction"
+    assert row["batch_id"] == "b9"

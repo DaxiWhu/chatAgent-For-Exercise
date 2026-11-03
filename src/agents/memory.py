@@ -30,7 +30,7 @@ import os
 from typing import Any
 
 from .. import observability
-from . import memory_index, memory_store
+from . import memory_index, memory_lifecycle, memory_store
 
 __all__ = [
     "enabled",
@@ -45,29 +45,32 @@ __all__ = [
 _TRUE = ("1", "on", "true", "yes")
 _FALSE = ("0", "off", "false", "no")
 
-#: 注入文本的字符上限。记忆是**每轮**都进的，不设上限等于让"记了很多条的用户"
-#: 每轮多付一笔固定成本 —— 而真正要紧的那几条早已由排序放在了最前面。
-MAX_INJECT_CHARS = 2000
+#: 注入块单次字数的**观测**阈值（不是限制）。超过它只记一条直方图，便于发现
+#: "提炼线被绕过了"—— 注入长度本该由写入侧的提炼与条数上限约束住。
+#: ⚠️ 2026-11-03 起不再按字数截断：截断会把排在后面、本来该给的内容切掉，
+#: 而排序已经保证了紧要的在前；长度治理放在写入与卸压那一侧。
+_INJECT_CHARS_WATCH = 6000
 
 #: 注入块的识别前缀。它有两个用途：内容自查（日志里一眼看出这段是哪来的）、
 #: 以及"同一份输入被重复加工时不重复插入"。
 MARKER = "以下是关于当前用户的长期记忆"
 
-#: 每次注入最多几条。40 条 × 平均 40 字 ≈ 1600 字，与 ``MAX_INJECT_CHARS`` 同量级。
+#: 每次注入最多几条。它是**硬顶**（容纳置顶条目），不是常态：全量注入最多
+#: ``retrieve_above()`` 条，检索模式是召回 ``RETRIEVE_TOP_K`` 条 + 全部置顶。
 MAX_INJECT_ITEMS = 40
 
 #: 检索召回的条数（最终注入的是它的子集：还要过一遍"是否仍有效 / 是否已淘汰"）。
 RETRIEVE_TOP_K = 20
 
-#: 记忆条数**超过**这个值才从"全量注入"切到"检索召回"。默认 40。
+#: 记忆条数**超过**这个值才从"全量注入"切到"检索召回"。默认 20（用户 2026-11-03 口径）。
 #:
-#: 为什么要这个阈值，而不是一律检索：全量注入更准（不存在召回失败这回事），
+#: 为什么要有阈值，而不是一律检索：全量注入更准（不存在召回失败这回事），
 #: 而且**前缀稳定** —— 同一份记忆每轮算出来的文本逐字节一致，上游缓存能命中。
 #: 检索的代价不止是每轮多一次 embedding + 一次向量查询，更难缠的是召回结果随
 #: 问题变化 ⇒ 记忆块每轮都变 ⇒ 它后面那一段全部重算。实测（输入约 2390 token）：
 #: 记忆块放第一条时命中率 0%，放历史之后 91% —— 所以位置（见 `inject_memories`）
-#: 比阈值更影响成本。它是"条目多到装不下"时的必需品，不是越多越好。
-_RETRIEVE_ABOVE_DEFAULT = 40
+#: 比阈值更影响成本。
+_RETRIEVE_ABOVE_DEFAULT = 20
 
 #: 检索用的查询文本最多取多少字。取本轮用户发言的**开头**：embedding 对超长输入
 #: 没有额外收益，而它每轮都要跑一次。
@@ -75,7 +78,7 @@ _QUERY_MAX_CHARS = 800
 
 
 def retrieve_above() -> int:
-    """切换检索的条数阈值（``AGENT_MEMORY_RETRIEVE_ABOVE``，默认 40）。"""
+    """切换检索的条数阈值（``AGENT_MEMORY_RETRIEVE_ABOVE``，默认 20）。"""
     raw = (os.getenv("AGENT_MEMORY_RETRIEVE_ABOVE", "") or "").strip()
     try:
         return max(1, int(raw)) if raw else _RETRIEVE_ABOVE_DEFAULT
@@ -159,9 +162,13 @@ async def inject_memories(model_data: Any, *, context: Any = None) -> Any:
     ⚠️ 去重判据必须扫**整份**输入：位置改到历史之后，``items[0]`` 永远是真实的历史条目，
     只看第一条会让"同一次调用被加工两次"直接插出两条记忆块。
 
-    两条取回路径（``_select``）：条数不超过 ``retrieve_above()`` 时全量按价值排序
-    取前 40 条；超过时按本轮问题去向量索引召回，pinned 仍然无条件注入。
-    检索任何一步失败都退回全量 —— 优化失败不能变成功能失败。
+    两条取回路径（``_select``）：条数不超过 ``retrieve_above()``（默认 20）时全部注入；
+    超过时按本轮问题去向量索引召回，pinned 仍然无条件注入。检索任何一步失败都退回全量
+    —— 优化失败不能变成功能失败。
+
+    ⚠️ **不按字数截断**（2026-11-03 改）：注入的永远是提炼后的短句，条数也有硬顶，
+    长度天然有界；再截一道只会切掉排在后面本来该给的内容。长度治理在写入侧
+    （``memory_digest``）与容量侧（``memory_lifecycle``），不在这里。
     """
     if not enabled():
         return model_data
@@ -182,19 +189,32 @@ async def inject_memories(model_data: Any, *, context: Any = None) -> Any:
     picked = await _select(owner, rows, _query_of(items))
     if not picked:
         return model_data
-    text = memory_store.render(picked, limit_chars=MAX_INJECT_CHARS)
+    text = memory_store.render(picked)
     if not text:
         return model_data
     try:
         from agents.run_config import ModelInputData
     except Exception:  # noqa: BLE001  SDK 换了形状 ⇒ 放弃改写（不改变行为）
         return model_data
-    # 记一次"这批被读进上下文了"：衰减的基准靠它。失败不影响本轮。
-    try:
-        await asyncio.to_thread(_store().touch, owner, [r["id"] for r in picked])
-    except Exception as e:  # noqa: BLE001
-        logging.debug("记忆 touch 失败（已忽略）：%s", e)
+    # 记一次"这批被读进上下文了"：访问频率（卸压分数里占 0.45 的那一项）靠它。
+    # ⚠️ 一次运行只计一次（见 ``TaskContext.memory_hit_ids``）：工具循环会让注入口
+    # 跑好几遍，不去重就是按"调用了几次模型"放大，而不是"这条被需要了几次"。
+    seen = getattr(context, "memory_hit_ids", None)
+    fresh = ([r["id"] for r in picked if r["id"] not in seen]
+             if isinstance(seen, set) else [r["id"] for r in picked])
+    if fresh:
+        try:
+            await asyncio.to_thread(_store().touch, owner, fresh)
+            if isinstance(seen, set):
+                seen.update(fresh)
+        except Exception as e:  # noqa: BLE001
+            logging.debug("记忆 touch 失败（已忽略）：%s", e)
     observability.histogram("agent_memory_injected", len(picked))
+    # 只观测、不截断：长度本该由写入侧的提炼与条数上限约束住，超过说明那条线
+    # 被绕过了（例如提炼失败后原样存了一条长文）。
+    observability.histogram("agent_memory_injected_chars", len(text))
+    if len(text) > _INJECT_CHARS_WATCH:
+        observability.counter("agent_memory_inject_oversize_total")
     at = _insert_index(items)
     return ModelInputData(
         input=[*items[:at], {"role": "system", "content": text}, *items[at:]],
@@ -292,12 +312,15 @@ def _text_of(item: Any) -> str:
 def remember_memory(*, owner_key: str, content: str, kind: str = "project",
                     tenant: str = "", source_thread: str = "",
                     supersedes: str = "", source: str = "memory",
-                    batch_id: str = "") -> dict:
+                    batch_id: str = "", raw_content: str = "") -> dict:
     """写一条记忆（追加式）。**同步** —— 工具函数直接调。
 
     ``source`` / ``batch_id``：写入来源与批次。模型主动调 ``remember`` 时是
     ``memory``；压缩时批量抽候选是 ``compaction`` + 同一个批次号，出问题能整批撤回
     （见 ``memory_store.forget_batch``）。
+
+    ``raw_content``：提炼前的原话。它**不注入**，只在用户要追溯"这条原来是哪段话"
+    时看 —— 注入的永远是提炼后的短句。
 
     写完顺手写一条向量。**向量写失败不算记忆写失败**：主表才是事实来源，
     检索只是"在条目很多时挑几条"的优化 —— 优化失败退化成全量注入，功能仍在。
@@ -310,7 +333,7 @@ def remember_memory(*, owner_key: str, content: str, kind: str = "project",
         result = _store().remember(
             owner_key, content, kind=kind, tenant=tenant,
             source_thread=source_thread, supersedes=supersedes,
-            source=source, batch_id=batch_id,
+            source=source, batch_id=batch_id, raw_content=raw_content,
         )
     except Exception as e:  # noqa: BLE001
         observability.counter("agent_memory_errors_total", stage="write",
@@ -321,28 +344,18 @@ def remember_memory(*, owner_key: str, content: str, kind: str = "project",
                           result=str(result.get("action") or result.get("reason") or "?"))
     if result.get("ok") and result.get("action") == "added":
         _index_put(owner_key, str(result.get("id") or ""), content, kind)
-        _prune(owner_key)
+        _relieve(owner_key)
     return result
 
 
-def _prune(owner_key: str) -> int:
-    """写入后顺带做一次容量淘汰。**失败吞掉**。
+def _relieve(owner_key: str) -> dict:
+    """写入后顺带跑一次三段卸压。**失败吞掉**。
 
     为什么挂在写入后面而不是定时任务：这个项目没有调度器，而"等有调度器再清理"
-    的意思是永远不清理。写记忆是低频动作（几百轮才一条），多一次 SELECT 可以忽略；
-    没超上限时它查一次就返回，连 UPDATE 都不发。
+    的意思是永远不清理。写记忆是低频动作（几百轮才一条），没超上限时只发一次
+    计数查询就返回。
     """
-    try:
-        dropped = _store().prune(owner_key)
-    except Exception as e:  # noqa: BLE001
-        observability.counter("agent_memory_errors_total", stage="prune",
-                             kind=type(e).__name__)
-        logging.warning("记忆淘汰失败（不影响写入）：%s", e)
-        return 0
-    if dropped:
-        observability.counter("agent_memory_pruned_total", amount=dropped)
-        logging.info("记忆容量淘汰：%d 条标为不再注入（用户=%s）", dropped, owner_key)
-    return int(dropped or 0)
+    return memory_lifecycle.relieve(owner_key, store=_store())
 
 
 def _index_put(owner_key: str, memory_id: str, content: str, kind: str) -> None:

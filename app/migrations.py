@@ -52,7 +52,7 @@ from dataclasses import dataclass
 #: ⚠️ 这里忘了改不会报错：``--status`` 会显示 pending 为空（"可以部署"），
 #: 而老库里 v10/v11 的两张表永远建不出来 —— 上线后第一次压缩/第一次写记忆才炸。
 #: 守卫：``tests/test_retention.py::test_schema_version_matches_the_latest_migration``。
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 #: 迁移元表。**这份 DDL 必须内联**：它是"记录其他迁移的工具"，不能被别的迁移依赖。
 _MIGRATIONS_TABLE = (
@@ -342,6 +342,37 @@ def _m12_memory_lifecycle(dsn, ctx):
                 cur.execute(statement)
 
 
+def _m13_memory_frequency_and_raw(dsn, ctx):
+    """访问频率与提炼前的原话（2026-11-03）。
+
+    DDL 出处仍是 `src.agents.memory_store.SCHEMA_STATEMENTS`（本文件不重写）。
+
+    两列各自的用途：
+
+    * ``hit_count`` —— **被注入进上下文过几次**。它是卸压分数里占 0.45 的那一项
+      （频率），与 ``use_count``（同一句话被重复说了几遍）是两件事。加这一列是因为
+      时间衰减的基准改成了不可变的 ``created_at``，频率必须有自己的计数器，
+      否则"被用过几次"这个信号就没地方放了。
+    * ``raw_content`` —— 提炼前的原话。**不注入**，只在用户要追溯"这条原来是哪段
+      话"时看；注入的永远是提炼后的短句。它还计入总字数上限 —— 原话吃存储与备份，
+      多了就该在第 1 段卸压里被回收。
+
+    ``stale_at`` 从这一版起**不再写入**（卸压改成按分数物理删除），列留着只为兼容
+    老数据：读路径仍然按它过滤，老行不会被突然放回来。
+
+    整份重跑 SCHEMA_STATEMENTS（全部 ``IF NOT EXISTS`` / ``ADD COLUMN IF NOT
+    EXISTS``），对已 apply 过 v12 的库幂等；真正新增的是这两列。
+    """
+    import psycopg
+
+    from src.agents.memory_store import SCHEMA_STATEMENTS
+
+    with psycopg.connect(dsn, connect_timeout=10, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            for statement in SCHEMA_STATEMENTS:
+                cur.execute(statement)
+
+
 MIGRATIONS: tuple = (
     Migration(1, "rag_chunks 向量表", _m1_rag_chunks),
     Migration(2, "review_queue 审核队列表", _m2_review_queue),
@@ -355,6 +386,7 @@ MIGRATIONS: tuple = (
     Migration(10, "agent_history_compactions 压缩记录表", _m10_compaction_records),
     Migration(11, "agent_memories 长期记忆表", _m11_long_term_memories),
     Migration(12, "agent_memories 来源/批次/淘汰标记", _m12_memory_lifecycle),
+    Migration(13, "agent_memories 访问频率与提炼原话", _m13_memory_frequency_and_raw),
 )
 
 

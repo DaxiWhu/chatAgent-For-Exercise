@@ -308,6 +308,15 @@ class TaskContext:
 
     stats: AgentStats = field(default_factory=AgentStats)
 
+    memory_hit_ids: set[str] = field(default_factory=set)
+    """本次运行里**已经计过访问频率**的记忆编号。
+
+    为什么需要：一次提问如果走 5 轮工具循环，注入口会跑 5 次，同一条记忆会被
+    ``touch`` 5 次 ⇒ 访问频率变成"这个会话工具调用多不多"，不是"这条记忆被需要
+    几次"。频率是卸压分数里占 0.45 的那一项，放大 5 倍不是小事。
+    所以按"本次运行只计一次"去重：语义上"这次提问需要它"是一次。
+    """
+
     started_at: float = 0.0
     """本次运行的**起点**（``time.monotonic()``；``0`` = 还没开始）。
 

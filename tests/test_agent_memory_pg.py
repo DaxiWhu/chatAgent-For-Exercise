@@ -102,11 +102,13 @@ def test_a_revoked_row_does_not_block_re_adding_it(store, owner):
 def test_prune_on_the_real_table_never_takes_the_correction(store, owner):
     """★ 真表上跑淘汰：纠错记录留着，项目事实先出局。
 
-    一条用例同时证明三件事：v12 的 ``stale_at`` 列真的能用、PG 分支与内存版
-    走同一个 ``prune_order``、豁免规则在真数据上成立。
+    一条用例同时证明三件事：卸压第 3 段的物理 ``DELETE`` 在真表上真能删、PG 分支
+    与内存版走同一个 ``rank_memories``、**纠错记录靠分数活下来而不是靠白名单**。
 
-    ⚠️ 纠错记录的取回分数在 400 天后是**最低**的（权重 0.5、半衰期 60 天），
-    所以这条不是"恰好没砍到它"，而是"按旧判据必砍、按新判据不砍"。
+    ⚠️ 这条用例的口径跟着 2026-11-03 那轮改过：以前纠错记录是 ``_NEVER_PRUNE``
+    整类免死，现在没有类别豁免了，它靠 ``KIND_WEIGHT['feedback'] = 0.8`` 与
+    1095 天半衰期在分数上排前面。所以这里既要验"没被删"，也要验"它排在最前"——
+    只看"没被删"的话，将来有人把豁免偷偷加回来、或者把分数改歪，用例照样绿。
     """
     import psycopg
 
@@ -119,6 +121,11 @@ def test_prune_on_the_real_table_never_takes_the_correction(store, owner):
             "UPDATE agent_memories"
             "   SET created_at = now() - interval '400 days', last_used_at = NULL"
             " WHERE owner_key = %s", (owner,))
+
+    # 同龄（都是 400 天前）时纠错记录必须排在最前 —— 这是"靠分数活"的直接证据。
+    # ``active()`` 返回的就是 ``rank_memories`` 排好的顺序，与卸压用的是同一份分数。
+    top = store.active(owner, limit=100)[0]
+    assert top["content"] == "迁移前必须先备份", "同龄下纠错记录的分数应最高"
 
     dropped = store.prune(owner, keep=5)
 
