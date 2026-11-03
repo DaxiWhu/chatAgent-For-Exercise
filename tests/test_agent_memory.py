@@ -375,3 +375,61 @@ def test_pg_a_vanished_row_is_reported_not_guessed(monkeypatch):
     result = store.remember("u1", "提交信息用中文")
 
     assert result == {"ok": False, "reason": "conflict"}
+
+
+def test_pg_prune_never_lists_a_protected_row_as_a_victim(monkeypatch):
+    """★ PG 分支的受害名单必须与内存版同源（都来自 ``prune_order``）。
+
+    两版各写一遍淘汰逻辑时，最典型的漂移是"内存版加了豁免、PG 版忘了"——
+    本地开发多半走内存降级，一切正常；上生产才丢数据，而且丢的正好是
+    纠错记录那类最贵的。所以这里不验"淘汰了几条"，验的是**UPDATE 的 id 列表里
+    有没有豁免的那条**。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from src.agents.memory_store import MemoryStore
+
+    captured: dict = {}
+
+    class _Cur:
+        rowcount = 6
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            captured["sql"] = " ".join(str(sql).split())
+            captured["params"] = params
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def cursor(self):
+            return _Cur()
+
+    import psycopg
+
+    monkeypatch.setattr(psycopg, "connect", lambda *a, **k: _Conn())
+
+    old = (datetime.now(UTC) - timedelta(days=400)).isoformat()
+
+    def row(ident: str, kind: str) -> dict:
+        return {"id": ident, "kind": kind, "content": ident, "pinned": False,
+                "use_count": 0, "created_at": old, "last_used_at": old}
+
+    live = [row("fb", "feedback")] + [row(f"p{i}", "project") for i in range(10)]
+    store = MemoryStore("postgresql://fake/db")
+    monkeypatch.setattr(store, "_live_rows", lambda owner: live)
+
+    store.prune("u1", keep=5)
+
+    victims = captured["params"][1]
+    assert "fb" not in victims, "纠错记录不许出现在 UPDATE 里"
+    assert len(victims) == 6, "11 条 - 5（1 条豁免 + 4 条事实）"

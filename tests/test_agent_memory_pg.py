@@ -97,3 +97,31 @@ def test_a_revoked_row_does_not_block_re_adding_it(store, owner):
 
     assert again["ok"] and again["action"] == "added"
     assert len(store.active(owner)) == 1
+
+
+def test_prune_on_the_real_table_never_takes_the_correction(store, owner):
+    """★ 真表上跑淘汰：纠错记录留着，项目事实先出局。
+
+    一条用例同时证明三件事：v12 的 ``stale_at`` 列真的能用、PG 分支与内存版
+    走同一个 ``prune_order``、豁免规则在真数据上成立。
+
+    ⚠️ 纠错记录的取回分数在 400 天后是**最低**的（权重 0.5、半衰期 60 天），
+    所以这条不是"恰好没砍到它"，而是"按旧判据必砍、按新判据不砍"。
+    """
+    import psycopg
+
+    store.remember(owner, "迁移前必须先备份", kind="feedback")
+    for i in range(10):
+        store.remember(owner, f"事实 {i}", kind="project")
+
+    with psycopg.connect(_DSN, connect_timeout=8) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE agent_memories"
+            "   SET created_at = now() - interval '400 days', last_used_at = NULL"
+            " WHERE owner_key = %s", (owner,))
+
+    dropped = store.prune(owner, keep=5)
+
+    alive = {r["content"] for r in store.active(owner, limit=100)}
+    assert dropped == 6, "11 条 - 5"
+    assert "迁移前必须先备份" in alive, "纠错记录不可淘汰"

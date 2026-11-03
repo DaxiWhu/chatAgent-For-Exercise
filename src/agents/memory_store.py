@@ -45,6 +45,7 @@ __all__ = [
     "make_memory_store",
     "max_live_per_owner",
     "normalize_content",
+    "prune_order",
     "rank_memories",
     "render",
 ]
@@ -163,7 +164,8 @@ _HALF_LIFE_DAYS = {
 }
 _DEFAULT_HALF_LIFE = 120.0
 
-#: 单用户"仍参与注入"的记忆条数上限。超出的按分数从低到高标 ``stale_at``。
+#: 单用户"仍参与注入"的记忆条数上限。超出的按**可丢弃性**（``prune_order``）
+#: 从尾部标 ``stale_at``，不是按取回分数。
 #: 为什么要有：没有它，表只增不减，而读取一侧有 40 条上限 ⇒ 多出来的那些
 #: **永远读不到、也不会消失**。那是静默遗忘，比删除更难发现。
 _DEFAULT_MAX_LIVE = 200
@@ -171,6 +173,22 @@ _DEFAULT_MAX_LIVE = 200
 #: 新写入的保护期（天）。淘汰只清理"长期没在场"的记忆，刚写进来的还没机会被用到 ——
 #: 按分数砍尾巴时它会因为分数低（还没被 touch 过）而首当其冲，那是反的。
 _PROTECT_DAYS = 7
+
+#: **永不自动淘汰**的类别（用户 2026-11-03 拍的口径）。
+#:
+#: 为什么这两类不给淘汰：身份（``persona``）与纠错记录（``feedback``）是"用户对我
+#: 这个人的定义"，条数天然有限（几十条），占的空间可以忽略，而丢失代价最大 ——
+#: 丢一条偏好用户会说第二遍；丢一条纠错记录意味着同一个错误再犯一次，而用户会
+#: 认为"我明明讲过了"。**它们不受分数影响，分数多低都留。**
+_NEVER_PRUNE = {"persona", "feedback"}
+
+#: 淘汰时的保留优先级（数字越大越该留）。**与 ``KIND_WEIGHT`` 是两份判据** ——
+#: 那份回答"这一轮先放哪条"，这份回答"哪条可以永远不再出现"。
+#:
+#: 索引类最易重建（它本来就只是"去哪查"的指针），项目事实会过期（"这版接口已经
+#: 改成 v2"），偏好最耐放。身份与纠错记录不在这里 —— 它们走 ``_NEVER_PRUNE``，
+#: 不进入比较。
+_KEEP_PRIORITY = {"reference": 0, "project": 1, "preference": 2}
 
 #: 单次读取的扫描上限（条）。它**不是**注入条数上限（那个是 ``limit`` 参数），
 #: 只是"一个用户最多扫多少行进内存排序"的保护值。噪声用户攒到几千条时，
@@ -208,20 +226,69 @@ def _as_dt(value: Any) -> datetime | None:
     return None
 
 
-def _score(row: dict, now: datetime) -> float:
-    """一条记忆的价值分数（0~1）。权重与理由见 ``KIND_WEIGHT`` 那条注释。"""
+def _recency(row: dict, now: datetime) -> float:
+    """新鲜度（0~1）：离最后一次在场越久越接近 0。
+
+    基准是 ``last_used_at``（触发过 ``touch``），没有就退回 ``created_at``。
+    半衰期按类别分 —— 偏好比项目事实活得久，见 ``_HALF_LIFE_DAYS``。
+
+    ``取回排序`` 与 ``淘汰`` 共用这一份，**不各写一遍**：两个公式分叉的那天，
+    会出现"注入顺序认为它很新、淘汰认为它很旧"，而两边各自看起来都自洽。
+    """
     kind = str(row.get("kind") or "")
-    weight = KIND_WEIGHT.get(kind, 0.5)
     half_life = _HALF_LIFE_DAYS.get(kind, _DEFAULT_HALF_LIFE)
     stamp = _as_dt(row.get("last_used_at")) or _as_dt(row.get("created_at"))
     if stamp is None:
-        recency = 0.5
-    else:
-        age_days = max(0.0, (now - stamp).total_seconds() / 86400.0)
-        recency = 0.5 ** (age_days / half_life)
+        return 0.5
+    age_days = max(0.0, (now - stamp).total_seconds() / 86400.0)
+    return 0.5 ** (age_days / half_life)
+
+
+def _score(row: dict, now: datetime) -> float:
+    """一条记忆的**取回**价值分数（0~1）。回答"这一轮该先放哪条"。"""
+    kind = str(row.get("kind") or "")
+    weight = KIND_WEIGHT.get(kind, 0.5)
     # 使用痕迹封顶在 10 次：再往上加已经没有区分度，而它对总数的影响本来就最小。
     usage = min(1.0, math.log1p(row.get("use_count") or 0) / math.log1p(10))
-    return 0.45 * weight + 0.40 * recency + 0.15 * usage
+    return 0.45 * weight + 0.40 * _recency(row, now) + 0.15 * usage
+
+
+def _is_protected(row: dict) -> bool:
+    """这条是否**不参与自动淘汰**。
+
+    ``pinned`` 之前只是"排序恰好排在最前"，不是规则 —— 有人动排序键就破，
+    而且破了不报错。这里把它写成显式判据。
+    """
+    return bool(row.get("pinned")) or str(row.get("kind") or "") in _NEVER_PRUNE
+
+
+def prune_order(rows: list[dict], *, now: datetime | None = None) -> list[dict]:
+    """淘汰排序（纯函数）：**越靠前越该保留，尾部先砍**。
+
+    与 ``rank_memories`` 是两份判据，别合并。取回排序回答"这一轮先放哪条"，
+    淘汰回答"哪条可以永远不再出现" —— 前者把 ``KIND_WEIGHT`` 算进去是对的
+    （纠错记录不是每轮都要遵守的规矩，取回时排后面没毛病），后者把同一份权重
+    算进去就是灾难：纠错记录的权重 0.5 是最低的一档之一，按分数砍尾巴时
+    它第一批出局，而它恰恰是"同一个错误别再犯"的唯一记录。
+
+    所以这里换了判据：先看豁免（``pinned`` / 身份 / 纠错记录），再看
+    ``_KEEP_PRIORITY``（索引最易重建 → 项目事实会过期 → 偏好尽量留），
+    最后才用新鲜度。新鲜度与取回排序共用 ``_recency``。
+    """
+    moment = now or datetime.now(UTC)
+
+    def key(row: dict) -> tuple:
+        kind = str(row.get("kind") or "")
+        created = _as_dt(row.get("created_at"))
+        return (
+            0 if _is_protected(row) else 1,
+            -_KEEP_PRIORITY.get(kind, 1),
+            -_recency(row, moment),
+            -created.timestamp() if created else 0.0,
+            str(row.get("id") or ""),
+        )
+
+    return sorted(rows, key=key)
 
 
 def rank_memories(rows: list[dict], *, now: datetime | None = None) -> list[dict]:
@@ -381,15 +448,22 @@ class InMemoryMemoryStore:
         return n
 
     def prune(self, owner_key: str, *, keep: int | None = None) -> int:
-        """容量淘汰：把分数最低的标 ``stale_at``，返回条数。
+        """容量淘汰：按**可丢弃性**砍尾部，标 ``stale_at``，返回条数。
 
         **不物理删**，和"改口"用同一套语义 —— 被淘汰的记忆仍然可查、可恢复，
         只是不再参与注入。物理删的后果是"用户三个月前提过的规矩"永久消失，
         而没人知道自己丢过什么。
 
+        判据见 ``prune_order``，**不是** ``rank_memories``：取回排序回答"这一轮先
+        放哪条"，淘汰回答"哪条可以永远不再出现"，两者的最优解不一样。``pinned`` /
+        身份 / 纠错记录一律不参与淘汰；剩下的按"索引 → 项目事实 → 偏好"的保留
+        优先级加新鲜度砍尾部。
+
         ``keep`` 默认取 ``max_live_per_owner()``。**新建不足保护期的不淘汰**：
         淘汰不是"按新旧排序砍尾巴"，而是"清理长期没在场的东西"，刚写进来的
         还没机会被用到。
+
+        豁免类自己就超过上限时**一条都不砍** —— 宁可超限，也不丢那两类。
         """
         limit = max(1, int(keep if keep is not None else max_live_per_owner()))
         now = datetime.now(UTC)
@@ -397,9 +471,14 @@ class InMemoryMemoryStore:
             live = self._active(owner_key)
             if len(live) <= limit:
                 return 0
-            ranked = rank_memories(live, now=now)
+            ordered = prune_order(live, now=now)
+            protected = [r for r in ordered if _is_protected(r)]
+            if len(protected) >= limit:
+                # 全是"不该自动删"的东西（置顶 / 身份 / 纠错记录）⇒ 一条都不砍。
+                # 这里如果照常砍，淘汰就会成为"绕过豁免"的后门。
+                return 0
             n = 0
-            for row in ranked[limit:]:
+            for row in [r for r in ordered if not _is_protected(r)][limit - len(protected):]:
                 created = _as_dt(row.get("created_at"))
                 if created and (now - created).days < _PROTECT_DAYS:
                     continue
@@ -621,14 +700,22 @@ class MemoryStore:
                 return cur.rowcount or 0
 
     def prune(self, owner_key: str, *, keep: int | None = None) -> int:
-        """容量淘汰（语义见内存版）：标 ``stale_at``，不物理删。"""
+        """容量淘汰（语义见内存版）：按可丢弃性砍尾部，标 ``stale_at``，不物理删。
+
+        判据是 ``prune_order`` 而非 ``rank_memories`` —— 两处必须同口径，
+        所以这里调的是同一个纯函数，只是落到 SQL 的只有 id 列表。
+        """
         limit = max(1, int(keep if keep is not None else max_live_per_owner()))
         now = datetime.now(UTC)
         rows = self._live_rows(owner_key)
         if len(rows) <= limit:
             return 0
+        ordered = prune_order(rows, now=now)
+        protected = [r for r in ordered if _is_protected(r)]
+        if len(protected) >= limit:
+            return 0
         victims = []
-        for row in rank_memories(rows, now=now)[limit:]:
+        for row in [r for r in ordered if not _is_protected(r)][limit - len(protected):]:
             created = _as_dt(row.get("created_at"))
             if created and (now - created).days < _PROTECT_DAYS:
                 continue

@@ -29,6 +29,16 @@ def _age_all(store, days: int) -> None:
             row["last_used_at"] = stamp
 
 
+def _age_one(store, content: str, days: int) -> None:
+    """只把某一条往前推，用来构造"极老的豁免类 vs 较新的可丢类"。"""
+    stamp = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    for row in store._rows:
+        if row["content"] == content:
+            row["created_at"] = stamp
+            if row["last_used_at"] is not None:
+                row["last_used_at"] = stamp
+
+
 # --------------------------------------------------------------------------- #
 # ① 排序：稳定偏好不能被"新写的临时事实"挤掉
 # --------------------------------------------------------------------------- #
@@ -241,3 +251,151 @@ def test_max_live_config(monkeypatch, raw, expect):
         monkeypatch.delenv("AGENT_MEMORY_MAX_LIVE", raising=False)
 
     assert M.max_live_per_owner() == expect
+
+
+# --------------------------------------------------------------------------- #
+# ⑤ 淘汰判据：与"这一轮先放哪条"是两份东西
+# --------------------------------------------------------------------------- #
+def test_a_correction_outlives_a_flood_of_project_facts():
+    """★★ 核心：纠错记录即使最老、被几十条项目事实淹没，也不被淘汰。
+
+    为什么这条最要紧：``KIND_WEIGHT`` 里纠错记录只有 0.5，是最低档之一，
+    半衰期又只有 60 天。用**取回分数**砍尾巴时它第一批出局 —— 而它恰恰是
+    "同一个错误别再犯"的唯一记录。丢一条偏好用户会说第二遍；丢一条纠错记录
+    意味着同一个错误再犯一次，而用户会认为"我明明讲过了"。
+    """
+    store = M.InMemoryMemoryStore()
+    store.remember("u1", "迁移前必须先备份", kind="feedback")
+    for i in range(40):
+        store.remember("u1", f"项目事实 {i}", kind="project")
+    _age_all(store, 400)
+
+    dropped = store.prune("u1", keep=20)
+
+    alive = {r["content"] for r in store.active("u1", limit=100)}
+    assert "迁移前必须先备份" in alive, "纠错记录不可淘汰"
+    assert dropped == 21, "41 条 - 20"
+
+
+def test_a_persona_is_never_pruned():
+    """身份类**十年前的**也留着 —— 这条必须让"老"足够极端才有区分度。
+
+    ⚠️ 第一版写成"全部推到 400 天前"，结果是**假通过**：身份类权重 1.0、
+    半衰期 730 天，400 天后分数仍高于项目事实，按任何判据都轮不到它被砍。
+    要证明豁免真的在起作用，被保护的必须**在旧判据下会掉到队尾**：
+    十年老身份（分数 0.46）vs 十天前的事实（分数 0.70）。
+    """
+    store = M.InMemoryMemoryStore()
+    store.remember("u1", "用户是后端工程师", kind="persona")
+    for i in range(30):
+        store.remember("u1", f"事实 {i}", kind="project")
+    _age_all(store, 10)                       # 事实：10 天，已过保护期
+    _age_one(store, "用户是后端工程师", 3650)  # 身份：十年前
+
+    store.prune("u1", keep=10)
+
+    alive = {r["content"] for r in store.active("u1", limit=100)}
+    assert "用户是后端工程师" in alive
+
+
+def test_a_pinned_memory_is_never_pruned():
+    """置顶以前只是"排序恰好排最前"，不是规则 —— 动一次排序键就破，且不报错。
+
+    ⚠️ 钉住的那条要**够老**：第一版让它和其他 30 条同龄，变异后靠 id 的随机
+    顺序侥幸留在前 10 里 —— 那不是守卫，是抽签。十年老的钉住条目在旧判据下
+    必然垫底，才测得出豁免。
+    """
+    store = M.InMemoryMemoryStore()
+    store.remember("u1", "这条钉住", kind="project", pinned=True)
+    for i in range(30):
+        store.remember("u1", f"事实 {i}", kind="project")
+    _age_all(store, 10)
+    _age_one(store, "这条钉住", 3650)
+
+    store.prune("u1", keep=10)
+
+    alive = {r["content"] for r in store.active("u1", limit=100)}
+    assert "这条钉住" in alive
+
+
+def test_reference_goes_before_project_goes_before_preference():
+    """淘汰顺序按可丢弃性：索引 → 项目事实 → 偏好。
+
+    索引类本来就只是"去哪查"的指针，重建成本最低；项目事实会过期
+    （"这版接口已经改成 v2"）；偏好最耐放。
+    """
+    store = M.InMemoryMemoryStore()
+    store.remember("u1", "索引：手册在 docs/", kind="reference")
+    store.remember("u1", "项目事实：接口是 v2", kind="project")
+    store.remember("u1", "偏好：先给结论", kind="preference")
+    _age_all(store, 400)
+
+    store.prune("u1", keep=2)
+
+    alive = {r["content"] for r in store.active("u1", limit=100)}
+    assert "索引：手册在 docs/" not in alive
+    assert "项目事实：接口是 v2" in alive
+    assert "偏好：先给结论" in alive
+
+
+def test_prune_does_nothing_when_the_protected_ones_already_fill_the_cap():
+    """豁免类自己就超上限 ⇒ 一条都不砍，宁可超限。
+
+    照常砍会变成"绕过豁免的后门"：豁免的排在前面占满名额，剩下的照砍，
+    于是"不淘汰"在字面上成立、行为上没有。
+    """
+    store = M.InMemoryMemoryStore()
+    for i in range(5):
+        store.remember("u1", f"纠错 {i}", kind="feedback")
+    for i in range(5):
+        store.remember("u1", f"事实 {i}", kind="project")
+    _age_all(store, 400)
+
+    assert store.prune("u1", keep=3) == 0
+    assert len(store.active("u1", limit=100)) == 10
+
+
+def test_prune_order_disagrees_with_rank_order_on_feedback():
+    """★★ 两份判据在纠错记录上必须给出**相反**结论 —— 这就是它们该分开的证明。
+
+    同一批数据：取回排序把纠错记录垫底（权重 0.5、半衰期 60 天，取回时不优先），
+    淘汰排序把它排到最前（不可淘汰）。
+
+    如果哪天有人"顺手把两个函数合并成一个"，合并后只能满足其中一边，
+    这条会立刻红 —— 而它红的理由不是数字对不上，是**语义被压平了**。
+    """
+    now = datetime.now(UTC)
+    old = (now - timedelta(days=400)).isoformat()
+    rows = [
+        {"id": "fb", "kind": "feedback", "content": "迁移前先备份", "pinned": False,
+         "use_count": 0, "created_at": old, "last_used_at": old},
+        {"id": "pf", "kind": "preference", "content": "先给结论", "pinned": False,
+         "use_count": 0, "created_at": old, "last_used_at": old},
+    ]
+
+    ranked = [r["id"] for r in M.rank_memories(rows, now=now)]
+    pruned = [r["id"] for r in M.prune_order(rows, now=now)]
+
+    assert ranked == ["pf", "fb"], "取回时偏好优先，纠错记录垫底"
+    assert pruned == ["fb", "pf"], "淘汰时纠错记录不可淘汰，偏好可淘汰"
+    assert M.prune_order(rows, now=now)[0] is rows[0], "必须返回原行对象，不是副本"
+
+
+def test_the_protected_ones_take_room_away_from_the_others():
+    """豁免类**占名额**：3 条纠错 + 5 条事实、上限 5 ⇒ 只砍 3 条事实。
+
+    如果切片写成 ``ordered[limit:]``（忘了先减掉豁免的条数），5 条事实里
+    一条都切不出来，总数停在 8 —— 淘汰看起来在跑、实际什么都没做，
+    而日志里 ``dropped=0`` 也完全正常。
+    """
+    store = M.InMemoryMemoryStore()
+    for i in range(3):
+        store.remember("u1", f"纠错 {i}", kind="feedback")
+    for i in range(5):
+        store.remember("u1", f"事实 {i}", kind="project")
+    _age_all(store, 400)
+
+    dropped = store.prune("u1", keep=5)
+
+    assert dropped == 3
+    assert len(store.active("u1", limit=100)) == 5
