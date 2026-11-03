@@ -37,11 +37,11 @@ def store(monkeypatch):
 # ① 追加式：改口留痕、改回原样能写进去
 # --------------------------------------------------------------------------- #
 def test_changing_a_setting_keeps_both_rows_and_both_stay_injectable(store):
-    """改口 ⇒ 两行都在，**旧版本也照样注入**，但带结束时间。
+    """改口 ⇒ 两行都在，**旧版本也照样注入**，但带生效时间。
 
     为什么旧版本不退出注入（用户 2026-11-03 口径）：它是**历史**，不是垃圾。
     要答得出"他以前喜欢 A、现在喜欢 B"，两条必须同时在上下文里，否则模型只能
-    看到最新那条，"以前是什么"永远查不到。渲染侧会给它加「已结束，截至 YYYY-MM」
+    看到最新那条，"以前是什么"永远查不到。渲染侧会给它加「YYYY-MM-DD 起生效」
     （见 ``render``），否则两条并排会变成自相矛盾。
     """
     first = store.remember("u1", "以后都用中文回答", kind="preference")
@@ -305,18 +305,36 @@ def test_render_does_not_truncate_by_length():
     assert "未列出" not in text
 
 
-def test_render_marks_the_old_version_with_its_end_time():
-    """旧版本必须带「已结束」和月份，否则同一主题的两条并排会自相矛盾。"""
+def test_render_marks_the_old_version_with_its_effective_date():
+    """旧版本必须带**生效时间**（精确到日），否则同一主题的两条并排会自相矛盾。
+
+    标的是生效时间、不是结束时间（用户 2026-11-03 口径）。原先标「已结束，截至
+    2026-08」有两个毛病：只到月份 ⇒ 同月内改两次分不出先后；而且"管到什么时候"
+    本来就能从下一条的生效时间推出来，写两遍只是多一个会写错的地方。
+    """
     rows = [
-        {"kind": "preference", "content": "喜欢深色主题", "invalid_at": None},
+        {"kind": "preference", "content": "喜欢深色主题", "invalid_at": None,
+         "valid_from": "2026-08-20T10:00:00+00:00"},
         {"kind": "preference", "content": "喜欢浅色主题",
-         "invalid_at": "2026-08-15T10:00:00+00:00"},
+         "invalid_at": "2026-08-15T10:00:00+00:00",
+         "valid_from": "2025-03-07T10:00:00+00:00"},
     ]
     text = render(rows)
 
-    assert "（已结束，截至 2026-08）" in text
-    assert text.count("（已结束，截至") == 1, "只有旧版本带标记"
+    assert "（2025-03-07 起生效）" in text, "旧版本要标生效时间，且是年月日"
+    body = text.split("\n")[1:]          # 抬头里也提到「起生效」，只数条目行
+    assert sum("起生效" in line for line in body) == 1, "只有旧版本带标记"
+    assert "2026-08" not in text, "不许再标结束时间"
     assert "以前是什么" in text, "抬头要解释标记的含义"
+
+
+def test_render_falls_back_to_creation_time_when_valid_from_is_missing():
+    """老数据 / 检索层给的字典可能没有 ``valid_from``，退回 ``created_at``，不许崩。"""
+    rows = [{"kind": "project", "content": "旧做法",
+             "invalid_at": "2026-08-15T10:00:00+00:00",
+             "created_at": "2025-12-01T10:00:00+00:00"}]
+
+    assert "（2025-12-01 起生效）" in render(rows)
 
 
 def test_content_is_collapsed_but_never_rewritten():

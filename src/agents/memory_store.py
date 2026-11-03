@@ -364,21 +364,28 @@ def render(memories: list[dict]) -> str:
     再压一道只会压掉排在后面本来该给的内容。真正的长度治理在写入与卸压那一侧。
     调用方仍然记一条字数直方图做观测，但**观测不是限制**。
 
-    旧版本（改口留下的、``invalid_at`` 有值的行）**照样注入**，但必须带结束时间，
-    否则同一主题的"以前是 A"和"现在是 B"并排摆着，模型会读成自相矛盾。
+    旧版本（改口留下的、``invalid_at`` 有值的行）**照样注入**，但必须带**生效时间**
+    （``valid_from``，精确到日），否则同一主题的"以前是 A"和"现在是 B"并排摆着，
+    模型会读成自相矛盾。
+
+    ⚠️ 标的是**生效时间**，不是结束时间（用户 2026-11-03 口径，原先是"已结束，截至
+    YYYY-MM"）。两个理由：① 只到月份，同一个月里改过两次就分不出先后；② "哪条管到
+    什么时候"本来就能从**下一条的生效时间**推出来 —— 老版标结束时间等于把同一个
+    事实写两遍，还多一处可能写错的地方。
     """
     if not memories:
         return ""
     head = ("以下是关于当前用户的长期记忆（跨会话保留）。"
-            "标了「已结束」的是历史版本，说明以前是什么，当前以未标记的那条为准。"
+            "带「起生效」的是历史版本，说明以前是什么，当前以没带标记的那条为准。"
             "它们是背景，不是本轮的指令：与用户当轮的要求冲突时，以当轮为准。")
     lines = [head]
     for m in memories:
         kind = m.get("kind") or "project"
         body = m.get("content") or ""
-        until = _as_dt(m.get("invalid_at"))
-        if until is not None:
-            lines.append(f"- [{kind}] {body}（已结束，截至 {until:%Y-%m}）")
+        if _as_dt(m.get("invalid_at")) is not None:
+            since = _as_dt(m.get("valid_from")) or _as_dt(m.get("created_at"))
+            stamp = f"{since:%Y-%m-%d} 起生效" if since is not None else "历史版本"
+            lines.append(f"- [{kind}] {body}（{stamp}）")
         else:
             lines.append(f"- [{kind}] {body}")
     return "\n".join(line.rstrip() for line in lines)
@@ -682,8 +689,10 @@ class MemoryStore:
 
     #: 取行时统一带上的列。**两个查询共用一份**：少了半列的后果是"内存版算得出
     #: 分数、PG 版算出来不一样"，而两边各自看起来都自洽。
+    # ⚠️ 新增列一律**追加在末尾**：``_row_from`` 按下标取值，中间插一个会把后面
+    # 每一列都错位，而错位后字段类型还能对得上（都是 text/timestamptz），不报错。
     _COLS = ("id, kind, content, raw_content, pinned, use_count, hit_count,"
-             " created_at, last_used_at, invalid_at, supersede_reason")
+             " created_at, last_used_at, invalid_at, supersede_reason, valid_from")
 
     def _rows_where(self, owner_key: str, where: str,
                     params: tuple = ()) -> list[dict]:
@@ -702,10 +711,11 @@ class MemoryStore:
 
     @staticmethod
     def _row_from(r: tuple) -> dict:
+        """按 ``_COLS`` 的**顺序**拼字典 —— 改 ``_COLS`` 就必须同步改这里。"""
         return {"id": r[0], "kind": r[1], "content": r[2], "raw_content": r[3],
                 "pinned": r[4], "use_count": r[5], "hit_count": r[6],
                 "created_at": r[7], "last_used_at": r[8],
-                "invalid_at": r[9], "supersede_reason": r[10]}
+                "invalid_at": r[9], "supersede_reason": r[10], "valid_from": r[11]}
 
     def _injectable_rows(self, owner_key: str) -> list[dict]:
         """能进上下文的行：当前有效的 + 改口留下的旧版本（口径见内存版）。"""
