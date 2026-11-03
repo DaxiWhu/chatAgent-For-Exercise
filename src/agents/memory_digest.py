@@ -35,6 +35,7 @@ import re
 from typing import Any
 
 from .. import observability
+from .memory_store import MAX_CONTENT_CHARS
 
 __all__ = ["digest_above", "digest", "hard_cap", "reset_digest_state"]
 
@@ -45,9 +46,21 @@ _ABOVE_DEFAULT = 200
 #: 开头那一段几乎总是最要紧的（结论/要求通常先说）。
 _MAX_INPUT_CHARS = 8000
 
-#: 提炼结果自身的上限（字）。模型不听话时会返回一整段，这里硬截一次 ——
-#: 只用于兜住"提炼本身没起作用"的情形，不是常规路径。
-_DIGEST_MAX_CHARS = 400
+#: 提示词里要求的**目标**长度。刻意比硬上限再低一档：模型对"控制在 N 字以内"
+#: 普遍会略微超出，留出这条余量之后，超出来的部分仍然落不进存储层的截断区。
+_TARGET_CHARS = max(120, MAX_CONTENT_CHARS - 40)
+
+#: 硬上限 —— 超过就**按句子边界**收一次。必须**不大于**存储层的截断线
+#: （``MAX_CONTENT_CHARS``），否则会出现"提炼成功了，然后被腰斩"：
+#: ``normalize_content`` 是 ``s[:300] + "…"``，一条路径 ``D:\...\python.exe``
+#: 正好可能被切成两半，而它看起来仍然像一条正常记忆。
+#:
+#: 2026-11-03 实测：原值 400 是**自己拍的、比存储上限还大**，真模型当场交出
+#: 298 字（离 300 只差 2 字）。现在从 ``MAX_CONTENT_CHARS`` 推导，两处不会再漂。
+_MAX_OUTPUT_CHARS = MAX_CONTENT_CHARS
+
+#: 句子边界。超长时优先在这些字符之后收尾，避免把一句话断成两截。
+_SENTENCE_ENDS = "。；！？;!?"
 
 _client: Any = None
 _client_failed = False
@@ -95,8 +108,8 @@ def digest_above() -> int:
 
 
 def hard_cap() -> int:
-    """单条记忆的字符硬上限。**不是截断线**，只用于挡住明显失控的输入。"""
-    return _DIGEST_MAX_CHARS
+    """提炼结果的字符上限。**恒不大于**存储层的截断线（从它推导）。"""
+    return _MAX_OUTPUT_CHARS
 
 
 def _timeout() -> float:
@@ -158,12 +171,13 @@ def _system_prompt(kind: str) -> str:
         "不要改写成概括。\n"
         "4. 丢掉一次性的过程（\"他先试了 X，后来改成 Y\"），只留最终结论。\n"
         "5. 如果原文其实是几件互不相关的事，只留最要紧的一件，其余一律丢弃。\n"
-        f"6. 长度控制在 {_DIGEST_MAX_CHARS} 字以内。"
+        f"6. 长度控制在 {_TARGET_CHARS} 字以内。**宁可短**：记不住全部时，先保住"
+        "路径、命令、数值这些逐字信息，再砍修饰语和过程描述。"
     )
 
 
 def _clean(text: str) -> str:
-    """剥掉模型爱加的那几层包装，取第一行有效内容。"""
+    """剥掉模型爱加的那几层包装，取第一行有效内容；超长时按句子边界收。"""
     out = _FENCE_RE.sub("", str(text or "")).strip()
     if not out:
         return ""
@@ -171,8 +185,25 @@ def _clean(text: str) -> str:
         line = _BULLET_RE.sub("", line.strip()).strip()
         line = line.strip("".join(_QUOTES)).strip()
         if line:
-            return line[:_DIGEST_MAX_CHARS]
+            return _fit(line)
     return ""
+
+
+def _fit(text: str) -> str:
+    """把提炼结果收进上限之内（**按句子边界**，不是硬切）。
+
+    为什么不直接 ``text[:n]``：硬切会把 "…\\langchain1.2\\python.exe" 或一个日期
+    切成两半，而切完的那条读起来仍然像正常记忆 —— 用户与模型都不知道它坏在哪。
+    优先在最后一个句末标点处结束；一句都没有（长句）才退回硬切。
+    """
+    if len(text) <= _MAX_OUTPUT_CHARS:
+        return text
+    head = text[:_MAX_OUTPUT_CHARS]
+    cut = max(head.rfind(ch) for ch in _SENTENCE_ENDS)
+    # 句子边界太靠前（不到三成）就不值得为它丢掉大半内容，退回硬切。
+    if cut >= int(_MAX_OUTPUT_CHARS * 0.3):
+        return head[:cut + 1]
+    return head
 
 
 def digest(content: str, kind: str = "project", *, stats: Any = None) -> str:

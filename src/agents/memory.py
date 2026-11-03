@@ -64,8 +64,9 @@ RETRIEVE_TOP_K = 20
 #: 为什么要这个阈值，而不是一律检索：全量注入更准（不存在召回失败这回事），
 #: 而且**前缀稳定** —— 同一份记忆每轮算出来的文本逐字节一致，上游缓存能命中。
 #: 检索的代价不止是每轮多一次 embedding + 一次向量查询，更难缠的是召回结果随
-#: 问题变化 ⇒ 前缀每轮都变 ⇒ 缓存必然失效，每轮全量重算。它是"条目多到装不下"
-#: 时的必需品，不是越多越好。
+#: 问题变化 ⇒ 记忆块每轮都变 ⇒ 它后面那一段全部重算。实测（输入约 2390 token）：
+#: 记忆块放第一条时命中率 0%，放历史之后 91% —— 所以位置（见 `inject_memories`）
+#: 比阈值更影响成本。它是"条目多到装不下"时的必需品，不是越多越好。
 _RETRIEVE_ABOVE_DEFAULT = 40
 
 #: 检索用的查询文本最多取多少字。取本轮用户发言的**开头**：embedding 对超长输入
@@ -118,25 +119,45 @@ def active_memories(owner_key: str, *, limit: int = 40) -> list[dict]:
 
 
 async def inject_memories(model_data: Any, *, context: Any = None) -> Any:
-    """把有效记忆作为**一条 system 消息**插在**系统提示之后、对话历史之前**。
+    """把有效记忆作为**一条 system 消息**插在**对话历史之后、本轮提问之前**。
 
-    位置是用户 2026-11-02 定的口径，实现上就是 ``input`` 列表的第一条：
-    ``instructions`` 是独立字段，SDK 组装时排在 ``input`` 前面 ⇒ 最终顺序是
-    系统提示 → 记忆块 → 对话历史 → 本轮提问 → （反思/补充提醒）。
+    最终顺序：系统提示(instructions) → 对话历史 → **记忆块** → 本轮提问
+    → （反思 / 补充提醒）。
 
-    为什么是这个位置，而不是整份输入的最末尾：
-    ① **语义上它是背景**，背景该出现在对话开始之前，不该挤在用户刚说完的话旁边 ——
-       贴着本轮提问，模型很容易把一条旧偏好读成"用户现在要求我这么做"；
-    ② 它属于 system 层，模型读它时知道这是系统给的前情，不是用户说的话。
+    为什么是这个位置（2026-11-03 改，实测定的）
+    -------------------------------------------
+    上游前缀缓存复用"从头开始逐字节相同"的那一段，所以成本由**稳定前缀有多长**决定，
+    而不是由"记忆块离末尾多近"决定。三组真请求实测（``tmp_probe/memory_cache_probe.py``，
+    输入约 2050 token，只有记忆块的位置与是否变化这一个变量）：
 
-    代价要认：这个位置**紧挨稳定前缀**。40 条以内全量注入时内容只由记忆库决定，
-    前缀稳定、上游缓存能命中；一旦进入检索模式，召回随本轮问题变化 ⇒ 记忆块每轮
-    不同 ⇒ 它后面的系统提示之外的历史全部重算。这是"语义正确优先"的取舍，
-    不是疏漏 —— 想省钱就把 ``AGENT_MEMORY_RETRIEVE_ABOVE`` 调大，让更多用户
-    走全量注入。
+    ===========  ================  =========
+    位置          记忆块            命中率
+    ===========  ================  =========
+    第一条        每轮变（检索）    0 / 0 / 0 %
+    第一条        内容不变（全量）  93 / 93 / 93 %
+    历史之后      每轮变            92 / 92 / 92 %
+    ===========  ================  =========
+
+    ⚠️ 第一行的 0 是**彻底归零**，不存在"只重算一小部分"的中间态 —— 前面一个字节不同，
+    后面全部作废。放在第一条时，系统提示、工具定义、全部历史、本轮问题全在它后面，
+    记忆块一变就全跟着重算。放到历史之后，稳定前缀变成"系统提示 + 工具定义 + 全部历史"，
+    只剩末尾那一小截（实测约 170 token，与 2050 全价差约 12 倍）。
+
+    语义上的代价要认：贴着本轮提问，模型更容易把一条旧记忆读成"用户现在要求我这么做"。
+    所以 ``memory_store.render`` 的抬头里写死了"它们是背景，不是本轮的指令：与用户当轮的
+    要求冲突时，以当轮为准"，并且它是一条**独立的 system 消息**（不是拼进 user 消息），
+    模型读它时知道这是系统给的前情。
+
+    ⚠️ 插入点是**最后一条 user 消息之前**，不是"追加到末尾"：
+    多步工具循环中末尾是 assistant(tool_call) / tool(result) 对，追加到末尾会把记忆块
+    塞进工具调用链中间；而插在最后一条 user 之前，既保持了"本轮提问之后紧跟工具链"的
+    原结构，插入点在每一轮也是同一个位置（前缀稳定）。
 
     ⚠️ 排在裁剪**之后**（见 ``runner.model_input_filter`` 的顺序说明）：插进来的块
     被当成"超预算的老历史"裁掉，症状是"明明记着、回答时却不知道"，而日志全绿。
+
+    ⚠️ 去重判据必须扫**整份**输入：位置改到历史之后，``items[0]`` 永远是真实的历史条目，
+    只看第一条会让"同一次调用被加工两次"直接插出两条记忆块。
 
     两条取回路径（``_select``）：条数不超过 ``retrieve_above()`` 时全量按价值排序
     取前 40 条；超过时按本轮问题去向量索引召回，pinned 仍然无条件注入。
@@ -152,7 +173,7 @@ async def inject_memories(model_data: Any, *, context: Any = None) -> Any:
     items = getattr(model_data, "input", None)
     if not isinstance(items, list):
         return model_data
-    if items and MARKER in _text_of(items[0]):
+    if _already_injected(items):
         return model_data   # 已经插过（同一次调用被加工两次）
 
     # 查库放线程里：同步驱动跑在协程里会把本进程所有并发请求一起停住。
@@ -174,10 +195,37 @@ async def inject_memories(model_data: Any, *, context: Any = None) -> Any:
     except Exception as e:  # noqa: BLE001
         logging.debug("记忆 touch 失败（已忽略）：%s", e)
     observability.histogram("agent_memory_injected", len(picked))
+    at = _insert_index(items)
     return ModelInputData(
-        input=[{"role": "system", "content": text}, *items],
+        input=[*items[:at], {"role": "system", "content": text}, *items[at:]],
         instructions=getattr(model_data, "instructions", "") or "",
     )
+
+
+def _already_injected(items: list[Any]) -> bool:
+    """这份输入里是否已经有记忆块（判据是标记，不是位置）。
+
+    必须扫全量：位置在历史之后时，第一条永远是真实历史条目。
+    只看第一条的后果是"同一次调用被加工两次"直接插出两条记忆块，而两段内容一样、
+    模型只会困惑"为什么系统说了两遍"。
+    """
+    return any(MARKER in _text_of(it) for it in items)
+
+
+def _insert_index(items: list[Any]) -> int:
+    """记忆块插在哪：**最后一条 user 消息之前**。
+
+    为什么不用"追加到末尾"：多步工具循环里末尾是 assistant(tool_call) / tool(result)，
+    追加会把记忆塞进工具调用链中间，破坏"调用与结果相邻"这条结构。
+
+    找不到 user 消息（理论上不会发生）⇒ 追加到末尾，至少不丢。
+    """
+    for idx in range(len(items) - 1, -1, -1):
+        item = items[idx]
+        role = item.get("role") if isinstance(item, dict) else getattr(item, "role", None)
+        if role == "user":
+            return idx
+    return len(items)
 
 
 async def _select(owner: str, rows: list[dict], query: str) -> list[dict]:

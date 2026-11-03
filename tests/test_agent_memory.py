@@ -135,20 +135,64 @@ def _context(owner="u1", thread="t-1"):
     return ctx
 
 
-def test_injection_puts_memories_first_and_keeps_the_tail_intact(store):
-    """记忆作为**一条 system 消息插在最前**；后面的历史逐条不变。
+def test_injection_sits_between_history_and_the_turn_question(store):
+    """记忆作为**一条 system 消息插在对话历史之后、本轮提问之前**。
 
-    为什么在最前：它是"背景"。放最后会和"关于你刚才做法的提醒"抢位置，
-    而且前缀每次都不一样 ⇒ 缓存命中不了。
+    为什么不在最前（2026-11-03 实测改）：上游缓存复用"从头逐字节相同"的那一段，
+    记忆块放第一条时，它后面还有系统提示、工具定义、全部历史、本轮提问 ——
+    记忆块一变（检索模式下**每轮都变**）这些全部重算，实测命中率直接归零。
+    放到历史之后，稳定前缀变成"系统提示 + 工具 + 全部历史"，只剩末尾一小截重算。
+
+    ⚠️ 这条断言必须用**多轮历史**：只有一条 user 消息时，"插在最后一条 user 之前"
+    与"插在最前"是同一个位置，测不出区别（第一版就是这么假通过的）。
     """
     store.remember("u1", "以后都用中文回答", kind="preference")
-    data = _input([{"role": "user", "content": "你好"}])
+    history = [
+        {"role": "user", "content": "早上好"},
+        {"role": "assistant", "content": "早"},
+        {"role": "user", "content": "现在几点了"},
+        {"role": "assistant", "content": "九点"},
+        {"role": "user", "content": "你好"},
+    ]
+    data = _input(history)
 
     out = asyncio.run(memory.inject_memories(data, context=_context()))
 
-    assert out.input[0]["role"] == "system"
-    assert "以后都用中文回答" in out.input[0]["content"]
-    assert out.input[1:] == [{"role": "user", "content": "你好"}]
+    at = next(i for i, msg in enumerate(out.input) if memory.MARKER in str(msg["content"]))
+    assert out.input[at]["role"] == "system"
+    assert "以后都用中文回答" in out.input[at]["content"]
+    # 前面是原样不动的历史，后面只剩本轮提问。
+    assert out.input[:at] == history[:-1]
+    assert out.input[at + 1:] == history[-1:]
+    # 历史必须**完整**保留（插一条，不改一条）。
+    assert len(out.input) == len(history) + 1
+
+
+def test_injection_goes_before_the_question_even_mid_tool_loop(store):
+    """多步循环中末尾是 assistant(tool_call) / tool(result) ⇒ 记忆块仍插在本轮提问之前。
+
+    为什么不"追加到末尾"：那会把记忆块塞进工具调用链中间，破坏"调用与结果相邻"。
+    """
+    store.remember("u1", "日期用 YYYY-MM-DD", kind="preference")
+    tool_loop = [
+        {"role": "user", "content": "上一轮问的"},
+        {"role": "assistant", "content": "上一轮答的"},
+        {"role": "user", "content": "查一下昨天的数据"},
+        {"role": "assistant", "content": "好的", "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "content": "查询结果：12 条", "tool_call_id": "c1"},
+    ]
+    data = _input(tool_loop)
+
+    out = asyncio.run(memory.inject_memories(data, context=_context()))
+
+    at = next(i for i, msg in enumerate(out.input) if memory.MARKER in str(msg["content"]))
+    # 位置 = 本轮提问（索引 2）之前；工具调用与结果仍然相邻。
+    assert at == 2
+    assert out.input[at + 1] == tool_loop[2]
+    assert out.input[at + 2] == tool_loop[3]
+    assert out.input[at + 3] == tool_loop[4]
+    # 前面那段历史逐条不变 —— 它是稳定前缀，缓存靠它。
+    assert out.input[:at] == tool_loop[:2]
 
 
 def test_injection_is_stable_across_calls(store):
@@ -165,13 +209,23 @@ def test_injection_is_stable_across_calls(store):
 
 
 def test_second_pass_does_not_duplicate_the_block(store):
-    """同一次调用被加工两次时不许插两遍（否则上下文里同一段记忆出现两次）。"""
+    """同一次调用被加工两次时不许插两遍（否则上下文里同一段记忆出现两次）。
+
+    ⚠️ 必须用**带历史**的输入：位置在历史之后时，插好的记忆块**不在第一条**，
+    只看 ``items[0]`` 的去重判据会漏掉它 —— 单条 user 的用例测不出这件事
+    （第一版就是这么漏过去的，变异存活）。
+    """
     store.remember("u1", "用中文回答", kind="preference")
-    once = asyncio.run(memory.inject_memories(
-        _input([{"role": "user", "content": "x"}]), context=_context()))
+    history = [
+        {"role": "user", "content": "上一轮问的"},
+        {"role": "assistant", "content": "上一轮答的"},
+        {"role": "user", "content": "x"},
+    ]
+    once = asyncio.run(memory.inject_memories(_input(history), context=_context()))
     twice = asyncio.run(memory.inject_memories(once, context=_context()))
 
     assert sum(1 for i in twice.input if memory.MARKER in str(i.get("content"))) == 1
+    assert twice.input == once.input
 
 
 def test_no_owner_means_no_read_and_no_write(store):

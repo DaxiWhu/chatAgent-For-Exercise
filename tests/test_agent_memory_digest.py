@@ -259,3 +259,39 @@ def test_a_missing_usage_does_not_break_the_write(store, monkeypatch):
 
     assert store.active("u1")[0]["content"] == _CONTRACTED
     assert "已记住" in out
+
+
+# --------------------------------------------------------------------------- #
+# ⑤ 长度：提炼结果的硬上限**必须不大于**存储层的截断线
+# --------------------------------------------------------------------------- #
+def test_the_hard_cap_never_exceeds_the_store_truncation_line():
+    """提炼上限必须 ≤ 存储层的 ``MAX_CONTENT_CHARS``。
+
+    这条不成立的后果不是"太长"：``normalize_content`` 是 ``s[:300] + "…"``，
+    一条路径 ``D://miniConda//envs//langchain1.2//python.exe`` 正好可能被切成两半，
+    切完读起来仍然像一条正常记忆 —— 用户与模型都不知道它坏在哪。
+
+    2026-11-03 真模型实测踩过：提炼上限当时自己拍的 400（比 300 还大），
+    模型当场交出 298 字，再多一个字就截了。
+    """
+    from src.agents.memory_store import MAX_CONTENT_CHARS
+
+    assert D.hard_cap() <= MAX_CONTENT_CHARS
+    # 提示词里的目标还要更低一档：模型对"控制在 N 字以内"普遍会略微超出。
+    assert D._TARGET_CHARS < D.hard_cap()
+
+
+def test_an_overlong_digest_is_cut_at_a_sentence_boundary(monkeypatch):
+    """超长时按**句末标点**收口，不硬切 —— 硬切会把路径和日期切成两半。"""
+    long_sentence = "用户要求先给结论再给理由，最多五条。" * 30
+    monkeypatch.setattr(D, "_client_or_none", lambda: _FakeClient(long_sentence))
+
+    out = D.digest("x" * 300)
+
+    assert len(out) <= D.hard_cap()
+    assert out.endswith(("。", "；", "！", "？", ";", "!", "?"))
+
+
+def test_a_single_endless_sentence_falls_back_to_a_hard_cut():
+    """整段没有句末标点（一个超长句）⇒ 只能硬切，但不许超过上限。"""
+    assert len(D._fit("甲" * 900)) == D.hard_cap()
