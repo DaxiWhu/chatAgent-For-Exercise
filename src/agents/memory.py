@@ -1,13 +1,38 @@
 """长期记忆的两个出入口：**每轮注入**（读）与 **工具写入**（写）。
 
-为什么读要挂在注入口
---------------------
-官方给的注入口只有 ``RunConfig.call_model_input_filter``（每次模型调用前拿到完整
-输入）。没有"运行结束钩子"，所以"跑完自动提炼"只能是自己加的旁路任务 ——
-而记忆是**每轮都要生效**的东西，读挂在 filter 上是唯一不依赖自定义调度的位置。
+★ 2026-11-04 改：注入从"每次模型调用"改成"**每轮运行一次，写进会话历史**"
+-------------------------------------------------------------------------
+原来的做法是挂在 ``RunConfig.call_model_input_filter`` 上，每次模型调用前现查库、
+现渲染、现插一条 system。三个后果都是坏的：
 
-写入为什么以工具为主
---------------------
+1. **工具循环里插 N 次**：一次运行可能调用模型十几次，就查库渲染十几次（虽然
+   ``_already_injected`` 挡住重复插入，但成本已经付了）。
+2. **位置是「最后一条 user 之前」** —— 这是**相对末尾**定义。会话数组只追加，
+   末尾每轮右移 ⇒ 这个槽位每轮都是**新的序号**，内容一字不改也整段重算
+   （实测 A=D=602，见 ``AGENT_CONSTRAINTS.md`` §25.1）。
+3. **它不落库** ⇒ 压缩看不见它。压缩压的是会话历史，而记忆块只在内存里飘着，
+   于是"压缩后必须保留的重要信息"里永远缺这一块。
+
+现在的形状：
+
+    每轮运行开始（``runner.run_agent``）
+      ↓  ``prepare_turn(owner, thread_id)`` —— 查一次库、渲染一次、**写进会话**
+      ↓  会话里因此有一条 system 记忆块，位置固定在"当前历史的末尾"
+    之后每次模型调用
+      ↓  什么都不做（它已经是历史的一部分，跟着历史走）
+
+位置为什么不钉在"第 0 条"：会话是**只追加**的，第 0 条只能在会话诞生那一刻写进去，
+之后改不了。写不进第 0 条退一步，**写进历史**也能拿到缓存 —— 关键是它跟着历史一起
+往后走，每一轮都**原样**出现在上一轮的位置上（前缀里），而不是每轮换一个序号。
+
+⚠️ 内容没变就**不重复写**：靠 ``_last_snapshot`` 指纹（存 ``TaskContext`` +
+会话末尾那条的正文）。20 轮各写一条 1400 字的记忆块 = 28000 字进场，那不叫注入。
+
+降级：拿不到 owner / 写会话失败 / 关掉 ``AGENT_MEMORY_IN_HISTORY`` ⇒ 退回老的
+``inject_memories``（每次模型调用现插）。功能不丢，只是回到旧成本。
+
+为什么写入仍以工具为主
+----------------------
 1. 它是官方原语（``FunctionTool``），不需要发明机制；
 2. 用户说"记住……"时**当轮就生效**，可解释；后台抽取是"下一轮才可能生效"；
 3. 不额外花模型调用 —— 后台抽取每轮都要多调一次。
@@ -25,6 +50,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 from typing import Any
@@ -34,11 +60,14 @@ from . import memory_index, memory_lifecycle, memory_store
 
 __all__ = [
     "enabled",
+    "in_history",
+    "prepare_turn",
     "inject_memories",
     "remember_memory",
     "forget_memory",
     "forget_batch_memories",
     "active_memories",
+    "recall",
     "retrieve_above",
 ]
 
@@ -91,6 +120,99 @@ def enabled() -> bool:
     if raw in _FALSE:
         return False
     return raw in _TRUE or raw == ""
+
+
+def in_history() -> bool:
+    """记忆块是否**写进会话历史**（``AGENT_MEMORY_IN_HISTORY``，默认开）。
+
+    关掉它 ⇒ 退回旧行为：每次模型调用前现查库、现插一条（见 ``inject_memories``）。
+    留着这个开关的理由不是"以后可能想回去"，而是**排障**：新形状一旦在某个部署上
+    出问题（写会话失败、或者用户抱怨"记忆每轮都在重复"），要有一条不改代码就能
+    回退的路。旧路径的测试与它的指标都还在。
+    """
+    raw = (os.getenv("AGENT_MEMORY_IN_HISTORY", "1") or "").strip().lower()
+    return raw not in _FALSE
+
+
+#: 会话里那条记忆块的标记（与 ``MARKER`` 同值）。写入时用它做"是不是已经有一条"的
+#: 判据，读取时用它做"这段是不是记忆块"的判据 —— 两处必须同一个字面量。
+_SNAPSHOT_TAG = MARKER
+
+
+def _fingerprint(text: str) -> str:
+    """记忆块内容的指纹。用来判"这一轮要不要再写一条"。
+
+    用 sha1 而不是直接比字符串：记忆块可能几千字，比字符串本身不贵，但把它整段
+    塞进 ``TaskContext`` 是为了**下一轮**比对 —— 那会让上下文多背一份几千字的副本，
+    而它每隔几毫秒就被复制一次。指纹只有 40 字节。
+    """
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _last_snapshot(context: Any) -> str:
+    """本会话上一次写进去的记忆块指纹（没有则空串）。"""
+    return str(getattr(context, "memory_snapshot", "") or "")
+
+
+async def prepare_turn(context: Any, *, session: Any = None,
+                       query: str = "") -> int:
+    """**每轮运行开始时调一次**：查库 → 渲染 → 写进会话（已写过同内容则跳过）。
+
+    返回写了几条（0 = 没内容 / 内容没变 / 写失败 / 功能关着）。
+
+    为什么是 async：查库与写会话都是 IO。调用方（``runner.run_agent``）本来就在
+    协程里，但**查库是同步驱动**，所以下面用 ``asyncio.to_thread`` 包住 ——
+    与 ``inject_memories`` 同一个理由（同步驱动跑在协程里会停住整个事件循环）。
+
+    三个 `return 0` 都不是错误，分别是：功能关着、无法归属、没有记忆。调用方不需要
+    区分它们（写进去 0 条与"没这条路径"对后续流程等价）。
+
+    ⚠️ **内容没变就不写**：判据是本轮渲染结果与 ``context.memory_snapshot``
+    （上一轮写进去那一条的指纹）。不做这件事的后果是历史按轮膨胀：20 轮 × 1400 字
+    = 28000 字，而且每一轮那一条都会进前缀 ⇒ 每轮多付它，比不注入还贵。
+    """
+    if not enabled() or not in_history():
+        return 0
+    owner = str(getattr(context, "owner_key", "") or "")
+    if not owner or session is None:
+        return 0
+    rows = await asyncio.to_thread(active_memories, owner, limit=MAX_INJECT_ITEMS * 5)
+    picked = await _select(owner, rows, query)
+    if not picked:
+        return 0
+    text = memory_store.render(picked)
+    if not text:
+        return 0
+    digest = _fingerprint(text)
+    if digest == _last_snapshot(context):
+        # 与上一轮写进去的完全相同 ⇒ 不再写一条。它已经在历史里，跟着历史走。
+        observability.counter("agent_memory_snapshot_total", result="reused")
+        return 0
+    try:
+        await session.add_items([{"role": "system", "content": text}])
+    except Exception as e:  # noqa: BLE001  会话写失败不该让本轮失败
+        observability.counter("agent_memory_errors_total", stage="snapshot",
+                              kind=type(e).__name__)
+        logging.warning("记忆块写入会话失败（本轮退回注入口，功能不受影响）：%s", e)
+        return 0
+    # 指纹在**写成功之后**才更新：写失败却记下指纹，下一轮会以为"已经写过了"，
+    # 于是这块记忆整个会话都不再出现 —— 而日志里只有一行 warning。
+    try:
+        context.memory_snapshot = digest
+    except Exception:  # noqa: BLE001  TaskContext 是 dataclass，正常可写
+        pass
+    # touch 跟着写入走：一轮只记一次（旧路径在 ``inject_memories`` 里按"本次运行
+    # 新出现的条目"去重，这里天然只有一次）。
+    try:
+        await asyncio.to_thread(_store().touch, owner, [r["id"] for r in picked])
+    except Exception as e:  # noqa: BLE001
+        logging.debug("记忆 touch 失败（已忽略）：%s", e)
+    observability.counter("agent_memory_snapshot_total", result="written")
+    observability.histogram("agent_memory_injected", len(picked))
+    observability.histogram("agent_memory_injected_chars", len(text))
+    if len(text) > _INJECT_CHARS_WATCH:
+        observability.counter("agent_memory_inject_oversize_total")
+    return 1
 
 
 def _dsn() -> str:
@@ -169,8 +291,21 @@ async def inject_memories(model_data: Any, *, context: Any = None) -> Any:
     ⚠️ **不按字数截断**（2026-11-03 改）：注入的永远是提炼后的短句，条数也有硬顶，
     长度天然有界；再截一道只会切掉排在后面本来该给的内容。长度治理在写入侧
     （``memory_digest``）与容量侧（``memory_lifecycle``），不在这里。
+
+    ★ 2026-11-04：这条路径现在是**降级路径**。正常情况由 ``prepare_turn`` 在运行
+    开始时把记忆写进会话，之后每次模型调用什么都不做（见模块 docstring）。
+    这里只在三种情况下还会被走到：``AGENT_MEMORY_IN_HISTORY`` 关掉、写会话失败、
+    或者没有会话（``session is None``，例如 CLI / 测试）。
     """
     if not enabled():
+        return model_data
+    # 正常情况下记忆已经是历史的一部分（``prepare_turn`` 写的）。再插一遍就是
+    # 同一段内容出现两次，模型会困惑"为什么系统说了两遍"，而且第二次那份
+    # 每轮换位置 ⇒ 又把缓存打掉。
+    # ⚠️ 判据用 ``context.memory_snapshot``（本次运行写过）而不是扫输入找 MARKER：
+    # 扫输入会把**上一轮**写进去的那条也认出来，而它可能已经变了（这轮该写新的）。
+    # 这里只回答"本次运行是不是已经处理过记忆了"。
+    if in_history() and getattr(context, "memory_snapshot", ""):
         return model_data
     owner = str(getattr(context, "owner_key", "") or "")
     if not owner:
@@ -411,3 +546,134 @@ def forget_batch_memories(*, owner_key: str, batch_id: str) -> int:
     observability.counter("agent_memory_forgets_total",
                           result="batch" if n else "batch_miss")
     return n
+
+
+def recall(*, owner_key: str, query: str = "", limit: int = 20) -> dict:
+    """**主动查记忆**：按一段话去找相关的记忆（给 ``recall_memory`` 工具用）。
+
+    为什么除了"每轮注入"还要有一个主动查询的入口
+    ----------------------------------------------
+    注入的那一份是**排序后的前 N 条**（或检索召回的 top-K），回答的是"这个人一贯
+    是怎么样的"。它回答不了"上次那个部署脚本的路径是什么" —— 那要求**按问题去翻**，
+    而且翻的范围是全部记忆（可能几百条），不是前 20 条。
+
+    与注入路径共用 ``_index().search``，但**不共用** ``_select``：``_select`` 是给
+    "这一轮该给哪些"用的（有条数硬顶、有 pinned 优先），而这里是**用户/模型明确
+    要查**，所以按 query 走纯相似度召回，附上编号（供 ``forget`` 用）。
+
+    返回 ``{"ok": bool, "items": [...]}``。``items`` 每项含 ``id`` / ``kind`` /
+    ``content`` / ``pinned``。**没有记忆不是错误** —— ``ok=True, items=[]``，
+    调用方据此说"没查到"。
+
+    ⚠️ 失败时 ``ok=False`` 而**不是**抛出：查记忆失败不该让一轮对话崩掉。
+    但也不能静默返回空列表 —— 那会让模型说"没有相关记忆"，而实际上库都没连上。
+    """
+    if not enabled() or not owner_key:
+        return {"ok": False, "reason": "disabled" if not enabled() else "no_owner",
+                "items": []}
+    text = (query or "").strip()
+    cap = max(1, min(int(limit or 20), MAX_INJECT_ITEMS))
+    try:
+        rows = _store().active(owner_key, limit=MAX_INJECT_ITEMS * 5)
+    except Exception as e:  # noqa: BLE001
+        observability.counter("agent_memory_errors_total", stage="recall",
+                             kind=type(e).__name__)
+        logging.warning("记忆查询失败：%s", e)
+        return {"ok": False, "reason": type(e).__name__, "items": []}
+
+    if not text:
+        # 没给问题 ⇒ 按价值排序给前几条（与注入同一口径），不是"随便挑"。
+        picked = rows[:cap]
+        observability.counter("agent_memory_recall_total", result="list")
+        return {"ok": True, "items": _brief(picked)}
+
+    hits: list[tuple[str, float]] = []
+    try:
+        hits = _index().search(owner_key, text, cap * 2)
+    except Exception as e:  # noqa: BLE001  索引坏了不等于记忆没了
+        observability.counter("agent_memory_errors_total", stage="recall_index",
+                             kind=type(e).__name__)
+        logging.debug("记忆索引查询失败，退回关键词包含匹配：%s", e)
+
+    by_id = {r["id"]: r for r in rows}
+    picked: list[dict] = []
+    seen: set[str] = set()
+    for ident, _score in hits:
+        row = by_id.get(ident)
+        if row is None or ident in seen:
+            # 索引是脏读的（失效/淘汰不删物理行），这里要按主表校验。
+            continue
+        picked.append(row)
+        seen.add(ident)
+        if len(picked) >= cap:
+            break
+
+    if not picked:
+        # 索引没命中 / 没建索引 ⇒ 退回**字面**匹配。宁可粗一点，也不要给出
+        # "没有相关记忆"这个结论而实际上只是向量库没建好。
+        picked = _literal_match(rows, text, cap)
+        observability.counter("agent_memory_recall_total",
+                              result="fallback" if picked else "miss")
+    else:
+        observability.counter("agent_memory_recall_total", result="hit")
+
+    if picked:
+        try:
+            _store().touch(owner_key, [r["id"] for r in picked])
+        except Exception as e:  # noqa: BLE001
+            logging.debug("记忆 touch 失败（已忽略）：%s", e)
+    observability.histogram("agent_memory_recalled", len(picked))
+    return {"ok": True, "items": _brief(picked)}
+
+
+def _literal_match(rows: list[dict], query: str, cap: int) -> list[dict]:
+    """向量索引不可用时的兜底：按**字面重合度**挑。
+
+    为什么不是简单的 ``query in content``：查询通常是一句问话（"部署脚本在哪"），
+    而记忆是一句陈述（"部署脚本在 deploy/release.sh"）—— 整串包含几乎永远不成立。
+
+    为什么不是 ``query.split()``：中文没有空格，整句会被切成**一个词**，
+    等于又回到整串包含。用**双字组**（bigram）重合度：中文里相邻两个字已经是很强的
+    信号，英文单词本身会被切成若干 bigram，照样能匹配上。
+
+    排序用重合数，够粗但绝不会因为"没建索引"就断言"没有这条记忆"。
+    """
+    def grams(text: str) -> set[str]:
+        cleaned = "".join(text.lower().split())
+        if len(cleaned) < 2:
+            return {cleaned} if cleaned else set()
+        return {cleaned[i:i + 2] for i in range(len(cleaned) - 1)}
+
+    want = grams(query)
+    if not want:
+        return []
+    scored: list[tuple[int, dict]] = []
+    for row in rows:
+        body = str(row.get("content") or "")
+        if not body:
+            continue
+        hit = len(want & grams(body))
+        # 至少命中两个 bigram 才算相关：一个 bigram（两个字）太容易撞上，
+        # 而"查了一次就说有"会把无关记忆塞进上下文，比查不到更糟。
+        if hit >= 2:
+            scored.append((hit, row))
+    scored.sort(key=lambda pair: (-pair[0], str(pair[1].get("id") or "")))
+    return [row for _hit, row in scored[:cap]]
+
+
+def _brief(rows: list[dict]) -> list[dict]:
+    """只留工具输出需要的四个字段（**不带** raw_content / 向量 / 时间戳）。
+
+    为什么收窄：这些字段会原样进模型的上下文。``raw_content`` 是提炼前的原话，
+    可能几千字，而且它与 ``content`` 说的是同一件事 —— 一起给等于把注入量翻倍，
+    还把"提炼"这件事的意义抵消掉。
+    """
+    return [
+        {
+            "id": str(r.get("id") or ""),
+            "kind": str(r.get("kind") or "project"),
+            "content": str(r.get("content") or ""),
+            "pinned": bool(r.get("pinned")),
+        }
+        for r in rows
+    ]

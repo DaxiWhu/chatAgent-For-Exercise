@@ -802,6 +802,18 @@ async def run_agent(
         # 只能读上下文 —— 现读的话拿到的是"已经跑了几步之后"的上下文，与判据同源
         # 就没意义了（它必须与"这一步为什么被做"对齐，不是与被判的那一刻对齐）。
         context.goal = _goal_of(prompt, context)
+        # ★ 长期记忆：**一轮只处理一次**（2026-11-04）。
+        # 在这里写进会话，而不是每次模型调用现插一条（见 ``memory`` 模块 docstring）。
+        # 放在 ``Runner.run`` 之前是必须的：写进去的那条要作为**输入的一部分**被读到，
+        # 写晚了这一轮就看不到它。放在 ``_build_input_items`` 之后也是必须的 ——
+        # 那条记忆块要排在**本轮提问之前**，而 ``run_input`` 是本轮提问。
+        # ⚠️ 失败不抛：记忆是增强，写不进去只该退化成"这一轮没有记忆"，
+        # 绝不能让它把整轮请求打挂（它会看到的异常只有写会话/查库两类）。
+        try:
+            await memory.prepare_turn(
+                context, session=session, query=_goal_of(prompt, context))
+        except Exception as e:  # noqa: BLE001
+            logging.warning("本轮长期记忆准备失败（已忽略，本轮无记忆）：%s", e)
 
     answer = ""
     exit_reason = "error"

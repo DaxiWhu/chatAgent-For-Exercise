@@ -485,7 +485,7 @@ _SUMMARY_PROMPT = (
     "下面是一段对话的**较早部分**（可能以一段已有摘要开头）。"
     "请把它压缩成一份**交接记录**：读它的是下一轮接着干的人（就是你自己），"
     "唯一标准是「拿着它能不能直接往下做，不用回头查」。\n"
-    "必须按下面八个小节写，**一节都不许省**；某节确实没有内容就写「(none)」。\n"
+    "必须按下面九个小节写，**一节都不许省**；某节确实没有内容就写「(none)」。\n"
     "一、原始请求与意图：这件事要干什么。目标变过就写清「从 X 改成 Y」，"
     "用户的措辞逐字引用。\n"
     "二、已完成事项：只写**已经确认**的结果，不写「大概做了」「应该可以」。\n"
@@ -506,13 +506,27 @@ _SUMMARY_PROMPT = (
     "六、涉及的文件与代码：路径写精确，说明改了什么。\n"
     "七、技术概念与约定：用到的框架、模式、项目里定过的规矩。\n"
     "八、当前进展：压缩这一刻正在做什么。\n"
+    "九、长期记忆：这段对话里**关于用户本人的、离开这段对话仍然成立**的东西 ——"
+    "他表达过的偏好与风格要求、他纠正过你的做法及原因、他定下的项目级事实与约束、"
+    "他的身份与工作方式。\n"
+    "  * 每条写成**一句自足的话**（离开这段对话也读得懂、照着就能做对），"
+    "前面加类别标记，形如 `[preference] 回答先给结论，正文不超过 5 条`；\n"
+    "  * 类别只能是 persona / preference / project / feedback / reference；\n"
+    "  * **只写仍然有效**的：他后来改口改掉的、明确说「不用了」的，不要写成当前状态"
+    "（要写就写成「[feedback] 曾要求 X，后改为 Y」）；\n"
+    "  * 路径、命令、报错原文、数值、日期**逐字照抄**；\n"
+    "  * ⚠️ 这一节与下面那段候选块**不是一回事**，两边都要写：这一节进摘要、"
+    "每轮都在上下文里，写的是「长期有效的结论」；候选块进记忆表、由用户级开关决定"
+    "去哪，写的是「值得单独存一条的条目」。同一件事在两边都出现是**预期**的，不是重复。\n"
+    "  * 这段对话里没有任何关于用户的长期信息就写「(none)」——**不要**为了填满而编，"
+    "也**不要**把一次性的任务内容（这次要改哪个文件、这次跑什么命令）写进来。\n"
     "**逐字保留**（不许改写成概括）：文件路径、命令、报错原文、标识符、数值、日期、"
     "函数签名、语法片段，以及用户的原话（尤其是纠正过你的那几句）。"
     "这些东西极易被「总结得通顺」抹掉，而它们改一个字就失效。\n"
     "硬性要求：**不许编造原文里没有的信息**（看不出成败就写「结果未明」）；"
     "不写建议、评价、客套话；不用「我」或「你」称呼；"
-    "八个小节直接开始，不要额外的标题或前后缀；正文总长控制在 {limit} 字以内。\n"
-    "八个小节之后**另起一段**，输出跨会话记忆候选，格式严格照下面：\n"
+    "九个小节直接开始，不要额外的标题或前后缀；正文总长控制在 {limit} 字以内。\n"
+    "九个小节之后**另起一段**，输出跨会话记忆候选，格式严格照下面：\n"
     "<memories>\n"
     "- [preference] 用户明确表达过的偏好\n"
     "- [project] 这个项目或这套代码的固定事实、约定\n"
@@ -901,6 +915,43 @@ def _segment_with_prior(segment: list[Any], prior: dict | None) -> list[Any]:
     return [{"role": "system", "content": summary}, *segment]
 
 
+def _memory_marker() -> str:
+    """记忆块的标记字面量（``memory.MARKER``）。
+
+    为什么惰性取而不是模块级常量：``memory`` 依赖 ``memory_store``，而压缩**不该**
+    被它拖住（压缩在冷启动与无库场景下也要能跑）。反过来 ``memory`` 不导入
+    ``compaction``，所以这里惰性取不会成环，只是把依赖推迟到真正用到那一步。
+    取不到就退回一个**不可能匹配上任何真实文本**的哨兵 —— 判据失效的后果是"记忆块
+    没被单独摆出来"（退化成在历史里跟着走），而不是崩掉整轮压缩。
+    """
+    try:
+        from .memory import MARKER
+        return MARKER
+    except Exception:  # noqa: BLE001
+        return "\x00no-memory-module"
+
+
+def _is_memory_item(item: Any) -> bool:
+    """这条输入项是不是**长期记忆块**（``memory.prepare_turn`` 写进会话的那条）。
+
+    判据是标记字面量而不是位置：记忆块按设计会出现在**任意**位置（每轮写在当时的
+    历史末尾），所以"第几条"不能用来判它。
+    """
+    content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+    return isinstance(content, str) and content.startswith(_memory_marker())
+
+
+def _memory_items(history: list[Any]) -> list[Any]:
+    """挑出压缩段里的记忆块（按出现顺序，**只保留最后一条**）。
+
+    为什么只留最后一条：这些块是**同一份东西的历代快照** —— 每轮内容变了才写新的。
+    全留下来等于把历史的每个版本都摆在模型面前，而它们互相矛盾（"以前是 A，现在是
+    B"），模型无从判断哪个当前有效。最后一条是**最新**的那份。
+    """
+    found = [item for item in history if _is_memory_item(item)]
+    return found[-1:] if found else []
+
+
 def project_history(history: list[Any], record: dict | None) -> list[Any]:
     """按压缩记录算出**模型该看到的那一份**历史：一条摘要 + 未被覆盖的原文。
 
@@ -929,7 +980,19 @@ def project_history(history: list[Any], record: dict | None) -> list[Any]:
         )
         observability.counter("agent_history_projection_errors_total", reason="shorter")
         return list(history)
+    # ★ 记忆块必须**跟着投影走**（2026-11-04）。两个理由，缺一都会真出问题：
+    # 1. 它可能落在被覆盖的那一段里（每轮写在"当时的历史末尾"，压过几次之后就在
+    #    很早的位置上了）。被压掉 = 这一轮上下文里完全没有长期记忆，而摘要里那一节
+    #    只有一句概括，具体条目（路径/命令/数值）全丢 —— 症状是"它明明记着，
+    #    却答不出细节"，日志全绿。
+    # 2. 它是 `_MEMORY_MARKER` 开头的 system 条目，与摘要抬头长得像，但要**分开**
+    #    摆：摘要在最前（背景），记忆紧随其后（关于用户的当前事实）。合并会让模型
+    #    分不清"这段是历史记录"还是"这个人现在就是这样"。
+    # 取**整份历史里最后一条**（最新快照），不是被覆盖段里的最后一条 —— 后者可能
+    # 比尾部里已有的那条更旧。
+    memory = _memory_items(history)
     return [{"role": "system", "content": _SUMMARY_PREAMBLE + summary},
+            *memory,
             *history[covered:]]
 
 
@@ -1310,7 +1373,16 @@ async def compact_for_window(
     if not body:
         return None
     tail = payload[keep_from:]
-    replacement = _session_replacement(body, tail)
+    # ★ 记忆块也跟着保留下来（2026-11-04），与 ``project_history`` 同一口径：
+    # 它可能被压进摘要段（它在"当时的历史末尾"，而压的是老的那一段），压掉就等于
+    # 这一轮完全没有长期记忆的具体条目。取**整份 payload 里最后一条**，不取被压段里的。
+    #
+    # ⚠️ 去重是必须的：记忆块若恰好落在 ``tail`` 里（刚写进去、还没被压到），
+    # 不去重就会摆两条**一模一样**的 system 消息 —— 模型会困惑"系统为什么说两遍"，
+    # 而且那两条一起进前缀，等于白付一份。
+    memory = _memory_items(payload)
+    rest = [item for item in tail if not _is_memory_item(item)]
+    replacement = _session_replacement(body, [*memory, *rest])
     observability.counter("agent_history_compacted_total", scope="window")
     observability.histogram("agent_history_compacted_items", keep_from)
     logging.info("窗口压缩完成：%d 条 → 1 条摘要 + %d 条（%d 轮，%d → 约 %d token）",

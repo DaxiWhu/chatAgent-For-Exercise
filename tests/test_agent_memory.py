@@ -559,3 +559,176 @@ def test_the_raw_copy_is_never_injected(store):
     text = str(out.input[0]["content"])
     assert "回答先给结论" in text
     assert "原话原话" not in text
+
+
+# --------------------------------------------------------------------------- #
+# ④ 一轮一次：写进会话历史（2026-11-04 改的主路径）
+# --------------------------------------------------------------------------- #
+class _RecordingSession:
+    """记下每一次写入的会话替身。只实现 ``add_items`` —— ``prepare_turn`` 只用到它。"""
+
+    def __init__(self):
+        self.written: list[list[dict]] = []
+
+    async def add_items(self, items):
+        self.written.append(list(items))
+
+
+def test_prepare_turn_writes_the_block_into_the_session(store):
+    """一轮开始时把记忆**写进会话**，而不是每次模型调用现插一条。
+
+    为什么必须写进会话：会话是**只追加**的，写进去的那条从此跟着历史一起往后走，
+    每一轮都原样出现在上一轮的位置上 —— 那是**前缀**。而"最后一条 user 之前"这种
+    相对位置每轮都换序号，内容一字不改也整段重算（实测 A=D=602）。
+    """
+    store.remember("u1", "以后都用中文回答", kind="preference")
+    session = _RecordingSession()
+    ctx = _context()
+
+    n = asyncio.run(memory.prepare_turn(ctx, session=session, query="你好"))
+
+    assert n == 1
+    assert len(session.written) == 1
+    block = session.written[0][0]
+    assert block["role"] == "system"
+    assert block["content"].startswith(memory.MARKER)
+    assert "以后都用中文回答" in block["content"]
+    assert ctx.memory_snapshot, "写成功要记下指纹，供下一轮比对"
+
+
+def test_prepare_turn_does_not_rewrite_the_same_block(store):
+    """内容没变就**不再写一条**。
+
+    不判这一下的后果是历史按轮膨胀：20 轮 × 1400 字 = 28000 字，而且每一轮那一条
+    都在前缀里 —— 比根本不注入还贵。判据是渲染结果的指纹，不是"条数变了没"。
+    """
+    store.remember("u1", "以后都用中文回答", kind="preference")
+    session = _RecordingSession()
+    ctx = _context()
+
+    assert asyncio.run(memory.prepare_turn(ctx, session=session, query="你好")) == 1
+    assert asyncio.run(memory.prepare_turn(ctx, session=session, query="接着聊")) == 0
+    assert len(session.written) == 1, "第二轮不该再写一条一模一样的"
+
+
+def test_prepare_turn_writes_again_when_the_memory_changed(store):
+    """记忆变了 ⇒ 必须再写一条（否则本轮看到的还是旧的那份）。
+
+    只判"写过没"是不够的：用户刚说"以后改英文"，这一轮就该看到英文那条。
+    """
+    store.remember("u1", "以后都用中文回答", kind="preference")
+    session = _RecordingSession()
+    ctx = _context()
+    asyncio.run(memory.prepare_turn(ctx, session=session, query="你好"))
+
+    store.remember("u1", "以后都用英文回答", kind="preference")
+    assert asyncio.run(memory.prepare_turn(ctx, session=session, query="换个语言")) == 1
+    assert len(session.written) == 2
+    assert "以后都用英文回答" in session.written[1][0]["content"]
+
+
+def test_snapshot_is_not_recorded_when_the_write_fails(monkeypatch, store):
+    """写会话失败 ⇒ **指纹必须保持空**，下一轮还要重试。
+
+    写失败却记下指纹，下一轮会以为"已经写过了"，于是这块记忆整个会话都不再出现 ——
+    而日志里只有一行 warning，看起来一切正常。
+    """
+    store.remember("u1", "以后都用中文回答", kind="preference")
+
+    class _Broken:
+        async def add_items(self, items):
+            raise RuntimeError("库挂了")
+
+    ctx = _context()
+    assert asyncio.run(memory.prepare_turn(ctx, session=_Broken(), query="你好")) == 0
+    assert ctx.memory_snapshot == "", "写失败不能留下指纹"
+
+
+def test_prepare_turn_is_a_noop_without_a_session_or_owner(store):
+    """没有会话 / 无法归属 ⇒ 什么都不做，**且不抛**（降级路径接手）。"""
+    store.remember("u1", "以后都用中文回答", kind="preference")
+    assert asyncio.run(memory.prepare_turn(_context(), session=None)) == 0
+
+    session = _RecordingSession()
+    assert asyncio.run(memory.prepare_turn(_context(owner=""), session=session)) == 0
+    assert session.written == []
+
+
+def test_injector_steps_aside_once_the_turn_has_prepared_memory(store):
+    """``prepare_turn`` 处理过之后，注入口**不再插第二份**。
+
+    不判这一下的后果：同一段内容出现两次（模型困惑"为什么系统说两遍"），而且第二份
+    走的是相对位置 ⇒ 每轮换序号 ⇒ 把刚修好的缓存又打掉。
+    """
+    store.remember("u1", "以后都用中文回答", kind="preference")
+    ctx = _context()
+    asyncio.run(memory.prepare_turn(ctx, session=_RecordingSession(), query="你好"))
+
+    data = _input([{"role": "user", "content": "你好"}])
+    out = asyncio.run(memory.inject_memories(data, context=ctx))
+    assert out.input == data.input, "本轮已经写进会话了，注入口不该再动输入"
+
+
+def test_switching_off_in_history_restores_the_old_injector(monkeypatch, store):
+    """``AGENT_MEMORY_IN_HISTORY=0`` ⇒ 退回老的注入口（排障用，功能不能丢）。"""
+    store.remember("u1", "以后都用中文回答", kind="preference")
+    monkeypatch.setenv("AGENT_MEMORY_IN_HISTORY", "0")
+    ctx = _context()
+    assert asyncio.run(memory.prepare_turn(ctx, session=_RecordingSession())) == 0
+
+    data = _input([{"role": "user", "content": "你好"}])
+    out = asyncio.run(memory.inject_memories(data, context=ctx))
+    assert any(memory.MARKER in str(m["content"]) for m in out.input)
+
+
+# --------------------------------------------------------------------------- #
+# ⑤ 主动查询：recall（给 recall_memory 工具用）
+# --------------------------------------------------------------------------- #
+def test_recall_finds_by_content_and_returns_ids(store):
+    """主动查询要给**编号** —— 否则模型拿到内容也没法 ``forget`` 它。"""
+    store.remember("u1", "部署脚本在 deploy/release.sh", kind="project")
+    store.remember("u1", "回答先给结论", kind="preference")
+
+    result = memory.recall(owner_key="u1", query="部署脚本在哪")
+
+    assert result["ok"] is True
+    assert result["items"], result
+    assert any("deploy/release.sh" in item["content"] for item in result["items"])
+    assert all(item["id"] for item in result["items"])
+
+
+def test_recall_without_query_lists_by_value(store):
+    """不给问题 ⇒ 按价值排序给前几条（与注入同一口径），不是"随便挑"。"""
+    store.remember("u1", "回答先给结论", kind="preference")
+    result = memory.recall(owner_key="u1", limit=5)
+    assert result["ok"] is True
+    assert len(result["items"]) == 1
+
+
+def test_recall_distinguishes_no_match_from_failure(monkeypatch):
+    """查不了 ≠ 没查到。前者必须 ``ok=False``。
+
+    把"库没连上"说成"没有相关记忆"，模型会据此断言"用户没说过这件事"并照着做 ——
+    这是把一次基础设施故障变成一个错误的**事实结论**。
+    """
+    class _Broken:
+        def active(self, owner, limit=40):
+            raise RuntimeError("库挂了")
+
+    monkeypatch.setattr(memory, "_store", lambda: _Broken())
+    monkeypatch.setenv("AGENT_MEMORY", "1")
+
+    result = memory.recall(owner_key="u1", query="随便")
+    assert result["ok"] is False
+    assert result["items"] == []
+
+
+def test_recall_never_returns_the_raw_copy(store):
+    """``raw_content`` 不进查询结果：它与 ``content`` 说的是同一件事，
+    一起给等于把注入量翻倍，还把"提炼"这件事的意义抵消掉。"""
+    memory.remember_memory(owner_key="u1", content="回答先给结论",
+                           kind="preference", raw_content="原话" * 200)
+    result = memory.recall(owner_key="u1", query="回答要先给结论吗")
+    assert result["items"], result
+    assert "原话原话" not in result["items"][0]["content"]
+    assert set(result["items"][0]) == {"id", "kind", "content", "pinned"}

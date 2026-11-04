@@ -629,6 +629,9 @@ def test_all_tools_that_can_fail_install_a_handler():
     #    （非法时区、除零、路径穿越），失败文案同样要能进步骤清单，所以都装了。
     #    2026-11-02 加了长期记忆的 remember / forget：写库会失败（没 DSN、无归属、
     #    内容为空），而那几种失败必须能被"这一步成没成"看见。
+    #    2026-11-04 加了 recall_memory：查库 / 查索引都会失败，而且它的失败**不能**
+    #    伪装成"没有相关记忆"（那会让模型断言"用户没说过这件事"）—— 正是必须走
+    #    错误处理函数的典型。
     assert {n for n, t in on_frontline.items() if installed(t)} == expected | {
         "save_text_asset",
         "deliver",
@@ -638,6 +641,7 @@ def test_all_tools_that_can_fail_install_a_handler():
         "read_asset",
         "remember",
         "forget",
+        "recall_memory",
     }
 
 

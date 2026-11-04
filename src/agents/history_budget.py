@@ -310,6 +310,25 @@ def is_system_item(item: Any) -> bool:
     return getattr(item, "type", "") == "system"
 
 
+def is_memory_item(item: Any) -> bool:
+    """这条输入项是不是**长期记忆块**（``memory.prepare_turn`` 写进会话的那条）。
+
+    判据是标记字面量而不是位置 —— 记忆块按设计写在"每轮当时的历史末尾"，
+    跑久了会落在中间任意位置。取不到 ``memory.MARKER`` 时用一个不可能匹配的哨兵，
+    让判据退化成"永不命中"（后果是那条记忆没被钉住），而不是崩掉裁剪。
+
+    ⚠️ 与 ``compaction._is_memory_item`` 是**同一判据的两份实现**，不是重复造轮子：
+    ``compaction`` 在模块级导入本模块（它要用同一把 token 尺子），所以反过来
+    在这里模块级导入 ``compaction`` 就成环。两边都只做一次字符串前缀比较。
+    """
+    try:
+        from .memory import MARKER
+    except Exception:  # noqa: BLE001
+        return False
+    content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+    return isinstance(content, str) and content.startswith(MARKER)
+
+
 def _trim_sync(data: Any) -> Any:
     """同步实现（测量 + 裁剪）。只由 ``trim_model_input`` 在线程里调用。
 
@@ -366,7 +385,12 @@ def _trim_sync(data: Any) -> Any:
     try:
         anchors: set[int] = {len(items) - 1}
         # 开头的 system 摘要：压缩刚从最前面放的，钉住它。
-        if is_system_item(items[0]):
+        # ⚠️ 判据必须**排除记忆块**（2026-11-04）：``project_history`` 会摆
+        # 「摘要 + 记忆块 + 尾部」，但记忆块也可能就在第 0 条（老会话里它写在最前）。
+        # 只看 ``is_system_item`` 会把第 0 条的记忆块当成摘要钉住 —— 而它可能是
+        # **旧**快照，钉住它就等于把一个过时的版本硬留在输入里。记忆块由下面那条
+        # 单独钉（只钉最新），所以这里要把它排除掉。
+        if is_system_item(items[0]) and not is_memory_item(items[0]):
             anchors.add(0)
         # 最后一条用户条目 = 本轮的目标。找不到时（纯工具续跑）只有一个末条锚点。
         for index in range(len(items) - 1, -1, -1):
@@ -378,6 +402,17 @@ def _trim_sync(data: Any) -> Any:
         # 找不到用户条目时这一条自然不落（纯工具续跑，与上面同一口径）。
         for index in range(len(items)):
             if is_user_item(items[index]):
+                anchors.add(index)
+                break
+        # ★ 长期记忆块（2026-11-04）：钉**最后一条**，不是全部。
+        # 记忆块每轮写在"当时的历史末尾"，跑久了前面会积好几条历代快照；全钉住等于
+        # 把每一个版本都留在输入里，而它们互相矛盾（"以前是 A，现在是 B"），模型无从
+        # 判断哪个当前有效，还白占预算。最后一条是最新那份。
+        # ⚠️ 不钉的后果不是"少点信息"，而是**这一轮完全没有长期记忆**：它按设计在
+        # 历史的中前段，正是"从最老开始丢"的第一批。症状是"它明明记着用户的偏好，
+        # 这一轮却完全没体现"，而日志、指标、请求全部正常。
+        for index in range(len(items) - 1, -1, -1):
+            if is_memory_item(items[index]):
                 anchors.add(index)
                 break
 

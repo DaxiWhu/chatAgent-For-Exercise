@@ -56,6 +56,7 @@ __all__ = [
     "kb_search",
     "list_assets",
     "read_asset",
+    "recall_memory",
     "remember",
     "render_deck",
     "render_slide_deck",
@@ -809,9 +810,10 @@ def forget(ctx: RunContextWrapper[TaskContext], memory_id: str = "",
 
     用户说"那个不用管了""以后不用这样了"时用它。作废之后那条不再进上下文，
     但库里留着 —— 以后要回答"他之前是怎么要求的"还查得到。
+    不到编号时先 ``recall_memory`` 查一次，它能给出编号。
 
     Args:
-        memory_id: 记忆编号（``remember`` 返回过）。知道编号就填它，最准。
+        memory_id: 记忆编号（``remember`` 返回过，或 ``recall_memory`` 列出来的）。
         content: 记不住编号时填那段内容里的一小段，按包含匹配。
     """
     context = ctx.context
@@ -826,6 +828,56 @@ def forget(ctx: RunContextWrapper[TaskContext], memory_id: str = "",
     if not n:
         return "没找到匹配的记忆（可能编号不对，或它已经失效了）。"
     return f"已作废 {n} 条。"
+
+
+@function_tool(failure_error_function=tool_error_handler("recall_memory"))
+@_isolated("recall_memory")
+def recall_memory(ctx: RunContextWrapper[TaskContext], query: str = "",
+                  limit: int = 20) -> str:
+    """按一段话去翻这个用户的长期记忆，取回相关的若干条（**按需查询**）。
+
+    什么时候用 —— 这是"上下文里已经有一份，但可能不够"的那个补充入口：
+
+    * 每轮开头会自动带上**一份记忆摘要**（排序后的前若干条）。它回答"这个人一贯
+      怎么要求"，回答不了"上次那个路径/命令/结论具体是什么"。
+    * 所以当你要找**具体细节**，而当前上下文里没有时，用它。典型信号：用户说
+      "上次我们定的那个""之前你提过""按以前的方式"，或者你要引用一条只听过一次
+      的约定、路径、数值、决定。
+    * 不确定有没有时也可以查 —— 查一次很便宜；猜一条记忆并照着做，代价是错的。
+
+    **不要**用它做这些：确认"有没有记住某件事"（查不到不代表没记，可能措辞不同）、
+    每轮无脑调用一次（那等于把自动注入重做一遍，还多一次往返）、以及代替
+    ``kb_search``（那个查的是文档语料，这个查的是关于用户的记忆）。
+
+    Args:
+        query: 要找什么。用**描述性的说法**，不要只给一个词 —— 检索是按语义比相似度，
+            「上次说的部署脚本路径」比「部署」更容易命中。留空则按价值排序返回前几条。
+        limit: 最多返回几条（默认 20，上限 40）。
+    """
+    context = ctx.context
+    if not isinstance(context, TaskContext):
+        return "查不到：缺少任务上下文。"
+    owner = (context.owner_key or "").strip()
+    if not owner:
+        return "查不到：当前会话没有可归属的用户（匿名或机器调用），长期记忆不可用。"
+    result = memory.recall(owner_key=owner, query=query, limit=limit)
+    if not result.get("ok"):
+        reason = result.get("reason") or "unknown"
+        if reason == "disabled":
+            return "查不到：长期记忆功能未开启。"
+        # 明确区分"没查到"与"查不了"：后者如果说成"没有相关记忆"，模型会
+        # 据此下结论"用户没定过这件事"，而实际上只是库没连上。
+        return f"查询失败（{reason}），这不代表没有相关记忆，只是这次没查到。"
+    items = result.get("items") or []
+    if not items:
+        return ("没查到相关记忆。这不等于用户没说过 —— 可能是措辞不同，"
+                "换一种说法再查一次，或直接问用户。")
+    lines = [f"查到 {len(items)} 条相关记忆（编号可给 forget 用）："]
+    for item in items:
+        mark = "★" if item.get("pinned") else " "
+        lines.append(f"{mark}[{item.get('kind')}] ({item.get('id')}) "
+                     f"{item.get('content')}")
+    return "\n".join(lines)
 
 
 def render_slide_deck(deck_json: str, asset_dir: Path | str) -> str:

@@ -142,12 +142,14 @@ def test_frontline_topology_is_exactly_what_the_design_claims():
     # 2026-11-02 加了两个长期记忆工具：``remember`` 写、``forget`` 标失效。
     # 它们**不挂审批**（写的是本用户自己的记忆表，不落交付物），但确实扩大了这个
     # 模型每轮要挑的选项面 —— 所以仍然走"精确相等"，加一个就必须在这里露一次面。
+    # 2026-11-04 加了 ``recall_memory``：按需查记忆（每轮注入的那份是摘要，
+    # 回答不了"上次那个路径具体是什么"）。它与 ``remember`` 同属记忆族，只读。
     # 这份清单刻意保持"精确相等"而不是"包含"：多挂一个工具也要有人看一眼，
     # 因为工具是模型可以忘掉的选项，每多一个都在稀释它的注意力。
     assert names == {"research", "build_slide_deck", "make_illustration",
                      "review_draft", "save_text_asset", "deliver",
                      "get_current_time", "calculate", "list_assets", "read_asset",
-                     "remember", "forget"}
+                     "remember", "forget", "recall_memory"}
     assert frontline_agent.output_type is None
     assert [h.name for h in frontline_agent.handoffs or []] == ["literary_writer"]
 

@@ -156,6 +156,60 @@ def test_the_first_user_message_survives(monkeypatch):
     assert "中间一" not in texts, "锚点不是不裁了：中间那条该丢还是要丢"
 
 
+def test_the_long_term_memory_block_survives_a_tiny_budget(monkeypatch):
+    """★★ 记忆块也必须被钉住 —— 它按设计就在"历史的中前段"，正是第一批被丢的。
+
+    为什么这条比前两条更危险：用户条目的丢失会让模型"不知道该干什么"，通常看得出来；
+    而记忆块丢掉只让模型"不知道这个人是怎么要求的"—— 它会**照常把活干完**，只是
+    答得不合口味（该给结论时讲过程、该用中文时用英文）。没有任何报错，也没有任何
+    迹象指向这里。
+
+    ⚠️ 钉**最后一条**而不是全部：记忆块每轮写在"当时的历史末尾"，跑久了前面会积好几条
+    历代快照，全钉住等于把互相矛盾的每个版本都摆在模型面前。
+    """
+    from src.agents.memory import MARKER
+
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "1")
+    items = [
+        _msg("system", f"{MARKER}（跨会话保留）。\n- [preference] 回答先给结论"),
+        _msg("assistant", "中间一" * 50),
+        _msg("assistant", "中间二" * 50),
+        _msg("user", "这一轮的问题"),
+    ]
+
+    out = _trim(items)
+
+    texts = [i.get("content") for i in out.input]
+    assert any(str(t).startswith(MARKER) for t in texts), (
+        "记忆块被裁掉了 —— 这一轮模型完全不知道用户的偏好，而它会照常作答"
+    )
+    assert "这一轮的问题" in texts
+    assert not any(str(t).startswith("中间一") for t in texts)
+
+
+def test_only_the_latest_memory_snapshot_is_anchored(monkeypatch):
+    """多条历代快照 ⇒ 只钉**最新**那条，旧的该丢还是丢。
+
+    全钉住不只是浪费预算：那些版本互相矛盾（"以前是 A，现在是 B"），留给模型
+    判断"哪个当前有效"这件事本身就会出错。
+    """
+    from src.agents.memory import MARKER
+
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "1")
+    old = _msg("system", f"{MARKER}（跨会话保留）。\n- [preference] 旧：用中文")
+    new = _msg("system", f"{MARKER}（跨会话保留）。\n- [preference] 新：用英文")
+    # 旧快照在最前、新快照在中间，"这一轮"在最后 ⇒ 预算 1 时中间全丢，
+    # 留下的只能是**锚点**（末条 + 最新快照 + 第一条用户条目）。
+    items = [old, _msg("user", "最初的问题"), new, _msg("assistant", "填充" * 80),
+             _msg("user", "这一轮")]
+
+    out = _trim(items)
+
+    blocks = [i for i in out.input if str(i.get("content", "")).startswith(MARKER)]
+    assert len(blocks) == 1, f"留下了 {len(blocks)} 条快照（只该钉最新那条）"
+    assert "新：用英文" in str(blocks[0]["content"]), "留下的是旧快照"
+
+
 def test_anchors_are_not_counted_as_a_failure_to_trim(monkeypatch):
     """锚点占满之后仍超额 ⇒ 记一条"预算不足"，而不是无声无息。
 

@@ -324,3 +324,70 @@ def test_store_isolates_threads():
         return await store.latest_active("b")
 
     assert asyncio.run(_go()) is None
+
+
+# --------------------------------------------------------------------------- #
+# ⑥ 长期记忆块：跟着投影走，不能被压掉（2026-11-04）
+# --------------------------------------------------------------------------- #
+def _mem_block(text="以后都用中文回答"):
+    """一条形状与 ``memory.prepare_turn`` 写进去的完全一致的记忆块。"""
+    from src.agents.memory import MARKER
+
+    return {"role": "system", "content": f"{MARKER}（跨会话保留）。\n- [preference] {text}"}
+
+
+def test_projection_keeps_the_memory_block_outside_the_covered_range(on, store,
+                                                                   short_summary):
+    """记忆块落在**被覆盖的那一段**里时，仍然要出现在投影结果里。
+
+    为什么这是必须的：记忆块按设计写在"每轮当时的历史末尾"，压过几次之后它就在很早
+    的位置上了。被压掉 = 这一轮上下文里完全没有长期记忆的具体条目（摘要里那一节只有
+    一句概括，路径 / 命令 / 数值全丢）。症状是"它明明记着，却答不出细节"，日志全绿。
+    """
+    # 记忆块在第 2 条（很早），压缩会把前 4 条覆盖掉。
+    items = [_rounds(1)[0], _mem_block(), _rounds(1)[1], *_rounds(4, start=1)]
+    fake = FakeSession(items)
+    wrapped = C.CompactingSession(fake, store=store)
+    asyncio.run(C.compact_session_history("s-1", session=wrapped, force=True))
+
+    view = asyncio.run(wrapped.get_items())
+
+    assert any(_mem_block()["content"] == str(m.get("content")) for m in view), \
+        "记忆块被压缩覆盖掉了 —— 这一轮将完全没有长期记忆的细节"
+    # 摘要仍在最前，记忆块紧随其后：模型要能分清"这是历史记录"与"这个人现在就是这样"。
+    from src.agents.compaction import _SUMMARY_PREAMBLE
+    assert str(view[0].get("content")).startswith(_SUMMARY_PREAMBLE)
+
+
+def test_projection_keeps_only_the_latest_memory_snapshot(on, store, short_summary):
+    """多条历代快照只留**最新**一条。
+
+    全留下来的后果不是"多点信息"：它们互相矛盾（"以前是 A，现在是 B"），模型无从
+    判断哪个当前有效，还白占预算。
+    """
+    items = [_mem_block("旧偏好：用中文"), _rounds(3)[0], _mem_block("新偏好：用英文"),
+             *_rounds(4, start=1)]
+    fake = FakeSession(items)
+    wrapped = C.CompactingSession(fake, store=store)
+    asyncio.run(C.compact_session_history("s-1", session=wrapped, force=True))
+
+    view = asyncio.run(wrapped.get_items())
+    from src.agents.memory import MARKER
+
+    blocks = [m for m in view if str(m.get("content", "")).startswith(MARKER)]
+    assert len(blocks) == 1, f"留下了 {len(blocks)} 条快照"
+    assert "新偏好：用英文" in str(blocks[0]["content"])
+
+
+def test_projection_without_memory_blocks_is_unchanged(on, store, short_summary):
+    """没有记忆块的会话，投影结果与改造前**逐条相等**（不能白改行为）。"""
+    fake = FakeSession(_rounds(6))
+    wrapped = C.CompactingSession(fake, store=store)
+    asyncio.run(C.compact_session_history("s-1", session=wrapped, force=True))
+
+    view = asyncio.run(wrapped.get_items())
+    from src.agents.compaction import _SUMMARY_PREAMBLE
+
+    assert str(view[0]["content"]).startswith(_SUMMARY_PREAMBLE)
+    assert all(not str(m.get("content", "")).startswith("以下是关于当前用户的长期记忆")
+               for m in view[1:])
