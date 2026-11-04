@@ -115,6 +115,11 @@ def stub_summary(monkeypatch):
     # 拉到同一刻度，算出来的水位永远装不下"一轮 + 摘要"，压缩压根不会发生，而断言
     # 会误把裁剪钉住的 r0 原文当成摘要（"摘要里没有 r4"就是这么来的）。
     monkeypatch.setattr(C, "_summary_max_chars", lambda chars: 300)
+    # 预算 6000 → 7000（2026-11-04）：水位 = 预算 × 0.40 = 2400，而"2 轮 × ~1000 +
+    # 摘要估算 300"原本正好 2300 —— 加法里再算上注入抬头（~110 token）就 2410 > 2400，
+    # 压缩判定"压不到水位"直接放弃，三个用例一起退化成"根本没压"。
+    # ⚠️ 这里**不把抬头打桩为空**（不像 ``tiny_budget``）：这几条测的是最终送进模型的
+    # 内容，抬头本来就该在里面 —— 打掉它等于把"摘要连抬头一起活下来"这件事也一起测掉。
     return _stub
 
 
@@ -152,12 +157,16 @@ def test_compaction_replaces_the_old_segment_and_keeps_the_newest_round(
     判据是原先的 ``r0-问`` 那条**不再逐字出现**（它只以摘要的形式存在）。
     """
     monkeypatch.setenv("AGENT_HISTORY_KEEP_ROUNDS", "2")
-    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "6000")
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "7000")
     items = _rounds(8)
 
     final = _trim(_cd(items))
 
     assert final[0].get("role") == "system"
+    assert _text(final[0]).startswith(C._SUMMARY_PREAMBLE), (
+        "抬头没活到最终输入：模型看到的是一段没有来源的摘要，会把几轮以前的待办"
+        "当成这轮的要求去做（不报错）"
+    )
     assert items[-1] in final and items[-2] in final
     assert items[0] not in final, "最早那轮原文应当已被摘要替换掉"
     assert "r0-问" in _text(final[0]) or "r0-" in _text(final[0]), (
@@ -174,7 +183,7 @@ def test_nothing_is_lost_in_the_gap_between_the_two_layers(
     里都算活着，唯独不能彻底消失。
     """
     monkeypatch.setenv("AGENT_HISTORY_KEEP_ROUNDS", "2")
-    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "6000")
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "7000")
     items = _rounds(8)
     # 埋在第 5 轮 —— 在保留窗之外，必然被压。
     items[10]["content"] = FEATURE + items[10]["content"]
@@ -199,7 +208,7 @@ def test_the_whole_old_segment_reaches_the_summary_before_trimming(
     而每一步看起来都成功了。
     """
     monkeypatch.setenv("AGENT_HISTORY_KEEP_ROUNDS", "2")
-    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "6000")
+    monkeypatch.setenv("AGENT_HISTORY_TOKEN_LIMIT", "7000")
     items = _rounds(8)
 
     final = _trim(_cd(items))

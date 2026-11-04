@@ -305,6 +305,9 @@ def test_window_compaction_strips_the_block_but_does_not_absorb(
     # 真实字号下 600 字的下限会把几十 token 的水位直接撑爆，测到的就不是算法了。
     monkeypatch.setattr(C, "_summary_max_chars", lambda chars: 2)
     monkeypatch.setattr(C, "_MIN_WINDOW_GAIN", 1)
+    # 同 ``test_history_compaction.tiny_budget``：抬头也是几十 token，在这个尺度上
+    # 会把水位顶爆，压不成。抬头本身另有专项用例盯着。
+    monkeypatch.setattr(C, "_SUMMARY_PREAMBLE", "")
     session = _wire(monkeypatch, _reply_with("- [project] 不该在这里落库"))
 
     replacement = asyncio.run(C.compact_for_window(session.items))

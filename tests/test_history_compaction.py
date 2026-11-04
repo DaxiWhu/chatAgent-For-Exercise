@@ -226,7 +226,8 @@ def test_old_history_becomes_a_projected_summary(on, fake_summary):
     dropped, view = asyncio.run(_go())
     assert dropped == 4, "4 轮里该新覆盖前 2 轮（保留 2 轮）"
     assert view[0]["role"] == "system", "摘要必须是 system 角色"
-    assert view[0]["content"] == fake_summary(items[:4])
+    assert view[0]["content"] == C._SUMMARY_PREAMBLE + fake_summary(items[:4]), \
+        "抬头 + 摘要正文；抬头不能替代正文，正文一个字都不许丢"
     assert view[1:] == items[4:]
     assert len(fake.items) == len(items), "★ 库里的条数不许变"
     assert "clear" not in fake.calls, "★ 不许再出现清空会话"
@@ -459,6 +460,10 @@ def tiny_budget(monkeypatch):
     monkeypatch.setattr(C, "_summarize_async", _fake_summarize)
     monkeypatch.setattr(C, "_summary_max_chars", lambda chars: 2)
     monkeypatch.setattr(C, "_MIN_WINDOW_GAIN", 1)
+    # 抬头也压掉：真实抬头有几十字（≈几十 token），在这个 40 token 的水位上它自己
+    # 就能把水位顶爆 ⇒ 所有窗口用例一律返回 None。这里测的是"留几轮"的算法，抬头
+    # 的注入另有专项用例（``test_the_summary_reaches_the_model_with_a_static_preamble``）。
+    monkeypatch.setattr(C, "_SUMMARY_PREAMBLE", "")
     C.reset_compaction_state()
     yield
     C.reset_compaction_state()

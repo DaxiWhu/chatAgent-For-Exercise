@@ -127,6 +127,32 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
+# 注入时给摘要加的抬头
+# ---------------------------------------------------------------------------
+#: 摘要注入模型时前置的一段说明。**写死、不含任何随时间变化的字段**。
+#:
+#: 为什么必须有：摘要正文从「一、原始请求与意图」直接开始，是一段**没有来源**的
+#: 文本；而里面恰好是最容易被误读成当前指令的东西 —— 「三、待办与下一步」、
+#: 「四、错误与修复」里的失败项、以及**逐字保留的用户原话**。那是几轮以前的状态，
+#: 没有任何标记说明这一点时，模型会把旧待办当成本轮要求去执行，或者把已完成的
+#: 重做一遍（两种都表现为"很听话地做了不该做的事"，日志全绿）。
+#:
+#: 为什么必须**写死**：它每轮都进上下文，属于稳定前缀。一旦带上「第 N 轮」/日期 /
+#: 条数，每轮就变，上游前缀缓存从这条消息起全部作废 —— 实测过：同样的内容放在第一条
+#: 且每轮变，命中率 0%；内容不变时 93%。
+#:
+#: ⚠️ 只在**注入**时拼（``project_history`` / ``_session_replacement``），**不入库**：
+#: 存进 ``summary`` 的话每代摘要都多一段自述，而且它会被下一次压缩当成正文再压一遍。
+#: 也不拼进 ``_segment_with_prior`` —— 那个位置是喂给**摘要模型**的输入，抬头进去会被
+#: 抄进摘要正文。
+_SUMMARY_PREAMBLE = (
+    "以下是本次会话较早部分的压缩记录（由系统在之前某一轮生成，不是用户说的话）。\n"
+    "它是背景：里面的「待办」「下一步」是当时的状态，可能已经完成或被放弃；"
+    "引用的用户原话也是当时说的。\n"
+    "与本轮用户的实际要求冲突时，以本轮为准。\n"
+)
+
+# ---------------------------------------------------------------------------
 # 配置（与 app/config.py 同一组环境变量名，链路层直读，理由同 session.py）
 # ---------------------------------------------------------------------------
 #: 保留最近多少轮**原样不动**。下限 **1**，不是随手定的：
@@ -404,8 +430,9 @@ def _plan_keep_to_target(
     需要，而那由 ``_MIN_WINDOW_GAIN``（收益太小就不压）挡住。
 
     ``after`` 含**摘要自身的成本**（按 ``_summary_max_chars`` 的上限估，中文约
-    1 字 = 1 token）。不算它的话，压掉一大段之后实际并没有降下来 —— 摘要上限
-    6000 字，在 40000 的水位里占 15%，不是零头。
+    1 字 = 1 token），也含注入时那几句抬头（``_SUMMARY_PREAMBLE``）。不算摘要的话，
+    压掉一大段之后实际并没有降下来 —— 摘要上限 6000 字，在 40000 的水位里占 15%，
+    不是零头；抬头只有几十字，但"估得刚好等于水位、实际略超"会让触发线反复抖动。
 
     从"保留最多轮"往"保留最少轮"试，**第一个满足水位的**就是最大保留量。
     ``None`` 的含义只有一种：连只留最后一轮都到不了水位（那一轮自己就超水位），
@@ -426,8 +453,12 @@ def _plan_keep_to_target(
         return None
     for keep in range(len(starts), floor - 1, -1):
         keep_from = starts[-keep]
-        after = (total - prefix_tokens[keep_from]) + _summary_max_chars(
-            prefix_chars[keep_from])
+        after = ((total - prefix_tokens[keep_from])
+                 + _summary_max_chars(prefix_chars[keep_from])
+                 # 抬头也算进摘要的成本：它每轮都在，按 1 字≈1 token 估。不计它不会
+                 # 让结果错得离谱，但"估出来刚好等于水位、实际超一点"正是触发线抖动
+                 # 的来源 —— 而抖动一次就多压一轮原文。
+                 + len(_SUMMARY_PREAMBLE))
         if after <= target:
             return keep_from, keep, after, total
     return None
@@ -877,7 +908,8 @@ def project_history(history: list[Any], record: dict | None) -> list[Any]:
         )
         observability.counter("agent_history_projection_errors_total", reason="shorter")
         return list(history)
-    return [{"role": "system", "content": summary}, *history[covered:]]
+    return [{"role": "system", "content": _SUMMARY_PREAMBLE + summary},
+            *history[covered:]]
 
 
 def _session_replacement(summary: str, tail: list[Any]) -> list[Any]:
@@ -897,9 +929,10 @@ def _session_replacement(summary: str, tail: list[Any]) -> list[Any]:
     3. 语义上它就是"系统补的一段背景"，不是用户说的话、也不是助手的回答。
 
     投影用的也是同一个形状（见 ``project_history``），所以模型看到的两种来源
-    （历史压缩 / 窗口压缩）在结构上一致。
+    （历史压缩 / 窗口压缩）在结构上一致 —— **连抬头也一样**，否则同一段摘要在两条
+    路径下长得不一样，模型对"这是背景"的判读会随入口而变。
     """
-    return [{"role": "system", "content": summary}, *tail]
+    return [{"role": "system", "content": _SUMMARY_PREAMBLE + summary}, *tail]
 
 
 # ---------------------------------------------------------------------------

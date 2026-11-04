@@ -126,8 +126,39 @@ def test_projection_is_byte_identical_across_two_reads(on, store, short_summary)
 
     a, b = asyncio.run(_go())
     assert a == b
-    assert a[0] == {"role": "system", "content": "简短摘要。"}
+    assert a[0] == {"role": "system", "content": C._SUMMARY_PREAMBLE + "简短摘要。"}
     assert len(a) == 5, "摘要 + 保留的 2 轮（4 条）"
+
+
+def test_the_summary_reaches_the_model_with_a_static_preamble(on, store, short_summary):
+    """★ 摘要注入时必须带抬头，且抬头**写死**、且**不入库**。
+
+    抬头回答的是"这段文本是谁说的、算不算本轮指令"。摘要正文里有「待办」、有逐字
+    引用的用户原话，没有这句话时模型会把几轮以前的待办当成现在的要求去做 —— 症状是
+    很听话地做了不该做的事，而日志全绿。
+
+    三条一起验，少一条都会退化：
+    * **两条注入路径一模一样**（历史压缩 / 窗口压缩）—— 不一致时同一段摘要在两个入口
+      下的判读会变，而两边各自的用例都是绿的；
+    * **不含任何数字** —— 带轮次/日期/条数就等于每轮都变，上游前缀缓存从这条消息起
+      全部作废（实测：内容每轮变 ⇒ 命中 0%）；
+    * **库里没有抬头** —— 存进去的话每代摘要都多一段自述，还会被下一代压缩当成正文
+      再压一遍，摘要一代代变长。
+    """
+    fake = FakeSession(_rounds(4))
+    wrapped = C.CompactingSession(fake, store=store)
+    _compact(wrapped)
+
+    head = asyncio.run(wrapped.get_items())[0]["content"]
+
+    assert head.startswith(C._SUMMARY_PREAMBLE), "历史压缩这条路径没带抬头"
+    assert "简短摘要。" in head, "抬头不能顶掉正文"
+    assert C._session_replacement("正文", [])[0]["content"] == C._SUMMARY_PREAMBLE + "正文", \
+        "窗口压缩这条路径的抬头必须逐字节一致"
+    assert not any(ch.isdigit() for ch in C._SUMMARY_PREAMBLE), \
+        "抬头里出现数字（轮次/日期/条数）⇒ 每轮都变 ⇒ 前缀缓存全废"
+    assert all(C._SUMMARY_PREAMBLE not in (r.get("summary") or "") for r in store.rows()), \
+        "抬头只该在注入时拼，不该写进库"
 
 
 def test_projection_keeps_everything_before_the_first_record(on, store):
