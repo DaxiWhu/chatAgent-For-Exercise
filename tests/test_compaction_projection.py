@@ -160,6 +160,15 @@ def test_the_summary_reaches_the_model_with_a_static_preamble(on, store, short_s
     assert all(C._SUMMARY_PREAMBLE not in (r.get("summary") or "") for r in store.rows()), \
         "抬头只该在注入时拼，不该写进库"
 
+    # ⚠️ 措辞本身也要钉住。第一版写的是「与本轮的实际要求冲突时以本轮为准」，真模型
+    # 实测**完全无效**（每格 10 次：无抬头 80% 会执行旧待办，带那句软措辞还是 80%）——
+    # 因为模糊指令下不存在"本轮的要求"，这条规则无处落地。改成默认禁止后才降到 10%。
+    # 这里不钉具体字句（措辞会调），只钉"必须是默认禁止"这个语义：一旦有人把它改回
+    # 条件句（"冲突时…"），下面两条就会红。
+    assert "不要执行" in C._SUMMARY_PREAMBLE, "抬头必须是默认禁止，不能是条件句"
+    assert "不是待执行的清单" in C._SUMMARY_PREAMBLE, \
+        "要明说它是背景而不是待办清单 —— 这是实测唯一有效的那一档"
+
 
 def test_projection_keeps_everything_before_the_first_record(on, store):
     """没压过 ⇒ **一次记录查询之外什么都不做**，历史原样返回。"""

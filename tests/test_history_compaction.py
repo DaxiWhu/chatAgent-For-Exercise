@@ -621,6 +621,32 @@ def test_the_summary_prompt_demands_a_step_skeleton():
     )
 
 
+def test_the_summary_prompt_evicts_abandoned_todos():
+    """★ 「三、待办与下一步」必须只留**现在还该做**的事，作废的不许留。
+
+    为什么这条是根治而不是修饰：抬头只是打包票，真正决定模型做什么的是摘要里那个
+    待办清单。真模型实测（``tmp_probe/preamble_ab_probe.py``，每格 10 次）：用户只说
+    「继续吧」时，摘要里留着一条已作废的待办，**80% 的样本会去执行它**，而当时加在
+    注入侧的软措辞对这个数字**一点作用都没有**（同样 80%）。把措辞改成否定式才降到
+    10% —— 但那是兜底，代价是模型对整份摘要都变保守。
+
+    ⇒ 根上的修法只有一处：让作废的待办**不进**这一节。这条判据只存在于提示词里
+    （摘要由模型自由生成，造不出稳定行为断言），所以做结构断言。
+    """
+    prompt = C._SUMMARY_PROMPT
+    # 取出「三、」这一节，避免"别处碰巧提到待办"让断言假通过。
+    third = prompt.split("三、待办与下一步", 1)[1].split("四、错误与修复", 1)[0]
+
+    assert "只写现在还该做的事" in third, "没给出「该不该留」的判据，模型只会照抄当时清单"
+    assert "不许留在这里" in third, "没明说作废的不许留"
+    assert "改方向" in third, "最常见的作废原因（用户换方向）没点名"
+    assert "不要因为" in third and "当时列过" in third, (
+        "没堵住「当时列过所以保留」这个具体错误 —— 这正是实测里 80% 的来源"
+    )
+    # 作废的不能直接消失：它属于「关键上下文」，否则会被重新讨论一遍。
+    assert "已放弃" in prompt or "已经放弃的待办" in prompt
+
+
 def test_the_summary_prompt_keeps_its_two_anti_fabrication_rules():
     """结构要求不能把原来两条硬约束挤掉：不编造、不评价。
 

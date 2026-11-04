@@ -278,7 +278,7 @@ def test_the_hard_cap_never_exceeds_the_store_truncation_line():
 
     assert D.hard_cap() <= MAX_CONTENT_CHARS
     # 提示词里的目标还要更低一档：模型对"控制在 N 字以内"普遍会略微超出。
-    assert D._TARGET_CHARS < D.hard_cap()
+    assert D.hard_cap() > D._TARGET_CHARS
 
 
 def test_an_overlong_digest_is_cut_at_a_sentence_boundary(monkeypatch):
