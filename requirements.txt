@@ -1,7 +1,7 @@
 # ---- 核心运行时 ----
 langgraph>=0.3
 langgraph-checkpoint-postgres>=2
-langchain-openai>=0.3
+langchain-openai>=1.7.3
 langchain-community>=0.3
 langchain-text-splitters>=0.3
 # ⚠️ `[binary]` extra 不能省 —— 少了它镜像里装的是**纯 Python 实现**，
