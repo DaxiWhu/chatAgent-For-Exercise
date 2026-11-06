@@ -988,21 +988,41 @@ class MemoryStore:
 
 #: 进程内单例（与 `session.py` 的会话缓存同一口径）。测试用它拿同一个实例。
 _MEMORY_STORE: Any = None
+#: 单例是按哪个 DSN 建出来的。**必须记住**，理由见 `make_memory_store`。
+_MEMORY_STORE_DSN: str = ""
 _LOCK = threading.Lock()
 
 
 def make_memory_store(dsn: str = "") -> Any:
     """按有没有 DSN 选实现。**没有配置时返回内存版**，不是 None ——
-    "记忆不可用"与"记忆是空的"对调用方是同一件事，少一个分支少一个漏判。"""
-    global _MEMORY_STORE
+    "记忆不可用"与"记忆是空的"对调用方是同一件事，少一个分支少一个漏判。
+
+    ⚠️ 单例**按 DSN 变化重建**，不是"建一次就永远用那个"（2026-11-06 修）
+    --------------------------------------------------------------------
+    原实现是 `if _MEMORY_STORE is None: 建一个`。在测试里这会造成**跨文件污染**：
+    谁先调用了它，就决定了整个进程后面所有测试用"连真库的版本"还是"内存版" ——
+    而 `tests/conftest.py` 为了隔离会把 `DB_URL` 从环境里删掉，于是
+
+      · 先进的那个测试带 `DB_URL` ⇒ 建了 `MemoryStore(dsn)`，
+        后面**没有** `DB_URL` 的测试仍然去连库（即使没配），
+        在 Windows 的 `asyncio.run()` 下直接撞
+        `psycopg.InterfaceError: cannot use the 'ProactorEventLoop'`；
+      · 反过来则是"配了库却一直用内存版"，表现为记忆永远为空且不报错。
+
+    两种都是**顺序依赖**，单独跑全绿、组合跑随机红，最难定位。
+    按 DSN 判等重建之后，"用哪个实现"只由**当前**的 DSN 决定，与调用顺序无关。
+    """
+    global _MEMORY_STORE, _MEMORY_STORE_DSN
     with _LOCK:
-        if _MEMORY_STORE is None:
+        if _MEMORY_STORE is None or dsn != _MEMORY_STORE_DSN:
             _MEMORY_STORE = MemoryStore(dsn) if dsn else InMemoryMemoryStore()
+            _MEMORY_STORE_DSN = dsn
         return _MEMORY_STORE
 
 
 def reset_memory_store(store: Any = None) -> None:
     """换掉进程内实例（**仅供测试**）。"""
-    global _MEMORY_STORE
+    global _MEMORY_STORE, _MEMORY_STORE_DSN
     with _LOCK:
         _MEMORY_STORE = store
+        _MEMORY_STORE_DSN = ""

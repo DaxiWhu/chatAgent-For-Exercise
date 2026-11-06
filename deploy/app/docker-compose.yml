@@ -15,6 +15,12 @@
 # 因此正确做法是**只改一处**，再让脚本同步：
 #   echo 0.3.0 > VERSION && python scripts/sync_version.py
 #
+# ⚠️ 新增一个带 `image: ...${APP_VERSION:-...}` 的服务时，必须同时更新
+#    `scripts/sync_version.py` 的 TARGETS 里那个**预期数量**（compose 当前是 5 处：
+#    app-stable / app-canary / alert-sink / retention-sweep / pg-stats）。
+#    不更新的话 `--check` 会返回非零，`make check` 与 CI 都会红 —— 这是有意的：
+#    宁可让人确认一次，也不要让某个服务的镜像 tag 永久停在旧版本号上且零报错。
+#
 # 想临时跑别的版本（如灰度回滚）时，用环境变量覆盖即可 —— 它优先级高于默认值，
 # `deploy/release.sh` / `rollback.sh` / `make` 都会自动注入：
 #   export APP_VERSION=$(cat VERSION)

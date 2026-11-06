@@ -142,3 +142,79 @@ def test_config_py_carries_no_hardcoded_version():
     assert not found, (
         f"app/config.py 里出现了硬编码版本号 {found} —— 版本号又有了第二个真源"
     )
+
+
+def test_compose_copy_count_matches_declaration():
+    """**副本数量**必须等于 TARGETS 里声明的预期值。
+
+    为什么要单独一条（而不是只靠 `test_sync_script_reports_clean`）
+    ----------------------------------------------------------------
+    此前 `sync_file` 的 `expected` 参数只用来 print 一句 WARN，`--check`
+    在数量不符时**照样返回 RC_OK**，于是那条"CI 走的就是这条路径"的测试
+    假绿了整整一段时间（实际 5 处、预期 4 处）。
+
+    这类失效的形态很隐蔽：`COMPOSE_RE` 若与 compose 的写法脱节（比如某个服务
+    改用了 `image: chatagent:${APP_VERSION}` 的新写法），那一行不再被匹配 ⇒
+    它**永不同步**；而剩下几处的值全都正确 ⇒ 值比对看不出任何问题。
+    最终某个服务的镜像 tag 永久停在旧版本号，且零报错。
+
+    本用例直接比对数量，`expected` 一旦与文件现实脱节就立刻红。
+    """
+    text = COMPOSE.read_text(encoding="utf-8")
+    actual = len(sync_version.COMPOSE_RE.findall(text))
+    declared = next(
+        exp
+        for path, _pat, _render, exp in sync_version.TARGETS
+        if path == COMPOSE
+    )
+    assert actual == declared, (
+        f"compose 里带 ${{APP_VERSION:-...}} 的 image 行实际 {actual} 处，"
+        f"但 TARGETS 声明 {declared} 处。\n"
+        f"如果新增/删除了服务，这是**有意的结构变化** —— 请同步更新 "
+        f"scripts/sync_version.py 的 TARGETS 预期数量。\n"
+        f"如果不是有意的，说明 COMPOSE_RE 已与文件写法脱节，"
+        f"那么少掉的那处副本将永远不被同步。"
+    )
+
+
+def test_check_mode_fails_when_copy_count_drifts(monkeypatch):
+    """`--check` 必须在**数量不符**时返回非零，而不是只打印一句 WARN。
+
+    这是上一条的"行为侧"：断言 `main()` 的返回值真的变了。只测数量相等
+    （上一条）测的是"当前状态对不对"，测不出"将来数量变了会不会被拦住"。
+    """
+    real_targets = sync_version.TARGETS
+    # 把 compose 的预期数量故意改错一处，模拟"加了服务但没同步 TARGETS"。
+    monkeypatch.setattr(
+        sync_version,
+        "TARGETS",
+        [
+            (path, pat, render, (exp + 1 if path == COMPOSE else exp))
+            for path, pat, render, exp in real_targets
+        ],
+    )
+    rc = sync_version.main(["--check"])
+    assert rc == sync_version.RC_DRIFT, (
+        "副本数量与预期不符时 `--check` 返回了 RC_OK —— "
+        "这意味着 `make check` 与 CI 都会放过它，"
+        "而某一处副本可能正永久停留在旧版本号上且零报错"
+    )
+
+
+def test_write_mode_does_not_fail_on_count_drift(monkeypatch):
+    """写模式（不带 `--check`）的职责只是把值改对，数量问题不判失败。
+
+    反过来钉一下，防止把上面那条的判定顺手加到写模式上 —— 那会让
+    `python scripts/sync_version.py` 在版本号已经同步好的情况下"报失败"，
+    发布脚本会因此中断，而实际上什么都没有错。
+    """
+    real_targets = sync_version.TARGETS
+    monkeypatch.setattr(
+        sync_version,
+        "TARGETS",
+        [
+            (path, pat, render, (exp + 1 if path == COMPOSE else exp))
+            for path, pat, render, exp in real_targets
+        ],
+    )
+    assert sync_version.main([]) == sync_version.RC_OK

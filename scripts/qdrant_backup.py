@@ -31,7 +31,13 @@ Qdrant 的恢复会覆盖当前集合，属破坏性动作，必须人工确认�
 
 环境变量
 --------
-    QDRANT_URL         默认 http://localhost:6333
+    以下变量从 `.env` 或进程环境读取（`.env` 由本脚本显式 `load_dotenv()` 载入，
+    命令行 `--url` / `--api-key` / `--collection` 优先级更高）。
+
+    QDRANT_URL         **必填**。不填则退出码 2（"未启用该后端"，不是失败）。
+                       本地开发一般是 http://localhost:6333 —— 但它**不是**代码里的
+                       默认值：配错地址与"根本没配"必须能被区分开，给个默认值会让
+                       "忘了配"伪装成"连不上一个不存在的服务"。
     QDRANT_API_KEY     托管/公网必填；本地无鉴权可留空
     QDRANT_COLLECTION  默认 rag_chunks
     BACKUP_DIR         默认 ./backups/qdrant
@@ -64,6 +70,36 @@ RC_OK, RC_FAIL, RC_UNREACHABLE = 0, 1, 2
 
 # 视为"本机"的主机名。对这些地址**必须绕过代理**，理由见 QdrantAdmin.__init__。
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _load_dotenv() -> None:
+    """载入项目根的 `.env`。
+
+    为什么必须显式加载（2026-11-06 实测踩到）
+    ----------------------------------------
+    此前本脚本只读 `os.environ`，而 `.env` **不会被自动读进来** ⇒
+    `python scripts/qdrant_backup.py drill` 直接报"未配置 QDRANT_URL（该后端可能未启用）"
+    并退出 2 —— 而 `.env` 里那一项明明存在、Qdrant 也确实在 6333 上健康应答。
+
+    危害在于**报错的文案指向了错误的方向**：它说"该后端可能未启用"，
+    于是人会去查"Qdrant 到底起没起"，而真正的原因是"脚本没读配置文件"。
+    同时退出码 2 的含义是"未启用该后端"（定时任务据此区分"没装"与"真失败"），
+    所以这个误报会让备份任务**长期静默地不执行**，且看起来完全正常。
+
+    `pg_backup.py` 一直是加载的（它有 `load_dotenv()`），两个脚本接口号称一致，
+    实际行为不一致 —— 这类"文档说一致、代码不一致"的漂移最容易骗过排查。
+
+    ⚠️ 传**显式路径**而不依赖 `load_dotenv()` 的默认行为：不传 path 时它会用
+    **调用者的栈帧**去定位 `.env`（在本脚本里就是 `scripts/` 目录），于是"读到哪个
+    `.env`"取决于调用方式与工作目录 —— 同一个脚本从仓库根跑和从 `scripts/` 里跑
+    会读到不同的配置。显式指向项目根，行为才是确定的。
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:  # 没装 python-dotenv：保持"只读环境变量"的行为，不算失败
+        return
+    # `__file__` = <repo>/scripts/qdrant_backup.py ⇒ parents[1] = <repo>
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 def _env(name: str, default: str = "") -> str:
@@ -366,6 +402,9 @@ def cmd_drill(args) -> int:
 
 
 def main(argv=None) -> int:
+    # 必须在解析任何环境变量之前加载 —— 命令行参数（--url 等）仍然优先，
+    # 这里只是补上"配置文件"这一层来源。
+    _load_dotenv()
     ap = argparse.ArgumentParser(description="Qdrant 快照备份 / 校验 / 清理")
     ap.add_argument("--url", default="", help="覆盖 QDRANT_URL")
     ap.add_argument("--api-key", default="", help="覆盖 QDRANT_API_KEY")

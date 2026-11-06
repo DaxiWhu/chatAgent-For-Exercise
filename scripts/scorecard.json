@@ -11,7 +11,7 @@
   "answer": {
     "cases": 22,
     "source_coverage": 0.9545,
-    "keypoint_coverage": 0.9545,
+    "keypoint_coverage": 0.9091,
     "traceable_rate": 1.0
   },
   "generation": {
@@ -21,8 +21,8 @@
     "ok_rate": 1.0,
     "ok_unknown": 0,
     "identifier_hallucination_rate": 0.0,
-    "identifier_total": 17,
+    "identifier_total": 16,
     "refusal_accuracy": 1.0,
-    "avg_grounded": 0.5915
+    "avg_grounded": 0.5628
   }
 }

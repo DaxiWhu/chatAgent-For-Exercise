@@ -381,3 +381,57 @@ def test_backup_warns_on_empty_collection(fake_qdrant, tmp_path, monkeypatch, ca
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+# ---------------------------------------------------------------------------
+# 配置来源：`.env` 必须被读到（否则"未配置"会指向错误的方向）
+# ---------------------------------------------------------------------------
+def test_missing_python_dotenv_degrades_to_plain_env(monkeypatch):
+    """没装 python-dotenv 时不许炸 —— 保持"只读环境变量"的行为即可。
+
+    备份脚本会跑在凌晨的定时容器里，那种环境装没装 python-dotenv 不归本脚本管。
+    为了一个可选的便利功能而在生产备份任务里抛 ImportError，是拿可靠性换洁癖。
+    """
+    monkeypatch.setitem(__import__("sys").modules, "dotenv", None)
+    QB._load_dotenv()   # 不抛异常即通过
+def test_dotenv_does_not_read_a_stray_env_beside_the_script(tmp_path, monkeypatch):
+    """`scripts/` 下若出现一个 `.env`，脚本**不许**读到它。
+
+    这条是唯一能区分"显式路径"与"裸 `load_dotenv()`"的用例
+    ------------------------------------------------------
+    我一开始写了好几条别的（按 cwd 读、按调用栈读），全部**变异存活** ——
+    因为 `find_dotenv()` 是从**调用者文件所在目录**向上找，而调用者就是
+    `scripts/qdrant_backup.py` ⇒ 从 `scripts/` 往上，第一个命中的就是仓库根
+    的 `.env`。两种写法在当前布局下**结果完全等价**，所以那些用例没有分辨力。
+
+    真正的分岔点是：**`scripts/` 目录里出现了一个 `.env`**。此时
+    - 裸 `load_dotenv()`：先命中 `scripts/.env` ⇒ 读到错的配置
+    - 显式路径：仍然读仓库根 ⇒ 不受影响
+
+    这个场景不是假想：从别的项目 `cp` 过来、编辑器在子目录生成 `.env`、
+    或者有人在 `scripts/` 里调试时留了一份。而后果是静默的 ——
+    `load_dotenv` 不报错，值就这么换了。
+    """
+    import os
+
+    stray = ROOT / "scripts" / ".env"
+    if stray.exists():
+        pytest.skip("scripts/.env 已存在（真实环境），本条会污染它")
+
+    real = getattr(__import__("dotenv").load_dotenv, "__wrapped__",
+                   __import__("dotenv").load_dotenv)
+    monkeypatch.setattr("dotenv.load_dotenv", real, raising=False)
+
+    stray.write_text("QDRANT_URL=http://STRAY-SHOULD-NOT-WIN:1234\n", encoding="utf-8")
+    try:
+        os.environ.pop("QDRANT_URL", None)
+        QB._load_dotenv()
+        got = (os.environ.get("QDRANT_URL") or "").strip()
+        assert "STRAY" not in got, (
+            f"读到了 scripts/.env 里的值 {got!r} —— 说明 `_load_dotenv` 用的是"
+            f"裸 `load_dotenv()`（按调用栈向上找），脚本目录里多一个 .env 就会"
+            f"静默换掉整个配置。应显式传 `Path(__file__).resolve().parents[1] / '.env'`。"
+        )
+    finally:
+        stray.unlink(missing_ok=True)
+        os.environ.pop("QDRANT_URL", None)

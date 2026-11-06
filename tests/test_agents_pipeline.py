@@ -89,10 +89,20 @@ def isolated_sessions(session_store, monkeypatch):
     （"历史真的跨轮到了模型面前"），不是 SQLAlchemy/PG 本身。PG 那侧另有守卫
     （``tests/test_agent_history_budget.py``）。
 
-    ⚠️ **两个名字都要换**：``runner`` 里是 ``from .session import session_for``（导入期
-    就绑定好了），而好几个用例直接调 ``session.session_for`` 去验"历史里到底存了什么"。
-    只换其中一个 ⇒ 另一半走真后端 ⇒ 本机没有 PG 时那条用例炸在
+    ⚠️ **两个名字都换**（2026-11-06 起是"都换更保险"，不是"必须都换"）：
+    - ``runner.session_for`` 现在是**惰性函数**，每次调用现取
+      ``session_module.session_for``；
+    - 所以只改源模块“session”也能生效。
+
+    仍保留两处都改，理由是两个方向各有调用者：本文件若干用例直接调
+    ``session.session_for`` 去验"历史里到底存了什么"，而那些调用不经过 runner。
+    只改 runner ⇒ 这些断言仍走真后端 ⇒ 本机没有 PG 时炸在
     ``NoneType has no attribute get_items``，看起来像"历史没接上"。
+
+    ⚠️ 历史坑（值得记住）：这段说明原本写的是"``runner`` 里是
+    ``from .session import session_for``（导入期就绑定好了）"，于是那些
+    **只** patch 了 ``session`` 模块的用例（``test_supplements.py`` 有两条）
+    以为换掉了后端、实际没有 —— 单跑绿、全量红，报错还指向完全无关的地方。
 
     顺带钉住"测试期间不碰 Redis"：``REDIS_URL`` 从环境里摘掉，免得开发机上恰好配了
     就真的往共享实例写测试数据（鉴权白名单 / 限流 / 配额也读它）。

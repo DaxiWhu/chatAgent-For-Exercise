@@ -117,6 +117,19 @@ from . import (
     runtime,
     supplements,
 )
+
+# ⚠️ 会话后端按**模块**访问（2026-11-06 改）
+#    ~~~~
+#    原来写的是 `from .session import session_for`，会在本模块里固化一份引用，
+#    于是 `monkeypatch.setattr(session_module, "session_for", 替身)` **不起作用** ——
+#    测试以为自己换掉了会话后端，实际仍在用真的 PostgreSQL 后端。
+#    症状：单跑绿、全量红（别的测试先把 `DB_URL` 留在环境里 ⇒ 真去连库 ⇒
+#    Windows 的 `asyncio.run()` 是 ProactorEventLoop ⇒ psycopg 抛 `InterfaceError`
+#    ⇒ 整轮 `exit_reason='error'`、`model.calls` 为空 ⇒ 后续 IndexError）。
+#
+#    真调用点在 `run_agent` 里，形式是 `session_for(...)`（本模块的惰性包装）。
+#    两种 patch 都能生效：打本模块、或打源模块 `session`。
+from . import session as session_module
 from .context import TaskContext
 from .frontline import frontline_agent
 from .guards import (
@@ -125,9 +138,32 @@ from .guards import (
 )
 from .history_budget import trim_model_input
 from .hooks import AGENT_HOOKS
-from .session import session_for
 from .specialists import literary_agent
 from .tools import render_slide_deck
+
+
+def session_for(session_id: str):
+    """取会话后端（**一次调用时才解析**，因此可被测试替换）。
+
+    为什么不直接 `from .session import session_for`
+    --------------------------------------------
+    那是导入期绑定：`runner.session_for` 会指向**当时**那个函数对象，此后
+    `monkeypatch.setattr(session_module, "session_for", 替身)` 对它毫无影响 ——
+    测试以为自己换了内存版会话，实际仍在连真的 PostgreSQL。
+
+    这个假守卫造成的真实故障（2026-11-06 抓到）
+    ----------------------------------------
+    `tests/test_supplements.py` 有两条用例只 patch 了 `session` 模块。单跑全绿，
+    全量跑红：别的测试把 `DB_URL` 留在了环境里 ⇒ 没被替换的真后端去连库 ⇒
+    Windows 的 `asyncio.run()` 用 ProactorEventLoop，psycopg 直接抛
+    `InterfaceError: cannot use the 'ProactorEventLoop'` ⇒ `run_agent` 整轮
+    `exit_reason='error'`、`model.calls` 是空的 ⇒ 断言里 `model.calls[0]` IndexError。
+    报错指向"补充提醒没生效"，与真正的原因（测试没换掉后端）毫无关系。
+
+    现在每次调用都现取 `session_module.session_for` ⇒ 两种 patch 方式都生效：
+    打在本模块（`runner.session_for`）或打在源模块（`session.session_for`）。
+    """
+    return session_module.session_for(session_id)
 
 __all__ = [
     "ENTRY_AGENT",

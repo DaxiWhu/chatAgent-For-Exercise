@@ -732,3 +732,61 @@ def test_recall_never_returns_the_raw_copy(store):
     assert result["items"], result
     assert "原话原话" not in result["items"][0]["content"]
     assert set(result["items"][0]) == {"id", "kind", "content", "pinned"}
+
+
+# ---------------------------------------------------------------------------
+# 单例：实现必须由**当前** DSN 决定，不能由"谁先调用"决定
+# ---------------------------------------------------------------------------
+def test_store_singleton_follows_the_current_dsn():
+    """DSN 变了就必须换实现 —— 单例不能"建一次就锁死"。
+
+    这是 2026-11-06 全量跑红抓出来的（`test_supplements` 两条，单独跑全绿）
+    ---------------------------------------------------------------------
+    原实现是 `if _MEMORY_STORE is None: 建一个`。于是**谁先调用谁决定**整个进程
+    后面所有测试用哪个实现：
+
+      · 带 `DB_URL` 的测试先跑 ⇒ 建了连真库的 `MemoryStore`，
+        之后 `conftest` 把 `DB_URL` 删掉的测试**仍然去连库**，
+        在 Windows 的 `asyncio.run()` 下撞
+        `psycopg.InterfaceError: cannot use the 'ProactorEventLoop'`
+        ⇒ `run_agent` 整轮 `exit_reason='error'`，`model.calls` 为空；
+      · 反过来则是"配了库却一直用内存版"，记忆永远为空且零报错。
+
+    两种都是顺序依赖：单跑全绿、组合跑随机红。修法是让实现跟随**当前** DSN。
+    """
+    from src.agents import memory_store as MS
+
+    MS.reset_memory_store()
+    try:
+        no_dsn = MS.make_memory_store("")
+        assert isinstance(no_dsn, MS.InMemoryMemoryStore), (
+            "没有 DSN 时应该是内存版（'记忆不可用' 与 '记忆是空的' 等价）"
+        )
+
+        with_dsn = MS.make_memory_store("postgresql://u:p@h:5432/db")
+        assert not isinstance(with_dsn, MS.InMemoryMemoryStore), (
+            "给了 DSN 却仍然返回内存版 —— 说明单例被第一次调用锁死了。"
+            "后果是配了库却永远读到空记忆，且零报错。"
+        )
+
+        back_to_none = MS.make_memory_store("")
+        assert isinstance(back_to_none, MS.InMemoryMemoryStore), (
+            "DSN 变回空之后没有切回内存版 —— 说明它仍拿着上一次连库的实例，"
+            "在测试里会变成'没配库的用例也去连库'，"
+            "Windows 下直接撞 ProactorEventLoop 的 InterfaceError。"
+        )
+    finally:
+        MS.reset_memory_store()
+
+
+def test_store_singleton_is_stable_for_the_same_dsn():
+    """同一个 DSN 必须反复返回**同一个**实例（不能每次新建连接池）。"""
+    from src.agents import memory_store as MS
+
+    MS.reset_memory_store()
+    try:
+        a = MS.make_memory_store("postgresql://u:p@h:5432/db")
+        b = MS.make_memory_store("postgresql://u:p@h:5432/db")
+        assert a is b, "同一 DSN 每次调用都新建实例 ⇒ 连接池按调用次数泄漏"
+    finally:
+        MS.reset_memory_store()

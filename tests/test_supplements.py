@@ -469,3 +469,54 @@ def test_without_a_key_nothing_is_deduped(client, idem, monkeypatch):
         assert r.status_code == 200
 
     assert len(fake.items) == 2, "没带键却被去重了（= 用户的第二句被静默吞掉）"
+
+
+# --------------------------------------------------------------------------- #
+# 四、会话后端必须真的能被替换（否则"接线"测试全是假的）
+# --------------------------------------------------------------------------- #
+def test_session_for_is_replaceable_by_module_attribute(monkeypatch):
+    """打 `session` 模块上的 `session_for`，`runner` 必须真的用上替身。
+
+    这条守的是什么
+    -------------
+    原实现是 `from .session import session_for` —— 导入期绑定，本模块里拿着一份
+    固化引用。于是 `monkeypatch.setattr(session_module, "session_for", 替身)`
+    **完全不起作用**：测试以为自己换成了内存版会话，实际仍在连真 PostgreSQL。
+
+    它造成的真实故障（2026-11-06 全量跑红）
+    ------------------------------------
+    本文件有两条用例只 patch 了 `session` 模块。单跑全绿、全量跑红 —— 因为别的
+    测试把 `DB_URL` 留在了环境里，真后端去连库，在 Windows 的 `asyncio.run()`
+    （ProactorEventLoop）下抛
+    `psycopg.InterfaceError: cannot use the 'ProactorEventLoop'`
+    ⇒ `run_agent` 整轮 `exit_reason='error'`、`model.calls` 为空
+    ⇒ 断言 `model.calls[0]` 报 IndexError。
+
+    报错信息指向"补充提醒没有生效"，与真正原因（测试压根没换掉后端）无关 ——
+    这类"守卫自己失效"比被测代码出错更难发现，因为它平时是绿的。
+    """
+    from src.agents import runner
+    from src.agents import session as agent_session
+
+    sentinel = object()
+    monkeypatch.setattr(agent_session, "session_for", lambda sid: sentinel)
+
+    assert runner.session_for("T1") is sentinel, (
+        "patch `session.session_for` 之后 `runner.session_for` 没有跟着变 —— "
+        "说明 runner 里还固化着一份导入期引用，所有'换掉会话后端'的测试都是假守卫"
+    )
+
+
+def test_session_for_is_also_replaceable_on_the_runner_module(monkeypatch):
+    """另一种 patch 方式（打在本模块上）也必须生效 —— 两种都要能用。
+
+    `tests/test_agents_pipeline.py` 的 fixture 习惯直接打 `runner.session_for`，
+    那是历史写法。两种写法都支持，才不会因为"用哪种 patch"而出现
+    "一半用例真换、一半没换"的混乱。
+    """
+    from src.agents import runner
+
+    sentinel = object()
+    monkeypatch.setattr(runner, "session_for", lambda sid: sentinel)
+
+    assert runner.session_for("T1") is sentinel

@@ -151,8 +151,10 @@ async def probe_agent(rounds: int) -> int:
         return 1
 
     shared = _MemorySession()
-    # ⚠️ 打在 ``runner`` 的命名空间上：那里是 ``from .session import session_for``，
-    # 改 ``session`` 模块属性对已绑定的名字无效（很常见的"patch 了却没生效"）。
+    # 打在 ``runner`` 的命名空间上。
+    # （2026-11-06 起两种都生效：``runner.session_for`` 是个惰性函数，每次调用现取
+    #  ``session_module.session_for``，所以改源模块或改本模块都能被看到。
+    #  这里保持改本模块，只是历史写法，不影响结果。）
     runner_mod.session_for = lambda _sid: shared
 
     ctx = TaskContext()

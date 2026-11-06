@@ -34,7 +34,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_FILE = ROOT / "VERSION"
 
-# 退出码：0 一致/已同步，1 有漂移（--check 时），2 VERSION 文件本身不合法
+# 退出码：0 一致/已同步，1 有漂移（--check 时）或副本数量不符，2 VERSION 文件本身不合法
+#
+# ⚠️ 「数量不符」也归到 1（而不是新开一个码）：对调用方（`make check`、发布脚本、
+#    CI）来说，这件事的含义就是"版本号副本的状态不可信，停下来"，与"有漂移"同级。
+#    另立一个码只会让每个调用点都多一条 if，而漏掉任何一条就等于这个守卫不存在。
 RC_OK = 0
 RC_DRIFT = 1
 RC_BAD_VERSION = 2
@@ -69,7 +73,13 @@ TARGETS = [
         ROOT / "deploy" / "app" / "docker-compose.yml",
         COMPOSE_RE,
         lambda m, ver: m.group(1) + "${APP_VERSION:-" + ver + "}",
-        4,
+        # 5 处 = app-stable / app-canary / alert-sink / retention-sweep / pg-stats。
+        # 后两个是 `1a0c360` 部署落地时加的，当时这个数字还停在 3 个服务时代的 4。
+        # ⚠️ 加**任何**带 `image:` + `${APP_VERSION:-...}` 的服务都要同步改这里，
+        #    否则 `--check` 会红 —— 这是有意的：宁可让人确认一次，
+        #    也不要让某个服务的镜像 tag 永久停在旧版本号上且零报错。
+        #    守卫：`tests/test_version_source.py::test_compose_copy_count_matches_declaration`
+        5,
     ),
     (
         ROOT / ".env.example",
@@ -102,7 +112,13 @@ def read_version() -> str:
 
 
 def sync_file(path: Path, pattern: re.Pattern, render, expected: int, ver: str, check: bool):
-    """把 `path` 里所有副本改成 `ver`。返回 (是否改动, 旧值集合, 匹配数)。"""
+    """把 `path` 里所有副本改成 `ver`。返回 (是否改动, 旧值集合, 匹配数)。
+
+    ⚠️ `expected` 是**有约束力的参数**，不是提示：数量不符 ⇒ 返回 0 以外的信号
+       （`main` 据此判定失败）。此前它只用来 print 一句话，于是"正则与文件写法脱节、
+       某一处副本再也不被匹配"这种失效**三道守卫全绿**照样溜过去 —— 那处副本会
+       永久停在旧版本号，且零报错。
+    """
     rel = path.relative_to(ROOT)
     try:
         raw = path.read_bytes().decode("utf-8")
@@ -137,27 +153,49 @@ def main(argv=None) -> int:
 
     ver = read_version()
     drifted: list[str] = []
+    # 副本数量不符的文件（正则与文件写法可能已脱节）。这是**独立于"值是否一致"**
+    # 的一类失效：数量少了 ⇒ 少掉的那处永不同步，而剩下的值全对 ⇒ 值比对看不出问题。
+    miscounted: list[str] = []
 
     for path, pattern, render, expected in TARGETS:
-        changed, old_values, _ = sync_file(path, pattern, render, expected, ver, args.check)
+        changed, old_values, n = sync_file(path, pattern, render, expected, ver, args.check)
         rel = path.relative_to(ROOT)
+        if n != expected:
+            miscounted.append(f"{rel}（实际 {n} 处，预期 {expected} 处）")
         if changed:
             stale = sorted(v for v in old_values if v != ver)
             drifted.append(f"{rel}（旧值 {stale}）")
             verb = "有漂移" if args.check else "已同步"
             print(f"[{'ERROR' if args.check else ' OK '}] {verb}：{rel} → {ver}")
 
-    if args.check and drifted:
-        print(f"\n[FAIL] {len(drifted)} 处副本与 VERSION({ver}) 不一致：")
-        for d in drifted:
-            print("  - " + d)
-        print("\n修法：python scripts/sync_version.py")
+    if args.check and (drifted or miscounted):
+        if drifted:
+            print(f"\n[FAIL] {len(drifted)} 处副本与 VERSION({ver}) 不一致：")
+            for d in drifted:
+                print("  - " + d)
+        if miscounted:
+            print(
+                f"\n[FAIL] {len(miscounted)} 个文件的副本数量与预期不符 —— "
+                f"正则可能已与文件写法脱节，少掉的那处不会被同步："
+            )
+            for d in miscounted:
+                print("  - " + d)
+            print(
+                "\n修法：确认 compose / .env.example 的结构变化是**有意的**，"
+                "然后同步更新 scripts/sync_version.py 的 TARGETS 里的预期数量。"
+            )
+        if drifted:
+            print("\n修法：python scripts/sync_version.py")
         return RC_DRIFT
 
-    if not drifted:
+    if not drifted and not miscounted:
         print(f"[ OK ] 版本一致：{ver}（检查了 {len(TARGETS)} 个副本文件，无需改动）")
-    else:
+    elif drifted:
         print(f"[ OK ] 已同步 {len(drifted)} 个文件到 {ver}")
+    else:
+        # 写模式 + 只有数量问题：值已同步好，但结构仍需人工确认，所以不算失败
+        # （写模式的职责只是把值改对；数量是给人看的告警）。
+        print("[ OK ] 已同步；但副本数量与预期不符，见上方 WARN（写入模式不判失败）")
     return RC_OK
 
 
