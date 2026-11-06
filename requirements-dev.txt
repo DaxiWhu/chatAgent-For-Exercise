@@ -14,6 +14,6 @@
 # ----------------------------
 # 这份文件**不参与** `scripts/lock_requirements.py` 的一致性门禁（那只管
 # `requirements.txt`）。工具版本在这里直接钉死，不需要再经一层 lock。
-ruff==0.16.10
-mypy==2.4.0
+ruff==0.17.3
+mypy==2.4.1
 pytest-cov==7.1.0
