@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 from agents.tool_context import ToolContext
 from agents.usage import Usage
@@ -242,15 +243,46 @@ def test_read_asset_refuses_to_escape_the_asset_dir(tmp_path):
 
     只断言"返回里有拒绝字样"是不够的：实现先读文件再报错，也会拿到这句话。
     所以这里在外层放一个真实存在的文件，并断言它的内容没有出现在返回里。
+
+    ⚠️ 两种分隔符不能一视同仁（2026-11-06 修）
+    ---------------------------------------
+    原来对 `../` 与 `..\\` **都**断言"目录外面"，在 Linux 上必红：POSIX 里
+    反斜杠是**普通文件名字符**，`..\\secret.txt` 是一个名字就叫 `..\\secret.txt`
+    的文件，压根不是穿越 ⇒ 实现返回"没有这个文件"是**对的**。
+    （那条断言此前只在 Windows 上跑过，等于把平台语义当成了通用语义。）
+
+    现在的口径分两层，两层都必须成立：
+      · **内容不许泄漏**：两种写法都不能返回外层文件的正文（跨平台硬要求）；
+      · **穿越必须被点名拒绝**：只对"在本平台确实构成穿越"的那种写法断言。
+
+    `../` 在 Windows 与 POSIX 上**都**是穿越（Windows 也接受正斜杠），
+    所以它是那个恒定成立的核心断言。
     """
     outside = tmp_path / "secret.txt"
     outside.write_text("这是目录外面的内容", encoding="utf-8")
-    ctx = make_ctx(tmp_path)
 
+    # ⚠️ 每次调用都换一份新 `TaskContext`：本文件 docstring 里那条规则在这里同样成立
+    # ——同一上下文里失败累计到 `AGENT_TOOL_FAIL_LIMIT`（默认 3）后，文案会被换成
+    # "不要再调用它"，于是第 4 次断言看到的不是路径相关的错误，而是那条劝退语。
+    def _try(name: str) -> str:
+        return _invoke(read_asset, make_ctx(tmp_path), name=name)
+
+    # 第一层：任何写法都不许把外层内容漏出来（这是安全底线，与平台无关）
     for name in ("../secret.txt", "..\\secret.txt"):
-        text = _invoke(read_asset, ctx, name=name)
-        assert "目录外面" in text, (name, text)
-        assert "这是目录外面的内容" not in text, name
+        text = _try(name)
+        assert "这是目录外面的内容" not in text, (name, text)
+
+    # 第二层：`../` 在所有平台上都是穿越 ⇒ 必须被明确拒绝
+    text = _try("../secret.txt")
+    assert "目录外面" in text, text
+
+    # `..\` 只在 Windows 上是穿越。POSIX 上它是合法文件名，此时正确的行为是
+    # "没有这个文件"（fail-closed：读不到就说读不到），而不是"目录外面"。
+    text = _try("..\\secret.txt")
+    if os.name == "nt":
+        assert "目录外面" in text, text
+    else:
+        assert "没有这个文件" in text, text
 
 
 def test_read_asset_refuses_a_binary_file_without_crashing(tmp_path):

@@ -860,4 +860,87 @@ def test_publish_depends_on_every_gate(ci):
     )
 
 
+# ---------------------------------------------------------------------------
+# e2e：`.env` 必须把 compose 的**全部**必填变量都填上
+# ---------------------------------------------------------------------------
+# 2026-11-06 的真实事故
+# ---------------------
+# `e2e` job 此前**从没真跑过**（只在 schedule/dispatch 触发）。首次执行时，起栈
+# 第一步就失败：
+#     error while interpolating services.app-stable.environment.DB_URL:
+#     required variable POSTGRES_PASSWORD is missing a value
+#
+# 起因是两件**各自都正确**的事撞在一起：
+#   · `compose` 里口令是 `${VAR:?…}` 必填（`test_password_vars_are_required_not_defaulted`
+#     在守它，这是对的 —— 默认值等于把口令公开写在仓库里）；
+#   · CI 用 `cp .env.example .env` 起头，而模板里口令**故意留空**
+#     （`test_env_example_does_not_ship_weak_passwords` 在守它，也是对的）。
+# 于是"复制模板"这一步永远不可能让栈起来，而缺的是哪几个变量、一共几个，
+# 全靠一条 compose 报错（它还只报**第一个**）来告诉你。
+#
+# 这条守卫把那个隐式依赖变成显式的：**compose 里出现的每个 `${VAR:?}`，
+# e2e 的准备步骤都必须给它生成一个非空值**。新增必填变量而忘了填 ⇒ 在这里红，
+# 而不是等到凌晨两点的定时任务里、藏在一行 compose 报错后面。
+_COMPOSE_FOR_E2E = ROOT / "deploy" / "app" / "docker-compose.yml"
+
+
+def test_e2e_env_step_fills_every_required_compose_variable(ci):
+    """e2e 准备 `.env` 的步骤必须覆盖 compose 里所有 `${VAR:?}` 必填变量。"""
+    compose_text = _COMPOSE_FOR_E2E.read_text(encoding="utf-8")
+    # ⚠️ 必须**剔除注释行**再扫：compose 的说明文字里有 `${VAR:?...}` 这样的
+    # **示范写法**（用来解释这个语法的含义），它不是真变量。不剔的话会扫出
+    # 一个叫 `VAR` 的"必填变量"，然后永远要求 CI 去填一个不存在的东西。
+    compose_code = "\n".join(
+        line for line in compose_text.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    # 只看 `${NAME:?` 这一种写法；`${NAME:-默认}` 是"有默认值"，不属于必填
+    required = set(re.findall(r"\$\{([A-Z_][A-Z0-9_]*):\?", compose_code))
+    assert required, (
+        "没能从 compose 里解析出任何 `${VAR:?}` 必填变量 —— "
+        "要么写法变了，要么这条守卫的匹配规则已失效"
+    )
+    assert "VAR" not in required, (
+        "扫出了字面量 `VAR` —— 说明注释剔除没生效（compose 的说明里用 "
+        "`${VAR:?...}` 作示范写法），这条守卫会去要求一个不存在的变量"
+    )
+
+    job = ci["jobs"]["e2e"]
+    # 找到"准备 .env"那一步（名字可能微调，按 cp .env.example 认）
+    prep = [s for s in job["steps"] if "cp .env.example .env" in str(s.get("run", ""))]
+    assert len(prep) == 1, (
+        f"e2e 里找不到唯一一个『准备 .env』的步骤（找到 {len(prep)} 个）—— "
+        "本守卫依赖它来核对必填变量"
+    )
+    script = str(prep[0]["run"])
+
+    # 每个必填变量都必须在脚本里被显式赋值/生成
+    missing = sorted(v for v in required if v not in script)
+    assert not missing, (
+        f"compose 里这些变量是 ${{VAR:?}} 必填，但 e2e 的 .env 准备步骤没有填它们：{missing}\n"
+        "模板里它们是空值，所以栈会在第一步就报 "
+        "'required variable ... is missing a value' 并退出。\n"
+        "修法是在该步骤里现生成一个非空值（不要给模板填默认值 —— 那等于把口令写进仓库）。"
+    )
+
+    # 光"出现变量名"还不够：注释里写一遍就能骗过。要求它出现在赋值/生成语句里。
+    for var in sorted(required):
+        assert re.search(
+            r"(?:set_pw\s+" + var + r"\b|" + var + r"=[^\n]*(?:openssl|rand|\\$\\())[^\n]*"
+            r"|printf[^\n]*" + var + r"=)",
+            script,
+        ), (
+            f"{var} 在 e2e 的准备步骤里出现了，但看不出是一次**赋值/生成**。\n"
+            "（本守卫要求它被真的赋值，而不是只在注释里提一句 —— "
+            "注释里提到变量名不会让 compose 拿到值。）"
+        )
+
+    # 反向自检必须存在：同类问题在起栈阶段的表现是"哪个容器没起来"，
+    # 真因藏在 compose 的一行报错里。在准备阶段自己拦一下，排查成本差一个量级。
+    assert "是空的" in script or "missing" in script.lower(), (
+        "e2e 的准备步骤没有对『必填变量为空』做自检 —— "
+        "那么下次再漏填，仍然只会得到一行 compose 报错"
+    )
+
+
 

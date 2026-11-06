@@ -695,12 +695,27 @@ def test_docs_endpoints_404_when_disabled():
 
 
 def test_production_env_turns_docs_off_by_default():
-    """子进程验证"APP_ENV=production 时默认关文档"这条推导真的成立。"""
-    # ⚠️ 必须给一个**用户鉴权**来源：生产环境"只配脚本通行证"会**拒绝启动**
-    # （见 `test_auth_policy_blocks_production_without_user_auth`），
-    # 那样这条用例根本测不到文档开关。
+    """子进程验证"APP_ENV=production 时默认关文档"这条推导真的成立。
+
+    ⚠️ 必须给一个**用户鉴权**来源：生产环境"只配脚本通行证"会**拒绝启动**
+    （见 `test_auth_policy_blocks_production_without_user_auth`），
+    那样这条用例根本测不到文档开关。
+
+    ⚠️ 也必须给 `LLM_API_KEY` 占位符（2026-11-06 修）
+    ----------------------------------------------
+    本用例验的是**文档开关**，而 `app.main` 在导入期还有一道与文档无关的闸门：
+    agent 链路不可用（`missing_api_key`）⇒ 拒绝启动。此前没给这个键，本地却能过
+    —— 因为子进程继承的环境里，`app.main` 的 `load_dotenv()` 会从**本机 `.env`**
+    把 Key 读回来（开发机上都写着）。CI 没有 `.env` ⇒ 直接红在"起不来"上，
+    报错与文档开关毫无关系。
+
+    这与 `tests/test_startup_guard.py` 模块 docstring 里记的是同一个坑：
+    **靠 `.env` 兜底的用例，在有 `.env` 的机器上恒绿、在干净环境里必红**，
+    而且红的位置离真正要验的东西很远。所以这里显式给一个假 Key，
+    让前置条件不依赖机器状态 —— 它只用于"配置在不在"这种静态检查，不会发请求。
+    """
     env = {**os.environ, "APP_ENV": "production", "AUTH_SESSION_SECRET": "s",
-           "DB_URL": ""}
+           "DB_URL": "", "LLM_API_KEY": "sk-test-not-a-real-key"}
     code = "import app.main as M; print(M.app.docs_url, M.app.openapi_url, M.config.ENABLE_DOCS)"
     out = subprocess.run([sys.executable, "-c", code], cwd=os.getcwd(), env=env,
                          capture_output=True, text=True, timeout=180)

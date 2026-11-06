@@ -282,3 +282,59 @@ def test_ci_has_a_drill_job_that_actually_runs_and_checks_the_metric():
     assert "backup_drill_result" in blob, (
         "drill job 没有断言指标内容 —— 文件存在不等于内容对"
     )
+
+
+def test_ci_checks_the_path_metrics_are_actually_published_to():
+    """CI 校验的指标文件路径，必须就是发布器**默认**落地的那个路径。
+
+    ⚠️ 这条是 2026-11-06 补的，起因是一次真实的首跑红灯
+    -------------------------------------------------
+    `drill` job 此前**从没真跑过**（只在 schedule/dispatch 触发）。首次执行时，
+    发布器把指标写进了 `backups/drill-pg.prom`（默认目录，相对 cwd），
+    而校验步骤去找 `/tmp/drill-backups/drill-pg.prom`（它自己的 `BACKUP_DIR`）——
+    两个路径毫无关系，于是"演练通过、指标存在，但校验说没生成"。
+
+    为什么不能靠"把 `DRILL_METRICS_DIR` 设成 `/tmp/...`"来凑
+    --------------------------------------------------------
+    那样确实能让 CI 变绿，但验的是一条**生产上不存在**的路径。指标目录与备份目录
+    本来就是两个概念（见 `scripts/drill_metrics.py::metrics_dir()`）：前者是
+    node-exporter 的 textfile 挂载点，后者是 dump 落在哪。把前者挪到 `/tmp` 之后，
+    CI 绿了，而生产上"指标有没有写到采集点"这件事**再没有任何东西在验**。
+
+    所以这条守卫的口径是：**CI 里写的那个路径 == 发布器默认路径**。
+    它同时挡住两个方向的漂移：
+      · 有人改了 `metrics_dir()` 的默认值（比如换成 `metrics/`）而 CI 没跟；
+      · 有人在 CI 里写了个手拼的路径（`/tmp/...`），与真实落地位置脱节。
+    """
+    cfg = yaml.safe_load(CI.read_text(encoding="utf-8"))
+    blob = "\n".join(
+        str(s.get("run", "")) for s in cfg["jobs"]["drill"]["steps"]
+    )
+
+    # CI 里给校验步骤写死了一个文件名，从中取出它认为的路径
+    m = re.search(r"^\s*F=(\S*drill-pg\.prom)\s*$", blob, re.M)
+    assert m, (
+        "drill job 的校验步骤里找不到 `F=<路径>/drill-pg.prom` —— "
+        "断言被改写成了别的形式，这条守卫需要同步更新"
+    )
+    ci_path = m.group(1)
+
+    # 发布器的默认落地路径（不读环境变量 ⇒ 拿到的就是默认值）
+    env_backup = os.environ.pop("DRILL_METRICS_DIR", None)
+    try:
+        default_prom = drill_metrics.prom_path("pg")
+    finally:
+        if env_backup is not None:
+            os.environ["DRILL_METRICS_DIR"] = env_backup
+
+    assert ci_path.replace("\\", "/") == default_prom.as_posix(), (
+        f"CI 校验的是 {ci_path}，而发布器默认写到 {default_prom.as_posix()}。\n"
+        "两者不一致时 drill job 会红在'没有生成文件'上，而真实情况是指标写去别处了；\n"
+        "更要紧的是：CI 若靠改 DRILL_METRICS_DIR 去凑，验的就是一条生产不存在的路径。"
+    )
+
+    # 顺带钉住"CI 没有偷偷改指标目录"这件事本身
+    assert "DRILL_METRICS_DIR" not in blob, (
+        "drill job 里出现了 DRILL_METRICS_DIR —— 那会把指标挪离 node-exporter "
+        "采集的目录，CI 绿了但生产上三条告警仍是哑弹"
+    )

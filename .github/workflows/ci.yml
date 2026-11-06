@@ -467,10 +467,25 @@ jobs:
       # 演练"通过"还不够：结果必须**落在指标上**，否则生产上的
       # BackupDrillMissing / BackupDrillOverdue 就是哑弹。
       # 这里断言的是**线格式**（文件里真有那一行），而不是"函数被调用过"。
+      #
+      # ⚠️ 路径必须是 `backups/drill-pg.prom`，**不要**设 `DRILL_METRICS_DIR`
+      # 把它挪到 `/tmp/...` 去迁就这条断言（2026-11-06 修，首次真跑就红在这）。
+      #
+      # 原因：指标目录与备份目录是**两个概念**（见 `scripts/drill_metrics.py`
+      # 的 `metrics_dir()` 说明）——
+      #   · `BACKUP_DIR` 是"dump 落在哪"，本 job 用 `/tmp/drill-backups` 避免污染工作区；
+      #   · `DRILL_METRICS_DIR` 是"node-exporter 采集哪个目录"，默认 `backups`
+      #     （与 compose 里 node-exporter 的 textfile 挂载一致）。
+      # 这一层要验的正是"生产上那条路径能不能收到指标"。若在 CI 里把它改指 `/tmp`，
+      # 验的就是一条**生产上根本不存在**的路径 —— 测试会绿，而真出事时那三条告警
+      # 依然是哑弹。所以这里刻意跟着默认值走。
+      #
+      # 守卫：`tests/test_drill_closure.py::test_ci_checks_the_path_metrics_are_actually_published_to`
+      # 会把这条路径与发布器的默认落地路径逐字比对，防止下次改了默认目录又静默脱节。
       - name: 校验演练指标真的写出来了
         run: |
           set -eu
-          F=/tmp/drill-backups/drill-pg.prom
+          F=backups/drill-pg.prom
           test -f "$F" || { echo "::error::没有生成 $F —— 演练指标没发布，那两条告警会是哑弹"; exit 1; }
           cat "$F"
           grep -q 'backup_drill_result{target="pg"} 1' "$F" \
@@ -539,6 +554,40 @@ jobs:
           cp .env.example .env
           # 会话签名密钥：每次现生成，不进仓库
           printf 'AUTH_SESSION_SECRET=%s\n' "$(openssl rand -hex 32)" >> .env
+
+          # ⚠️ 三个口令必须**现生成**填进去（2026-11-06 修，e2e 首次真跑就红在这）
+          #
+          # `.env.example` 里这三个键是**故意留空**的（`tests/test_deploy_topology.py::
+          # test_env_example_does_not_ship_weak_passwords` 钉着这一点），而 compose 里
+          # 它们是 `${VAR:?…}` 的必填写法 ⇒ 空值 = `docker compose` 直接报错退出：
+          #   "required variable POSTGRES_PASSWORD is missing a value"
+          # 也就是说"复制模板"这一步本身就不足以让栈起来，缺的正是口令。
+          #
+          # 为什么是"在这里生成"而不是"给模板填个默认值"：
+          # 给模板填默认值等于把口令公开写在仓库里，而且 compose 那边的必填写法
+          # 就是为了挡这件事 —— 加默认值会把那条守卫的价值整个抵消。
+          #
+          # 为什么 e2e 也要**真口令**而不是随便一个占位：
+          # Redis 带 `--requirepass`、PG 带 `POSTGRES_PASSWORD`，服务端与客户端
+          # （app 的 `DB_URL`/`REDIS_URL`）插值的是同一个变量，所以只要"非空且一致"
+          # 就能起来。用随机值只是顺手保证了"CI 日志里不会出现一个能复用的口令"。
+          #
+          # GRAFANA_PASSWORD 也一起填：它属于 observability profile（本 job 不启用），
+          # 但 compose 的变量插值是**整文件**做的 —— 只要文件里有 `${VAR:?}`，
+          # 就算那个服务不会启动，缺值同样会让**任何** compose 命令直接失败
+          # （实测：`docker compose ... ps` 也一起报错，把排查方向带到"哪个容器没起来"上）。
+          #
+          # 用 `sed` 原地替换而不是"删掉再追加"：追加会把口令挪到文件末尾，
+          # 与它们上方那几段说明（"只在数据卷首次初始化时生效"等）分家 ——
+          # 排障时看到的是一个孤零零的键，得回头翻 600 行才知道它是什么。
+          # `s|^KEY=.*|KEY=VALUE|` 同时保证"原来那行空值被换掉，不会出现两个同名键"。
+          set_pw() {
+            sed -i "s|^$1=.*|$1=$2|" .env
+          }
+          set_pw POSTGRES_PASSWORD "pg-$(openssl rand -hex 16)"
+          set_pw REDIS_PASSWORD "redis-$(openssl rand -hex 16)"
+          set_pw GRAFANA_PASSWORD "grafana-$(openssl rand -hex 16)"
+
           # 服务账号：**不给角色**（最小权限，与 scripts/script_auth.py 的指引一致）。
           # 密码每次随机、写进 GITHUB_ENV 供后续 pytest 步骤读，不落仓库。
           PW="e2e-$(openssl rand -hex 12)"
@@ -552,6 +601,19 @@ jobs:
           for k in AUTH_SESSION_SECRET AUTH_USERS; do
             grep -q "^${k}=" .env || { echo "✗ .env 缺少 ${k}"; exit 1; }
           done
+          # 自检：compose 里所有 `${VAR:?}` 的必填变量都**非空**。
+          # 这一步刻意放在起栈之前：同类问题在起栈阶段的表现是
+          # "error while interpolating ..."，而 tasks.py 会把失败归到
+          # "起栈并跑端到端检查"，真因藏在一行 compose 报错里。
+          missing=""
+          for k in POSTGRES_PASSWORD REDIS_PASSWORD GRAFANA_PASSWORD; do
+            v=$(sed -n "s/^${k}=//p" .env | tail -n 1)
+            [ -n "$v" ] || missing="${missing} ${k}"
+          done
+          if [ -n "$missing" ]; then
+            echo "✗ .env 里这些必填口令是空的（compose 会直接报错退出）：${missing}"
+            exit 1
+          fi
           # 反向自检：已删除的开关**不许**出现 —— 存在即拒绝启动，那会让 e2e 卡在
           # "容器起不来"上，报错信息藏在容器日志里，排查成本远高于在这里拦一下。
           for k in SERVE_API_KEY REQUIRE_AUTH; do
@@ -560,7 +622,7 @@ jobs:
               exit 1
             fi
           done
-          echo "[e2e] .env 就绪：要求鉴权 + 服务账号 svc-e2e（密码每次随机，不落仓库）"
+          echo "[e2e] .env 就绪：要求鉴权 + 服务账号 svc-e2e + 三个随机口令（都不落仓库）"
 
       # 一条命令包办：构建 → 起栈 → 等就绪 → 跑检查 → 失败时打印容器日志 → 收栈
       - name: 起栈并跑端到端检查
