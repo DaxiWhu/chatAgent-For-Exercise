@@ -271,9 +271,20 @@ def test_the_edge_splits_traffic_between_releases():
         f"{SAMPLES} 次取样只落到了 {dict(seen)} —— 灰度没有生效。"
         f"依次检查：upstream 里两个 server 都在吗？权重是不是 0？canary 容器起来了吗？"
     )
-    top, _, second = seen.most_common(3)
+    # ⚠️ 别写 `top, _, second = seen.most_common(3)` —— 那有两个问题：
+    #   ① 恰好只有 2 个 release 时（**这是正常情况**）只返回 2 项，解包直接 ValueError。
+    #      上面那条断言只保证 `>= 2`，所以"正好 2 个"完全合法，却会被这里判成崩溃。
+    #   ② 更隐蔽：`_` 把第三名丢掉了，于是**"不应该有第三个实例"这句断言从来没生效过**
+    #      —— 错误信息写着这件事，代码却没检查它。
+    ranked = seen.most_common()
+    top = ranked[0]
     assert top[0] == "stable", f"占比最高的是 {top[0]!r}（{dict(seen)}）—— 权重配反了？"
-    assert second[0] == "canary", f"除了 stable 还有 {second[0]!r}（{dict(seen)}）—— 不应该有第三个实例"
+    assert ranked[1][0] == "canary", (
+        f"除了 stable 还有 {ranked[1][0]!r}（{dict(seen)}）—— 应该是 canary"
+    )
+    assert len(ranked) == 2, (
+        f"出现了第 3 个 release 标识：{dict(seen)} —— upstream 里只该有 stable 与 canary 两个 server"
+    )
 
 
 # --------------------------------------------------------------------------

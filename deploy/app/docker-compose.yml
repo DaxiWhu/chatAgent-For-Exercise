@@ -258,8 +258,28 @@ services:
     #    本机排查用：docker compose --env-file .env -f deploy/app/docker-compose.yml exec redis redis-cli
     security_opt:
       - no-new-privileges:true
+    # ⚠️ `cap_drop: ALL` 之后**必须**加回 SETUID / SETGID —— 否则容器起不来。
+    #
+    # `redis:7-alpine` 的 entrypoint 是 `docker-entrypoint.sh`：先以 root 启动
+    # （要用 root 才能 chown 数据目录），然后 `setpriv --reuid redis --regid redis`
+    # 降权到 redis 用户再 exec redis-server。这两个 setuid/setgid 系统调用需要
+    # CAP_SETUID / CAP_SETGID；全砍掉之后的表现是：
+    #
+    #     setpriv: setresuid failed: Operation not permitted
+    #     （容器 exit 127，健康检查永远不过，app 因 depends_on 直接起不来）
+    #
+    # 这个失败**不依赖机器**，任何环境都一样 —— 也就是说 `cap_drop: ALL` 写在这
+    # 就等于 redis 从未能启动过。与 pgvector 那条注释（"刻意不加 cap_drop，
+    # 因为要 chown 数据目录、切 postgres 用户"）是同一类问题，只是这里选择
+    # 保留"砍到只剩两个"而不是完全不砍。
+    #
+    # 只加回这两个、不加别的：它们的作用域就是"切换子进程身份"，不涉及 raw socket、
+    # 改内核参数或提权到别的能力 —— 最小权限原则仍然成立。
     cap_drop:
       - ALL
+    cap_add:
+      - SETUID
+      - SETGID
     deploy:
       resources:
         limits: { memory: 320m, cpus: "0.5", pids: 128 }

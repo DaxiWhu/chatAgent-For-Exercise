@@ -361,6 +361,37 @@ def test_compose_drops_privileges(compose_cfg):
         )
 
 
+def test_compose_keeps_the_caps_redis_needs_to_start(compose_cfg):
+    """`cap_drop: ALL` 与"能起来"在 redis 上直接冲突，必须补回 SETUID/SETGID。
+
+    为什么这条要单独钉住（2026-11-06 补，e2e 第一次真跑才暴露）
+    ----------------------------------------------------------
+    `redis:7-alpine` 的 entrypoint 先以 root 启动（要 root 才能 chown 数据目录），
+    再 `setpriv --reuid redis --regid redis` 降权后 exec。这两步需要
+    CAP_SETUID / CAP_SETGID。`cap_drop: ALL` 把它们砍掉之后是：
+
+        setpriv: setresuid failed: Operation not permitted
+        （容器 exit 127 → 健康检查永远不过 → app 因 depends_on 直接起不来）
+
+    **这个失败与机器无关**，任何环境都一样 —— 也就是说写下 `cap_drop: ALL`
+    的那一刻，redis 就再也没能启动过。而这一点在 CI 上一直没被发现，因为
+    e2e job 只在 schedule / workflow_dispatch 触发，日常 push 根本不跑它。
+
+    守卫的取法是"**只要砍了 ALL，就必须把这两个加回来**"，而不是"必须出现
+    cap_add"—— 后者在将来改成"完全不砍"时仍然成立，不会误报。
+    """
+    svc = compose_cfg["services"]["redis"]
+    dropped = svc.get("cap_drop") or []
+    if "ALL" not in dropped:
+        return  # 没全砍就不需要补，这条不管
+    added = {str(c).upper() for c in (svc.get("cap_add") or [])}
+    missing = {"SETUID", "SETGID"} - added
+    assert not missing, (
+        f"redis 砍了 ALL 但没补回 {sorted(missing)} —— 容器会 setpriv 失败从而永远起不来。"
+        f"当前 cap_add={sorted(added)}"
+    )
+
+
 def test_compose_keeps_loopback_db_binding(compose_cfg):
     """数据库端口必须绑回环。
 

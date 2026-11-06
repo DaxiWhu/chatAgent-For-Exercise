@@ -177,3 +177,48 @@ def test_langsmith_integration_stays_declared():
         f"lock 钉的 langsmith {pin} 低于清单下限 {m.group(1)}："
         "这个版本可能没有 openai_agents_sdk 集成，接上去只会静默不产生 trace"
     )
+
+
+def test_psycopg_is_declared_with_the_binary_extra():
+    """`psycopg` 必须带 `[binary]`，否则**镜像里连不上数据库**。
+
+    为什么这条是硬需求而不是优化
+    ----------------------------
+    不带 extra 时装的是**纯 Python 实现**，它需要一个可用的 libpq；`python:3.13-slim`
+    里没有，于是运行时的真实表现是（2026-11-06 首次真跑 e2e 时暴露）：
+
+        /health/ready -> checks.db.ok = false
+        ImportError: no pq wrapper available.
+        - couldn't import psycopg 'c' implementation: No module named 'psycopg_c'
+        - couldn't import psycopg 'binary' implementation: No module named 'psycopg_binary'
+        - couldn't import psycopg 'python' implementation: libpq library not found
+
+    ⚠️ 这个故障**自我掩盖得很彻底**：`/health/live` 仍是 200，`/health/ready`
+    只是 `degraded`（不是 503 拒绝），服务看起来"起来了"。实际后果是会话状态写不进库
+    ——检查点恒为内存，重启丢状态且跨轮历史静默失效。
+
+    ⚠️ 为什么本地/CI 的单元测试发现不了：它们的安装路径是 `pip install
+    "psycopg[binary]>=3.2"`（见 ci.yml 的 test job），**只有镜像构建**走
+    `requirements.txt`。两份清单不同，就会"测试全绿、容器带病"。
+    """
+    # ⚠️ 不能用 `_parse()` 的结果判断：它把 extras 放进单独的 group 里，
+    #    `spec` 只剩 `>=3.2`，extras 根本不在里面 —— 拿它断言会**永远失败**。
+    #    这里直接读原始行，才能看见 `[binary]`。
+    lines = [
+        raw.split("#", 1)[0].strip()
+        for raw in REQ.read_text(encoding="utf-8").splitlines()
+    ]
+    decl = [ln for ln in lines if re.match(r"^psycopg\[", ln) or re.match(r"^psycopg\s*[><=]", ln)]
+    assert decl, "requirements.txt 没声明 psycopg"
+    assert any(ln.startswith("psycopg[binary]") for ln in decl), (
+        f"psycopg 的声明是 {decl}，缺少 `[binary]` extra —— "
+        "镜像里会装成纯 Python 版，连不上 PostgreSQL"
+    )
+
+    # 反向：约束文件里**不能**出现 extras（那是 pip 解析期硬错误，见 test_lock_has_no_extras）。
+    # 两件事一起钉住，才不会有人"为了修这个"去改 lock。
+    lock_spec = dict(_parse(LOCK)).get("psycopg") or ""
+    assert not lock_spec.startswith("["), (
+        f"requirements.lock 里不该有 extras（现在是 {lock_spec!r}）—— "
+        "extras 只写在 requirements.txt，lock 只钉版本"
+    )

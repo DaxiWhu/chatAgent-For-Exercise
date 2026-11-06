@@ -4,7 +4,24 @@ langgraph-checkpoint-postgres>=2
 langchain-openai>=0.3
 langchain-community>=0.3
 langchain-text-splitters>=0.3
-psycopg>=3.2
+# ⚠️ `[binary]` extra 不能省 —— 少了它镜像里装的是**纯 Python 实现**，
+# 没有 libpq，运行时表现是 `/health/ready` 的 `checks.db.ok=false`：
+#
+#     ImportError: no pq wrapper available.
+#     - couldn't import psycopg 'c' implementation: No module named 'psycopg_c'
+#     - couldn't import psycopg 'binary' implementation: No module named 'psycopg_binary'
+#     - couldn't import psycopg 'python' implementation: libpq library not found
+#
+# 而这时 `/health/live` 仍是 200、`/health/ready` 只是 `degraded`（不是 503 拒绝），
+# 所以**服务看起来是好的**，只是会话状态写不进库、跨轮历史静默失效。
+#
+# 为什么本地测试发现不了：CI 的 test job 与开发机都单独装了 `psycopg[binary]`，
+# 只有**镜像构建路径**（走 requirements.txt）会漏。由 e2e 的
+# `test_ready_is_green_with_a_persistent_checkpointer` 钉住。
+#
+# 锁文件里仍然只写 `psycopg==<版本>`（约束文件不允许 extras，见 requirements.lock
+# 头部说明）—— extras 只影响装哪个 wheel，不影响版本解析。
+psycopg[binary]>=3.2
 pydantic>=2.7
 python-dotenv>=1.0
 
