@@ -163,6 +163,41 @@ _TIMEOUT_MESSAGE = (
 超时之后**照样完成**。不写这一句，模型会重试一遍，文件就被写两遍。
 """
 
+_MODEL_ERROR_DETAIL_MAX = 300
+"""回给模型的错误细节长度上限（字符）。
+
+异常消息本来就该简短；超过这个长度基本只有一种情况 —— 有人在里面塞了一整段
+payload 或服务端响应体。截断而不是整段回给模型，既省窗口也降低"把不该给的东西
+带出去"的概率。
+"""
+
+_MODEL_ERROR_MESSAGE = (
+    "工具 {tool} 这次没成功：{detail}\n"
+    "按这个原因改一下再试；如果改不了，就换一种做法，或说明这一步做不到。"
+)
+"""一般工具失败时回给模型的话。
+
+⚠️ 为什么不直接转调官方 ``default_tool_error_function``
+------------------------------------------------------
+openai-agents **0.23.0** 的 ``#5112 redact default tool failure details`` 把它改成了
+"固定一句话、刻意不暴露异常"：
+
+    "An error occurred while running the tool. Please try again."
+
+那对**通用 SDK** 是合理的（它兜的是任意异常，可能带 HTTP 头、token、服务端回显）。
+但对本项目，它把模型唯一能拿到的线索抹掉了：模型分不清"除数是零"与"参数名写错"，
+只能原样重试 —— 于是 `AGENT_TOOL_FAIL_LIMIT` 的到线劝退与震荡检测被触发，
+一个一次就能改对的失败升级成"这轮做不成"。
+
+官方对这条收紧给出的出路就是本函数（PR #5112 原文）：
+
+> "Applications can continue to provide approved error details through a custom
+>  ``failure_error_function``."
+
+放行边界见 ``_detail_of``：只放行**我们自己抛的业务异常**的消息，并且过一遍
+``redact``。
+"""
+
 _GIVE_UP_MESSAGE = (
     "工具 {tool} 在这一轮里已经失败 {count} 次了。**不要再调用它**。\n"
     "换个参数重试同一个已经坏掉/用不上的工具，只会继续烧时间，不会得到新结果 ——"
@@ -317,16 +352,40 @@ def tool_error_handler(tool_name: str):
     实测：失败路径 ``on_tool_end`` **照样触发**，它的 ``result`` 就是那句错误文本。
     所以从钩子侧**分不出**"真的成功了"与"收到一句错误文本"。
 
-    这里在官方实现外面套一层：先记一条 ``failed``，再把默认实现的结果**原样返回**
-    ⇒ 回给模型的文本与官方逐字节一致，自愈能力完全不受影响。
+    为什么**不再**转调 ``default_tool_error_function``（2026-11-06 改）
+    -----------------------------------------------------------------
+    此前这里最后一行的写法是 ``return default_tool_error_function(ctx, error)``，
+    理由是"回给模型的文本与官方逐字节一致，自愈能力完全不受影响"。**那个理由在
+    openai-agents 0.20 成立，0.23 起不成立了。**
+
+    官方 0.23.0 的 ``core: redact default tool failure details (#5112)`` 把默认实现
+    从「拼上 ``str(error)``」改成了「固定一句话、刻意不暴露异常」：
+
+        # 0.20
+        f"An error occurred while running the tool. Please try again. Error: {str(error)}"
+        # 0.23+（原文注释：Return a fixed error response without exposing the exception）
+        "An error occurred while running the tool. Please try again."
+
+    ⇒ 继续转调它，模型收到的就是**一句没有任何信息量的话**：不知道是除数是零、
+    参数不认识，还是路径越界。它唯一能做的动作是**重试同一个动作** —— 于是
+    ``fail_limit`` 的"到线劝退"与震荡检测会被触发，一个本来一次就能改对的失败
+    升级成"这轮做不成"。**这不是变慢，是这条能力没有了。**
+
+    官方给的出路正是这条（PR #5112 原文）：
+
+    > "Applications can continue to provide approved error details through a
+    >  custom ``failure_error_function``."
+
+    我们本来就有自定义函数，只是把工作**转交**出去了。现在自己产出。
+    「approved」的边界很清楚：这里的异常**全部是本项目工具自己抛的业务异常**
+    （``ToolContractError`` / 参数校验 / 路径越界 / 超时），不含任何第三方响应体
+    或用户数据 —— 详细说明见 ``_MODEL_ERROR_MESSAGE`` 那条的实现注释。
 
     ⚠️ 回调签名是 ``(ctx, error)``，**没有工具名形参** ⇒ 工具名必须在**构造期**用
     闭包捕获（``tool_error_handler("kb_search")``），不要试图从回调参数里取。
     """
 
     def handler(ctx: Any, error: BaseException) -> str:
-        from agents.tool import default_tool_error_function
-
         log = _log_of(ctx) if steps_enabled() else None
         if log is not None:
             log.fail(tool_name, error)
@@ -350,9 +409,40 @@ def tool_error_handler(tool_name: str):
             # 以及那件最容易被忽略的事实：超时只是放弃等待，**动作可能已经发生**。
             # 少了后半句，模型会当成"失败了"直接重试，于是同一个文件被写两遍。
             return _TIMEOUT_MESSAGE.format(tool=tool_name)
-        return default_tool_error_function(ctx, error)
+        return _MODEL_ERROR_MESSAGE.format(tool=tool_name, detail=_detail_of(error))
 
     return handler
+
+
+def _detail_of(error: BaseException) -> str:
+    """从异常里取一段**能给模型看**的说明。
+
+    ⚠️ 这里是"哪些信息可以放行"的唯一判定点，改动前先读下面两条。
+
+    放行的理由：本项目工具抛出的异常**全部是自己构造的业务异常**，消息内容是我们
+    自己写的（"除数是零"、"目录外面"、"不支持这个函数"这类），不含第三方响应体、
+    不含用户输入原文、不含凭据。对比一下 openai-agents 收紧的那个场景 —— 那里
+    兜的是**任意**异常（可能是 SDK/HTTP 层抛出的，``str(error)`` 里可能带请求头、
+    token、服务端回显）。两者的信任边界不同，不能因为名字一样就套同一套规则。
+
+    ⚠️ **这里刻意不做脱敏**（2026-11-06 定）
+    --------------------------------------------------
+    `app/logging_setup.py::redact` 那套是给**日志落盘**用的，不能拿到这里来：
+    ① 架构上 `src/` 不许反向依赖 `app/`（守卫：
+       `tests/test_index_identity.py::test_rag_layer_never_imports_app_layer`）；
+    ② 语义上也不该做 —— 这条字符串的收件人是**模型**，它本来就是"把内部原因告诉
+       模型"的通道。如果某个工具把凭据写进了异常消息，那是**抛出点的 bug**，
+       应该在抛出点修；在出口处做一层会掩盖它，还让"到底泄没泄"变得说不清。
+        （与 §16 工具契约的口径一致：契约问题在边界上报错，不在出口处静默修正。）
+
+    取不到消息（``str(error)`` 为空）时退回异常**类名** —— 至少让模型知道
+    失败类型，比"未知错误"有用。
+    """
+    raw = str(error).strip()
+    if not raw:
+        return type(error).__name__
+    # 模型吃不下超长文本；异常消息本来就该简短，超了就是有人在里面塞了 payload。
+    return raw if len(raw) <= _MODEL_ERROR_DETAIL_MAX else raw[:_MODEL_ERROR_DETAIL_MAX] + "……"
 
 
 @dataclass

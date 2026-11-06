@@ -21,7 +21,6 @@ import pytest
 pytest.importorskip("agents", reason="openai-agents 未安装 ⇒ agent 链路不存在，本组无从验证")
 
 from agents.run_config import CallModelData, ModelInputData  # noqa: E402
-from agents.tool import default_tool_error_function  # noqa: E402
 
 from agents import Agent  # noqa: E402
 from src import observability  # noqa: E402
@@ -322,14 +321,20 @@ def test_the_message_changes_after_the_limit(monkeypatch):
     assert "不要再调用它" in second
 
 
-def test_below_the_limit_keeps_the_official_text(monkeypatch):
-    """没到线 ⇒ 与官方默认实现逐字节一致（自愈能力不受影响）。"""
+def test_below_the_limit_keeps_the_reason_for_the_model(monkeypatch):
+    """没到线 ⇒ 文案里带原因（自愈能力不受影响），且**不是**劝退文案。
+
+    ⚠️ 2026-11-06 改：原来断言"与官方默认实现逐字节一致"。官方 0.23.0 `#5112`
+    之后默认实现不再带异常 ⇒ 那条断言等于"模型看不到原因"。现在钉的是这条用例
+    **真正要防的边界**：没到线就不该提前劝退，而原因必须还在。
+    """
     monkeypatch.setenv("AGENT_TOOL_FAIL_LIMIT", "3")
     _task, wrapper = _handler_ctx()
 
     text = S.tool_error_handler("kb_search")(wrapper, ValueError("boom"))
 
-    assert text == default_tool_error_function(wrapper, ValueError("boom"))
+    assert "boom" in text, f"没到线时模型却拿不到原因：{text!r}"
+    assert "不要再调用它" not in text, f"没到线就提前劝退了：{text!r}"
 
 
 def test_the_give_up_is_counted_once(monkeypatch):

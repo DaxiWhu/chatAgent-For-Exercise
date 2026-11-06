@@ -103,7 +103,7 @@ jobs:
             "scikit-learn>=1.4" "numpy>=1.26" "pgvector>=0.3" \
             pdfminer.six python-docx openpyxl python-pptx beautifulsoup4 lxml \
             "pytest>=8.0" "httpx>=0.27" tiktoken \
-            "openai-agents>=0.20" "sqlalchemy>=2.0"
+            "openai-agents>=0.20" "sqlalchemy[asyncio]>=2.0"
 
       # 依赖锁定一致性：requirements.txt 声明的包必须都在 requirements.lock 里有精确版本。
       # 放在装依赖之后、跑测试之前 —— 这样"漂移"以最明确的方式失败，
@@ -172,8 +172,27 @@ jobs:
             "scikit-learn>=1.4" "numpy>=1.26" "pgvector>=0.3" \
             pdfminer.six python-docx openpyxl python-pptx beautifulsoup4 lxml \
             "pytest>=8.0" "httpx>=0.27" tiktoken \
-            "openai-agents>=0.20" "sqlalchemy>=2.0"
+            "openai-agents>=0.20" "sqlalchemy[asyncio]>=2.0"
 
+      # ⚠️ `sqlalchemy[asyncio]` 的 extra **不能省**（2026-11-06 补）。
+      #    `sqlalchemy>=2.0` 本身**不带** `greenlet`，而那正是异步引擎
+      #    （`create_async_engine`）与官方 PG 会话后端的运行时必需项。
+      #    少了它的报错长这样：
+      #
+      #        ImportError: The SQLAlchemy asyncio module requires that the
+      #        Python 'greenlet' library is installed. In order to ensure this
+      #        dependency is available, use the 'sqlalchemy[asyncio]' install
+      #        target: 'pip install sqlalchemy[asyncio]'
+      #
+      #    它是**收集期**错误 ⇒ 整个 `tests/test_agent_session_pg.py` 一条
+      #    都跑不起来（6 个 error，不是 6 个 fail），而这个 job 存在的唯一
+      #    目的就是那 6 条 —— 等于这个 job 自建立起就没验证过任何东西。
+      #
+      #    为什么本地发现不了：开发机的 `sqlalchemy` 是被别的包顺带带进来的
+      #    （或装过 `[asyncio]`），`greenlet` 早就躺在 site-packages 里了。
+      #
+      #    ⚠️ 上面 `test` job（约 106 行）与 `bench` job 的同一行也要一起改 ——
+      #    它们现在**没崩**只是因为那两条用例在那边被 skip 了，属于运气。
       - name: 跨轮历史的真库测试
         env:
           # 专用变量、**刻意不复用 DB_URL**：把"被测库"与"日常开发库"分开，
@@ -201,7 +220,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install "langchain-openai>=0.3" "langchain-text-splitters>=0.3" \
-            "scikit-learn>=1.4" "numpy>=1.26" python-dotenv "httpx>=0.27"
+            "scikit-learn>=1.4" "numpy>=1.26" python-dotenv "httpx>=0.27" \
+            beautifulsoup4 lxml
+
+      # ⚠️ `beautifulsoup4` / `lxml` **不能省**（2026-11-06 补）—— 门禁的语料里
+      #    有一个 `历史.html`，缺 bs4 时 loaders 只是**打印一行 `解析失败，跳过`
+      #    然后继续**，于是语料从 35 个片段悄悄缩到 28 个，Top1 从 61% 掉到 50%，
+      #    门禁红在"检索质量退化"上 —— 而真正的病因是**依赖没装**。
+      #
+      #    这条最坏的地方是**两个错误互相掩盖**：红的信息指向检索，日志里那行
+      #    `解析失败，跳过 历史.html：No module named 'bs4'` 才是真因，而它藏在
+      #    eval 输出的最上面、被后面的表格淹掉。本地永远复现不了（开发机有 bs4）。
+      #
+      #    也就是说：这道门禁此前的"绿"是**在残缺语料上**得出的。阈值 0.55 是按
+      #    61% 的完整语料校准的，一旦依赖掉了就直接跌破 —— 反向说明它确实在防退化，
+      #    只是这次防到的是自己缺依赖。
 
       # 只用 bm25 后端：纯本地、零外部调用、结果确定，适合做 CI 门禁。
       #
@@ -309,7 +342,7 @@ jobs:
             "scikit-learn>=1.4" "numpy>=1.26" "pgvector>=0.3" \
             pdfminer.six python-docx openpyxl python-pptx beautifulsoup4 lxml \
             "pytest>=8.0" "httpx>=0.27" tiktoken \
-            "openai-agents>=0.20" "sqlalchemy>=2.0"
+            "openai-agents>=0.20" "sqlalchemy[asyncio]>=2.0"
 
       # 清空外部依赖配置（与 test / eval-gate 同口径）：这里量的是**本机**开销，
       # 一旦有 EMBEDDING_API_KEY，检索基准量的就是外部网络往返而不是热路径。
@@ -603,8 +636,30 @@ jobs:
           echo "探活通过：$(curl -fsS http://localhost:8000/health/live)"
           docker logs chatagent-ci || true
 
+      # ⚠️ 从 v0.28.0 升到 v0.36.0（2026-11-06），原因是 **v0.28.0 已经坏了**，
+      #    不是"顺手升个新版本"。它的 `action.yaml` 里写的是：
+      #
+      #        uses: aquasecurity/setup-trivy@v0.2.1     # ← 用可变 tag
+      #
+      #    而 `setup-trivy` 的 `v0.2.1` **已经被上游删除**（现存 v0.2.6 / v0.3.0 /
+      #    v0.3.1）。于是报错发生在**解析 action 的阶段**：
+      #
+      #        Unable to resolve action `aquasecurity/setup-trivy@v0.2.1`,
+      #        unable to find version `v0.2.1`
+      #
+      #    这一步在 `Set up job` 就失败了 —— 也就是说**镜像根本没构建、更没扫描**。
+      #    与之前那次"写成 @0.28.0 而仓库只有 v0.28.0"是同一个坑的第二次发作：
+      #    钉住自己的引用不够，**依赖链上下游的引用也得钉**，否则一个仍会被删。
+      #
+      #    v0.36.0 已经自己改好了（内部改用 SHA 钉 setup-trivy）：
+      #
+      #        uses: aquasecurity/setup-trivy@3fb12ec12f... # v0.2.6
+      #
+      #    这恰好印证了本文件开头那条规矩：**tag 可被上游重指/删除，SHA 不可变**。
+      #    守卫：`tests/test_ci_config.py` 该补一条"上游 action 内部引用是否可解析"，
+      #    但那是网络依赖，不适合放进离线测试，故只在此记录成因。
       - name: 漏洞扫描（镜像）
-        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2  # v0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: chatagent:ci
           format: table

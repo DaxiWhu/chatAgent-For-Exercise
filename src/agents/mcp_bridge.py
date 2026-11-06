@@ -243,6 +243,85 @@ _TRUNCATED = (
 )
 
 
+# --------------------------------------------------------------------------- #
+# 字段名兼容层：MCP SDK v1（驼峰）与 v2（蛇形）
+# --------------------------------------------------------------------------- #
+# ⚠️ 为什么必须有这一层（2026-11-06）
+# ---------------------------------
+# MCP Python SDK **v2.0.0（2026-07-28）** 把协议类型（含 ``CallToolResult``）的
+# Python 属性名统一改成了 snake_case，但**JSON 线上格式仍是 camelCase**（靠
+# Pydantic alias 保持）。官方迁移文档原话：
+#
+#   "All Pydantic model fields in the protocol types now use snake_case names for
+#    Python attribute access. The JSON wire format is unchanged — traffic the SDK
+#    sends still uses camelCase via Pydantic aliases, but your own ``model_dump()``
+#    calls now need ``by_alias=True`` to produce it."
+#
+# 于是 ``result.structuredContent`` 在 v2 上**直接 AttributeError**；而
+# ``requirements.txt`` 写的是 ``mcp>=1.0``（没有上界）⇒ 干净环境装到 2.x，
+# 本地开发机停在 1.27 ⇒ **同一份代码两边行为不同，且本地永远复现不了**。
+# 实测表现：CI 里 `tests/test_agent_mcp_bridge.py` 15 条全红，本地全绿。
+#
+# 为什么选"兼容层"而不是锁 `<2`
+# ----------------------------
+# 锁上界只是把迁移推迟，下次升 v2 还要做同一件事；而这两个名字的语义完全等价，
+# 取值本身没有任何歧义。所以这里只在**读写边界**上做一次归一，业务代码继续用
+# 驼峰口径书写（与本文件其余部分的文档、注释保持一致）。
+#
+# ⚠️ 两个方向都必须走这里：
+#   · **读**（属性访问）：v2 上驼峰会 AttributeError；
+#   · **写**（``model_copy(update=...)`` 的键）：v2 上给驼峰键，Pydantic 会把它
+#     当成"未知字段"**静默丢弃**（v2 的 MCP 类型改成了忽略未知字段，不报错、
+#     不回环）—— 那比报错更糟：裁剪逻辑看起来生效了，实际 structured_content
+#     原封不动地留着。
+#
+# 判据：**以 snake_case 为准**（v2 是未来方向），取不到再退回驼峰。反过来不行 ——
+# 在 v1 上试 snake_case 会抛 AttributeError，正好被下面的 try 吃掉，语义正确。
+
+
+def _read_field(obj: Any, snake: str, camel: str, default: Any = None) -> Any:
+    """从 MCP 协议对象上取一个字段，兼容 v1（驼峰）与 v2（蛇形）。
+
+    优先 snake_case：v2 是官方当前方向。取不到时退回 camelCase（v1）。
+    两边都没有 ⇒ 返回 ``default``，不抛 —— 协议字段是**可选**的，缺了按"没有"处理
+    比中断整次工具调用合理（这条字段只用于裁剪判断，不是业务必需）。
+    """
+    for name in (snake, camel):
+        try:
+            return getattr(obj, name)
+        except AttributeError:
+            continue
+    return default
+
+
+def _set_field(obj: Any, snake: str, camel: str, value: Any) -> Any:
+    """给 MCP 协议对象换一个字段值，兼容 v1（驼峰）与 v2（蛇形）。
+
+    ⚠️ 键名必须跟着版本走：v2 的类型忽略未知字段，**给错名字不会报错**，
+    只会静默丢弃 —— 那会变成"以为清空了、其实没清"。
+    """
+    key = snake if hasattr(obj, snake) or not hasattr(obj, camel) else camel
+    return obj.model_copy(update={key: value})
+
+
+def _structured_content(result: CallToolResult) -> Any:
+    """``CallToolResult.structuredContent``（v1）/ ``structured_content``（v2）。"""
+    return _read_field(result, "structured_content", "structuredContent")
+
+
+def _is_error(result: CallToolResult) -> bool:
+    """``CallToolResult.isError``（v1）/ ``is_error``（v2）。
+
+    缺字段按 ``False``：MCP 规范里它默认就是 false。
+    """
+    return bool(_read_field(result, "is_error", "isError", False))
+
+
+def _without_structured_content(result: CallToolResult) -> CallToolResult:
+    """把结构化返回置空（v1/v2 字段名各自正确）。"""
+    return _set_field(result, "structured_content", "structuredContent", None)
+
+
 class MCPToolError(RuntimeError):
     """服务器把这次调用标成了失败（``isError=true``）。
 
@@ -316,7 +395,7 @@ def _render_block(
                 return block, cost
         observability.counter("agent_mcp_image_dropped_total", server=server, tool=tool)
         text = _IMAGE_DROPPED.format(
-            mime=getattr(block, "mimeType", "") or "image",
+            mime=_read_field(block, "mime_type", "mimeType", "") or "image",
             kb=_kb(len(block.data) * 3 // 4),  # base64 → 原始字节
         )
         return _render_text(text, budget)
@@ -324,7 +403,7 @@ def _render_block(
     if isinstance(block, AudioContent):
         observability.counter("agent_mcp_audio_dropped_total", server=server, tool=tool)
         text = _AUDIO_DROPPED.format(
-            mime=getattr(block, "mimeType", "") or "audio",
+            mime=_read_field(block, "mime_type", "mimeType", "") or "audio",
             kb=_kb(len(getattr(block, "data", "") or "") * 3 // 4),
         )
         return _render_text(text, budget)
@@ -334,7 +413,7 @@ def _render_block(
         text = (
             f"〔外部资源〕{getattr(block, 'name', '') or ''}"
             f" uri={getattr(block, 'uri', '')} "
-            f"mime={getattr(block, 'mimeType', '') or '未知'}"
+            f"mime={_read_field(block, 'mime_type', 'mimeType', '') or '未知'}"
         )
         return _render_text(text, budget)
 
@@ -413,7 +492,7 @@ def convert_result(result: CallToolResult, *, server: str, tool: str) -> CallToo
     if used:
         observability.histogram("agent_mcp_result_chars", used, server=server)
 
-    structured = result.structuredContent
+    structured = _structured_content(result)
     if limit > 0 and structured:
         try:
             size = len(json.dumps(structured))
@@ -430,7 +509,8 @@ def convert_result(result: CallToolResult, *, server: str, tool: str) -> CallToo
             observability.counter(
                 "agent_mcp_result_truncated_total", server=server, tool=tool
             )
-            return result.model_copy(update={"content": kept, "structuredContent": None})
+            cleared = _without_structured_content(result)
+            return cleared.model_copy(update={"content": kept})
 
     if kept == blocks:
         return result
@@ -527,7 +607,7 @@ class _ContentGuarded:
     ) -> CallToolResult:
         result = await super().call_tool(tool_name, arguments, meta=meta)  # type: ignore[misc]
         converted = convert_result(result, server=self.name, tool=tool_name)
-        if converted.isError:
+        if _is_error(converted):
             observability.counter(
                 "agent_mcp_tool_error_total", server=self.name, tool=tool_name
             )

@@ -88,7 +88,18 @@ mcp>=1.0
 # SDK 把它列为可选 extra（`pip install "openai-agents[sqlalchemy]"`），这里显式列出：
 # **选了 PostgreSQL 会话后端它就必需**。漏装的症状是运行期才炸（`session_for` 建不起来
 # ⇒ 每轮没有历史，模型看不到上文，而所有指标正常）。
-sqlalchemy>=2.0
+#
+# ⚠️ `[asyncio]` extra **不能省**（2026-11-06 补）：`sqlalchemy` 本身**不带**
+# `greenlet`，而 `sqlalchemy.ext.asyncio`（`create_async_engine`）在导入期就要求它。
+# 少了它的报错是**收集期** ImportError：
+#
+#     The SQLAlchemy asyncio module requires that the Python 'greenlet' library
+#     is installed. ... use the 'sqlalchemy[asyncio]' install target
+#
+# 为什么一直没被发现：开发机的 `greenlet` 早被别的包（langgraph 系）顺带装上了，
+# 而镜像里恰好也有 —— 只有"干净环境 + 只装这份清单"才暴露，即 CI 的
+# `agent-session-pg` job，那里 6 条用例全部 error（不是 fail）。
+sqlalchemy[asyncio]>=2.0
 
 # ---- RAG：检索（src/retrieval.py）----
 scikit-learn>=1.4

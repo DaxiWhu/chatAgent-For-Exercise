@@ -23,9 +23,30 @@ from __future__ import annotations
 import base64
 import time
 
-from mcp.server.fastmcp import FastMCP, Image
+# ⚠️ 导入路径在 MCP SDK v2 里改了名（2026-11-06 补）—— 两版都要能用
+# ---------------------------------------------------------------------------
+#   v1: from mcp.server.fastmcp import FastMCP, Image
+#   v2: from mcp.server.mcpserver import MCPServer, Image    # FastMCP 改名为 MCPServer
+#
+# 直接 `import FastMCP` 在 v2 上会抛：
+#
+#     ModuleNotFoundError: No module named 'mcp.server.fastmcp'. This is mcp 2.x,
+#     where FastMCP was renamed to MCPServer ...
+#
+# 这是**夹具**不是产品代码，但它偏偏是"端到端验证转换层"的唯一途径 —— 少了它，
+# `test_end_to_end_*` 三条只能 skip，而"外部返回真的走了一遍协议"这件事就没人验了。
+# 所以这里做兼容导入，而不是把 requirements 锁回 <2（锁了以后再做一次同样的活）。
+#
+# 类名差异只影响**怎么构造**，`@mcp.tool()` 装饰器与 `mcp.run(transport=...)`
+# 两版签名一致，所以下面只是把名字归一，其余一行不用改。
+try:  # pragma: no cover - 取决于装的是哪一版
+    from mcp.server.mcpserver import Image
+    from mcp.server.mcpserver import MCPServer as _Server
+except ModuleNotFoundError:  # v1
+    from mcp.server.fastmcp import FastMCP as _Server
+    from mcp.server.fastmcp import Image
 
-mcp = FastMCP("agent-mcp-test")
+mcp = _Server("agent-mcp-test")
 
 # 1x1 透明 PNG。要的是"它是一张真图"，不是"它好看"。
 _PNG_1X1 = base64.b64decode(

@@ -511,21 +511,32 @@ def test_pending_calls_are_matched_by_tool_name():
 # --------------------------------------------------------------------------- #
 # 五、错误处理函数：既保住自愈，又多记一条失败
 # --------------------------------------------------------------------------- #
-def test_error_handler_returns_the_official_text_unchanged():
-    """★★ 回给模型的文本与官方默认实现**逐字节相同**。
+def test_error_handler_tells_the_model_what_went_wrong():
+    """★★ 回给模型的文本里**必须带上失败原因**。
 
-    为什么这条这么重要：那句话是模型**自愈**的唯一依据（官方专门为 JSON 解析失败
-    写了另一句措辞）。这里若自作主张改写（"工具失败了，请停止重试"之类），模型就
-    失去了"看错误信息改参数再试一次"的能力 —— 而这件事在测试里不会自己暴露，
-    只会表现为"线上工具失败率一高，整条链就答不出来"。
+    为什么这条这么重要：那句话是模型**自愈**的唯一依据。这里若只回一句
+    "工具失败了，请重试"，模型就分不清"除数是零"与"参数名写错"，只能原样重试 ——
+    而这件事在测试里不会自己暴露，只会表现为"线上工具失败率一高，整条链就答不出来"。
 
-    ⇒ 所以这里不做"要么官方、要么我"的选择，而是**官方之外多记一份**。
+    ⚠️ 2026-11-06 改：这条用例**原来**断言的是"与官方默认实现逐字节相同"。
+    那个契约是错的（或者说，只是当时恰好成立）：openai-agents 0.23.0 的
+    `#5112 redact default tool failure details` 把官方默认文案改成了固定一句话、
+    刻意不暴露异常 —— 于是"与官方一致"和"模型能看到原因"变成了**互斥**的两件事。
+
+    现在钉的是**真正的意图**：原因必须在。具体措辞可以改（那属于文案，不是契约），
+    所以这里断言"含原始异常消息"而不是断言整句。
     """
     _task, wrapper = _pipeline()
     handler = tool_error_handler("kb_search")
 
-    assert handler(wrapper, ValueError("boom")) == default_tool_error_function(
-        wrapper, ValueError("boom"))
+    text = handler(wrapper, ValueError("boom"))
+    assert "boom" in text, f"回给模型的文本里没有失败原因：{text!r}"
+    assert "kb_search" in text, f"没说是哪个工具失败了：{text!r}"
+
+    # 反过来钉住**不许退回**官方那句没有信息量的话 —— 那正是这次要修的东西。
+    assert text != default_tool_error_function(wrapper, ValueError("boom")), (
+        "回给模型的仍是官方默认文案（不含任何原因）⇒ 模型无法自愈"
+    )
 
 
 def test_error_handler_records_exactly_one_failed_step():
@@ -539,18 +550,25 @@ def test_error_handler_records_exactly_one_failed_step():
     assert "boom" in task.steps.steps[0].detail
 
 
-def test_error_handler_still_talks_to_the_official_function_when_disabled(monkeypatch):
+def test_error_handler_text_is_identical_whether_steps_are_on_or_off(monkeypatch):
     """★ 关掉记录时：清单为空，**但回给模型的文本分毫不动**。
 
     这是"开关只影响观测"这条边界的守卫 —— 如果关掉开关会改变错误文本（比如变成
     空串），那这个开关就成了"能改变业务行为的观测开关"，最坏的一种形态。
+
+    ⚠️ 2026-11-06 改：原来是与 ``default_tool_error_function`` 对比（当时它带原因）。
+    现在直接对比"开 / 关两种状态下的文本是否**逐字节相同**" —— 这比原来更贴合这条
+    用例要防的东西：它要防的是**开关造成差异**，不是"文本长什么样"。
     """
+    err = ValueError("boom")
+
+    on = tool_error_handler("kb_search")(_pipeline()[1], err)
+
     monkeypatch.setenv("AGENT_TOOL_STEPS", "0")
     task, wrapper = _pipeline()
+    off = tool_error_handler("kb_search")(wrapper, err)
 
-    text = tool_error_handler("kb_search")(wrapper, ValueError("boom"))
-
-    assert text == default_tool_error_function(wrapper, ValueError("boom"))
+    assert off == on, "关掉步骤记录后错误文案变了 ⇒ 观测开关影响了业务行为"
     assert task.steps.steps == []
 
 
@@ -1130,14 +1148,17 @@ def test_the_timeout_message_tells_the_model_the_action_may_already_have_run():
     assert "重做" in text
 
 
-def test_a_non_timeout_failure_keeps_the_official_message():
-    """非超时失败仍用官方默认文案。
+def test_a_non_timeout_failure_carries_the_reason_to_the_model():
+    """非超时失败：文案里带原因，且**不是**超时那套专门措辞。
 
-    换掉它是退步：官方那句经过版本演进，模型对它的先验更稳；而这里只需要补
-    "超时"这一种官方没有语义的失败。
+    ⚠️ 2026-11-06 改：原来断言"等于官方默认文案"。官方 0.23.0 的 `#5112` 之后，
+    默认文案不再含异常，那条断言等价于"模型看不到原因" —— 与本项目"注入错误上下文
+    让 agent 自我修复"的口径相反。现在改钉两件真正重要的事：
+
+      1. 原因在（模型能据以改参数）；
+      2. **没有**误用超时文案（那句会告诉模型"动作可能已经执行"，对非超时失败
+         是错误信息，会让它去确认一个根本没发生的动作）。
     """
-    from agents.tool import default_tool_error_function
-
     from src.agents import tools
 
     task = TaskContext()
@@ -1145,7 +1166,9 @@ def test_a_non_timeout_failure_keeps_the_official_message():
     error = RuntimeError("boom")
     handler = _installed_handler(tools.deliver)
 
-    assert handler(ctx, error) == default_tool_error_function(ctx, error)
+    text = handler(ctx, error)
+    assert "boom" in text, f"非超时失败没有把原因带给模型：{text!r}"
+    assert "超时" not in text, f"非超时失败误用了超时文案：{text!r}"
 
 
 def test_repeated_timeouts_raise_the_repeat_count():

@@ -49,9 +49,25 @@ def _clean_env(monkeypatch):
 
 
 def _result(*blocks, is_error: bool = False, structured=None) -> CallToolResult:
+    # ⚠️ 构造期给驼峰键是**安全的**：MCP SDK 文档明确写了模型在构造时接受两种拼写
+    # （"The models accept both spellings at construction time"）。但**读取**必须
+    # 走 snake_case 或兼容层 —— 见下面 `_field()`，否则在 v2 上直接 AttributeError。
     return CallToolResult(
         content=list(blocks), isError=is_error, structuredContent=structured
     )
+
+
+def _field(obj, snake: str, camel: str):
+    """按版本取协议字段：v2 是蛇形，v1 是驼峰。
+
+    为什么测试里也要兼容而不是硬写一个名字：这些用例的价值在于"转换层没改变语义"，
+    而与 SDK 版本无关。硬写 ``out.isError`` 会让整个文件在 CI（mcp 2.x）上 15 条全红，
+    红的原因却是**读属性写法过时**，不是被测行为有问题 —— 那会把真问题淹掉。
+    """
+    try:
+        return getattr(obj, snake)
+    except AttributeError:
+        return getattr(obj, camel)
 
 
 def _text(value: str) -> TextContent:
@@ -181,7 +197,7 @@ def test_error_flag_is_preserved_by_conversion(monkeypatch):
     out = convert_result(
         _result(_text("错" * 500), is_error=True), server="s", tool="t"
     )
-    assert out.isError is True
+    assert _field(out, "is_error", "isError") is True
 
 
 def test_oversized_structured_content_is_cleared(monkeypatch):
@@ -194,13 +210,13 @@ def test_oversized_structured_content_is_cleared(monkeypatch):
     out = convert_result(
         _result(_text("短"), structured={"blob": "甲" * 1000}), server="s", tool="t"
     )
-    assert out.structuredContent is None
+    assert _field(out, "structured_content", "structuredContent") is None
 
 
 def test_small_structured_content_is_kept(monkeypatch):
     monkeypatch.setenv("AGENT_MCP_RESULT_MAX_CHARS", "1000")
     out = convert_result(_result(_text("短"), structured={"a": 1}), server="s", tool="t")
-    assert out.structuredContent == {"a": 1}
+    assert _field(out, "structured_content", "structuredContent") == {"a": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +378,21 @@ def test_end_to_end_conversion_through_a_real_server(monkeypatch):
     assert isinstance(error, MCPToolError), (
         "服务器标了 isError，却没有变成异常 —— 这次失败会在步骤清单里记成成功"
     )
-    assert "测试用的故意失败" in str(error), "异常消息里要带上服务器给的原文"
+    # ⚠️ 这里**不能**再断言"异常消息含服务器原始报错"（2026-11-06 改）。
+    # 该断言只在 MCP SDK v1 上成立，v2 起服务器端主动剥离了原始异常文本：
+    #
+    #   v1: 异常消息 = "测试用的故意失败"
+    #   v2: 异常消息 = "Error executing tool boom"
+    #        （仅在服务器 stderr 里保留原文，见 mcpserver/tools/base.py 的
+    #          `raise UnexpectedToolError(f"Error executing tool {self.name}") from exc`）
+    #
+    # 这与 openai-agents 0.23 的 `#5112 redact default tool failure details`
+    # 是**同一波收紧**：上游在系统性地避免把内部异常原文跨进程/跨信任边界传出去。
+    # 我们的代码对此无能为力 —— 那句话是**服务器**产出并写在 isError 结果里的，
+    # 客户端只能照搬。所以断言改为钉住真正属于我们的保证：
+    #   · 业务失败**必须**变成异常（上面那条，这才是防止"失败被记成成功"的关键）；
+    #   · 消息**非空**（模型至少知道"失败了"，而不是拿到一句空话）。
+    assert str(error).strip(), "MCPToolError 的消息不能是空串"
 
 
 def test_end_to_end_tool_names_are_prefixed():
@@ -466,3 +496,68 @@ def test_startup_hook_survives_bad_config(monkeypatch):
 
     _asyncio.run(_run())
     assert ENTRY_AGENT.mcp_servers == before, "配置坏了却挂上了半个 —— 必须一个都不挂"
+
+
+# ---------------------------------------------------------------------------
+# 七、SDK 双版本兼容（v1 驼峰 / v2 蛇形）
+# ---------------------------------------------------------------------------
+# 这一组钉的是**兼容层本身**，不是某个业务行为。
+#
+# 为什么需要：`requirements.txt` 写的是 `mcp>=1.0`（无上界），而 mcp **v2.0.0
+# （2026-07-28）** 把协议类型的 Python 属性名从驼峰改成了蛇形（线上 JSON 仍是驼峰）。
+# 于是同一个仓库在"开发机（1.27）"与"CI 干净环境（2.x）"上行为不同，而本地**永远
+# 复现不了** —— 实测：CI 里这个文件 15 条全红，本地全绿。
+#
+# 变异验证：把 `_read_field` 改回"只认驼峰" ⇒ 本文件在 v2 环境下 3 条红
+# （`test_image_downgraded_to_text_by_default` / `test_oversized_structured_content_is_cleared`
+#  / `test_end_to_end_conversion_through_a_real_server`）。
+
+
+def test_field_reader_accepts_both_naming_styles():
+    """兼容层对两种命名都能取到值 —— 这是它存在的唯一理由。"""
+
+    class _Camel:
+        structuredContent = {"x": 1}
+        isError = True
+
+    class _Snake:
+        structured_content = {"x": 1}
+        is_error = True
+
+    for obj in (_Camel(), _Snake()):
+        assert mcp_bridge._read_field(obj, "structured_content", "structuredContent") == {
+            "x": 1
+        }, f"{type(obj).__name__} 上取不到 structured content"
+        assert mcp_bridge._is_error(obj) is True, f"{type(obj).__name__} 上取不到 is_error"
+
+
+def test_field_reader_falls_back_to_default_when_absent():
+    """两边都没有 ⇒ 返回默认值，**不抛**。
+
+    协议里这些字段是**可选**的；为了一个只用于裁剪判断的字段让整次工具调用炸掉，
+    是把"少一个提示"升级成"这步做不成"。
+    """
+
+    class _Empty:
+        pass
+
+    assert mcp_bridge._read_field(_Empty(), "structured_content", "structuredContent") is None
+    assert mcp_bridge._is_error(_Empty()) is False, "MCP 规范里 isError 默认就是 false"
+
+
+def test_set_field_writes_under_the_name_this_sdk_uses():
+    """写字段时键名**必须跟着版本走**。
+
+    ⚠️ 这是最隐蔽的一处：v2 的 MCP 类型忽略未知字段（官方迁移文档：
+    "In v2, MCP types silently ignore extra fields"），给错名字**不报错**，
+    只会静默丢弃 —— 那会变成"以为清空了、其实原封不动"。
+    """
+    from mcp.types import CallToolResult
+
+    base = CallToolResult(content=[])
+    # 用真实类型构造，再通过兼容层写入；随后按**当前 SDK 的取名**读回来验证
+    filled = mcp_bridge._set_field(base, "structured_content", "structuredContent", {"a": 1})
+
+    assert mcp_bridge._read_field(
+        filled, "structured_content", "structuredContent"
+    ) == {"a": 1}, "写入没有真正落到这个 SDK 认的那个字段上"
