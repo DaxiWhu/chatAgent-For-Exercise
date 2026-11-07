@@ -37,7 +37,7 @@ msgpack>=1.2.3
 #
 # 锁文件里仍然只写 `psycopg==<版本>`（约束文件不允许 extras，见 requirements.lock
 # 头部说明）—— extras 只影响装哪个 wheel，不影响版本解析。
-psycopg[binary]>=3.2
+psycopg[binary]>=3.3.8
 pydantic>=2.7
 python-dotenv>=1.0
 
