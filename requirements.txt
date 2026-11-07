@@ -58,7 +58,7 @@ sse-starlette>=2.1
 # 运维看到配置项已填就以为共享生效了。启动配置回显现在会分别打印
 # `shared_configured`（打算用）与 `backend`（实际在用），二者不一致会打 ERROR。
 # 装成硬依赖可以直接消灭这一整类误配（纯 python，无编译依赖）。
-redis>=5.0
+redis>=8.1.0
 # 用户鉴权（第二档，app/auth.py）：OIDC / JWT 验签。
 # PyJWT 做编解码与算法实现，[crypto] 拉入 cryptography —— JWKS 里的
 # RS256/ES256 验签必须靠非对称实现，纯 Python 做不到。
