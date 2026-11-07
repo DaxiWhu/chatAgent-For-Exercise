@@ -811,7 +811,10 @@ jobs:
         run: |
           set -eu
           echo "── 这几个包在镜像里到底是哪个版本、来自哪个 dist-info ──"
-          docker run --rm --entrypoint python chatagent:ci - <<'PY'
+          # ⚠️ `-i` 不能省：不加它 docker 会把容器的 stdin 直接关掉，
+          #    `python -` 读到的就是空脚本 —— **静默退出 0、一行都不打印**
+          #    （第一次写这一步时就是这样，看着"跑过了"，其实什么也没查）。
+          docker run --rm -i --entrypoint python chatagent:ci - <<'PY'
           from importlib import metadata
           targets = {"msgpack", "setuptools", "urllib3", "pillow", "rapidocr", "onnxruntime"}
           found = False
@@ -863,6 +866,28 @@ jobs:
           # 需要长期忽略的**可修**项，请加到仓库根的 `.trivyignore`，
           # 并写明理由与到期日（见该文件的头部说明）。
           ignore-unfixed: true
+          # ⚠️ 跳过 **pip 自带的 vendored 依赖清单**（2026-11-07 第五次真跑定位）
+          # ------------------------------------------------------------------
+          # 症状：报告里 msgpack 1.1.2 / setuptools 70.3.0 / urllib3 2.7.0 三条（共 5 个
+          # 漏洞），而**同一份报告**的明细里 `msgpack-1.2.3.dist-info` / `-81.0.0` /
+          # `-2.8.0` 全是 0 漏洞，构建日志也写着 `Successfully installed msgpack-1.2.3`。
+          # 那三条挂在**不带路径**的聚合目标「Python」下 —— 一看就不像从文件系统读的。
+          #
+          # 真因：这几个包都是 **pip 自己 vendored 的副本**，而 pip 在 wheel 里带了一份
+          # CycloneDX 清单：
+          #     /usr/local/lib/python3.13/site-packages/pip/_vendor/bom.cdx.json
+          # trivy 发现它后**按它列出的版本**去匹配漏洞库（同时警告 "Third-party SBOM
+          # may lead to inaccurate vulnerability detection"），于是报的是 pip 打包那天
+          # 冻结的 vendored 版本 —— 这也解释了"为什么两次构建报的是同一组旧版本"。
+          #
+          # 为什么不"把 msgpack 升到 1.2.3 了事"：**已经升了**，装的就是 1.2.3；
+          # 要消掉这三条只能升 pip 本身（那是基础镜像的构建工具，不是我们的运行时依赖），
+          # 而且下次基础镜像里 pip 再换代，同一处又会漂。
+          #
+          # 跳过的代价：**零**。我们真正装的每个包都有自己的 `*.dist-info/METADATA`，
+          # trivy 照样逐个扫（报告里那些 `.../site-packages/xxx-1.2.3.dist-info/METADATA`
+          # 行就是）。不装在 site-packages 顶层的 vendored 副本本来就不该被当成依赖。
+          skip-files: "**/pip/_vendor/bom.cdx.json"
 
       - name: 清理容器
         if: always()

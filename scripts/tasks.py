@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -346,6 +347,42 @@ def _wait_ready(base: str, timeout: float) -> bool:
     return False
 
 
+def _seen_releases(base: str, timeout: float, want: int = 2) -> set[str]:
+    """轮询 `/health/live`，直到见到 `want` 种不同的 `release`（最多 timeout 秒）。
+
+    ⚠️ 为什么「nginx 已经 200」还不够（2026-11-07 第五次真跑撞出来的）
+    ----------------------------------------------------------------
+    `_wait_ready` 打的是**同一个**入口：只要**任意一个**实例在服务它就返回 200。
+    而 nginx 的被动健康检查会在另一个实例还在启动时把它连续判死并**暂时摘除**：
+
+        [error] connect() failed (111: Connection refused) ... "http://172.20.0.3:8000"
+        [warn]  upstream server temporarily disabled while connecting to upstream
+
+    `fail_timeout=15s` ⇒ 被摘掉的实例要 15 秒后才会重新被试。此时若立刻开跑
+    灰度用例，20 次取样会**全部**落到 stable，报错是"灰度没有生效" ——
+    而磁盘上的权重、upstream、容器全都正常。这是最难查的一类假故障：
+    **被测对象没错，错在取样时刻**。
+
+    所以起栈后要多等一步：直到两种 release 都真的答上来，再把判断交给用例。
+    采样间隔刻意取 0.2s（不是 2s）：nginx 是 9:1 平滑加权轮询，平均要打 10 个
+    请求才会有 1 个进 canary，间隔太大等于用超时时间换运气。
+    """
+    deadline = time.monotonic() + timeout
+    seen: set[str] = set()
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(base + "/health/live", timeout=3) as resp:
+                if resp.status == 200:
+                    body = json.loads(resp.read().decode("utf-8"))
+                    seen.add(str(body.get("release", "<缺失>")))
+                    if len(seen) >= want:
+                        return seen
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+        time.sleep(0.2)
+    return seen
+
+
 def task_e2e(args: list[str]) -> int:
     """端到端检查：起真实栈 → 等就绪 → 跑 `tests/test_e2e_stack.py` → 收栈。
 
@@ -398,6 +435,22 @@ def task_e2e(args: list[str]) -> int:
         if not keep:
             compose("down", [])
         return 1
+
+    # 再等"两个 release 都答上来"：nginx 会在实例启动期把它暂时摘除 15 秒，
+    # 那段时间里灰度用例必然只看到 stable（详见 `_seen_releases` 的说明）。
+    gray_wait = float(os.environ.get("E2E_GRAY_WAIT", "60"))
+    print(f"[e2e] 等灰度两个实例都答上来（最多 {gray_wait:.0f}s）…", flush=True)
+    releases = _seen_releases(base, gray_wait)
+    if len(releases) < 2:
+        print(
+            f"[e2e] ⚠️ 只看到 {sorted(releases)} —— 灰度实例没答上来。",
+            file=sys.stderr, flush=True,
+        )
+        compose("logs --tail=40 app-canary nginx", [])
+        print("[e2e] 继续跑其余用例；灰度那条会红，真因在上面的 upstream 日志里。",
+              file=sys.stderr, flush=True)
+    else:
+        print(f"[e2e] 两个实例都在线：{sorted(releases)}", flush=True)
 
     env = dict(os.environ, E2E_BASE_URL=base)
     if _has_script_credentials():

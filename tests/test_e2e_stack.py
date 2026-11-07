@@ -270,6 +270,12 @@ def test_the_edge_splits_traffic_between_releases():
     assert len(seen) >= 2, (
         f"{SAMPLES} 次取样只落到了 {dict(seen)} —— 灰度没有生效。"
         f"依次检查：upstream 里两个 server 都在吗？权重是不是 0？canary 容器起来了吗？"
+        # ⚠️ 历史坑（2026-11-07 第五次真跑）：上游实例**刚启动**时会被 nginx 的被动
+        #    健康检查连续判死并"暂时摘除"（max_fails=3 / fail_timeout=15s），那 15 秒里
+        #    取样必然只看到 stable —— 配置全对、容器也在跑，只是取样时刻不对。
+        #    现在 `scripts/tasks.py` 会先等到两个 release 都答上来才跑用例
+        #    （`_seen_releases`），所以这条红了就**不是**那个时序问题。
+        f"（起栈脚本已等过两个实例都在线；此时红 = canary 真的没在服务）"
     )
     # ⚠️ 别写 `top, _, second = seen.most_common(3)` —— 那有两个问题：
     #   ① 恰好只有 2 个 release 时（**这是正常情况**）只返回 2 项，解包直接 ValueError。

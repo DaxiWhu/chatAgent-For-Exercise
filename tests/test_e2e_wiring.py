@@ -224,3 +224,109 @@ def test_ci_e2e_job_is_manual_or_scheduled_not_per_push():
         "workflow 没有声明 workflow_dispatch —— e2e 就只剩定时这一条触发路径，"
         "改了 nginx / compose 之后想立刻验证一下都做不到"
     )
+
+
+# --------------------------------------------------------------------------
+# ⑤ 起栈之后：必须等"两个 release 都答上来"再跑灰度用例
+# --------------------------------------------------------------------------
+# 这条守的是一个**假故障**（2026-11-07 第五次真跑）：
+#   nginx 的被动健康检查会在实例启动期把它连续判死并"暂时摘除"
+#   （`max_fails=3 fail_timeout=15s`），那 15 秒里灰度用例取样全部落到 stable，
+#   报错写的是"灰度没有生效"——而权重、upstream、容器全是对的。
+#
+#   所以 `tasks.py` 在 `_wait_ready`（只保证"有一个实例在服务"）之后，还要等
+#   `_seen_releases` 见到两种 release。少了这步，e2e 会以约 50% 的概率红
+#   （取决于哪个容器先起来），而这种"重跑一次就好"的红最容易被当成 flaky 放过。
+class _ReleaseServer:
+    """极小的本地 HTTP 服务：按顺序回报 `release` 字段。
+
+    不用子进程起服务（本机沙箱对测试派生的子进程做事后审计，一次要二十多秒），
+    直接在**线程**里跑 `http.server`。
+    """
+
+    def __init__(self, releases):
+        import http.server
+        import threading
+
+        self._releases = list(releases)
+        self._i = 0
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802  标准库要求这个名字
+                body = json.dumps(
+                    {"release": outer._releases[min(outer._i, len(outer._releases) - 1)]}
+                ).encode()
+                outer._i += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):  # 别把访问日志打到测试输出里
+                pass
+
+        self._httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self._httpd.server_port}"
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self):
+        self._httpd.shutdown()
+        self._httpd.server_close()
+
+
+def test_seen_releases_returns_as_soon_as_both_releases_answer():
+    """两种 release 都出现就立刻返回，不会傻等满超时。"""
+    srv = _ReleaseServer(["stable"] * 8 + ["canary"])
+    try:
+        seen = tasks._seen_releases(srv.base, timeout=5)
+    finally:
+        srv.close()
+    assert seen == {"stable", "canary"}, f"应当看到两种 release，实得 {seen}"
+
+
+def test_seen_releases_does_not_fake_success_when_only_one_answers():
+    """只有一个实例在服务时，必须**等到超时**并如实返回一种 —— 不能提前返回成功。
+
+    这条是反向断言：如果实现被改成"打一次 200 就返回"，它会在第一个请求就返回，
+    上面那条仍然绿、这条会红（见 `_elapsed` 的判据）。
+    """
+    import time
+
+    srv = _ReleaseServer(["stable"])
+    try:
+        started = time.monotonic()
+        seen = tasks._seen_releases(srv.base, timeout=0.8)
+        elapsed = time.monotonic() - started
+    finally:
+        srv.close()
+    assert seen == {"stable"}, f"只应该看到 stable，实得 {seen}"
+    assert elapsed >= 0.5, (
+        f"只用了 {elapsed:.2f}s 就返回 —— 说明它没有真的等，"
+        "而是把'打过一次 200'当成了'灰度在线'"
+    )
+
+
+def test_e2e_waits_for_the_canary_before_running_the_suite(monkeypatch):
+    """`task_e2e` 必须在跑用例**之前**等两个实例，且等不到时不能直接放弃。"""
+    order: list[str] = []
+
+    monkeypatch.setattr(tasks, "require", lambda *a, **k: True)
+    monkeypatch.setattr(tasks, "compose", lambda *a, **k: order.append("compose") or 0)
+    monkeypatch.setattr(tasks, "_wait_ready", lambda *a, **k: order.append("ready") or True)
+    monkeypatch.setattr(
+        tasks, "_seen_releases",
+        lambda *a, **k: order.append("gray") or {"stable"},   # ← 只有 stable：模拟等不到
+    )
+    monkeypatch.setattr(tasks, "run", lambda *a, **k: order.append("pytest") or 0)
+    monkeypatch.setenv("E2E_USER", "svc")
+    monkeypatch.setenv("E2E_PASSWORD", "pw")
+
+    rc = tasks.task_e2e([])
+
+    assert rc == 0, "灰度没等到也不该让整个 e2e 提前退出（其余用例仍有价值）"
+    assert order.index("ready") < order.index("gray") < order.index("pytest"), (
+        f"执行顺序不对：{order} —— 顺序必须是 等存活 → 等灰度 → 跑用例"
+    )
