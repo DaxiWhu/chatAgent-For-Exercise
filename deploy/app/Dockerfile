@@ -34,15 +34,50 @@ RUN apt-get update \
 # 在不同时间构建可能跑出不同行为 —— 这类故障排查成本极高（代码一样、结果不一样）。
 COPY requirements.txt requirements.lock ./
 ARG INSTALL_DOCLING=1
+# slim 变体的卸载清单**只放 docling 自己的重依赖**，不要顺手把 tiktoken 也删掉。
+#
+# ⚠️ `tiktoken` 不是 docling 的依赖，是 `langchain-openai` 的**硬依赖**：
+#       langchain-openai 1.1.11 requires tiktoken<1.0.0,>=0.7.0
+#   而 `langchain_openai` 在**模块导入期**就 `import tiktoken`（base.py:49），
+#   我们的导入链是 app.main → src.turn → src.agents.runner → frontline →
+#   specialists → tools → src.rag.retrieval → `from langchain_openai import ChatOpenAI`。
+#   于是把它卸掉 = **镜像一定起不来**：容器启动即 ModuleNotFoundError，
+#   而 /health/live 永远不通。实测（2026-11-06 CI）：容器 60 秒探活超时，
+#   日志里是 `ModuleNotFoundError: No module named 'tiktoken'`。
+#
+#   它只有几 MB，卸载它省不到什么，代价却是镜像完全不可用。
 RUN pip install -r requirements.txt -c requirements.lock \
  && if [ "$INSTALL_DOCLING" = "0" ]; then \
-      pip uninstall -y docling docling-core transformers tiktoken || true; \
+      pip uninstall -y docling docling-core transformers || true; \
     fi
 
 # 再拷贝代码（改代码只让这几层失效）
 COPY src ./src
 COPY app ./app
 COPY scripts ./scripts
+
+# 构建期自检：镜像必须能导入"服务启动必经的那条链"。
+#
+# 为什么在**构建期**验而不是等 CI 探活（这条是 2026-11-06 的真实事故）：
+# 探活失败的表现是"容器 60 秒没起来"，真因埋在 `docker logs` 里，排查要先绕一圈；
+# 构建期的报错直接指到缺哪个包。
+#
+# ⚠️ 必须放在 `COPY src/app` **之后** —— 导入的是本仓库的代码，代码没拷进来时
+# `import app.main` 必然 ModuleNotFoundError，那是位置错、不是依赖错。
+# 也刻意导入 `app.main` 而不只是 `import tiktoken`：它才是真正的启动路径，
+# 缺任何一环都在这里炸，而不是在部署后。
+#
+# ⚠️ 还得给一个**构建期假 Key**：`app.main` 导入期会走 `_assert_agents_ready()`，
+# 没配 `LLM_API_KEY` 就 `missing_api_key` 直接抛 RuntimeError。那本来是对的
+# （"能起来但答不出来"不该被放行），但它在构建期没有意义 —— 构建时不该有真凭据，
+# 凭据是**运行时**通过 `--env-file` / 编排注入的。所以这里只给一个明显是假的值，
+# 让"依赖是否齐全"这件事能被单独验证出来。
+#
+# 注意：这一步只验**导入**，不会发任何网络请求（构造 client 不需要连上游）。
+RUN LLM_API_KEY=sk-build-time-placeholder-not-a-real-key \
+    DB_URL= \
+    python -c "import app.main" \
+ && python -c "import tiktoken, langchain_openai; print('[build] INSTALL_DOCLING=$INSTALL_DOCLING 依赖自检通过')"
 
 # 非 root 运行：容器被攻破时的最小影响面
 RUN useradd -m appuser && chown -R appuser /app

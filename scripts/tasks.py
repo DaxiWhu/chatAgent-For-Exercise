@@ -366,8 +366,29 @@ def task_e2e(args: list[str]) -> int:
 
     # `--build` 让"镜像构建失败"与"起栈失败"分开定位 —— CI 里首次跑必然要构建，
     # 若不显式 build，构建错误会混在 `up` 的输出里，看起来像"服务起不来"。
-    print(f"[e2e] 起栈：{E2E_SERVICES}{'（先构建镜像）' if build else ''}", flush=True)
-    if compose(f"up -d{' --build' if build else ''} {E2E_SERVICES}", []) != 0:
+    #
+    # ⚠️ 构建必须**单独一步**先做完，不能只靠 `up --build`（2026-11-06 修）
+    # ------------------------------------------------------------------
+    # `app-canary` 刻意没有 `build:` 段（它的镜像是被发布脚本踢过来的，
+    # 见编排文件里那段说明），只有 `image: ${CANARY_IMAGE:-chatagent:<ver>}`。
+    # 而 `docker compose up --build` 的执行顺序是：**先并行拉取所有 image，
+    # 再去构建带 build 段的服务**。于是 canary 在"stable 还没构建出来"的那个瞬间
+    # 去找 `chatagent:0.2.0`，本地没有 ⇒ 转去 Docker Hub 拉 ⇒ 报
+    #   pull access denied for chatagent, repository does not exist
+    # 并让整条 up 失败。实测时序（CI）：13:38:51 canary 拉取失败 →
+    # 13:41:23 stable 才 `naming to docker.io/library/chatagent:0.2.0 done`。
+    #
+    # 所以这里先 `compose build app-stable` 把镜像造出来，再 `up -d`。
+    # 这样 canary 引用的同 tag 镜像**在本地已经存在**，compose 就不会去远端拉。
+    if build:
+        print("[e2e] 先构建镜像：app-stable（canary 复用同一个 tag，必须先存在）", flush=True)
+        if compose("build app-stable", []) != 0:
+            print("[e2e] ✗ 镜像构建失败（这一步与『起栈失败』分开报，便于定位）",
+                  file=sys.stderr, flush=True)
+            return 1
+
+    print(f"[e2e] 起栈：{E2E_SERVICES}", flush=True)
+    if compose(f"up -d {E2E_SERVICES}", []) != 0:
         return 1
 
     print(f"[e2e] 等待 {base}/health/live 就绪（最多 {wait:.0f}s）…", flush=True)

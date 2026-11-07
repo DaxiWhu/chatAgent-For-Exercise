@@ -385,6 +385,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ⚠️ 必须先**真的把模型下下来**，否则下面那条"全量测试"必然红（2026-11-06 首次真跑）
+      # ---------------------------------------------------------------------------
+      # `tests/conftest.py` 默认 `HF_HUB_OFFLINE=1`，它写着"这几个模型本来就在本地缓存里"，
+      # 前提是开发机跑过 `scripts/fetch_docling_models.py`（`models/` 有 430MB，**没入库**）。
+      # CI 的 runner 是干净环境，从来没缓存过 ⇒ docling 直接报：
+      #     Cannot find an appropriate cached snapshot folder ... HF_HUB_OFFLINE=0
+      # 于是 test_cite_images 里 5 条表格/扫描件用例全红，而它们红的真因是
+      # **"没下模型"**，不是"解析逻辑坏了"。
+      #
+      # 为什么是"在这里预取"而不是"把 HF_HUB_OFFLINE 关掉"：
+      # 关掉之后测试就**依赖网络**了 —— 网络一抖就是随机红，而且这类红会让人
+      # 学会"重跑一次就好"，门禁慢慢失效。所以口径是：**取模型时联网、测试时离线**。
+      # 这样"模型在不在"与"代码对不对"两件事各自独立、各自可解释。
+      #
+      # 用 `scripts/fetch_docling_models.py` 而不是 `docling --download-models`：
+      # 那个脚本正是为绕开 HF 缓存的符号链接与 .lock 删除问题写的（见其模块说明），
+      # 在受限的 CI runner 上更可靠；且它按 `docling` 自身读清单，不会随版本漂移。
+      - name: 预取 docling 模型（测试步骤随后仍走离线）
+        env:
+          HF_ENDPOINT: https://hf-mirror.com
+        run: |
+          set -eu
+          python scripts/fetch_docling_models.py models/docling --endpoint "$HF_ENDPOINT"
+          echo "已下载到 models/docling："
+          du -sh models/docling
+          # 自检：目录非空才算成功。脚本本身在失败时返回 1，这里再确认一次
+          # —— 免得"退出码被管道吃掉"这类问题让它静默通过。
+          test -d models/docling && [ -n "$(ls -A models/docling)" ] || {
+            echo "::error::models/docling 是空的 —— 测试会因缺少模型而全红"
+            exit 1
+          }
+
       - name: 全量测试（含 docling 解析链路）
         env:
           # 与 test job 同口径：清空外部依赖配置，确保走降级/离线路径
@@ -392,6 +424,13 @@ jobs:
           LLM_API_KEY: ""
           EMBEDDING_API_KEY: ""
           HF_ENDPOINT: https://hf-mirror.com
+          # 让 docling 直接从上面下好的目录加载，不经 HF 缓存（symbolic link / lock
+          # 那类问题在 CI 上同样存在，绕开它最稳）。
+          DOCLING_ARTIFACTS_PATH: models/docling
+          # 显式钉住离线：本步**不该**联网。若哪个用例偷偷去拉模型，
+          # 宁可立刻失败，也不要卡在 TLS 握手上等几分钟。
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
         run: pytest tests/ -q -p no:cacheprovider
 
   # ------------------------------------------------------------------

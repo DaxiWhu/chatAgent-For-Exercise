@@ -943,4 +943,160 @@ def test_e2e_env_step_fills_every_required_compose_variable(ci):
     )
 
 
+# ---------------------------------------------------------------------------
+# 镜像的 slim 变体：不许把"硬依赖"当成 docling 的包袱一起卸掉
+# ---------------------------------------------------------------------------
+# 2026-11-06 的真实事故（CI `image` job）
+# -------------------------------------
+# `INSTALL_DOCLING=0` 的卸载清单里带了 `tiktoken`，于是容器启动即
+#     ModuleNotFoundError: No module named 'tiktoken'
+# `/health/live` 60 秒不通，job 红在"容器没起来"上。
+#
+# 为什么 `tiktoken` 绝不能进那份清单：
+#   它是 `langchain-openai` 的**硬依赖**（`tiktoken<1.0.0,>=0.7.0`），
+#   而 `langchain_openai` 在**模块导入期**就 `import tiktoken`。
+#   我们的导入链 app.main → … → src.rag.retrieval → `from langchain_openai import ChatOpenAI`
+#   是服务启动的必经之路 ⇒ 卸掉它 = 镜像一定起不来。
+DOCKERFILE = ROOT / "deploy" / "app" / "Dockerfile"
+
+#: 无论装不装 docling 都必须存在的包（服务启动链上的硬依赖）。
+_MUST_SURVIVE_SLIM = ("tiktoken",)
+
+
+def test_slim_variant_does_not_uninstall_hard_dependencies():
+    """`INSTALL_DOCLING=0` 的 uninstall 清单里不许出现启动链的硬依赖。"""
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    m = re.search(r"pip uninstall -y ([^\n|;&]+)", text)
+    assert m, (
+        "Dockerfile 里找不到 slim 变体的 `pip uninstall -y ...` —— "
+        "要么写法变了，要么瘦身逻辑被删了，这条守卫需要同步更新"
+    )
+    removed = set(m.group(1).split())
+
+    for pkg in _MUST_SURVIVE_SLIM:
+        assert pkg not in removed, (
+            f"{pkg} 出现在 slim 变体的卸载清单里：{sorted(removed)}\n"
+            f"{pkg} 是 langchain-openai 的硬依赖，而 langchain_openai 在导入期就 import 它 ——"
+            " 卸掉它镜像一定起不来（容器 60 秒探活超时，真因藏在 docker logs 里）。"
+        )
+
+
+def test_dockerfile_self_checks_the_startup_import_chain():
+    """Dockerfile 必须在构建期验证"服务启动链"能导入。
+
+    为什么值得一条守卫：探活失败的表现是"容器 60 秒没起来"，真因埋在
+    `docker logs` 里；构建期报错直接指到缺哪个包，成本差一个量级。
+
+    两个细节都要断言，否则这条自检本身会变成"看起来在验、其实恒过"：
+      · 必须导入 `app.main`（真正的启动路径），不能只 `import tiktoken`；
+      · 必须在 `COPY src`/`COPY app` **之后** —— 代码没拷进来时导入必然失败，
+        那是位置错、不是依赖错，会让人误判。
+    """
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert "import app.main" in text, (
+        "Dockerfile 没有在构建期导入 app.main —— "
+        "镜像可能构建成功但一启动就 ImportError"
+    )
+
+    copy_pos = text.find("COPY app ./app")
+    check_pos = text.find("import app.main")
+    assert copy_pos != -1, "Dockerfile 里找不到 `COPY app ./app`"
+    assert check_pos > copy_pos, (
+        "构建期自检写在了 `COPY app ./app` 之前 —— 那时代码还没进镜像，"
+        "`import app.main` 必然失败，报的是位置错而不是依赖错"
+    )
+
+
+# ---------------------------------------------------------------------------
+# full-deps：必须先真的把模型下下来，测试步骤才可能绿
+# ---------------------------------------------------------------------------
+def test_full_deps_prefetches_docling_models_before_testing(ci):
+    """`full-deps` 必须在下测试之前预取模型，且测试步骤显式离线。
+
+    `tests/conftest.py` 默认 `HF_HUB_OFFLINE=1`，它写着"模型本来就在本地缓存里"
+    —— 前提是开发机跑过预取脚本（`models/` 430MB，**没入库**）。CI runner 是干净
+    环境 ⇒ 没有缓存 ⇒ docling 报
+        Cannot find an appropriate cached snapshot folder
+    于是表格/扫描件那 5 条用例全红，而真因是"没下模型"。
+
+    为什么口径是"预取时联网、测试时离线"而不是"把离线开关关掉"：
+    关掉之后测试就依赖网络了 —— 网络一抖就是随机红，这类红会训练人"重跑一次就好"，
+    门禁慢慢失效。分开之后，"模型在不在"与"代码对不对"各自独立可解释。
+    """
+    job = ci["jobs"]["full-deps"]
+    steps = job["steps"]
+    names = [str(s.get("name") or "") for s in steps]
+
+    # ① 存在预取步骤，且调用的是仓库里那个绕开 HF 缓存的脚本
+    prefetch_idx = next(
+        (i for i, s in enumerate(steps)
+         if "fetch_docling_models.py" in str(s.get("run", ""))),
+        None,
+    )
+    assert prefetch_idx is not None, (
+        "full-deps 没有预取 docling 模型 —— CI runner 没有模型缓存，"
+        "表格/扫描件用例会因为『没下模型』而红（真因不是解析逻辑坏了）"
+    )
+
+    # ② 预取必须在下测试之前
+    test_idx = next(
+        (i for i, s in enumerate(steps) if "pytest" in str(s.get("run", ""))),
+        None,
+    )
+    assert test_idx is not None, "full-deps 里找不到跑 pytest 的步骤"
+    assert prefetch_idx < test_idx, (
+        f"预取步骤（#{prefetch_idx} {names[prefetch_idx]!r}）排在测试步骤"
+        f"（#{test_idx} {names[test_idx]!r}）**之后** —— 那时测试已经红了"
+    )
+
+    # ③ 测试步骤必须显式钉住离线 + 指定 artifacts 目录
+    test_step = steps[test_idx]
+    env = test_step.get("env") or {}
+    assert str(env.get("HF_HUB_OFFLINE")) == "1", (
+        "full-deps 的测试步骤没有显式 HF_HUB_OFFLINE=1 —— "
+        "模型若缺，用例会卡在 TLS 握手上等几分钟，而不是立刻失败"
+    )
+    assert env.get("DOCLING_ARTIFACTS_PATH"), (
+        "full-deps 的测试步骤没有 DOCLING_ARTIFACTS_PATH —— "
+        "docling 会回去找 HF 缓存（symbolic link / .lock 问题在 CI 上同样存在）"
+    )
+
+
+# ---------------------------------------------------------------------------
+# e2e：起栈前必须先把镜像单独构建出来
+# ---------------------------------------------------------------------------
+def test_e2e_builds_the_image_before_starting_the_stack():
+    """`tasks.py e2e --build` 必须先单独 build，再 `up`。
+
+    `app-canary` 刻意没有 `build:` 段（它的镜像是发布脚本踢过来的），只有
+    `image: ${CANARY_IMAGE:-chatagent:<ver>}`。而 `docker compose up --build`
+    的执行顺序是**先并行拉取所有 image，再去构建带 build 段的服务** ——
+    于是 canary 在"stable 还没构建出来"的瞬间去找那个 tag，本地没有 ⇒
+    转去 Docker Hub 拉 ⇒ `pull access denied for chatagent` ⇒ 整条 up 失败。
+    实测时序（CI）：13:38:51 canary 拉取失败 → 13:41:23 stable 才构建完成。
+    """
+    tasks_py = (ROOT / "scripts" / "tasks.py").read_text(encoding="utf-8")
+
+    # ⚠️ 只看 `task_e2e` 函数体，**不要**在全文件里搜 —— 文件里还有
+    # `compose("up -d", args)`（起全栈）与 observability profile 那两处，
+    # 全局正则先命中它们，于是"up 里还带 --build"这个变异根本抓不到
+    # （实测过：第一版守卫就是这么漏掉的）。
+    m = re.search(r"\ndef task_e2e\(.*?(?=\ndef )", tasks_py, re.S)
+    assert m, "scripts/tasks.py 里找不到 task_e2e 函数"
+    body = m.group(0)
+
+    # 必须存在一次独立的 build（不是只靠 up --build）
+    assert re.search(r'compose\(\s*["\']build\s+app-stable["\']', body), (
+        "tasks.py 的 e2e 没有先单独 `compose build app-stable` —— "
+        "只用 `up --build` 时，app-canary 会在 stable 构建完成前就去远端拉镜像"
+    )
+    # 且 up 本身不该再带 --build（带了就说明顺序没改，只是加了一条无用语句）
+    up_line = re.search(r'compose\(\s*f?["\'][^"\']*up -d[^"\']*["\']', body)
+    assert up_line, "task_e2e 里找不到 `up -d` 调用"
+    assert "--build" not in up_line.group(0), (
+        f"`up` 命令里仍带 --build（{up_line.group(0)!r}）—— "
+        "那会让 compose 继续走『先并行 pull 再 build』的旧顺序"
+    )
+
+
 
