@@ -46,9 +46,24 @@ ARG INSTALL_DOCLING=1
 #   日志里是 `ModuleNotFoundError: No module named 'tiktoken'`。
 #
 #   它只有几 MB，卸载它省不到什么，代价却是镜像完全不可用。
+#
+# ⚠️ 卸载清单必须按**分发包名**写，不是按 import 名写（2026-11-07 撞出来的）。
+#   `docling` 从 2.x 某版起拆成了「元包 + `docling-slim`（真正的代码）+
+#   `docling-parse`（解析引擎）」三个分发包，而 `import docling` 这个名字来自
+#   `docling-slim`。所以原来只写 `pip uninstall docling docling-core`
+#   **只卸掉了那个空的元包**，真正的 docling 代码一直留在镜像里 ——
+#   证据是镜像漏洞扫描报告里出现 `docling-slim (METADATA) 2.129.0`。
+#   表现是"以为卸干净了、体积和漏洞都还在"，而没有任何一步会报错。
 RUN pip install -r requirements.txt -c requirements.lock \
  && if [ "$INSTALL_DOCLING" = "0" ]; then \
-      pip uninstall -y docling docling-core transformers || true; \
+      pip uninstall -y docling docling-slim docling-core docling-parse \
+                        docling-ibm-models transformers || true; \
+      for pkg in docling docling-slim docling-core; do \
+        if pip show "$pkg" >/dev/null 2>&1; then \
+          echo "ERROR: slim 变体里 $pkg 仍在 —— 卸载清单里的分发包名已过期"; \
+          exit 1; \
+        fi; \
+      done; \
     fi
 
 # 再拷贝代码（改代码只让这几层失效）

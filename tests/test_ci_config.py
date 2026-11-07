@@ -1030,6 +1030,41 @@ def test_slim_variant_does_not_uninstall_hard_dependencies():
         )
 
 
+def test_slim_variant_uninstalls_the_distribution_that_holds_the_code():
+    """瘦身清单必须按**分发包名**写，而且要包含 `docling-slim`。
+
+    `docling` 从 2.x 起拆成三块：`docling`（空元包）+ `docling-slim`（真正的代码）
+    + `docling-parse`（解析引擎）。`import docling` 这个名字属于 `docling-slim`。
+    所以只写 `pip uninstall -y docling` 只会卸掉那个空元包，
+    **代码一直在镜像里**，而没有任何一步会报错 ——
+    证据是镜像扫描报告里出现 `docling-slim (METADATA) 2.129.0`（2026-11-07）。
+    """
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    m = re.search(r"pip uninstall -y ([^\n|;&]+(?:\n\s+[^\n|;&]+)*)", text)
+    assert m, "Dockerfile 里找不到 slim 变体的卸载清单"
+    removed = set(m.group(1).replace("\\", " ").split())
+
+    assert "docling-slim" in removed, (
+        f"slim 变体的卸载清单里没有 docling-slim：{sorted(removed)}\n"
+        "`docling` 已经是空元包，真正的代码在 docling-slim 里 —— "
+        "只卸元包 = 以为瘦了，其实代码和漏洞都还在"
+    )
+
+
+def test_slim_variant_verifies_the_uninstall_actually_happened():
+    """卸完必须**自检**：指名的那几个包真的没了。
+
+    只写 `pip uninstall -y ... || true` 时，上游改名 / 名字写错都**静默通过**
+    （上一版就是这么漏掉 `docling-slim` 的：卸载命令返回 0，包还在）。
+    自检要覆盖"到底有没有真的卸掉"这一层，而不是只看命令返回码。
+    """
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert 'pip show "$pkg"' in text, (
+        "slim 变体卸完没有自检 —— `pip uninstall` 的名字写错时它照样返回 0，"
+        "镜像会带着本该卸掉的包继续构建（症状是体积和漏洞都没变）"
+    )
+
+
 def test_dockerfile_self_checks_the_startup_import_chain():
     """Dockerfile 必须在构建期验证"服务启动链"能导入。
 

@@ -41,11 +41,17 @@
 #    而是整条 `pip install` 命令当场退出。extras 只写在 `requirements.txt` 里
 #    （那里写着 `psycopg>=3.2`；要二进制 wheel 就在那边加 extras）。
 #    这条由 `tests/test_dependency_lock.py::test_lock_has_no_extras` 钉住。
-langgraph==1.1.2
+langgraph==1.2.20
 langgraph-checkpoint-postgres==3.0.5
-langchain-openai==1.1.11
+langchain-openai==1.7.4
 langchain-community==0.4.1
-langchain-text-splitters==1.1.1
+langchain-core==1.7.6
+langchain-classic==1.0.8
+langgraph-sdk==0.4.14
+msgpack==1.2.3
+urllib3==2.8.0
+setuptools==81.0.0
+langchain-text-splitters==1.1.3
 psycopg==3.3.3
 pydantic==2.12.5
 python-dotenv==1.2.1
@@ -59,7 +65,7 @@ redis==8.1.0
 # ---- 用户鉴权（第二档）----
 # JWKS 的 RS256/ES256 验签走 [crypto] extra（cryptography 是它的传递依赖，
 # 按本文件惯例只锁直接声明的那一个）。
-PyJWT==2.10.1
+PyJWT==2.14.0
 
 # ---- 可观测 / tracing ----
 # 直接 import 的包（app/tracing.py、scripts/trace_probe.py），按本文件惯例只锁直接依赖。
@@ -83,8 +89,9 @@ beautifulsoup4==4.14.3
 lxml==6.1.0
 
 # ---- RAG：Docling 解析层 ----
-docling==2.129.0
-docling-core==2.98.0
+docling==2.132.0
+pillow==12.3.0
+docling-core==2.106.0
 transformers==5.3.0
 tiktoken==0.12.0
 
@@ -101,6 +108,6 @@ lupa==2.8
 openai-agents==0.20.0
 # MCP 客户端（agents.mcp 的依赖，mcp_bridge 直接 import mcp.types）。
 # 版本来自本机实测（2026-10-23）：SDK 0.20.0 配套的就是这一版。
-mcp==1.27.0
+mcp==1.28.1
 # 官方 SQLAlchemySession 的异步引擎（PG 会话表）。
 sqlalchemy==2.0.48

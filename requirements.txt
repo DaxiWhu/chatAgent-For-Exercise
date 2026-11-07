@@ -1,9 +1,25 @@
 # ---- 核心运行时 ----
-langgraph>=0.3
+# ⚠️ 这一族的下限是**被漏洞修复版本倒推出来的**，不是"顺手升到最新"（2026-11-07）。
+#    镜像漏洞门禁（trivy）第一次真跑就红了 45 条，其中三处的修复版互相牵引：
+#      langchain-classic 1.0.2 → 1.0.8   （CVE-2026-45134）
+#      langgraph-sdk     0.3.15 → 0.4.14 （CVE-2026-104873，授权绕过）
+#    但 langgraph 1.1.2 写死了 `langgraph-sdk<0.4.0`，而 sdk 0.4.x 又要求
+#    `langchain-core>=1.4.0`，classic 1.0.8 同理 ⇒ **不能单升其中任何一个**，
+#    只能整条链一起走。所以下面几行的下限必须同时满足，改一行就可能回到"装不上"。
+langgraph>=1.2.20
+# 下限单独钉住，不靠 langgraph 的 `>=0.4.0` 兜着：那个区间里仍有 <0.4.14 的版本，
+# 而漏洞修复点是 0.4.4 —— 只写 `>=0.4.0` 时，装到哪个版本取决于解析时的偶然。
+langgraph-sdk>=0.4.14
 langgraph-checkpoint-postgres>=2
-langchain-openai>=0.3
+langchain-openai>=1.7.4
 langchain-community>=0.3
-langchain-text-splitters>=0.3
+langchain-core>=1.7.6
+langchain-classic>=1.0.8
+langchain-text-splitters>=1.1.3
+# 传递依赖，但**必须显式约束**：它的修复版（1.2.3）不会自动被选中 ——
+# 上游只写 `msgpack>=1.0` 之类，装到哪个版本取决于当时 PyPI 的最新。
+# 症状是"同一份代码、两次构建，漏洞扫描一红一绿"。CVE-2026-114613（内存泄漏 DoS）。
+msgpack>=1.2.3
 # ⚠️ `[binary]` extra 不能省 —— 少了它镜像里装的是**纯 Python 实现**，
 # 没有 libpq，运行时表现是 `/health/ready` 的 `checks.db.ok=false`：
 #
@@ -51,7 +67,12 @@ redis>=5.0
 # 也不要"配了 OIDC 却静默不生效"（那会表现为"用户全都登不上"而无一行报错）。
 # 注意 PyJWT 2.10 起自己会拒绝"用非对称公钥做 HMAC 密钥"，这层防护**不能依赖**
 # （换版本就没了），服务端的算法白名单才是防线（见 app/auth.py 的 verify）。
-PyJWT[crypto]>=2.8
+#
+# ⚠️ 下限 2.14.0 是安全修复版（CVE-2026-102268，CRITICAL：公钥处理不当导致
+#    认证绕过）。我们用的是 HS256 对称密钥，该路径理论上走不到 —— 但"这次走不到"
+#    不是可以长期挂着 CRITICAL 的理由：`verify` 支持多种算法，而限制算法集合是
+#    配置项，配置一改就成立。
+PyJWT[crypto]>=2.14.0
 # LLM 链路 tracing（二选一即可）。不装则完全不上报，行为与没有这层代码一致。
 # langfuse>=2.0
 # LangSmith 有两条**互不相干**的路，别混为一谈：
@@ -83,7 +104,14 @@ openai-agents>=0.20
 #   ① `src/agents/mcp_bridge.py` 直接 `from mcp.types import ...`（转换层按内容块类型
 #      分支），依赖一个只存在于传递关系里的包，等于上游调整依赖树时我们会静默失去类型；
 #   ② 直接 import 的包必须有显式版本约束，否则"这次构建装到哪个版本"是不可复现的。
-mcp>=1.0
+#
+# ⚠️ 下限 1.28.1 是安全修复版。三条 CVE 的修复点是分开的：
+#    CVE-2026-52869 / 52870 → 1.27.2；CVE-2026-59950 → **1.28.1**。
+#    只升到 1.27.2 会留下第三条（第一次真跑就是这么以为够了的）。
+#    影响面：HTTP 传输会把**同一个会话**的请求串给别的调用方。我们目前只走 stdio
+#    子进程，该路径不在使用中 —— 但桥接层的 transport 是可配置的
+#    （`src/agents/mcp_bridge.py`），补丁级升级没有代价，不拿"当前不用"当永久豁免。
+mcp>=1.28.1
 # 官方 SQLAlchemySession 用它建异步引擎（PG 的 agent_sessions / agent_messages 两张表）。
 # SDK 把它列为可选 extra（`pip install "openai-agents[sqlalchemy]"`），这里显式列出：
 # **选了 PostgreSQL 会话后端它就必需**。漏装的症状是运行期才炸（`session_for` 建不起来
@@ -130,10 +158,33 @@ lxml>=5.0                    # bs4 的解析后端
 #   python -c "from pathlib import Path; from docling.utils.model_downloader import download_models; download_models(output_dir=Path('models/docling'))"
 # 之后把 DOCLING_ARTIFACTS_PATH 指向该目录即可，运行时不再联网。
 # 国内直连 huggingface.co 常超时，下载时需设 HF_ENDPOINT 走镜像。
-docling>=2.129               # 版式检测/表格识别/图片分类/OCR
+#
+# ⚠️ 下限 2.132 是安全修复版（CVE-2026-105744：任意文件读写）。
+# ⚠️ **pillow 不能升到 13**：docling-slim 的 standard/convert-core/extract-core
+#    extra 里写着 `pillow<13.0.0,>=10.0.0`，而 `docling` 元包会带上 standard
+#    ⇒ pillow 13 与 docling 在依赖层面**互斥**（实测 `pip install docling pillow==13`
+#    直接 ResolutionImpossible）。因此 pillow 的几条 HIGH/CRITICAL 只能走
+#    `.trivyignore` 挂账（带到期日），等 docling 放开上限再清。详见该文件。
+#
+#    上限**显式写出来**，不靠 docling 的 cap 兜着：只写 `pillow>=12` 的话，
+#    "装到哪个 12.x"取决于解析时的偶然（不可复现）。这条同时是**复查点** ——
+#    docling 一放开 `pillow<13`，就把这里改成 `>=13` 并清掉 .trivyignore 里那批。
+pillow>=12.3.0,<13
+docling>=2.132               # 版式检测/表格识别/图片分类/OCR
 docling-core[chunking]>=2.98 # HybridChunker 结构感知切分(依赖 semchunk)
 transformers>=4.40           # 切分 tokenizer(与 embedding 模型对齐)
 tiktoken>=0.7                # 离线 tokenizer 兜底(拉不到 HF tokenizer 时用)
+
+# ---- 安全下限：这三条不是"我们要用"，而是"要压住镜像里的旧版本" ----
+# 它们的共同点是**下限不会自己上去**：基础镜像里带着旧版，或者上游只写宽松的
+# `>=`，于是同一个 commit 在不同时间构建会装到不同版本，漏洞扫描一红一绿。
+#
+# urllib3：CVE-2026-97687 / 97689（修复 2.8.0）。走 requests 的路径才用到。
+urllib3>=2.8.0
+# setuptools：CVE-2025-47273（修复 78.1.1）。它不是运行时依赖，但
+#   `python:3.13-slim` 基础镜像自带 70.3.0，而 trivy 扫的是**镜像里装了什么**，
+#   不管它是不是运行时路径 ⇒ 不压住它，这条会永远红。
+setuptools>=78.1.1
 
 # ---- 测试 ----
 pytest>=8.0
