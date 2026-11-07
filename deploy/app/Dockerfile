@@ -23,8 +23,17 @@ WORKDIR /app
 
 # libgl1 / libglib2.0-0：opencv（docling 依赖）运行时需要；
 # curl：给 HEALTHCHECK 用。
+#
+# ⚠️ `zlib1g` 是**显式列出来升级**的，不是"多装一个包"（2026-11-07 第四次真跑）：
+#   基础镜像自带的 1:1.3.dfsg+really1.3.1-1+b1 有两条 HIGH
+#   （CVE-2026-76844 路径穿越 / CVE-2026-85091 gz_vacate 堆溢出，可导致任意代码执行），
+#   修复版 `1:...+deb13u1` 已在 trixie 的安全源里。`python:3.13-slim` 打包时间早于
+#   该修复 ⇒ 光靠从基础镜像继承，这两条会一直挂在扫描报告里。
+#   显式写出来 apt 就会把已装的 zlib1g **升到候选版本**（同版本时是空操作，无副作用）。
+#   证据：镜像扫描里 debian 目标从 2 条降到 0 条。
+#   注意 apt 列表在同一层里删掉了，所以升级必须发生在**这一层**（`rm -rf .../lists` 之前）。
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 curl \
+ && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 curl zlib1g \
  && rm -rf /var/lib/apt/lists/*
 
 # 先只拷贝依赖清单：依赖没变时这层走缓存，不必每次重装几个 GB

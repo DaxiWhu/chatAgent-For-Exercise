@@ -563,6 +563,22 @@ jobs:
       # `scripts/hash_password` 能 import `app.auth`，实测其依赖链
       # （app/auth → app/config、app/metrics）**全是标准库**（哈希是 `hashlib.pbkdf2_hmac`），
       # 唯一的外部依赖是 `python-dotenv`（用于读 `.env`；缺失时会静默退化，但装上更贴近真实部署）。
+      #
+      # ⚠️ 这份清单是**契约**，不是"差不多够用"（2026-11-07 第四次真跑）
+      # ------------------------------------------------------------------
+      # 那天 6 条 e2e 用例**全部 ERROR**（不是断言失败，是 setup 阶段）：
+      #     ModuleNotFoundError: No module named 'langchain_openai'
+      # 看起来像"少了依赖，补上就行"，真因却在 `tests/conftest.py`：一条 autouse
+      # fixture 在 import 期把 `src.rag.retrieval` 拖了进来，而它模块级就
+      # `from langchain_openai import ChatOpenAI`。也就是说，一个**只发 HTTP 请求**
+      # 的黑盒进程被塞进了整棵服务端依赖树。
+      #
+      # 修法是让那条 fixture 在缺依赖时什么都不做，**不是**往这里加 langchain-openai：
+      # 黑盒进程里根本不存在 retrieval 的进程级状态需要重置，那种"补依赖"式的修法
+      # 会让这份清单一路腐化（今天 langchain-openai、明天 docling、后天 torch）。
+      # 守卫：tests/test_ci_config.py 里的
+      #   `test_e2e_job_stays_a_black_box_client`（清单里不许有服务端依赖）
+      #   `test_conftest_loads_without_server_side_dependencies`（真跑一遍黑盒加载）
       - name: 安装最小依赖
         run: |
           python -m pip install --upgrade pip
@@ -779,6 +795,38 @@ jobs:
           fi
           echo "探活通过：$(curl -fsS http://localhost:8000/health/live)"
           docker logs chatagent-ci || true
+
+      # 扫描结论的**前提**：镜像里到底装了什么（2026-11-07 第四次真跑）
+      # ------------------------------------------------------------------
+      # 那次扫描报了 msgpack 1.1.2 / setuptools 70.3.0 / urllib3 2.7.0，而同一份
+      # 报告的 python-pkg 明细里明明写着 msgpack-1.2.3 / setuptools-81.0.0 /
+      # urllib3-2.8.0，三者的漏洞数都是 0；构建日志也是"Successfully installed 1.2.3"。
+      # 也就是说：**同一个镜像里出现两套版本**，而报告只给了"目标: Python"这种
+      # 不带路径的写法，看不出第二套在哪。
+      #
+      # 与其猜（"缓存层？SBOM？第二份 site-packages？"），不如把这件事本身变成一个
+      # 可读的输出：发行版元数据的真实路径 + 有没有 SBOM 文件。这三行在正常运行时
+      # 只花两秒，但它决定了扫描红的时候"该改代码"还是"该改扫描口径"。
+      - name: 镜像内容自检（扫描结论的前提）
+        run: |
+          set -eu
+          echo "── 这几个包在镜像里到底是哪个版本、来自哪个 dist-info ──"
+          docker run --rm --entrypoint python chatagent:ci - <<'PY'
+          from importlib import metadata
+          targets = {"msgpack", "setuptools", "urllib3", "pillow", "rapidocr", "onnxruntime"}
+          found = False
+          for dist in metadata.distributions():
+              name = (dist.metadata["Name"] or "").strip()
+              if name.lower() in targets:
+                  found = True
+                  where = getattr(dist, "_path", "?")
+                  print(f"{name}=={dist.version}  <- {where}")
+          if not found:
+              print("[自检] 一个都没找到（说明依赖没装进镜像）")
+          PY
+          echo "── 镜像里有没有 SBOM 类文件（trivy 会优先用它，从而与文件系统不一致）──"
+          docker run --rm --entrypoint sh chatagent:ci -c \
+            'find / -xdev \( -name "*.spdx.json" -o -name "*.cdx.json" -o -iname "*sbom*.json" \) 2>/dev/null | head -20; echo "[自检结束]"'
 
       # ⚠️ 从 v0.28.0 升到 v0.36.0（2026-11-06），原因是 **v0.28.0 已经坏了**，
       #    不是"顺手升个新版本"。它的 `action.yaml` 里写的是：

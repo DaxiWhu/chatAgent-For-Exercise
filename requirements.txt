@@ -172,6 +172,30 @@ lxml>=5.0                    # bs4 的解析后端
 #    docling 一放开 `pillow<13`，就把这里改成 `>=13` 并清掉 .trivyignore 里那批。
 pillow>=12.3.0,<13
 docling>=2.132               # 版式检测/表格识别/图片分类/OCR
+# ⚠️ OCR 的**推理后端**必须单独声明 —— docling 只把它的一半带进来（2026-11-07）
+# ---------------------------------------------------------------------------
+# `docling` 的 standard extra 会装 `rapidocr`（OCR 引擎），但 rapidocr 3.x 把
+# **推理后端**拆成了 extra（`rapidocr[onnxruntime]` / `[openvino]` / `[paddle]` /
+# `[torch]`），默认**一个都不装**。而 `docling_loader` 的默认后端正是
+# `onnxruntime`（`DOCLING_OCR_BACKEND` 默认值，与预取脚本下载的权重对齐）。
+#
+# 缺了它的表现不是"OCR 慢一点"，而是**扫描件整条链路失败**：
+#     Stage ocr failed for run 1: onnxruntime is not installed.
+#     ⇒ ParseOutcome(status='failed') ⇒ 调用方降级到 pdfminer，扫描件没有文字层 ⇒ 无内容
+# 连带 3 条用例红：`test_scanned_pdf_text_is_recovered_by_ocr`、
+# `test_scanned_pdf_returns_the_whole_page`、`test_unprocessable_scan_still_returns_the_page_image`
+# （最后一条尤其误导：它期望 `unprocessable`，实得 `failed` —— 看起来像状态机口径错了，
+#  实际是 OCR 压根没跑起来）。
+#
+# 为什么本地一直没发现：开发机 7 月就单独装过 `onnxruntime`（`pip list` 里有、
+# 两份清单里都没有），而测试只在**干净环境**里才会暴露这类漏装。同一族的历史案例：
+# `greenlet`（agent-session-pg job 6 条全 error）、`psycopg[binary]`（e2e 的 ready 变黄）。
+#
+# 为什么不写成 `rapidocr[onnxruntime]` 一行：约束文件里**不能有 extras**
+# （`test_lock_has_no_extras`，pip 是解析期硬错误），拆成两行才能让 lock 同时钉住
+# 引擎与后端的精确版本 —— 否则"装哪个后端、哪个版本"又变回不可复现。
+rapidocr>=3.9.1              # OCR 引擎（docling[standard] 会带进来，显式写出来是为了能被钉版本）
+onnxruntime>=1.20            # rapidocr 的默认推理后端，缺了 OCR 阶段直接 failed
 docling-core[chunking]>=2.98 # HybridChunker 结构感知切分(依赖 semchunk)
 transformers>=4.40           # 切分 tokenizer(与 embedding 模型对齐)
 tiktoken>=0.7                # 离线 tokenizer 兜底(拉不到 HF tokenizer 时用)

@@ -90,6 +90,10 @@ lxml==6.1.0
 
 # ---- RAG：Docling 解析层 ----
 docling==2.132.0
+# OCR 引擎与它的推理后端。docling 只带引擎（rapidocr），后端是 rapidocr 的 extra，
+# 默认不装 —— 缺了 onnxruntime 扫描件解析直接 failed（2026-11-07 CI 真跑撞出来）。
+rapidocr==3.9.2
+onnxruntime==1.25.1
 pillow==12.3.0
 docling-core==2.106.0
 transformers==5.3.0

@@ -312,8 +312,32 @@ def _reset_rag_embedding_cooldown_each_test():
     的用例都拿到 ``NullRetriever``，连 ``test_vector_store`` 里"默认走内存后端"
     那种断言都会红 —— 而单跑那个文件又是绿的。出错地点与原因离得太远，
     所以由框架兜住，不靠每个文件自觉。
+
+    ⚠️ 本进程**没装服务端依赖**时，这个 fixture 什么也不做（2026-11-07 第四次真跑）
+    ------------------------------------------------------------------------
+    `e2e` job 刻意只装 `pytest` + `python-dotenv`（它的说明里写着"唯一的外部依赖是
+    python-dotenv"）：被测服务跑在容器里，本进程只发 HTTP 请求。而
+    `src.rag.retrieval` 在**模块级** `from langchain_openai import ChatOpenAI`，
+    于是这条 autouse fixture 把**整个服务端依赖树**拖进了一个纯黑盒测试进程 ——
+    表现不是断言失败，而是 6 条 e2e 用例**全部 ERROR**（setup 阶段就炸）：
+
+        ModuleNotFoundError: No module named 'langchain_openai'
+
+    反过来"给 e2e 装上 langchain-openai"也能绿，但那是拿补依赖掩盖越界：
+    黑盒进程里根本不存在 `_EMBED_DOWN_UNTIL` 这个进程级状态，它从来不需要被重置。
+    所以这里选择"导入不了就跳过"，而不是"让 e2e 把服务端依赖装一遍"。
+
+    跳过是否会让守卫失效？不会：这个 fixture 守的是"跨文件静默污染"，而**能**被污染的
+    环境（test / full-deps）都装齐了依赖，import 不会失败；反过来若 retrieval 的导入
+    链本身坏了，几十个直接 import 它的用例会当场红，藏不住。这里只吞
+    `ModuleNotFoundError`（依赖缺失），其它异常照常抛出。
     """
-    from src.rag import retrieval
+    try:
+        from src.rag import retrieval
+    except ModuleNotFoundError:
+        # 纯黑盒环境（e2e）：本进程不会触碰 retrieval 的任何状态，无需重置。
+        yield
+        return
 
     retrieval.reset_embedding_cooldown()
     yield

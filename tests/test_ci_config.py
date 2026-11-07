@@ -1183,4 +1183,109 @@ def test_e2e_builds_the_image_before_starting_the_stack():
     )
 
 
+# ---------------------------------------------------------------------------
+# e2e job 的「最小依赖」是一份契约
+# ---------------------------------------------------------------------------
+# 这一节守的不是 YAML 里某一行写没写，而是**这份清单能不能一直保持最小**。
+# 2026-11-07 第四次真跑，e2e 的 6 条用例**全部 ERROR**（不是断言失败，是 setup 阶段）：
+#
+#     ModuleNotFoundError: No module named 'langchain_openai'
+#
+# 真因不在 e2e，而在 `tests/conftest.py` 的一条 autouse fixture：它 import
+# `src.rag.retrieval`，而那个模块**模块级**就 `from langchain_openai import ChatOpenAI`。
+# 于是一个"只发 HTTP 请求"的黑盒测试进程，被强行拖进整棵服务端依赖树。
+#
+# 当时有两条修法：① 让 fixture 在缺依赖时什么都不做；② 往 e2e 的安装清单里加
+# `langchain-openai`。选 ① 的理由不是省事，而是**职责**：黑盒进程里根本不存在
+# retrieval 的进程级状态（`_EMBED_DOWN_UNTIL`），这条 fixture 对它没有任何意义。
+# 选 ② 会让"最小依赖"这条口径开始腐蚀 —— 今天加 langchain-openai，明天 docling、
+# 后天 torch，最后 e2e 变成一个装满服务端依赖却只发 HTTP 的进程。
+#
+# 所以这里钉两件事：清单里不许出现服务端依赖；以及**在那种环境里 conftest 真的能加载**。
+def _e2e_install_step(ci_cfg):
+    for job_name, _job, step in _iter_steps(ci_cfg):
+        if job_name != "e2e":
+            continue
+        if "pip install" in str(step.get("run", "")):
+            return step
+    return None
+
+
+def test_e2e_job_stays_a_black_box_client(ci):
+    """e2e 的安装清单里不该出现**服务端**依赖。
+
+    它测的是"容器里的服务能不能用"，本进程只负责发 `urllib` 请求 + 签一个 JWT。
+    加进 `langchain-*` / `docling` / `torch` 这类包，等于把 e2e 变成"半个全量测试"，
+    而且会掩盖"某条本地 fixture 越界"这类问题（这正是 2026-11-07 那次的原因）。
+    """
+    step = _e2e_install_step(ci)
+    assert step is not None, "e2e job 里找不到安装依赖的步骤"
+    run = str(step.get("run", ""))
+    for forbidden in ("langchain", "docling", "torch", "transformers", "openai-agents"):
+        assert forbidden not in run, (
+            f"e2e 的安装清单里出现了服务端依赖 {forbidden!r}：\n{run}\n"
+            "它是黑盒客户端（被测服务在容器里），加服务端依赖会让这份清单失去意义。"
+            "如果是因为 conftest 里的 fixture 越界，请修 fixture，而不是补依赖。"
+        )
+
+
+def test_conftest_loads_without_server_side_dependencies(tmp_path):
+    """**行为**校验：只装 pytest + python-dotenv 的环境里，conftest 必须能加载。
+
+    为什么不写成"断言 conftest.py 的源码里有 try/except"：那种断言在把
+    try/except 换成别的写法（比如 `importlib.util.find_spec` 预判）后会误报，
+    而它想防的事（"纯黑盒进程里 setup 就炸"）**一次都没被真正验证**。
+
+    这里用子进程复现 e2e 的真实处境：
+      · 一个 `meta_path` 拦截器让 `import langchain_openai` 抛 ModuleNotFoundError
+        —— 与"这台机器没装它"对 Python 而言是同一件事；
+      · `-p tests.conftest` 把仓库的 conftest 当插件装进来（探针文件在 tmp 下，
+        不会被自动发现），于是它的 autouse fixture 会真的跑起来；
+      · 探针用例本身什么都不做，**它能通过就说明 fixture 没有把服务端依赖拖进来**。
+
+    ⚠️ 变异验证（2026-11-07 实测）：把 fixture 里的 `except ModuleNotFoundError`
+    改成 `except ZeroDivisionError`，这条用例立刻红，报的正是 CI 上那句
+    `ModuleNotFoundError: No module named 'langchain_openai'`。
+    """
+    import os
+    import subprocess
+    import sys
+
+    blocker = tmp_path / "block_langchain.py"
+    blocker.write_text(
+        "import sys\n"
+        "\n"
+        "\n"
+        "class _Blocker:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name == 'langchain_openai' or name.startswith('langchain_openai.'):\n"
+        "            raise ModuleNotFoundError(f'No module named {name!r}', name=name)\n"
+        "        return None\n"
+        "\n"
+        "\n"
+        "sys.meta_path.insert(0, _Blocker())\n",
+        encoding="utf-8",
+    )
+
+    probe = tmp_path / "test_probe.py"
+    probe.write_text("def test_probe():\n    assert True\n", encoding="utf-8")
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(tmp_path)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+    )
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", str(probe), "-q",
+         "-p", "tests.conftest", "-p", "block_langchain",
+         "-p", "no:cacheprovider"],
+        cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode == 0, (
+        "在没有 langchain_openai 的环境里，conftest 加载失败了 —— 这正是 e2e job "
+        "（只装 pytest + python-dotenv）会踩的坑。\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+
+
 

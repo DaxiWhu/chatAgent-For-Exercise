@@ -222,3 +222,61 @@ def test_psycopg_is_declared_with_the_binary_extra():
         f"requirements.lock 里不该有 extras（现在是 {lock_spec!r}）—— "
         "extras 只写在 requirements.txt，lock 只钉版本"
     )
+
+
+def _ver(text: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.split(r"[.+]", text) if x.isdigit())
+
+
+def test_ocr_inference_backend_is_declared_with_its_engine():
+    """OCR 的引擎（rapidocr）与**推理后端**（onnxruntime）都必须显式声明并锁版本。
+
+    为什么这条不能靠"docling 会带进来"
+    ----------------------------------
+    `docling` 的 standard extra 只带**引擎** `rapidocr`；rapidocr 3.x 把推理后端
+    拆成了 extra（`[onnxruntime]` / `[openvino]` / `[paddle]` / `[torch]`），
+    **默认一个都不装**。而 `docling_loader` 的默认后端就是 `onnxruntime`
+    （`DOCLING_OCR_BACKEND` 缺省值，与 `scripts/fetch_docling_models.py` 下载的
+    权重对齐）⇒ 缺了它的表现是**扫描件整条链路失败**，不是"OCR 稍微差一点"：
+
+        Stage ocr failed for run 1: onnxruntime is not installed.
+        ⇒ ParseOutcome(status='failed') ⇒ 降级 pdfminer ⇒ 扫描件没有文字层 ⇒ 空内容
+
+    2026-11-07 的 `full-deps` job 就是这么红的 3 条：两条 `test_cite_images`
+    加一条 `test_docling_loader::test_scanned_pdf_text_is_recovered_by_ocr`
+    （其中"期望 unprocessable、实得 failed"那条最误导 —— 看起来像状态机口径错了）。
+
+    ⚠️ 本地一直测不出来，是因为开发机 7 月就单独装过 onnxruntime：
+    `pip list` 里有、两份清单里都没有。这与 `greenlet`（agent-session-pg 全 error）、
+    `psycopg[binary]`（e2e 的 ready 变黄）是同一族故障 —— **只有干净环境才暴露**。
+
+    判据三条，缺一条风险就回来：
+      ① requirements.txt 声明了 onnxruntime，且带下限；
+      ② requirements.lock 钉了精确版本（否则"装哪个后端版本"不可复现）；
+      ③ 引擎 rapidocr 也被声明 —— docling 只写 `rapidocr>=3.9.1` 这种宽松下限，
+         不显式声明就永远拿不到"我们验证过的那一版"。
+    """
+    specs = dict(_parse(REQ))
+    pins = _lock_pins()
+
+    backend = specs.get("onnxruntime")
+    assert backend, (
+        "requirements.txt 没声明 onnxruntime —— 它是 docling 那条链里**唯一不会**"
+        "被自动装上的运行时（rapidocr 把它做成了 extra）。缺了它扫描件解析直接 failed。"
+    )
+    m = re.match(r">=\s*([0-9][0-9.]*)", backend)
+    assert m, f"onnxruntime 的约束应是 >=x.y 的下限形式，现在是 {backend!r}"
+
+    pin = pins.get("onnxruntime")
+    assert pin, "requirements.lock 没钉 onnxruntime —— 推理后端版本会随构建时间漂移"
+    assert _ver(pin) >= _ver(m.group(1)), (
+        f"lock 钉的 onnxruntime {pin} 低于清单下限 {m.group(1)}"
+    )
+
+    engine = specs.get("rapidocr")
+    assert engine, (
+        "requirements.txt 没声明 rapidocr —— 它只是 docling 的传递依赖，"
+        "上游一升下限就会换掉我们验证过的 OCR 引擎版本"
+    )
+    assert pins.get("rapidocr"), "requirements.lock 没钉 rapidocr"
+
