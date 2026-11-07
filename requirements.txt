@@ -111,7 +111,7 @@ openai-agents>=0.20
 #    影响面：HTTP 传输会把**同一个会话**的请求串给别的调用方。我们目前只走 stdio
 #    子进程，该路径不在使用中 —— 但桥接层的 transport 是可配置的
 #    （`src/agents/mcp_bridge.py`），补丁级升级没有代价，不拿"当前不用"当永久豁免。
-mcp>=1.28.1
+mcp>=2.3.0
 # 官方 SQLAlchemySession 用它建异步引擎（PG 的 agent_sessions / agent_messages 两张表）。
 # SDK 把它列为可选 extra（`pip install "openai-agents[sqlalchemy]"`），这里显式列出：
 # **选了 PostgreSQL 会话后端它就必需**。漏装的症状是运行期才炸（`session_for` 建不起来
