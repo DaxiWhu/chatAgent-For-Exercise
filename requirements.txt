@@ -84,10 +84,11 @@ PyJWT[crypto]>=2.14.0
 # ⚠️ 不写这一行也装得上，它是 langchain-core 的传递依赖。但**传递依赖的版本不由我们定**：
 # 上游哪天把下限降回没有该集成的版本，app/tracing.py 的 import 就会失败并**静默降级**
 # （只剩一行 warning、服务照常起）⇒ 症状是"配了 key、平台没数据"。显式声明 + 锁版本消灭这一类。
-# 下限写成 0.9.1 是**本机实测可用**的那一版（lock 里钉的就是它）；该集成从哪一版开始有，
-# 没有逐一回溯，所以门槛取实测值，不猜一个更早的数。
-# 接入或改动前先离线验证转换层：python scripts/trace_probe.py（零成本、不发网络）。
-langsmith[openai-agents]>=0.9.1
+# 下限原来写 0.9.1（本机实测可用的那版）；2026-11-07 随 langchain-core 1.7.6 一起
+# **被倒推上调到 0.14.17** —— core 1.7.6 自己要求 `langsmith>=0.14.x`，
+# 锁在 0.9.1 会让 `pip install -r requirements.txt -c requirements.lock` 直接
+# ResolutionImpossible（第二次真跑撞到的就是这个：镜像构建在解析阶段就退出）。
+langsmith[openai-agents]>=0.14.17
 # 指标：app/metrics.py 自带 Prometheus 文本输出，**无需** prometheus-client。
 
 # ---- agent 链路（src/agents/，官方 openai-agents SDK）----

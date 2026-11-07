@@ -72,7 +72,7 @@ PyJWT==2.14.0
 # ⚠️ 钉住它的理由同 redis：不是"装了就行"，而是"版本不到就没有 openai_agents_sdk 这个
 #    集成"。缺了不会报错，只会静默降级为不产生 trace（症状：配了 key、平台没数据）。
 #    版本 0.9.1 = 本仓库实测跑通 trace_probe 自检与真依赖挂载的那一版。
-langsmith==0.9.1
+langsmith==0.14.17
 
 # ---- RAG：检索 ----
 scikit-learn==1.8.0
