@@ -61,12 +61,39 @@ def test_under_the_limit_passes(monkeypatch):
 
 
 def test_at_the_limit_trips(monkeypatch):
-    """判据是 ``>=``：正好到点就停，不等下一圈。"""
+    """判据是 ``>=``：正好到点就停，不等下一圈。
+
+    ⚠️ 边界**不能拿真钟去撞**（2026-11-07 远端 CI run 26 实测：这条 1/2 概率红，
+    报 ``DID NOT RAISE``，而本机怎么跑都是绿的）。
+
+    原因在浮点，不在判据：``_ctx_aged(60)`` 写的是 ``started_at = monotonic() - 60``，
+    这个减法按 ~1e-10 量级舍入；``elapsed()`` 再算一次 ``monotonic() - started_at``。
+    只要两次 ``monotonic()`` 落在**同一刻度**（粗粒度时钟、或执行够快），
+    结果就是 ``60 ± 舍入误差`` —— 落在 60 下方时判据不触发。
+    本机时钟是纳秒级、两次调用差 100ns 量级，差值永远把这点误差盖掉，
+    所以本地永远撞不到，只有换了机器才现形。
+
+    ⇒ 这里把 ``elapsed`` 钉成精确的 60.0，只测 ``check`` 的**比较**；
+      ``elapsed()`` 自己的算术由 ``test_mark_start_and_elapsed`` 覆盖。
+      两件事分开之后，这条判据与机器时钟的粒度无关。
+    """
     monkeypatch.setenv("AGENT_RUN_TIMEOUT_SECONDS", "60")
+    monkeypatch.setattr(deadline, "elapsed", lambda _ctx: 60.0)
     with pytest.raises(deadline.AgentStoppedByDeadline) as exc:
-        deadline.check(_ctx_aged(60))
+        deadline.check(TaskContext())
     assert exc.value.limit_seconds == 60
-    assert exc.value.elapsed_seconds >= 60
+    assert exc.value.elapsed_seconds == 60.0
+
+
+def test_just_under_the_limit_passes(monkeypatch):
+    """边界的另一侧：**差一点**就不停。
+
+    与上一条配对：只测"到点停"的话，把判据写成 ``<=``（差一点也停）同样能过。
+    两条一起才钉住 ``>=`` 这**一侧**的语义。
+    """
+    monkeypatch.setenv("AGENT_RUN_TIMEOUT_SECONDS", "60")
+    monkeypatch.setattr(deadline, "elapsed", lambda _ctx: 59.999)
+    deadline.check(TaskContext())
 
 
 def test_the_stop_is_counted(monkeypatch):
