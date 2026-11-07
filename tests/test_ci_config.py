@@ -143,6 +143,55 @@ def test_ci_smoke_fails_the_job_on_boot_failure(ci):
     )
 
 
+def test_ci_smoke_gives_the_key_the_service_refuses_to_start_without(ci):
+    """探活必须传 `LLM_API_KEY`：缺 Key 时**拒绝启动是刻意设计**，不是缺陷。
+
+    这条守的是"口径"而不是"代码"：`app.main._assert_agents_ready()` 明确写着
+    `missing_api_key ⇒ 拒绝启动`（"能起来但每个请求都答不出来"不是可接受的部署
+    状态）。所以「不传任何环境变量也能起」这个断言**永远不可能成立** ——
+    它从写下那天起就是红的，只是 image job 之前没人真跑过。
+
+    ⇒ 探活必须给最小必需配置；同时"没给 Key 时必须拒绝启动"这条要单独反向断言
+    （见 `test_ci_smoke_pins_the_fail_closed_contract`），两者不能合并成一条。
+    """
+    step = _smoke_step(ci)
+    assert step is not None
+    run = step["run"]
+    # ⚠️ 断言必须落在**命令**上，不能只搜关键词 —— 这一步的注释里也写着
+    # `LLM_API_KEY`，只搜关键词的话，把命令删掉、注释留着，守卫照样是绿的。
+    assert "-e LLM_API_KEY=" in run, (
+        "探活没有把 LLM_API_KEY 传进容器 —— 服务刻意在缺 Key 时拒绝启动"
+        "（missing_api_key），这一步会必然失败：现象是 60 秒探活超时，"
+        "容器日志里是 RuntimeError"
+    )
+
+
+def test_ci_smoke_pins_the_fail_closed_contract(ci):
+    """反向断言：**不给 Key 必须拒绝启动**，且真因必须落在 `missing_api_key`。
+
+    为什么这条不能省：正向探活只证明"给了配置能起来"。如果哪天有人为了"方便
+    本地跑"把 `_assert_agents_ready()` 放宽成 warning，正向探活**照样是绿的**,
+    而线上就会退化成"服务在，但每次都答不出来"。只钉正向等于没钉这条契约。
+
+    三个细节都是必要的，少一个就失去判据：
+      · `timeout` —— 区分"自己退出"与"挂住 60 秒"（rc=124），后者不算拒绝启动；
+      · `rc != 0` —— 区分"拒绝启动"与"居然起来了"；
+      · `grep missing_api_key` —— 区分"因为缺 Key 退出"与"因为别的原因崩了"
+        （镜像坏了也会非 0 退出，那不是 fail-closed 的证据）。
+    """
+    step = _smoke_step(ci)
+    assert step is not None
+    run = step["run"]
+    assert "timeout 60 docker run" in run, (
+        "无 Key 的反向断言没有 timeout —— 分辨不出「自己退出」与「挂住不退出」"
+    )
+    assert 'grep -q "missing_api_key"' in run, (
+        "反向断言只看了退出码，没核对真因 —— 镜像坏了同样会非 0 退出，"
+        "那不是 fail-closed 的证据。"
+        "（断言落在 grep 命令上：注释里也出现 missing_api_key，只搜关键词抓不住删除）"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 漏洞扫描
 # ---------------------------------------------------------------------------

@@ -719,11 +719,54 @@ jobs:
 
       - name: 启动容器并探活
         # 这一步不可省：`docker build` 成功只证明"层能构建"，不证明**应用能起来**。
-        # 刻意**不传任何环境变量** —— 默认配置就能启动本身就是被断言的东西
-        # （镜像不该依赖某个没写进 Dockerfile 的环境变量才能跑）。
+        #
+        # ⚠️ 必须传 `LLM_API_KEY`（2026-11-07 第三次真跑撞出来的）
+        # ------------------------------------------------------------------
+        # 这里原来刻意**不传任何环境变量**，理由写的是"默认配置就能启动本身就是
+        # 被断言的东西（镜像不该依赖某个没写进 Dockerfile 的环境变量才能跑）"。
+        # 这个理由与服务自身的**刻意设计**直接冲突 ——
+        # `app.main._assert_agents_ready()` 在 Key 为空时主动 raise 让进程退出
+        # （`missing_api_key ⇒ 拒绝启动`）。也就是说"没 Key 也能起来"从来不是契约，
+        # 恰恰相反："起不来"才是契约。
+        # ⇒ 这一步从写下那天起就**必然红**：实测 60 秒探活超时，容器日志是
+        #      RuntimeError: agent 链路不可用（missing_api_key）⇒ 拒绝启动。
+        #    （镜像构建、pip 安装、导入链全部成功，唯独在"应用启动"这一环断掉。）
+        #
+        # 现在拆成两条**互补**的断言，取代原来那条错的口径：
+        #   ① 正向：给了**最小必需配置**后能起来并通过 `/health/live`
+        #      —— 检的是「依赖完整 + 打包没错 + 端口/CMD 对」；
+        #   ② 反向：**不给 Key 时必须拒绝启动**（fail-closed 契约）
+        #      —— 否则 `_assert_agents_ready` 被谁改软了也没人知道。
+        # 拆开之后，"配置缺失"不会再被误读成"镜像坏了"，
+        # 而 fail-closed 这条真正重要、又最容易被人"顺手放宽"的契约被单独钉住。
         run: |
           set -eu
-          docker run -d --name chatagent-ci -p 8000:8000 chatagent:ci
+
+          # ① 反向断言先跑（便宜：进程导入期就退出，不占端口）
+          #    期望：非 0 退出，且**必须是自己退出** ——
+          #      rc=0    ⇒ 没 Key 也起来了，fail-closed 被破坏；
+          #      rc=124  ⇒ 60 秒还活着（挂住），同样不算拒绝启动。
+          set +e
+          timeout 60 docker run --rm --name chatagent-ci-nokey chatagent:ci \
+            >/tmp/nokey.log 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" = "0" ] || [ "$rc" = "124" ]; then
+            echo "::error::没有 LLM_API_KEY 时容器没有拒绝启动（rc=$rc）—— fail-closed 契约被破坏"
+            sed -n '1,80p' /tmp/nokey.log
+            exit 1
+          fi
+          echo "反向断言通过：无 Key 拒绝启动（rc=$rc）"
+          if ! grep -q "missing_api_key" /tmp/nokey.log; then
+            echo "::error::无 Key 时容器确实退出了，但**不是因为缺 Key** —— 真因见下"
+            sed -n '1,80p' /tmp/nokey.log
+            exit 1
+          fi
+
+          # ② 正向：给最小必需配置（只需 Key；其余走默认值），能起来并回 200
+          docker run -d --name chatagent-ci -p 8000:8000 \
+            -e LLM_API_KEY=ci-smoke-dummy-not-a-real-key \
+            chatagent:ci
           ok=0
           for i in $(seq 1 30); do
             if curl -fsS http://localhost:8000/health/live >/dev/null 2>&1; then ok=1; break; fi
