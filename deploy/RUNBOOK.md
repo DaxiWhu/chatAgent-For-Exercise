@@ -664,9 +664,10 @@ docker compose --env-file .env -f deploy/app/docker-compose.yml logs --tail=200 
 它与 `CitationUnsupportedFrequent` 的分工：后者只看引用编号，这条还会看
 `KEY=VALUE`、路径、常量这类标识符。
 
-1. ⚠️ **先确认采样开着**：`RAG_ONLINE_QUALITY_SAMPLE` 默认 **0**。没开时这两个序列
-   **不存在**（不是 0）⇒ 本规则 inactive。**先看 `online_answer_judged_total` 有没有序列**，
-   没有就是"没在检查"，不是"没问题"。
+1. ⚠️ **先确认采样真的在跑**：`RAG_ONLINE_QUALITY_SAMPLE` 默认 **0.01**（1%，2026-11-08 起
+   默认开）。若 `online_answer_judged_total` **一条序列都没有**，说明有人把它显式写成了 `0`
+   （或改过没重启）—— 这时是"没在检查"，**不是**"没问题"，先去 `.env` 与 `/metrics` 上核对。
+   本规则 inactive 且序列不存在，两者必须分开看。
 2. 看 `online_answer_judged_total{verdict}` 的构成：`unknown` 占比过高说明多数回答
    没有可核的标识符，此时这个**比率本身参考价值有限**（先确认有效样本量再说）。
    ⚠️ `unknown` 是**刻意**单列的 —— 把"无从判断"并进 `pass` 会让线上 ok_rate 朝好看的方向偏。

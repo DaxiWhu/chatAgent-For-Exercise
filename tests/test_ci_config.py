@@ -937,7 +937,13 @@ def test_publish_depends_on_every_gate(ci):
     )
 
     # 反向锁：被排除的那几个必须是"确实只在定时触发"的，否则上面的排除逻辑会变成万能免死牌
-    assert scheduled_only == {"full-deps", "drill", "e2e"}, (
+    #
+    # `agent-quality`（2026-11-08 加）为什么可以不在 publish 的 needs 里：
+    #   它跑的是**真模型**的工具三层评测，随上游模型漂移、要密钥，本身就不是
+    #   "这次提交对不对"的判据 —— 放进门禁会让一次模型抖动挡住发布。它的用途是
+    #   每晚发现"工具链是不是变差了"，红了发通知、不拦合并。所以它只在 schedule /
+    #   dispatch 跑，与 full-deps / drill / e2e 同一类。
+    assert scheduled_only == {"full-deps", "drill", "e2e", "agent-quality"}, (
         f"被当成『定时专属』排除的 job 集合变了：{sorted(scheduled_only)}。"
         "如果不是它们真的都只在 schedule/dispatch 跑，请同步复核本守卫的排除规则 —— "
         "否则任何 job 只要加一句 if 就能绕过发布门禁。"
@@ -1376,3 +1382,87 @@ def test_e2e_job_says_aloud_when_it_has_no_real_model(ci):
     assert "else" in run, "只有『有 Key』的分支 —— 缺 secret 时会静默跳过注入"
     assert "DEEPSEEK_API_KEY" in run, "没说缺的是哪个 secret，看日志的人不知道该配什么"
     assert "skip" in run, "没说那条用例会 skip —— 等于把『没覆盖』当成了『通过』"
+
+
+# ---------------------------------------------------------------------------
+# 真模型质量 job（agent-quality）：守"工具三层到底有没有人在看"
+# ---------------------------------------------------------------------------
+# 这一 job 的失效方式全是静默的：
+#   · 进了 PR 路径 ⇒ 随模型漂移随机红 ⇒ 有人 `continue-on-error` 掉 ⇒ 守着等于没有；
+#   · 缺 secret 却"跳过" ⇒ 屏幕上绿，而这一层一条断言都没跑；
+#   · 只跑不比基线 ⇒ 每天打印三个百分数，没人看得出是变好还是变坏；
+#   · `--json` 写成基线文件本身 ⇒ 先写后读自己 ⇒ 永远"持平"（自愈门禁）；
+#   · `LLM_API_BASE` 没设 ⇒ 客户端打 api.openai.com ⇒ DeepSeek 的 key 401。
+def _agent_quality_job(ci_cfg):
+    job = (ci_cfg.get("jobs") or {}).get("agent-quality")
+    assert job, "缺少 agent-quality job —— 真模型那一层在 CI 里就完全没人跑了"
+    return job
+
+
+def _agent_quality_run(ci_cfg) -> str:
+    job = _agent_quality_job(ci_cfg)
+    runs = [str(s.get("run", "")) for s in job.get("steps") or [] if "--baseline" in str(s.get("run", ""))]
+    assert runs, "agent-quality 里没有一步带 --baseline —— 它只是在'跑一遍'，看不出变化"
+    return "\n".join(runs)
+
+
+def test_agent_quality_only_runs_on_schedule(ci):
+    """不许进 PR 路径。真模型评测要密钥、随模型漂移，随机红的终点是被关掉。"""
+    job = _agent_quality_job(ci)
+    cond = str(job.get("if") or "")
+    assert "schedule" in cond and "workflow_dispatch" in cond
+    assert "pull_request" not in cond and "push" not in cond
+
+
+def test_agent_quality_fails_loudly_without_the_secret(ci):
+    """缺 secret 必须红并说清缺什么 —— "跳过"会让这一层静默变空。"""
+    text = _agent_quality_run(ci)
+    assert "exit 1" in text, "缺 secret 时没有让 job 失败"
+    assert "DEEPSEEK_API_KEY" in text, "没说缺的是哪个 secret"
+    assert not _agent_quality_job(ci).get("continue-on-error")
+
+
+def test_agent_quality_compares_against_the_shipped_baseline(ci):
+    text = _agent_quality_run(ci)
+    assert "scripts/agent_tool_eval_baseline.json" in text
+
+
+def test_agent_quality_never_overwrites_its_own_baseline(ci):
+    """`--json` 不能指向基线文件：写完再读自己，每一项都会算成持平。"""
+    text = _agent_quality_run(ci)
+    m = re.search(r"--json\s+(\S+)", text)
+    assert m, "没把明细落盘：退化时没法看是哪一条坏的"
+    assert m.group(1) != "scripts/agent_tool_eval_baseline.json"
+    assert ">>" not in text and "sed -i" not in text, "命令行里出现了改写基线的动作"
+
+
+def test_agent_quality_points_at_the_real_gateway(ci):
+    """`LLM_API_BASE` 为空时 openai 客户端会打官方地址，DeepSeek 的 key 在那里 401。
+
+    症状是"任务失败但看不出为什么"—— 它不会说"地址配错了"。
+    """
+    job = _agent_quality_job(ci)
+    env = {}
+    for step in job.get("steps") or []:
+        env.update(step.get("env") or {})
+    assert str(env.get("LLM_API_BASE", "")).startswith("https://api.deepseek.com")
+    assert env.get("AGENT_STRUCTURED_OUTPUT") == "json_object", (
+        "DeepSeek 不支持 json_schema：三个 as_tool 专家会全部 400，而选择层可能照样满分"
+    )
+
+
+def test_the_tool_eval_baseline_ships_with_the_repo():
+    """基线必须是仓库里的文件，且字段齐全。
+
+    指向一个不存在的位置 ⇒ 脚本退出码 2 ⇒ nightly 从第一天起天天红；
+    字段缺一层 ⇒ 对比静默跳过那一层（屏幕上写"未对比"，而退出码是 0）。
+    """
+    import json
+
+    path = ROOT / "scripts" / "agent_tool_eval_baseline.json"
+    assert path.is_file(), "基线文件没有随仓库分发"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    summary = data.get("summary") or {}
+    for key in ("turns_total", "turns_passed", "tool_total", "calls_total", "result_total"):
+        assert key in summary, f"基线缺 {key}：这一层会被静默跳过"
+    assert data.get("cases"), "基线没有 cases：无法判断两次跑的是不是同一批用例"

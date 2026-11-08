@@ -12,6 +12,7 @@
 import asyncio
 import os
 import time
+from pathlib import Path
 
 import pytest
 import yaml
@@ -532,14 +533,36 @@ def test_review_wait_seconds_absent_when_created_at_unparsable():
 # ---------------------------------------------------------------------------
 # 9. 在线答案质量采样
 # ---------------------------------------------------------------------------
-def test_online_quality_sampling_is_off_by_default(monkeypatch):
-    """默认不采样：它是趋势指标，不需要为它给每个请求加几毫秒。"""
+def test_online_quality_sampling_is_off_when_rate_is_zero(monkeypatch):
+    """采样率写 0 = 关：它是趋势指标，不需要为它给每个请求加几毫秒。"""
     monkeypatch.setattr(config, "ONLINE_QUALITY_SAMPLE", 0.0)
     metrics.reset()
     M._maybe_sample_quality("配置项 `APP_WORKERS` 控制并发", "`APP_WORKERS` 默认 1")
     assert metrics.value("online_answer_judged_total", verdict="pass") == 0
     assert _count_total("online_answer_judged_total") == 0
     assert _count_total("online_answer_hallucinated_total") == 0
+
+
+def test_online_quality_sampling_defaults_to_one_percent():
+    """★ 默认值必须 > 0 —— 这是"线上到底有没有质量数字"的总开关。
+
+    默认 0 时 `online_answer_judged_total` / `online_answer_hallucinated_total`
+    **序列不存在（不是 0）**，告警 `OnlineHallucinationDetected` 永远 inactive。
+    于是"没在检查"与"质量没问题"在告警界面上完全一样 —— 可用性、延迟、5xx
+    全部正常而答案变差的场景，只能等用户投诉。
+
+    所以这条守两处（配置默认值与部署模板），改回 0 必须是一次**有意的**动作：
+    删掉这两个断言可以，但要同时接受"线上重新变瞎"。
+    """
+    root = Path(__file__).resolve().parent.parent
+    cfg = (root / "app" / "config.py").read_text(encoding="utf-8")
+    assert '_env_float("RAG_ONLINE_QUALITY_SAMPLE", 0.01)' in cfg, (
+        "配置默认值被改回 0 了：线上会失去唯一的质量信号"
+    )
+    example = (root / ".env.example").read_text(encoding="utf-8")
+    assert "RAG_ONLINE_QUALITY_SAMPLE=0.01" in example, (
+        "部署模板与配置默认值不一致：照模板部署的实例与代码默认行为会给出两套数字"
+    )
 
 
 def test_online_quality_sampling_keeps_three_way_verdict(monkeypatch):

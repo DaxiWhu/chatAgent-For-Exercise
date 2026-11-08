@@ -53,6 +53,13 @@
     python scripts/agent_tool_eval.py --model deepseek    # 走评测对照线（DEEPSEEK_*）
     python scripts/agent_tool_eval.py --only time-today
     python scripts/agent_tool_eval.py --json tmp_probe/tool_eval.json
+
+    # 与基线比（CI 的 agent-quality job 每晚就是这么跑的）：只判"比基线差"才非 0
+    python scripts/agent_tool_eval.py --baseline scripts/agent_tool_eval_baseline.json
+
+    # 更新基线：**手动**执行，确认新数字合理之后。脚本永不自动覆写基线 ——
+    # 写完再读自己 = 自愈门禁（每一项都算持平，永远绿）。
+    python scripts/agent_tool_eval.py --json scripts/agent_tool_eval_baseline.json
 """
 
 from __future__ import annotations
@@ -421,6 +428,153 @@ def _layers(rows: list[dict]) -> dict[str, list[dict]]:
     }
 
 
+def _summary_of(rows: list[dict]) -> dict:
+    """把逐轮结果压成一份汇总 —— **屏幕、JSON、基线对比共用这一份**。
+
+    ⚠️ 曾经这段是内联在 `--json` 分支里的，屏幕上另算一遍。两处各算一次的
+    失效方式很安静：屏幕上显示 12/12，落盘的却是另一个数，而**看出来的人
+    只会去改阈值**。汇总口径必须只有一个入口。
+    """
+    layers = _layers(rows)
+    tools = [t for r in rows for t in r["tools"]]
+    return {
+        "turns_total": len(rows),
+        "turns_passed": len(layers["passed"]),
+        "tool_total": len(layers["tool"]),
+        "tool_ok": len(layers["tool_ok"]),
+        "result_total": len(layers["result"]),
+        "result_ok": len(layers["result_ok"]),
+        "soft_total": len(layers["soft"]),
+        "soft_ok": len(layers["soft_ok"]),
+        "calls_total": sum(len(r["status"]) for r in rows),
+        "calls_ok": sum(1 for r in rows for s in r["status"] if s == "ok"),
+        "loop_turns": sum(1 for r in rows if r["repeats"]),
+        "dead_turns": sum(1 for r in rows if r["dead"]),
+        "tool_calls": len(tools),
+        "seconds": round(sum(r["seconds"] for r in rows), 1),
+        "input_tokens": sum(r["input_tokens"] for r in rows),
+        "output_tokens": sum(r["output_tokens"] for r in rows),
+    }
+
+
+# 参与基线对比的各层：(键, 屏显名, 分子, 分母)。
+# ⚠️ 分母为 0 的一侧**不参与判定** —— 两边的分母本来就不一样（这一批可能
+#    只有 18 轮里的一部分带答案判据），拿"这次测了"去比"上次没测"是假退化。
+_RATE_LAYERS = (
+    ("turns", "总通过", "turns_passed", "turns_total"),
+    ("tool", "工具选择", "tool_ok", "tool_total"),
+    ("calls", "工具执行", "calls_ok", "calls_total"),
+    ("result", "答案结果", "result_ok", "result_total"),
+    ("soft", "软判定", "soft_ok", "soft_total"),
+)
+
+# 退化容差：**一个判定轮次的量级**（当前 18 轮 ⇒ 每轮 5.6%）。
+# 留这一格是为了不把"模型这一次少调了一次工具"报成退化 —— 假红的代价不是
+# "更安全"，而是下次有人把容差调大或干脆不看。掉两个轮次才算真退化。
+_DEGRADE_MARGIN = 0.06
+
+
+def _rate(summary: dict, ok_key: str, total_key: str) -> float | None:
+    """某一层的通过率；该层没有被测到（分母 0）时返回 None，**不是 0**。
+
+    0 与 None 的区别在这里是硬要求：把"没测"当成"零分"会让基线对比报出
+    一堆不存在的退化，把"没测"当成"满分"则会让真退化溜过去。
+    """
+    total = summary.get(total_key) or 0
+    if not total:
+        return None
+    return (summary.get(ok_key) or 0) / total
+
+
+def _diff_against_baseline(baseline: dict, current: dict) -> list[dict]:
+    """逐层比基线，返回每一项的变化；退化项带 ``degraded=True``。
+
+    判据：**下降超过容差才算退化**（上升永远是好事，哪怕只升一点点）。
+    空转轮次反过来 —— 它是"有动作、无一成功"的轮数，多一轮就多一轮白烧的
+    模型调用，所以**任何增加都算退化**，不给容差。
+    """
+    old = (baseline or {}).get("summary") or {}
+    out: list[dict] = []
+    for key, label, ok_key, total_key in _RATE_LAYERS:
+        before, after = _rate(old, ok_key, total_key), _rate(current, ok_key, total_key)
+        if before is None or after is None:
+            out.append({
+                "key": key, "label": label, "before": before, "after": after,
+                "delta": None, "degraded": False, "skipped": True,
+            })
+            continue
+        delta = after - before
+        out.append({
+            "key": key, "label": label, "before": before, "after": after,
+            "delta": delta, "degraded": delta < -_DEGRADE_MARGIN, "skipped": False,
+        })
+    dead_before = old.get("dead_turns")
+    dead_after = current.get("dead_turns")
+    if dead_before is not None and dead_after is not None:
+        out.append({
+            "key": "dead", "label": "空转轮次", "before": dead_before, "after": dead_after,
+            "delta": dead_after - dead_before, "degraded": dead_after > dead_before,
+            "skipped": False,
+        })
+    return out
+
+
+def _case_sets_match(baseline: dict, reports: list[dict]) -> bool:
+    """本次跑的用例集与基线是不是同一批。
+
+    为什么必须查（2026-11-08 实测）：`--only chat-no-tools` 跑 1 条得到 1/1=100%，
+    对着 18 轮的基线比，屏幕上打出"**改善 +5.6pt**" —— 两个分母根本不是一个东西。
+    这类假改善比假退化更危险：看到"改善"的人不会去复核。
+
+    基线没有 `cases` 字段时按"可比"处理（手写的汇总基线只能自己负责核对口径）。
+    """
+    old = baseline.get("cases")
+    if not old:
+        return True
+    return {c.get("id") for c in old} == {c.get("id") for c in reports}
+
+
+def _print_diff(diffs: list[dict], path: str) -> None:
+    """打印对比结果。``skipped`` 必须说出来 —— 静默跳过等于"这项没退化"。"""
+    print(f"\n与基线 {path} 对比：")
+    for d in diffs:
+        if d["skipped"]:
+            print(f"  {d['label']}：基线或本次缺这一层，未对比")
+            continue
+        if d["key"] == "dead":
+            mark = "退化" if d["degraded"] else "持平"
+            print(f"  {d['label']}：{d['before']} → {d['after']} 轮（{mark}）")
+            continue
+        arrow = "↑" if d["delta"] > 0 else ("↓" if d["delta"] < 0 else "=")
+        pts = f"{d['delta'] * 100:+.1f}pt" if d["delta"] else "0"
+        mark = "退化" if d["degraded"] else ("改善" if d["delta"] > 0 else "持平")
+        print(f"  {d['label']}：{d['before'] * 100:.0f}% {arrow} {d['after'] * 100:.0f}%（{pts}，{mark}）")
+    bad = [d for d in diffs if d["degraded"]]
+    if bad:
+        print(f"⚠️ 与基线相比退化 {len(bad)} 项 —— " + "、".join(d["label"] for d in bad))
+        print("   先确认是模型抖动还是真退化：同一条命令再跑一次，两次都退化才是退化。")
+
+
+def _exit_code(summary: dict, dead: list, degraded: bool, has_baseline: bool) -> int:
+    """退出码：**带基线时只判"有没有比基线更差"**，不判"是不是全过"。
+
+    为什么必须分开（2026-11-08 实测）
+    ------------------------------
+    这份评测的基线里本来就带着一条已知失败（`cross-turn-memory` 第一轮调了
+    `remember`，而那一轮刻意要求"只靠会话历史"）。按"全过才 0"退出，接进每晚
+    定时之后会**从第一天起每晚都红** —— 而每晚都红的通知等于没有通知：两三周后
+    所有人都学会忽略它，连同真正的退化一起忽略。
+
+    所以语义分两种，与"手动跑一次"和"与上次比"这两个用途一一对应：
+      * 无基线（手动）：全过且没有空转才算 0 —— 目的是发现失败；
+      * 有基线（定时）：只要不比基线差就算 0 —— 目的是发现**变化**。
+    """
+    if has_baseline:
+        return 0 if not degraded else 1
+    all_passed = summary["turns_passed"] == summary["turns_total"]
+    return 0 if (all_passed and not dead) else 1
+
+
 async def _run_turn(
     case_id: str,
     index: int,
@@ -512,6 +666,24 @@ async def _run_turn(
 
 
 async def main_async(args: argparse.Namespace) -> int:
+    # ⚠️ 基线**必须在跑用例之前、更在写 `--json` 之前读**。
+    #    `--baseline` 与 `--json` 指同一个文件是最常见的用法（"与上次比"），
+    #    先写后读会让"基线"变成刚落盘的自己 ⇒ 每一项都算成持平，永远绿。
+    #    守卫见 `tests/test_agent_tool_eval_baseline.py`。
+    baseline = None
+    if args.baseline:
+        if not os.path.exists(args.baseline):
+            print(f"基线文件不存在：{args.baseline}", file=sys.stderr)
+            print("先跑一次不带 --baseline 并把 --json 指到它，确认数字合理后再作为基线。",
+                  file=sys.stderr)
+            return 2
+        try:
+            with open(args.baseline, encoding="utf-8") as fh:
+                baseline = json.load(fh)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"基线文件读不了：{args.baseline}（{e}）", file=sys.stderr)
+            return 2
+
     data = json.loads(Path(args.set).read_text(encoding="utf-8"))
     cases = data["cases"]
     if args.only:
@@ -598,55 +770,46 @@ async def main_async(args: argparse.Namespace) -> int:
         reports.append({"id": case["id"], "note": case.get("note", ""), "turns": rows})
 
     all_rows = [r for c in reports for r in c["turns"]]
-    layers = _layers(all_rows)
-    passed = layers["passed"]
-    tool_rows = layers["tool"]
-    tool_ok = layers["tool_ok"]
-    result_rows = layers["result"]
-    result_ok = layers["result_ok"]
-    soft_rows = layers["soft"]
-    soft_ok = layers["soft_ok"]
-    tools = [t for r in all_rows for t in r["tools"]]
-    seconds = sum(r["seconds"] for r in all_rows)
-    tokens_in = sum(r["input_tokens"] for r in all_rows)
-    tokens_out = sum(r["output_tokens"] for r in all_rows)
-    calls_ok = sum(1 for r in all_rows for s in r["status"] if s == "ok")
-    calls_total = sum(len(r["status"]) for r in all_rows)
+    # 唯一口径：屏幕、JSON、基线对比都从这里取数（见 `_summary_of` 的说明）。
+    summary = _summary_of(all_rows)
     dead = [r for r in all_rows if r["dead"]]
+    looped = [r for r in all_rows if r["repeats"]]
 
     print("-" * 78)
-    if tool_rows:
+    if summary["tool_total"]:
         print(
-            f"① 工具选择：{len(tool_ok)}/{len(tool_rows)} 通过"
-            f"（{len(tool_ok) / len(tool_rows) * 100:.0f}%）"
+            f"① 工具选择：{summary['tool_ok']}/{summary['tool_total']} 通过"
+            f"（{summary['tool_ok'] / summary['tool_total'] * 100:.0f}%）"
         )
-    if calls_total:
+    if summary["calls_total"]:
         print(
-            f"② 工具执行：{calls_ok}/{calls_total} 次成功"
-            f"（{calls_ok / calls_total * 100:.0f}%）"
+            f"② 工具执行：{summary['calls_ok']}/{summary['calls_total']} 次成功"
+            f"（{summary['calls_ok'] / summary['calls_total'] * 100:.0f}%）"
         )
-    if result_rows:
+    if summary["result_total"]:
         print(
-            f"③ 答案结果：{len(result_ok)}/{len(result_rows)} 轮给出正确结果"
-            f"（{len(result_ok) / len(result_rows) * 100:.0f}%）"
-            f"｜其余 {len(all_rows) - len(result_rows)} 轮无答案判据"
+            f"③ 答案结果：{summary['result_ok']}/{summary['result_total']} 轮给出正确结果"
+            f"（{summary['result_ok'] / summary['result_total'] * 100:.0f}%）"
+            f"｜其余 {summary['turns_total'] - summary['result_total']} 轮无答案判据"
         )
-    if soft_rows:
-        print(f"④ 软判定（该承认做不到）：{len(soft_ok)}/{len(soft_rows)}")
+    if summary["soft_total"]:
+        print(f"④ 软判定（该承认做不到）：{summary['soft_ok']}/{summary['soft_total']}")
     if dead:
         # 这一行是**这份评测最重要的输出**：选择全对、执行全失败，只看通过率是满分。
         print(f"⚠️ 空转（有动作、无一成功）：{len(dead)} 轮 -> " + "、".join(
             f"{r['prompt'][:12]}…" for r in dead
         ))
-    looped = [r for r in all_rows if r["repeats"]]
     if looped:
         # 与空转并列的第二类"看板看不出来"的浪费：每一步都成功、通过率满分，
         # 但同一个动作被重复做了 N 次 —— 成本全在模型调用上（每轮 1 次调用 + 反思）。
         print(f"⚠️ 重复动作（同一动作 ≥2 次）：{len(looped)} 轮 -> " + "、".join(
             f"{r['prompt'][:12]}…" for r in looped
         ))
-    print(f"工具调用合计 {len(tools)} 次｜耗时 {seconds:.1f}s｜token 入 {tokens_in} / 出 {tokens_out}")
-    if tools:
+    print(
+        f"工具调用合计 {summary['tool_calls']} 次｜耗时 {summary['seconds']:.1f}s"
+        f"｜token 入 {summary['input_tokens']} / 出 {summary['output_tokens']}"
+    )
+    if summary["tool_calls"]:
         from collections import Counter
 
         fails: dict[str, int] = {}
@@ -658,7 +821,7 @@ async def main_async(args: argparse.Namespace) -> int:
             "工具分布："
             + "、".join(
                 f"{k}×{v}" + (f"（失败{fails[k]}）" if fails.get(k) else "")
-                for k, v in Counter(tools).most_common()
+                for k, v in Counter(t for r in all_rows for t in r["tools"]).most_common()
             )
         )
 
@@ -668,26 +831,9 @@ async def main_async(args: argparse.Namespace) -> int:
             # 检索来自桩还是真关着 —— 少了这一格，"检索通了"会被读成 RAG 链路也通了。
             "retrieval": retrieval_mode,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "summary": {
-                # 三层分开落盘：只有选择层全绿、而结果层掉下来，才是"工具在跑、
-                # 但模型没用它的返回值"这个最难看的形态。
-                "turns_total": len(all_rows),
-                "turns_passed": len(passed),
-                "tool_total": len(tool_rows),
-                "tool_ok": len(tool_ok),
-                "result_total": len(result_rows),
-                "result_ok": len(result_ok),
-                "soft_total": len(soft_rows),
-                "soft_ok": len(soft_ok),
-                "calls_total": calls_total,
-                "loop_turns": len(looped),
-                "calls_ok": calls_ok,
-                "dead_turns": len(dead),
-                "tool_calls": len(tools),
-                "seconds": round(seconds, 1),
-                "input_tokens": tokens_in,
-                "output_tokens": tokens_out,
-            },
+            # 三层分开落盘：只有选择层全绿、而结果层掉下来，才是"工具在跑、
+            # 但模型没用它的返回值"这个最难看的形态。
+            "summary": summary,
             "cases": reports,
         }
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
@@ -696,9 +842,24 @@ async def main_async(args: argparse.Namespace) -> int:
         )
         print(f"明细已写入 {args.json}")
 
-    # 退出码把"空转"也算作失败：选择全对、执行全崩时，只看通过率是满分 ——
-    # 而那正是最需要有人看一眼的状态。
-    return 0 if (len(passed) == len(all_rows) and not dead) else 1
+    # 基线对比放在**落盘之后**打印，但基线文件是在跑用例之前读的 —— 顺序反过来
+    # 就成了"写完再读自己写的"，每一项都会算成持平（那是自愈门禁）。
+    degraded = False
+    if baseline is not None:
+        if not _case_sets_match(baseline, reports):
+            print(
+                f"\n⚠️ 本次跑的用例集与基线不同（{len(reports)} 条 vs 基线 "
+                f"{len(baseline.get('cases') or [])} 条），比率分母不同 ⇒ 跳过对比。"
+                "\n   要比就放开 `--only` 跑全量；子集的数字不能与全量基线相减。"
+            )
+        else:
+            diffs = _diff_against_baseline(baseline, summary)
+            _print_diff(diffs, args.baseline)
+            degraded = any(d["degraded"] for d in diffs)
+
+    # 退出码把"空转"与"比基线退化"也算作失败：选择全对、执行全崩时，只看通过率
+    # 是满分 —— 而那正是最需要有人看一眼的状态。
+    return _exit_code(summary, dead, degraded, baseline is not None)
 
 
 def main() -> int:
@@ -707,6 +868,14 @@ def main() -> int:
     parser.add_argument("--set", default=str(DEFAULT_SET))
     parser.add_argument("--only", default="", help="只跑这些用例 id（逗号分隔）")
     parser.add_argument("--json", default="", help="把明细写到这个路径")
+    parser.add_argument(
+        "--baseline",
+        default="",
+        help=(
+            "与这份历史结果对比（通常是上一次 --json 落盘的文件）。"
+            "**不会**自动覆写它 —— 覆写等于自愈门禁；确认新数字可作为基线时请手动替换文件。"
+        ),
+    )
     parser.add_argument("--assets", default="var/eval_assets")
     parser.add_argument("--docs-dir", default="", help="语料目录（给了才会做引用校验）")
     parser.add_argument("--max-turns", type=int, default=8)
