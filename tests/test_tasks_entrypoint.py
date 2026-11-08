@@ -344,6 +344,32 @@ def test_python_sources_use_lf_on_disk():
     )
 
 
+def test_workflow_and_compose_files_use_lf_on_disk():
+    """`.py` 之外还有一类文件同样会被这条坑到：**YAML**。
+
+    2026-11-08 实测：往 `.github/workflows/ci.yml` 里插几段注释，工作区整份文件
+    变成了 CRLF（1297 行）。功能上零影响 —— `yaml.safe_load` 照读、CI 照跑、
+    测试全绿，`git diff --stat` 甚至只显示 19 行改动（因为 `.gitattributes`
+    入库时会归一化）。于是它只会以两种方式出现：
+      · `git status` 一直显示"已修改"，`git diff` 看着却没什么变化；
+      · 别人在 Linux 上拉到 CRLF 之后，按字节比对的断言 / 日志格式开始漂。
+
+    守卫的是**工作区字节**，不是入库结果：入库那侧 `.gitattributes` 已经管了，
+    管不住的是"我本地写进去的到底是什么"。
+    """
+    bad = []
+    for pat in ("*.yml", "*.yaml"):
+        for p in ROOT.rglob(pat):
+            if {"__pycache__", "node_modules", "tmp_probe"} & set(p.parts):
+                continue
+            if b"\r\n" in p.read_bytes():
+                bad.append(str(p.relative_to(ROOT)))
+    assert not bad, (
+        f"这些 YAML 含 CRLF（仓库钉的是 LF）：{bad}\n"
+        f"修法：`write_bytes(raw.replace(b'\\r\\n', b'\\n'))`，别用文本模式写回"
+    )
+
+
 # --------------------------------------------------------------------------
 # ⑤ CHANGELOG 与版本号
 # --------------------------------------------------------------------------

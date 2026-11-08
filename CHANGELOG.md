@@ -11,6 +11,34 @@
 
 ## [Unreleased]
 
+### 变更 — 发布改为打 tag 才发；PR 门禁按"每次事件都跑的 job"登记（2026-11-08）
+
+**① `publish` 从"main 或 tag"改成"只有 tag"——顺带修了一个从没被触发过的链路。**
+
+原条件是 `github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')`，
+而本仓库默认分支叫 `master`（根本没有 `main`），且 `on.push` 只有
+`branches: ["**"]` —— **`branches` 过滤器不匹配 tag**，推 tag 时整个 workflow
+连启动都不会。两处叠加的结果：`publish` 自建立起非 skipped 次数为 **0**，
+即"镜像推 GHCR + cosign 签名"这条链路一次都没执行过，且全程零报错。
+
+现在：`on.push` 增加 `tags: ["v*"]`，`publish` 只在 `refs/tags/v*` 触发；
+镜像标签去掉永远不会成立的滚动 `:main`，只留 `sha-<短哈希>` 与版本号。
+
+**② 新增三条守卫**（`tests/test_ci_config.py`）
+
+- `test_the_workflow_actually_triggers_on_version_tags`：`on.push.tags` 必须覆盖
+  `publish` 条件里认的 tag 前缀 —— 这两处各写一套就等于永远不触发；
+- `test_publish_only_runs_on_version_tags`：不许再出现 `refs/heads/`（分支名写错
+  在这类条件里不会报错，只会一直跳过）；
+- `test_pr_gate_list_is_exactly_the_jobs_that_run_on_every_event`：仓库分支保护里
+  登记的必需检查，必须等于"没有 schedule/dispatch 专属 `if` 的 job 集合"。
+  这份名单不在仓库里，改 job 名或新增 job 时两边会静默错开：少一个 ⇒ 漏门禁，
+  多一个 ⇒ PR 永久卡在"Waiting for status to be reported"。
+
+**③ 顺带补一条工作区换行守卫**：`test_workflow_and_compose_files_use_lf_on_disk`。
+往 `ci.yml` 里插几段注释曾让整份文件在工作区变成 CRLF（1297 行），功能零影响、
+测试全绿，只有 `git status` 一直显示"已修改"。此前只有 `.py` 有这条守卫。
+
 ### 变更 — 真模型质量评测接进每晚定时；在线质量采样默认打开（2026-11-08）
 
 **① 工具三层评测有了基线，并被 CI 每晚跑一次。**

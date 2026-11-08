@@ -448,18 +448,45 @@ def _publish_job(ci):
     return job
 
 
-def test_publish_only_runs_on_main_or_version_tags(ci):
-    """发布不能跟着每次 push / PR 走。
+def test_publish_only_runs_on_version_tags(ci):
+    """发布不能跟着每次 push / PR 走，也不跟着分支走。
 
     一旦每个分支都推 registry，镜像仓库会堆满从未上线的构建产物，
     真正上线的那个 digest 也失去意义（"最新"成了噪音）。
+    2026-11-08 起改为**打 tag 才发**：发布节奏由人决定。
     """
     cond = str(_publish_job(ci).get("if", ""))
-    assert "refs/heads/main" in cond, (
-        f"publish 没有限定 main 分支（if: {cond!r}）——会跟着每个分支的 push 发布"
-    )
     assert "refs/tags/" in cond, "publish 没有覆盖版本 tag"
+    assert "refs/heads/" not in cond, (
+        f"publish 还在按分支发布（if: {cond!r}）—— 本仓库默认分支是 master，"
+        "写成 main 等于一条永远不会成立的分支条件"
+    )
     assert "pull_request" not in cond, "publish 不该在 PR 上运行"
+
+
+def test_the_workflow_actually_triggers_on_version_tags(ci):
+    """`on.push.tags` 缺一行，`publish` 就**永远等不到事件**。
+
+    这是本项目真实踩过的形态：`publish` 的 `if` 里写着
+    `startsWith(github.ref, 'refs/tags/v')`，看起来完全正确，但 `on.push`
+    只有 `branches: ["**"]` —— 而 `branches` 过滤器**不匹配 tag**，推 tag 时
+    整个 workflow 连启动都没有。症状是 publish 长期是灰色 skipped，且零报错，
+    很容易被读成"这次本来就不该发"。实测该 job 非 skipped 次数为 0。
+    """
+    trig = ci.get("on") if isinstance(ci.get("on"), dict) else ci.get(True)
+    assert isinstance(trig, dict), f"on 不是映射：{trig!r}"
+    push = trig.get("push") or {}
+    tags = push.get("tags") or []
+    assert any(str(t).startswith("v") or t == "**" for t in tags), (
+        f"on.push.tags 没有覆盖 v* 版本 tag（实际：{tags!r}）—— "
+        "publish 的条件写对了也永远不触发"
+    )
+    # 条件里认的 tag 前缀必须被触发器覆盖，两边口径不能各写一套。
+    cond = str(_publish_job(ci).get("if", ""))
+    if "refs/tags/v" in cond:
+        assert any(str(t).startswith("v") for t in tags), (
+            f"publish 等 refs/tags/v*，而 on.push.tags 只覆盖 {tags!r}"
+        )
 
 
 def test_publish_requires_the_verified_image(ci):
@@ -947,6 +974,56 @@ def test_publish_depends_on_every_gate(ci):
         f"被当成『定时专属』排除的 job 集合变了：{sorted(scheduled_only)}。"
         "如果不是它们真的都只在 schedule/dispatch 跑，请同步复核本守卫的排除规则 —— "
         "否则任何 job 只要加一句 if 就能绕过发布门禁。"
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR 门禁：仓库设置里的必需检查 = 每次事件都跑的这批 job
+# ---------------------------------------------------------------------------
+# 这份名单**不在仓库里**（仓库 Settings → Branches → master 的分支保护），所以
+# 代码侧没有"编译器"能发现两边不一致。不一致的两种形态都很安静：
+#   · 名单里写了一个不存在的 job 名 ⇒ PR 永久卡在
+#     "Expected — Waiting for status to be reported"，红色都不给，只是等；
+#   · 把一个只在 schedule/dispatch 跑的 job 写进去 ⇒ 同样永远等不到（PR 上它 skipped）；
+#   · 新增了一个每次事件都跑的 job 却没加进名单 ⇒ 它红了也能合，门禁漏一块。
+# 所以这里把"应登记的那份名单"固定下来：改 job 名 / 加 job 时先在这里红一次，
+# 提醒去把仓库设置同步改掉。
+_PR_GATE = {
+    "lint",
+    "test",
+    "agent-session-pg",
+    "eval-gate",
+    "bench",
+    "image",
+    "security",
+}
+
+
+def test_pr_gate_list_is_exactly_the_jobs_that_run_on_every_event(ci):
+    jobs = ci.get("jobs") or {}
+    always_on = set()
+    for name, job in jobs.items():
+        if name == "publish":           # 只在 tag 上跑，登记成必需检查会让 PR 永远等
+            continue
+        cond = str(job.get("if") or "")
+        if "schedule" in cond or "workflow_dispatch" in cond:
+            continue
+        always_on.add(name)
+    assert always_on == _PR_GATE, (
+        "每次事件都会跑的 job 集合变了，仓库分支保护里登记的必需检查也要同步改：\n"
+        f"  现在会跑：{sorted(always_on)}\n"
+        f"  保护里的：{sorted(_PR_GATE)}\n"
+        "新增的先改这个常量，再去 Settings → Branches → master 勾上同名检查。"
+    )
+
+
+def test_the_gate_list_names_match_real_job_names(ci):
+    """名字对不上 ⇒ PR 卡在"等待状态上报"，而不是报错。"""
+    jobs = set((ci.get("jobs") or {}).keys())
+    missing = sorted(_PR_GATE - jobs)
+    assert not missing, (
+        f"门禁名单里有不存在的 job：{missing} —— PR 会永久停在"
+        "『Expected — Waiting for status to be reported』，且不会有任何报错"
     )
 
 

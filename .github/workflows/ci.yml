@@ -20,6 +20,15 @@ name: CI
 on:
   push:
     branches: ["**"]
+    # ⚠️ 单独一行 `tags` 是**发布链路能否触发**的前提，不是可选装饰。
+    # `branches: ["**"]` 只匹配分支；推一个 tag 时它**不匹配**，整个 workflow
+    # 连启动都不会 —— 于是 `publish` 里写的 `startsWith(github.ref, 'refs/tags/v')`
+    # 永远等不到事件。症状是"发布 job 一直是灰色 skipped"，而且没有任何报错，
+    # 看起来像"这次不该发"。2026-11-08 实测：仓库建到现在，`publish` 非 skipped
+    # 次数为 0（条件里写的 `refs/heads/main` 也不存在，默认分支是 master），
+    # 即这条链路从建立起就没跑过一次。守卫：
+    # `tests/test_ci_config.py::test_the_workflow_actually_triggers_on_version_tags`。
+    tags: ["v*"]
   pull_request:
   # 每日全量：装齐 docling/transformers，跑一遍主流程刻意跳过的那批用例。
   # UTC 18:00 = 北京时间次日 02:00，避开使用高峰。
@@ -1129,9 +1138,13 @@ jobs:
   # 所以正常情况下**不需要额外配任何密钥**；cosign 走 keyless（OIDC），
   # 也不需要私钥。要临时关掉发布：仓库变量 `PUBLISH_IMAGE=false`。
   publish:
+    # 只在**打版本 tag**时发布：`git tag v1.2.0 && git push origin v1.2.0`。
+    # 为什么不再跟着分支推送发（2026-11-08 改）：每次提交都产出一个镜像，
+    # registry 会堆满从未上线的制品，"最新"变成噪音；而发布节奏应当由人决定。
+    # ⚠️ 前提是 `on.push.tags` 里有 `v*` —— 少了那一行，本 job 永远等不到事件。
     if: >-
       github.event_name == 'push'
-      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      && startsWith(github.ref, 'refs/tags/v')
       && vars.PUBLISH_IMAGE != 'false'
     needs: [lint, test, agent-session-pg, eval-gate, bench, image, security]
     runs-on: ubuntu-latest
@@ -1166,11 +1179,13 @@ jobs:
           IMAGE="${{ steps.pre.outputs.image }}"
           SHA_SHORT="$(git rev-parse --short=12 HEAD)"
           TAGS="${IMAGE}:sha-${SHA_SHORT}"
-          # main 上同时打 :main（可回退的滚动指针）；tag 事件上再打语义化版本号。
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then TAGS="${TAGS},${IMAGE}:main"; fi
+          # 本 job 只在 tag 事件上运行，所以这里只需要再打一个语义化版本号。
+          # （原先还有一条"在 main 上同时打 :main"的分支：本仓库默认分支是 master、
+          #  且已改为只按 tag 发布，那行永远不会成立 —— 死分支留着会让人以为
+          #  存在一个滚动的 :main 指针。）
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then TAGS="${TAGS},${IMAGE}:${GITHUB_REF_NAME}"; fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-          # sha-<短哈希> 才是**唯一可信的定位方式**：:main 会被下一次推送覆盖，
+          # sha-<短哈希> 才是**唯一可信的定位方式**：版本号 tag 可以被重指向，
           # 而"线上跑的到底是哪个 commit"必须能反查 —— 这正是本 job 存在的理由。
           echo "sha_short=${SHA_SHORT}" >> "$GITHUB_OUTPUT"
           echo "digest_tag=${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
