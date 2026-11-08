@@ -330,3 +330,125 @@ def test_e2e_waits_for_the_canary_before_running_the_suite(monkeypatch):
     assert order.index("ready") < order.index("gray") < order.index("pytest"), (
         f"执行顺序不对：{order} —— 顺序必须是 等存活 → 等灰度 → 跑用例"
     )
+
+
+# --------------------------------------------------------------------------
+# ⑥ 建表：必须发生在"数据层已起"与"app 已起"之间
+# --------------------------------------------------------------------------
+# 守的是一类**假绿**（2026-11-07 第七次真跑才看出来）：
+#   `agent_runs` / `agent_messages` / `agent_memories` / `agent_history_compactions`
+#   这四张表没有任何模块会在首次写入时自建 —— DDL 的单一出处是 `app/migrations.py`。
+#   而 `tasks.py e2e` 之前**从不跑迁移**，于是每个 chat 请求都在与 LLM 无关的地方
+#   炸掉（`psycopg.errors.UndefinedTable`）。SSE 用例按设计接受 `error` 事件
+#   （没配真模型时那是唯一合法的流内容）⇒ 整条链路一次都没跑通，用例却全绿。
+def _record_compose(monkeypatch, calls: list[str], *, migrate_rc: int = 0) -> None:
+    """把 `compose` / `_wait_ready` / `_seen_releases` / `run` 换成记录器。"""
+    monkeypatch.setattr(tasks, "require", lambda *a, **k: True)
+    monkeypatch.setattr(tasks, "compose", lambda args, extra, **k: calls.append(args) or 0)
+    monkeypatch.setattr(tasks, "_wait_ready", lambda *a, **k: True)
+    monkeypatch.setattr(tasks, "_seen_releases", lambda *a, **k: {"stable", "canary"})
+    monkeypatch.setattr(
+        tasks, "_apply_migrations",
+        lambda *a, **k: calls.append("MIGRATE") or migrate_rc,
+    )
+    monkeypatch.setattr(tasks, "run", lambda *a, **k: 0)
+    monkeypatch.setenv("E2E_USER", "svc")
+    monkeypatch.setenv("E2E_PASSWORD", "pw")
+
+
+def _index_of(calls: list[str], needle: str) -> int:
+    for i, c in enumerate(calls):
+        if needle in c:
+            return i
+    raise AssertionError(f"{needle!r} 没有出现在调用序列里：{calls}")
+
+
+def _index_of_up(calls: list[str], services: str) -> int:
+    """找到"起这一组服务"的那条命令。
+
+    ⚠️ 不能直接找 `"up -d <服务名>"`：数据层那条带 `--wait --wait-timeout`，
+    选项插在 `-d` 与服务名之间 ⇒ 按字面前缀匹配会找不到，然后报"顺序不对"——
+    于是修复本身（加 `--wait`）会被守卫当成破坏。这里只认"这条命令里两者都有"。
+    """
+    for i, c in enumerate(calls):
+        if c.startswith("up ") and services in c:
+            return i
+    raise AssertionError(f"没找到起 [{services}] 的命令：{calls}")
+
+
+def test_e2e_applies_migrations_after_the_data_layer_and_before_the_apps(monkeypatch):
+    """顺序必须是 起数据层 → 建表 → 起 app，不能把建表挪到 app 之后。"""
+    calls: list[str] = []
+    _record_compose(monkeypatch, calls)
+
+    assert tasks.task_e2e([]) == 0, "起栈被记录器替身接管后应当正常返回"
+
+    data_up = _index_of_up(calls, tasks.E2E_DATA_SERVICES)
+    migrate = _index_of(calls, "MIGRATE")
+    apps_up = _index_of_up(calls, tasks.E2E_SERVICES)
+
+    assert data_up < migrate < apps_up, (
+        f"顺序不对：{calls}\n"
+        f"建表必须落在『数据层起来之后、app 起来之前』——"
+        f"放到 app 之后会让首个请求先按『表不存在』降级一次"
+    )
+
+
+def test_e2e_refuses_to_start_the_apps_when_migrations_fail(monkeypatch):
+    """迁移失败必须**就此停下**，不能"提示一句然后继续起栈"。
+
+    继续起栈的后果不是红，是绿：app 起来了、探活绿、SSE 收到合法的 error 帧，
+    用例全过，而 agent 链路一次都没跑通。所以这里断言的是"没有起 app"。
+    """
+    calls: list[str] = []
+    _record_compose(monkeypatch, calls, migrate_rc=1)
+
+    rc = tasks.task_e2e([])
+
+    assert rc == 1, "迁移失败时 task_e2e 必须返回非零"
+    assert "MIGRATE" in calls, "连迁移都没尝试，断言会变成空转"
+    assert not any(c.startswith("up -d " + tasks.E2E_SERVICES) for c in calls), (
+        f"迁移失败了却还是起了 app：{calls}\n"
+        f"那会让 SSE 用例收到合法的 `error` 帧并**通过** —— 假绿正是这么来的"
+    )
+    assert not any("pytest" in c for c in calls), "迁移失败后不该再跑用例"
+
+
+def test_migration_step_runs_inside_a_container_not_on_the_host(monkeypatch):
+    """建表用的是**镜像里的** python 与依赖，不是宿主机环境。
+
+    宿主机上没有镜像里那套依赖（psycopg / pgvector / SQLAlchemy），
+    在宿主机上跑 `python -m app.migrations` 会 ImportError；
+    而"用宿主机 python 去连容器内的库"还会因为端口/DSN 不同连不上。
+    """
+    captured: list[str] = []
+    monkeypatch.setattr(tasks, "require", lambda *a, **k: True)
+    monkeypatch.setattr(
+        tasks, "compose", lambda args, extra, **k: captured.append(args) or 0
+    )
+
+    assert tasks._apply_migrations() == 0
+
+    assert len(captured) == 1, f"应当只发一条 compose 命令，实得 {captured}"
+    cmd = captured[0]
+    assert cmd.startswith("run "), (
+        f"必须是 `run`（一次性容器）而不是 `exec`（要求 app 已起）：{cmd!r}"
+    )
+    assert "--entrypoint python" in cmd, f"没有覆盖 entrypoint：{cmd!r}"
+    assert "app-stable" in cmd, f"没有点名服务：{cmd!r}"
+    assert "app.migrations --apply" in cmd, (
+        f"必须是 `--apply`（不是只做预检的 `--status`）：{cmd!r}"
+    )
+    assert "--rm" in cmd, f"少了 `--rm`，一次性容器会堆在宿主机上：{cmd!r}"
+
+
+def test_e2e_data_services_are_a_subset_of_the_e2e_stack():
+    """数据层服务集必须是 E2E 服务集的子集，且都是 compose 里真实的服务名。"""
+    services = _compose()["services"]
+    data = tasks.E2E_DATA_SERVICES.split()
+    assert data, "E2E_DATA_SERVICES 不能为空"
+    assert set(data) <= set(tasks.E2E_SERVICES.split()), (
+        f"数据层 {data} 不在 E2E 服务集 {tasks.E2E_SERVICES} 里"
+    )
+    missing = [s for s in data if s not in services]
+    assert not missing, f"E2E_DATA_SERVICES 里这些不是 compose 的服务名：{missing}"

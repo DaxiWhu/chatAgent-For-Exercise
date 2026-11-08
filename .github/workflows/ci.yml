@@ -679,7 +679,13 @@ jobs:
           done
           echo "[e2e] .env 就绪：要求鉴权 + 服务账号 svc-e2e + 三个随机口令（都不落仓库）"
 
-      # 一条命令包办：构建 → 起栈 → 等就绪 → 跑检查 → 失败时打印容器日志 → 收栈
+      # 一条命令包办：构建 → 起数据层 → 建表 → 起栈 → 等就绪 → 跑检查 → 失败时打印容器日志 → 收栈
+      #
+      # 「建表」这一步不能省（2026-11-07 第七次真跑才发现漏了）：
+      # `agent_runs` / `agent_messages` / `agent_memories` / `agent_history_compactions`
+      # 四张表没有任何模块会在首次写入时自建，DDL 的单一出处是 `app/migrations.py`。
+      # 不跑迁移 ⇒ 每个 chat 请求都 `psycopg.errors.UndefinedTable`，而 SSE 用例
+      # 按设计接受 `error` 事件 ⇒ **整条链路一次都没跑通，用例却是绿的**。
       - name: 起栈并跑端到端检查
         run: python scripts/tasks.py e2e --build
 

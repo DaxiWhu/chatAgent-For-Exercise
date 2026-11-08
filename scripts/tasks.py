@@ -93,6 +93,8 @@ DRILL_STEPS: tuple[tuple[str, str], ...] = (
 # 对这里的检查没有贡献，却会明显拖慢启动、占用内存，还可能因为缺配置而起不来 ——
 # 那会让"E2E 失败"看起来像是业务代码坏了。
 E2E_SERVICES = "pgvector qdrant redis app-stable app-canary nginx"
+#: 其中的数据层单独起一次，好在"库起来"与"app 起来"之间插一步建表。
+E2E_DATA_SERVICES = "pgvector qdrant redis"
 E2E_DEFAULT_BASE = "http://127.0.0.1:8080"
 
 
@@ -383,12 +385,39 @@ def _seen_releases(base: str, timeout: float, want: int = 2) -> set[str]:
     return seen
 
 
+def _apply_migrations() -> int:
+    """在**数据层已起、app 还没起**的窗口里建表，返回退出码。
+
+    为什么用 `compose run` 而不是 `compose exec app-stable`：后者要求 app 已经起来，
+    而"表没建就先把 app 起起来"正是要避免的（那一刻起的 app 会按"表不存在"降级，
+    且部分降级是**进程内一次性的**，之后再建表也不会自动补回来）。
+
+    为什么**不用** `--no-deps` 之外的花样：`run` 默认会把依赖一起拉起来，那会把
+    刚起好的数据层再走一遍健康等待；`--no-deps` 让这一步只做一件事。
+
+    `-m app.migrations --apply` 在 `--entrypoint python` 之后是**命令参数**，
+    不会被 docker 当成自己的选项（`compose run <svc> python -m ...` 是常规用法）。
+    `--apply` 结束时还会跑一次 `status`，结构仍有问题就返回非零 —— 所以这一个
+    退出码同时覆盖"没建成"与"建了但不完整"。
+
+    `-T`（不分配伪终端）在 CI 里是必须的：默认会尝试分配 TTY，非交互环境下
+    要么报 `the input device is not a TTY`，要么把 python 的输出塞进伪终端控制符里。
+    """
+    return compose(
+        "run --rm -T --no-deps --entrypoint python app-stable -m app.migrations --apply",
+        [],
+    )
+
+
 def task_e2e(args: list[str]) -> int:
-    """端到端检查：起真实栈 → 等就绪 → 跑 `tests/test_e2e_stack.py` → 收栈。
+    """端到端检查：起数据层 → **建表** → 起真实栈 → 等就绪 → 跑用例 → 收栈。
 
     ⚠️ 需要 docker，并会占用 8080（nginx）等端口。跑完**默认收栈**；
     要保留现场排障就加 `--keep`。
     检查内容见 `tests/test_e2e_stack.py` 的模块文档（SSE 分帧 / 灰度权重 / 持久化检查点）。
+
+    建表那一步不是"顺手加的"：它是真实部署里的必要步骤，而漏掉它的后果是**假绿**
+    —— 缺表的 chat 请求仍会回一个合法的 `error` 帧，用例照过（见 `_apply_migrations`）。
     """
     if not require(
         "docker",
@@ -423,6 +452,44 @@ def task_e2e(args: list[str]) -> int:
             print("[e2e] ✗ 镜像构建失败（这一步与『起栈失败』分开报，便于定位）",
                   file=sys.stderr, flush=True)
             return 1
+
+    # `--wait` 不是可选的美化：`up -d` 只保证"容器已创建"，不等健康检查。
+    # 紧接着的建表是**一次性容器**（`--no-deps`，不替我们等），库还没 accept 连接时
+    # 它会直接 `connection refused` ⇒ 整条 e2e 在"库没起来"上失败，
+    # 而日志里写的是迁移失败 —— 排查方向会被带到错误的地方。
+    print(f"[e2e] 起数据层：{E2E_DATA_SERVICES}（等健康检查）", flush=True)
+    if compose(f"up -d --wait --wait-timeout 180 {E2E_DATA_SERVICES}", []) != 0:
+        print("[e2e] ✗ 数据层没能在 180s 内就绪。逐个看：",
+              file=sys.stderr, flush=True)
+        compose(f"ps {E2E_DATA_SERVICES}", [])
+        return 1
+
+    # 建表必须在 **app 起来之前**（2026-11-07 第七次真跑才补上）
+    # ------------------------------------------------------------------
+    # 这是真实部署里也有的一步（README / RUNBOOK 都写着 `python -m app.migrations --apply`），
+    # 但 `tasks.py e2e` 之前把它漏了。后果不是"红"，而是**假绿**：
+    #
+    #   agent_runs / agent_messages / agent_memories / agent_history_compactions
+    #   这四张表**没有任何模块会在首次写入时自建**（DDL 的单一出处是迁移模块），
+    #   于是每个 chat 请求都在与 LLM 无关的地方炸：
+    #     psycopg.errors.UndefinedTable: relation "agent_runs" does not exist
+    #   `begin()` 把登记失败降级成 warning（设计如此），但随后 agents SDK 取历史
+    #   那步是硬失败 ⇒ 整轮 exit_reason=error。
+    #
+    #   而 SSE 用例按设计接受 `error` 事件（没配真模型时那是唯一合法的流内容），
+    #   所以**整条链路其实一次都没跑通过，用例却全绿**。这是最坏的一种绿。
+    print("[e2e] 建表：python -m app.migrations --apply（app 起来前必须做完）", flush=True)
+    if _apply_migrations() != 0:
+        print(
+            "[e2e] ✗ 迁移没跑成功。缺表的直接后果是每个 chat 请求都 UndefinedTable，"
+            "而 SSE 用例会把 error 帧当成合法帧 ⇒ 用例仍然绿（假绿）。\n"
+            "     先在本地跑 `python -m app.migrations --status` 看缺什么。",
+            file=sys.stderr, flush=True,
+        )
+        compose("logs --tail=40 pgvector", [])
+        if not keep:
+            compose("down", [])
+        return 1
 
     print(f"[e2e] 起栈：{E2E_SERVICES}", flush=True)
     if compose(f"up -d {E2E_SERVICES}", []) != 0:
