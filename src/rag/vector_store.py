@@ -8,8 +8,9 @@
 - 向量规模在百万级以内时，pgvector + HNSW 的性能足够，且不用额外运维一个向量服务。
 
 ⚠️ **服务端前置条件**：数据库必须已安装 `vector` 扩展（`CREATE EXTENSION vector`）。
-本模块会在 `ensure_schema` 里尝试自动创建，但如果连接角色没有超级用户权限，
-需要管理员先手动执行一次。
+本模块会在 `ensure_schema` 里自动创建（`_bootstrap_extension`，走一条**不注册
+vector 类型**的连接 —— 注册那步本身要求扩展已存在，见该方法的说明）；但如果连接
+角色没有超级用户权限，`CREATE EXTENSION` 会失败，需要管理员先手动执行一次。
 
 依赖隔离
 --------
@@ -195,23 +196,51 @@ class PgVectorStore:
         self.tenant = None if tenant is None else str(tenant).strip()
 
     # ---------- 连接 ----------
-    def _connect(self):
-        """建立连接并注册 vector 类型适配器。
+    def _connect(self, *, register: bool = True):
+        """建立连接（默认顺带注册 vector 类型适配器）。
 
         返回 psycopg 连接（调用方用 with 管理）。
 
         延迟导入 psycopg / pgvector：没装时抛 ImportError，由调用方（build_retriever）
         捕获后回退内存后端。`register_vector` 会去查 vector 类型的 OID，
         **扩展没装时这一步就会失败** —— 正好当作"pgvector 不可用"的自然探测点。
+
+        ⚠️ `register=False` 是**给"建扩展"那一步专用的**（见 `_bootstrap_extension`）：
+        那个探测点同时也是"全新库上永远建不出表"的原因 —— 建扩展需要一条**不注册
+        类型**的连接，否则连 `CREATE EXTENSION` 都执行不到就先抛了
+        `ProgrammingError: vector type not found in the database`。
         """
         if not self.dsn:
             raise RuntimeError("未配置 DB_URL，无法使用 pgvector 后端")
         import psycopg
-        from pgvector.psycopg import register_vector
 
         conn = psycopg.connect(self.dsn, connect_timeout=self.connect_timeout)
-        register_vector(conn)
+        if register:
+            from pgvector.psycopg import register_vector
+
+            register_vector(conn)
         return conn
+
+    def _bootstrap_extension(self):
+        """建 `vector` 扩展（幂等）。**必须走不注册类型的连接**。
+
+        为什么单独一步、而不是写在 `ensure_schema` 的建表语句前面：`_connect()`
+        会 `register_vector`，而它要查 vector 类型的 OID ⇒ 扩展没装时它自己先抛。
+        于是"自动建扩展"这句承诺在**全新库**上从未兑现过 —— 只有管理员手动装过
+        扩展的库才走得到建表。2026-11-08 e2e 第一次真跑迁移就撞在这里：
+
+            psycopg.ProgrammingError: vector type not found in the database
+              File "/app/src/rag/vector_store.py", line 213, in _connect
+                register_vector(conn)
+
+        需要超级用户权限（`CREATE EXTENSION` 的固有限制），失败就抛 ——
+        与原来同一口径：上层按"pgvector 不可用"处理，而不是静默降级。
+        """
+        if not self.dsn:
+            raise RuntimeError("未配置 DB_URL，无法使用 pgvector 后端")
+        with self._connect(register=False) as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
     # ---------- 建表 ----------
     def ensure_schema(self, dim):
@@ -221,7 +250,8 @@ class PgVectorStore:
             维度只影响"首次建表"；表已存在时不会改动列定义（改维度要重建表）。
 
         建表用 `IF NOT EXISTS`，索引同理；唯一可能失败的是 `CREATE EXTENSION`
-        需要超级用户权限，失败会抛错并由上层回退/告警。
+        需要超级用户权限，失败会抛错并由上层回退/告警。扩展在
+        `_bootstrap_extension` 里先建好（那里刻意不注册类型，理由见它的说明）。
 
         多租户：表里固定有 `tenant` 列（老表用 ALTER 补上，不影响既有数据）。
         单租户场景该列恒为空串，行为与以前完全一致。
@@ -229,9 +259,9 @@ class PgVectorStore:
         dim = int(dim)
         if dim <= 0:
             raise ValueError("向量维度必须为正整数")
+        self._bootstrap_extension()
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
                 cur.execute(
                     f"CREATE TABLE IF NOT EXISTS {self.table} ("
                     "  id         text PRIMARY KEY,"

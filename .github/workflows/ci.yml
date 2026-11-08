@@ -956,7 +956,14 @@ jobs:
         run: |
           set -eu
           VER=8.18.4
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" \
+          # `--retry` 不是装饰：2026-11-08 那次 `security` 红在
+          #   curl: (22) The requested URL returned error: 504
+          # 上 —— 卡了 2 分钟之后 GitHub 的 release 下载返回 504。全仓库没有一行代码
+          # 变化，门禁却红了。**但也不能把它改成 continue-on-error**：下载失败意味着
+          # "这一次一条都没扫"，那不是"通过"，而是"没查"。所以正确的处置是——
+          # 瞬时 5xx 重试，重试完还失败就照旧红（真·下载不了时门禁必须挡住发布）。
+          curl -sSfL --retry 5 --retry-delay 3 --retry-all-errors \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" \
             | tar -xz gitleaks
           # ⚠️ 扫**全部 git 历史**（2026-10-05 改；此前是 `--no-git`，只扫当前工作树）
           # ----------------------------------------------------------------

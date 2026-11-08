@@ -94,7 +94,7 @@ class _FakeConn:
 def test_ensure_schema_creates_table_and_hnsw_index(monkeypatch):
     store = PgVectorStore("postgresql://u:p@localhost:5432/db", "rag_chunks", "hnsw")
     cur = _FakeCursor()
-    monkeypatch.setattr(store, "_connect", lambda: _FakeConn(cur))
+    monkeypatch.setattr(store, "_connect", lambda **kw: _FakeConn(cur))
 
     store.ensure_schema(1024)
 
@@ -103,6 +103,46 @@ def test_ensure_schema_creates_table_and_hnsw_index(monkeypatch):
     assert "CREATE TABLE IF NOT EXISTS rag_chunks" in joined
     assert "vector(1024)" in joined
     assert "USING hnsw" in joined
+
+
+def test_ensure_schema_bootstraps_the_extension_before_registering_the_type(monkeypatch):
+    """全新库上 `register_vector` 会先失败 ⇒ 建扩展必须走**不注册类型**的连接。
+
+    真实报错（2026-11-08 e2e 第一次真跑迁移，v1 就死在这里）：
+
+        psycopg.ProgrammingError: vector type not found in the database
+          File "/app/src/rag/vector_store.py", line 213, in _connect
+            register_vector(conn)
+
+    原因是 `_connect()` 里的 `register_vector` 要查 vector 类型的 OID，而
+    `CREATE EXTENSION` 本来写在它的**下游**（同一个 with 块的建表语句之前）——
+    于是"自动建扩展"在全新库上从未兑现过：只有管理员手动装过扩展的库才走得到建表。
+
+    这里的假连接**按真实行为**模拟：扩展没装时，注册类型那一步直接抛。
+    """
+    state = {"extension": False}
+
+    class _Cur(_FakeCursor):
+        def execute(self, sql, params=None):
+            super().execute(sql, params)
+            if "CREATE EXTENSION" in sql:
+                state["extension"] = True
+
+    cur = _Cur()
+
+    def fake_connect(*, register=True):
+        if register and not state["extension"]:
+            raise RuntimeError("vector type not found in the database")
+        return _FakeConn(cur)
+
+    store = PgVectorStore("postgresql://u:p@localhost:5432/db")
+    monkeypatch.setattr(store, "_connect", fake_connect)
+
+    store.ensure_schema(1024)          # 修复前：这里就抛 RuntimeError
+
+    assert state["extension"] is True, "扩展没被创建 —— 后面的建表语句都在它下游"
+    joined = " ".join(sql for sql, _ in cur.sqls)
+    assert "CREATE TABLE IF NOT EXISTS rag_chunks" in joined, "扩展建好之后仍要建表"
 
 
 def test_ensure_schema_rejects_bad_dim():
@@ -115,7 +155,7 @@ def test_existing_ids_returns_empty_when_table_absent(monkeypatch):
     """表不存在（to_regclass 返回 NULL）时应返回空集，而不是抛错。"""
     store = PgVectorStore("postgresql://u:p@localhost:5432/db")
     cur = _FakeCursor(fetchone_value=(None,))
-    monkeypatch.setattr(store, "_connect", lambda: _FakeConn(cur))
+    monkeypatch.setattr(store, "_connect", lambda **kw: _FakeConn(cur))
 
     assert store.existing_ids() == set()
 

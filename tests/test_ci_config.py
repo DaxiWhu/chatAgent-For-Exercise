@@ -625,6 +625,41 @@ def test_security_advisory_steps_stay_non_gating_until_baselined(ci):
         )
 
 
+def test_gitleaks_download_survives_transient_5xx_but_still_fails_when_it_cannot(ci):
+    """下载 gitleaks 的 curl 必须带重试，**但这一步仍然不许 continue-on-error**。
+
+    2026-11-08 的 `security` 红在
+
+        curl: (22) The requested URL returned error: 504
+
+    —— 卡了两分钟之后 GitHub 的 release 下载返回 504，全仓库一行代码没改。
+    这类红会被当成"网络问题重跑一次"，而真正危险的是它引出的那种"修法"：
+    给这一步加 `continue-on-error`（或者把 `set -eu` 去掉）。那样"下载不到"
+    与"扫过且干净"在 CI 里长得一模一样 —— 门禁从此可以永远绿着什么都不查。
+
+    正确的取舍：瞬时 5xx 重试；重试仍失败就照旧红。
+    """
+    steps = _security_job(ci).get("steps") or []
+    g = [s for s in steps if "gitleaks" in str(s.get("run", "")).lower()]
+    assert g, "security job 里没有密钥扫描步骤"
+    step = g[0]
+    run = str(step.get("run", ""))
+    download = [
+        ln for ln in run.splitlines()
+        if "releases/download" in ln or "curl" in ln
+    ]
+    assert download, f"没找到下载 gitleaks 的那条命令：\n{run}"
+    joined = "\n".join(download)
+    assert "--retry" in joined, (
+        "下载 gitleaks 的 curl 没有重试 —— 一次 504 就会让整条密钥门禁变红，"
+        "而它与代码毫无关系（2026-11-08 实际发生过）"
+    )
+    assert not step.get("continue-on-error"), (
+        "密钥扫描步骤加了 continue-on-error：下载失败/扫描失败都会变成绿，"
+        "而'没扫'与'扫过且干净'必须能被区分 —— 这正是它当初没加这个开关的原因"
+    )
+
+
 def test_gitleaks_config_keeps_default_rules(ci):
     """gitleaks 配置必须**沿用内置规则集**。
 
