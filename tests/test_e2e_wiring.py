@@ -22,6 +22,7 @@ import json
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 from scripts import tasks
@@ -452,3 +453,76 @@ def test_e2e_data_services_are_a_subset_of_the_e2e_stack():
     )
     missing = [s for s in data if s not in services]
     assert not missing, f"E2E_DATA_SERVICES 里这些不是 compose 的服务名：{missing}"
+
+
+# --------------------------------------------------------------------------
+# ⑦ 真模型判据的开关：读 .env 决定，且放宽必须**可见**
+# --------------------------------------------------------------------------
+# 背景（2026-11-08）：`tests/test_e2e_stack.py` 新增了一条用例，要求真收到
+# `token` + `done`。它证明的是"agent 链路真的跑通"，而不是"nginx 不攒帧" ——
+# 后者是旧用例唯一能证明的东西，于是 `UndefinedTable` 那类故障从它眼皮底下过去了。
+#
+# 这条用例能不能跑，取决于栈里有没有真 Key。判断由 `_env_file_has_real_llm_key`
+# 做，所以它错了会有两种后果，都是坏的：
+#   · 判成"有真 Key"而其实是占位符 ⇒ 用例去校验 token/done，模型调不通 ⇒ **每次 CI 都红**；
+#   · 判成"没 Key"而其实有 ⇒ 用例被 skip ⇒ **覆盖悄悄消失**，而 CI 依然是绿的。
+_ENV_PLACEHOLDERS = ["", "your_api_key_here", "sk-xxx", "changeme", '""', "  "]
+
+
+@pytest.mark.parametrize("value", _ENV_PLACEHOLDERS)
+def test_placeholder_keys_are_not_mistaken_for_a_real_model(tmp_path, value):
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"LLM_API_KEY={value}\n", encoding="utf-8")
+
+    assert tasks._env_file_has_real_llm_key(env_file) is False, (
+        f"LLM_API_KEY={value!r} 被当成了真 Key —— e2e 会去校验 token/done，"
+        f"而模型根本调不通，于是每次 CI 都红"
+    )
+
+
+def test_a_real_looking_key_is_recognized(tmp_path):
+    env_file = tmp_path / ".env"
+    # 不用形如真 Key 的字面量：`security` job 的 gitleaks 会把它当成泄露的凭据。
+    fake = "sk-" + "0" * 32
+    env_file.write_text(
+        f"LLM_MODEL=deepseek-chat\nLLM_API_KEY={fake}\n",
+        encoding="utf-8",
+    )
+
+    assert tasks._env_file_has_real_llm_key(env_file) is True, (
+        "真 Key 没被认出来 ⇒『链路跑通』那条用例会被 skip，覆盖悄悄消失"
+    )
+
+
+def test_a_missing_env_file_reads_as_no_real_model(tmp_path):
+    """没有 `.env` 时不该抛，也不该假定有 Key。"""
+    assert tasks._env_file_has_real_llm_key(tmp_path / "absent.env") is False
+
+
+def test_e2e_marks_the_llm_case_as_skipped_when_the_key_is_a_placeholder(monkeypatch, capsys):
+    """占位符 Key ⇒ 交给 pytest 的是 `E2E_EXPECT_LLM=0`，且**在 stderr 里说明**。
+
+    只设变量不吭声是不行的：CI 依旧是绿，没人会去看"少跑了一条"。
+    警告里必须出现 `skip` 与缺的那个 secret 名 —— 让人一眼知道"这不是通过，是没覆盖"。
+    """
+    calls: list[str] = []
+    _record_compose(monkeypatch, calls)
+    monkeypatch.setattr(tasks, "_env_file_has_real_llm_key", lambda *a, **k: False)
+
+    seen_env: dict[str, str] = {}
+    monkeypatch.setattr(
+        tasks, "run",
+        lambda cmd, *, env=None: seen_env.update(env or {}) or 0,
+    )
+
+    assert tasks.task_e2e([]) == 0
+
+    assert seen_env.get("E2E_EXPECT_LLM") == "0", (
+        f"传给 pytest 的 E2E_EXPECT_LLM 是 {seen_env.get('E2E_EXPECT_LLM')!r} —— "
+        f"占位符环境下那条用例会去校验 token/done 并直接红"
+    )
+    err = capsys.readouterr().err
+    assert "skip" in err, f"没有说明『用例会 skip』：{err[-400:]!r}"
+    assert "DEEPSEEK_API_KEY" in err, (
+        f"没告诉人缺哪个 secret —— 只说『没 Key』的话，没人知道该去配什么：{err[-400:]!r}"
+    )

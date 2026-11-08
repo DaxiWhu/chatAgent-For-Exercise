@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -54,6 +55,18 @@ USER = (os.getenv("E2E_USER") or os.getenv(script_auth.USER_ENV) or "").strip()
 PASSWORD = (os.getenv("E2E_PASSWORD") or os.getenv(script_auth.PASSWORD_ENV) or "").strip()
 SAMPLES = int(os.getenv("E2E_SAMPLES", "20"))
 CHAT_TIMEOUT = float(os.getenv("E2E_CHAT_TIMEOUT", "90"))
+
+#: 这个栈是不是接了**真模型**。
+#:
+#: 默认 **开**：本地 `python scripts/tasks.py e2e` 用的是仓库根 `.env`，那里本来就有
+#: 真 Key。默认关的话，"链路到底跑没跑通"这条判据在本地也永远不执行 —— 而它恰恰是
+#: 这份文件最该守住的东西。
+#:
+#: 关掉必须是**显式动作**（`E2E_EXPECT_LLM=0`），由 `scripts/tasks.py` 在读不到真 Key
+#: 时自动设置，并打印警告。理由见 `test_chat_run_completes_with_token_and_done`。
+EXPECT_LLM = os.getenv("E2E_EXPECT_LLM", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 
 pytestmark = [
     pytest.mark.e2e,
@@ -142,6 +155,58 @@ def _json(path: str, **kw):
         return status, {"_raw": raw[:400].decode("utf-8", "replace")}, headers
 
 
+def _read_sse_events(resp, timeout: float) -> list[tuple[str, str]]:
+    """把一条 SSE 流**读完**，返回 `[(event, data)]`。
+
+    为什么必须读完整条流
+    --------------------
+    `read1` 只能证明"有帧到达"。而 `error` 也是合法帧 ⇒ 只读首帧的话，
+    "模型调用失败"与"nginx 没攒帧"长得一模一样。判"链路跑通"必须看到 `done`，
+    那只能读到流结束。
+
+    为什么要自己解析
+    ----------------
+    标准库没有 SSE 解析器，引 `httpx-sse` 又会让 e2e 的最小依赖清单多一项。
+    这里只处理三种行：`event:` / `data:`（支持多行 data）/ 以 `:` 开头的注释行
+    （服务端心跳）。够用，且不引入依赖。
+
+    ⚠️ **没有 data 行的事件也要保留**：`done` 就是这种（服务端 `yield {"event": "done"}`，
+    不带 payload）。按"有 data 才记"的写法写，`done` 会被静默丢掉，
+    于是"流正常收尾"这个判据永远为假 —— 而且报错会指向别处。
+    """
+    events: list[tuple[str, str]] = []
+    name, data_lines, opened = "message", [], False
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        line = resp.readline()
+        if not line:  # EOF
+            break
+        text = line.decode("utf-8", "replace").rstrip("\r\n")
+
+        if not text:  # 空行 = 一帧结束
+            if opened:
+                events.append((name, "\n".join(data_lines)))
+            name, data_lines, opened = "message", [], False
+            continue
+
+        if text.startswith(":"):  # 注释行（心跳），不构成事件
+            continue
+
+        field, _, value = text.partition(":")
+        if value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            name, opened = value, True
+        elif field == "data":
+            data_lines.append(value)
+            opened = True
+
+    if opened:  # 流在帧中间结束（连接被掐）
+        events.append((name, "\n".join(data_lines)))
+    return events
+
+
 # --------------------------------------------------------------------------
 # ① 探针：经 nginx 打得通，且**真的**探到了依赖
 # --------------------------------------------------------------------------
@@ -209,12 +274,16 @@ def test_protected_endpoint_rejects_unauthenticated_requests():
 # ③ SSE：经 nginx 打，帧必须**一帧一帧地**到达
 # --------------------------------------------------------------------------
 def test_sse_frames_reach_the_client_unbuffered():
-    """验证 SSE 经 nginx 后仍然分帧到达。
+    """验证 SSE 经 nginx 后仍然**分帧**到达 —— 只测分帧，**不测链路**。
 
-    ⚠️ 这条**不需要 LLM Key**：没配 LLM 时服务会立刻回一个 `error` 事件 ——
-    那也是合法的 SSE 帧，同样能证明 nginx 没有破坏分帧、也没有把它攒起来
-    （`proxy_buffering off` 漏写时会攒够一块才转发，本用例会超时）。
-    配了 Key 时走完整链路（token … done）。
+    ⚠️ 这条刻意不要求 LLM：`error` 也是合法 SSE 帧，同样能证明 nginx 没有
+    破坏分帧、也没有把它攒起来（`proxy_buffering off` 漏写时会攒够一块才转发，
+    本用例会超时）。
+
+    但它**证明不了链路跑通**：2026-11-07 那次 e2e 全绿，日志里却有 4 次
+    `UndefinedTable` 与 `agent 链路执行异常`，就是因为当时只有这一条。
+    链路判据是紧随其后的 `test_chat_run_completes_with_token_and_done`
+    —— 两者分工不一样，别把这条当"agent 已覆盖"。
     """
     url = BASE + "/v1/chat"
     body = json.dumps({"thread_id": "e2e-sse-probe", "message": "ping"}).encode("utf-8")
@@ -248,6 +317,77 @@ def test_sse_frames_reach_the_client_unbuffered():
     text = first.decode("utf-8", "replace")
     assert "event:" in text or "data:" in text, (
         f"首块不是 SSE 帧格式：{text[:200]!r} —— 帧格式坏了客户端会静默丢事件"
+    )
+
+
+@pytest.mark.skipif(
+    not EXPECT_LLM,
+    reason=(
+        "这个栈没接真模型（E2E_EXPECT_LLM=0）⇒ 跳过『链路跑通』判据。"
+        "⚠️ 这是 skip 而不是通过：分帧由 test_sse_frames_reach_the_client_unbuffered 单独守。"
+    ),
+)
+def test_chat_run_completes_with_token_and_done():
+    """一轮 chat 必须产出非空 `token`、以 `done` 收尾，且**全程没有 `error`**。
+
+    这是"agent 链路真跑通"的唯一判据，也是这份文件此前缺的那一环：
+    老判据只要求"首帧是合法 SSE 帧"，而 `error` 恰好也是合法帧
+    ⇒ **"调用失败"与"没攒帧"在它眼里长得一样**，最坏的一种绿。
+
+    `ping` 是最省 token 的探针：只要求"模型回了一句话"，**不校内容** ——
+    校内容会把提示词/模型版本的变化变成测试失败，那不是这条要防的东西。
+    """
+    url = BASE + "/v1/chat"
+    thread_id = f"e2e-llm-{os.getpid()}-{int(time.time())}"
+    body = json.dumps({"thread_id": thread_id, "message": "ping"}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers=_headers({"Content-Type": "application/json", "Accept": "text/event-stream"}),
+        method="POST",
+    )
+
+    try:
+        resp = urllib.request.urlopen(req, timeout=CHAT_TIMEOUT)
+    except urllib.error.HTTPError as exc:
+        pytest.fail(f"/v1/chat 返回 {exc.code}：{exc.read()[:300]!r}")
+    except urllib.error.URLError as exc:
+        pytest.fail(f"连不上 {url}：{exc.reason}")
+
+    with resp:
+        ctype = resp.headers.get("Content-Type", "")
+        assert ctype.startswith("text/event-stream"), (
+            f"Content-Type 是 {ctype!r} —— 不是 SSE，客户端不会按流处理"
+        )
+        events = _read_sse_events(resp, CHAT_TIMEOUT)
+
+    kinds = [name for name, _ in events]
+    assert events, (
+        f"{CHAT_TIMEOUT}s 内一帧都没收到 —— 要么 nginx 把流攒住了，"
+        f"要么服务端在读请求体时就卡住了"
+    )
+
+    errors = [data for name, data in events if name == "error"]
+    assert not errors, (
+        "agent 链路没有跑通，服务端回了 error 帧：\n"
+        + "\n".join(f"  · {e}" for e in errors[:3])
+        + f"\n  事件序列：{kinds}\n"
+        "常见成因（按排查顺序）：\n"
+        "  1) LLM_API_KEY 是占位符或已失效 —— 这种情况该让 E2E_EXPECT_LLM=0，"
+        "而不是让这条红；\n"
+        "  2) 迁移没跑，agent_runs / agent_messages 不存在"
+        "（看 app-stable 日志里的 UndefinedTable）；\n"
+        "  3) 模型网关不可达（LLM_API_BASE 写错 / runner 出网被拦）。"
+    )
+
+    tokens = "".join(data for name, data in events if name == "token")
+    assert tokens.strip(), (
+        f"收到 {len(events)} 帧但没有任何 token 内容（事件序列：{kinds}）—— "
+        f"模型没产出任何文字就结束了"
+    )
+    assert events[-1][0] == "done", (
+        f"最后一帧是 {events[-1][0]!r} 而不是 'done'（事件序列：{kinds}）—— "
+        f"流没有正常收尾，客户端会一直等下去"
     )
 
 

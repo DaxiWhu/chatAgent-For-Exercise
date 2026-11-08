@@ -330,6 +330,41 @@ def _has_script_credentials() -> bool:
     )
 
 
+#: `.env.example` 里那个占位符。运维偶尔会换写法，所以判据是"像不像真 Key"
+#: 而不是"等不等于这一个字符串"。
+_PLACEHOLDER_KEYS = frozenset({"your_api_key_here", "sk-xxx", "changeme", "xxx", "todo"})
+
+
+def _env_file_has_real_llm_key(path: Path | None = None) -> bool:
+    """仓库根 `.env` 里的 `LLM_API_KEY` 是不是**真 Key**（不是模板占位符）。
+
+    `scripts/tasks.py e2e` 起栈用的是仓库根 `.env`（compose 的 `env_file`），
+    CI 那边则是把 `.env.example` 复制成 `.env` 再按 secret 覆盖。所以"这个栈有没有
+    真模型"这件事，**看 .env 就知道** —— 不需要再让 workflow 额外传一个开关，
+    那样两处判断迟早会不一致。
+
+    返回 False 时由调用方设 `E2E_EXPECT_LLM=0` 并**打印警告**：跳过"链路跑通"
+    判据必须是显式可见的，不能靠一个默认值悄悄把用例废掉。
+
+    path: 只为可测性暴露。默认读 `ROOT/.env`，测试传临时文件。
+    """
+    target = path or (ROOT / ".env")
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("LLM_API_KEY="):
+            continue
+        value = line.split("=", 1)[1].strip().strip('"').strip("'")
+        if not value or value.lower() in _PLACEHOLDER_KEYS:
+            return False
+        # 真 Key 至少得有点长度；`sk-x` 这种明显是手写的占位
+        return len(value) >= 16
+    return False
+
+
 def _wait_ready(base: str, timeout: float) -> bool:
     """轮询 `/health/live` 直到 200。
 
@@ -520,6 +555,16 @@ def task_e2e(args: list[str]) -> int:
         print(f"[e2e] 两个实例都在线：{sorted(releases)}", flush=True)
 
     env = dict(os.environ, E2E_BASE_URL=base)
+    # "这个栈有没有真模型"由 `.env` 决定（起栈用的就是它），不额外要 workflow 传开关。
+    # 没有真 Key 时**显式关掉**"链路跑通"判据并打警告 —— 那条用例会显示为 skipped，
+    # 而不是悄悄通过。把放宽做成一个可见动作，是这份 e2e 唯一能守住"别假绿"的办法。
+    if _env_file_has_real_llm_key():
+        print("[e2e] 检测到真模型 Key ⇒ 用例会校验 token + done（链路必须真跑通）。", flush=True)
+    else:
+        env["E2E_EXPECT_LLM"] = "0"
+        print("[e2e] ⚠️ .env 里的 LLM_API_KEY 是占位符 ⇒ "
+              "『链路跑通』那条用例会 **skip**（不是通过）。"
+              "它在 CI 里需要 DEEPSEEK_API_KEY secret。", file=sys.stderr, flush=True)
     if _has_script_credentials():
         print("[e2e] 已检测到脚本账号（E2E_USER / AGENT_SCRIPT_USER）⇒ "
               "用例会登录换令牌后带 Bearer 访问。", flush=True)

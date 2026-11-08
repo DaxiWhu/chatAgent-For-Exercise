@@ -1324,3 +1324,55 @@ def test_conftest_loads_without_server_side_dependencies(tmp_path):
 
 
 
+
+
+# --------------------------------------------------------------------------
+# e2e 的真模型：Key 从 secret 来，没有就必须**说出来**
+# --------------------------------------------------------------------------
+def _e2e_env_step(ci_cfg):
+    """e2e 里「准备 .env」那一步（`cp .env.example .env` 所在步骤）。"""
+    for job_name, _job, step in _iter_steps(ci_cfg):
+        if job_name != "e2e":
+            continue
+        if ".env.example" in str(step.get("run", "")):
+            return step
+    return None
+
+
+def test_e2e_job_takes_the_real_model_key_from_a_secret(ci):
+    """e2e 必须能把真模型 Key 注入 `.env`。
+
+    `tests/test_e2e_stack.py::test_chat_run_completes_with_token_and_done` 要真模型，
+    而它跑不跑由这里的一个 secret 决定。两件事必须成对：
+      · 有 secret、没有那条用例 ⇒ 花了钱还是只验了分帧；
+      · 有那条用例、没有 secret ⇒ 永远 skipped，等于没覆盖。
+    """
+    step = _e2e_env_step(ci)
+    assert step is not None, "e2e job 里没找到准备 .env 的步骤"
+
+    env = step.get("env") or {}
+    assert "secrets.DEEPSEEK_API_KEY" in str(env), (
+        f"准备 .env 的步骤没引用 secrets.DEEPSEEK_API_KEY（现在是 {env}）—— "
+        f"没有它『链路跑通』那条用例会一直 skipped"
+    )
+
+    run = str(step.get("run", ""))
+    assert "LLM_API_KEY=${E2E_LLM_KEY}" in run, (
+        "引用了 secret 却没把它写进 .env 的 LLM_API_KEY —— "
+        "服务读的是 .env，不是这一步的环境变量"
+    )
+
+
+def test_e2e_job_says_aloud_when_it_has_no_real_model(ci):
+    """缺 secret 时必须打印说明，不能悄悄退化成「只验分帧」。
+
+    这不是措辞检查，是**可见性**检查：CI 全绿却没人覆盖 agent 主链路，
+    正是 2026-11-07 那类假绿的成因。降级可以，但要留在日志里。
+    """
+    step = _e2e_env_step(ci)
+    assert step is not None, "e2e job 里没找到准备 .env 的步骤"
+    run = str(step.get("run", ""))
+
+    assert "else" in run, "只有『有 Key』的分支 —— 缺 secret 时会静默跳过注入"
+    assert "DEEPSEEK_API_KEY" in run, "没说缺的是哪个 secret，看日志的人不知道该配什么"
+    assert "skip" in run, "没说那条用例会 skip —— 等于把『没覆盖』当成了『通过』"

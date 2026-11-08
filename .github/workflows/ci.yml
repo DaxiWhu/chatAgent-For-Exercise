@@ -604,6 +604,10 @@ jobs:
       #     生产全量口径测试（那会连带关掉 /docs、隐藏错误详情，干扰其它断言）。
       #     生产启动期检查由 `tests/test_identity.py` 的守卫覆盖。
       - name: 准备 .env（含一个 e2e 服务账号）
+        env:
+          # 真模型 Key。只在**这一步的 shell** 里存在：没开 `set -x`，
+          # 日志里不会出现值；也不写进任何持久化位置（.env 除外）。
+          E2E_LLM_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           set -euo pipefail
           cp .env.example .env
@@ -642,6 +646,25 @@ jobs:
           set_pw POSTGRES_PASSWORD "pg-$(openssl rand -hex 16)"
           set_pw REDIS_PASSWORD "redis-$(openssl rand -hex 16)"
           set_pw GRAFANA_PASSWORD "grafana-$(openssl rand -hex 16)"
+
+          # 真模型（2026-11-08）
+          # ------------------------------------------------------------
+          # `tests/test_e2e_stack.py` 现在有一条用例要校验 `token` + `done`，
+          # 它证明的**不是**"nginx 不攒帧"，而是"agent 链路真的跑通"。
+          # 此前只有前者：2026-11-07 的 e2e 全绿，日志里却有 4 次 `UndefinedTable`
+          # 与 `agent 链路执行异常` —— 因为 `error` 也是合法 SSE 帧。
+          #
+          # 没有 Key 时那条会 **skip**（`tasks.py` 读 .env 后自动设 `E2E_EXPECT_LLM=0`），
+          # 不会伪装成通过，但也就等于本 job 没有覆盖 agent 主链路。
+          # 要覆盖：仓库 Settings → Secrets and variables → Actions 加
+          # `DEEPSEEK_API_KEY`（与本地 `.env` 的 `LLM_API_KEY` 同一个值）。
+          if [ -n "${E2E_LLM_KEY:-}" ]; then
+            sed -i "s|^LLM_API_KEY=.*|LLM_API_KEY=${E2E_LLM_KEY}|" .env
+            echo "[e2e] ✓ 已注入真模型 Key ⇒ 会校验 token + done"
+          else
+            echo "⚠️ 没有 DEEPSEEK_API_KEY secret ⇒ 本 job 只验分帧，"
+            echo "   『链路跑通』那条用例会被 skip。这不是通过，是没覆盖。"
+          fi
 
           # 服务账号：**不给角色**（最小权限，与 scripts/script_auth.py 的指引一致）。
           # 密码每次随机、写进 GITHUB_ENV 供后续 pytest 步骤读，不落仓库。
