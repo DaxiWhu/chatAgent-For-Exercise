@@ -1231,7 +1231,14 @@ jobs:
         if: steps.pre.outputs.ok == '1'
         run: |
           set -eu
-          cosign sign --yes "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
+          # ⚠️ 镜像名来自 **pre** 步骤（那里拼 IMAGE 并写进 GITHUB_OUTPUT），
+          # 不是 meta —— meta 只产出 tags / sha_short / digest_tag。
+          # 2026-11-08 首次真跑发布时这里写成了 `steps.meta.outputs.image`，
+          # 拼出来是空串，cosign 报：
+          #   parsing reference: could not parse reference: @sha256:...
+          # 空变量的症状是"引用格式错"，而不是"变量不存在"，很容易误判。
+          # 守卫：test_publish_only_references_outputs_it_declares。
+          cosign sign --yes "${{ steps.pre.outputs.image }}@${{ steps.push.outputs.digest }}"
 
       - name: 附带 SBOM 到签名制品
         if: steps.pre.outputs.ok == '1'
@@ -1240,7 +1247,7 @@ jobs:
           # attach 之后 SBOM 与镜像 digest 绑定；签名已经签在 digest 上，
           # 因此"谁改了 SBOM"同样可被 cosign verify 的证明链发现。
           cosign attach sbom --sbom sbom.spdx.json \
-            "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
+            "${{ steps.pre.outputs.image }}@${{ steps.push.outputs.digest }}"
 
       # ----------------------------------------------------------------
       # 验签：证明"确实签上了、且能被验过"
@@ -1268,8 +1275,8 @@ jobs:
           cosign verify \
             --certificate-identity-regexp "^https://github.com/${{ github.repository }}/\.github/workflows/ci\.yml@" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
-          echo "签名验证通过：${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
+            "${{ steps.pre.outputs.image }}@${{ steps.push.outputs.digest }}"
+          echo "签名验证通过：${{ steps.pre.outputs.image }}@${{ steps.push.outputs.digest }}"
 
       - name: 上传 SBOM
         if: always()

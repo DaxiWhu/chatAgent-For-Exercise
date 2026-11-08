@@ -18,6 +18,7 @@ CI 配置的错误和监控配置一样是**静默的**：YAML 合法、job 显�
 
 from __future__ import annotations
 
+import copy
 import re
 from pathlib import Path
 
@@ -599,6 +600,54 @@ def test_publish_image_path_is_lowercased(ci):
         f"镜像路径没有转小写：ghcr.io/{expr}\n"
         "`github.repository` 是 `DaxiWhu/chatAgent-For-Exercise`（含大写），"
         "registry 会拒绝 —— 发布必然失败，且只在真推送时暴露"
+    )
+
+
+def test_publish_only_references_outputs_it_declares(ci):
+    """每个 `steps.<id>.outputs.<key>` 的 key，必须由那个步骤真的写出来。
+
+    2026-11-08 首次真跑发布时撞上：签名步骤引用 `steps.meta.outputs.image`，
+    而 `image` 是**预检步骤**（`id: pre`）写进 `GITHUB_OUTPUT` 的，meta 只产出
+    tags / sha_short / digest_tag。拼出来是个空串，于是 cosign 报：
+
+        parsing reference: could not parse reference: @sha256:...
+
+    **空变量不会报"变量不存在"**，它拼进字符串之后以"格式错"的形态出现 ——
+    所以这类错只能靠静态核对"引用方"与"产出方"是否对得上，靠读日志基本靠猜。
+    """
+    job = _publish_job(ci)
+    # ⚠️ 先剥掉 shell 注释再扫：解释这个 bug 的注释里就写着
+    # `steps.meta.outputs.image` 这串字面量，直接扫会把说明文字当成引用。
+    # （同一类坑：变异测试打中注释 ⇒ 变异"没生效"却看着像生效了。）
+    clean = copy.deepcopy(job)
+    for step in clean.get("steps") or []:
+        body = step.get("run")
+        if isinstance(body, str):
+            step["run"] = "\n".join(
+                line for line in body.splitlines() if not line.lstrip().startswith("#")
+            )
+    text = yaml.safe_dump(clean, allow_unicode=True)
+
+    declared: dict[str, set[str]] = {}
+    for step in job.get("steps") or []:
+        sid = step.get("id")
+        if not sid:
+            continue
+        body = str(step.get("run") or "")
+        declared[sid] = set(re.findall(r'echo\s+"([A-Za-z0-9_]+)=', body))
+
+    # 由 action 自身提供、脚本里当然看不到的 output
+    from_actions = {("push", "digest")}
+
+    refs = set(re.findall(r"steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)", text))
+    bad = sorted(
+        f"steps.{sid}.outputs.{key}" for sid, key in refs
+        if (sid, key) not in from_actions and key not in declared.get(sid, set())
+    )
+    assert not bad, (
+        "这些 output 引用了不存在的产出：" + "、".join(bad) + "\n"
+        f"各步骤实际写出的 output：{ {k: sorted(v) for k, v in declared.items()} }\n"
+        "空变量不会报错，只会在下游以'格式不对'的形态炸开"
     )
 
 

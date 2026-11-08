@@ -24,7 +24,30 @@
 现在：`on.push` 增加 `tags: ["v*"]`，`publish` 只在 `refs/tags/v*` 触发；
 镜像标签去掉永远不会成立的滚动 `:main`，只留 `sha-<短哈希>` 与版本号。
 
-**② 新增三条守卫**（`tests/test_ci_config.py`）
+**② 首次真跑发布，立刻暴露第二个 bug：镜像仓库名含大写。**
+
+```
+ERROR: invalid tag "ghcr.io/DaxiWhu/chatAgent-For-Exercise:sha-23f8a89c0030":
+repository name must be lowercase
+```
+
+`github.repository` 保留仓库名原始大小写，而 OCI / registry 要求仓库名全小写。
+隐蔽点：`docker build` 本地构建完全正常，只有 `--push` 才校验仓库名 ——
+所以配置审查看不出来，它只会在真发布那一刻让整条链路失败。
+修法：`IMAGE` 拼装处用 `tr` 转小写（唯一出处，所有 tag 由它派生）。
+
+**③ 修完小写后重跑，又暴露第三个 bug：签名步骤引用了不存在的输出。**
+
+```
+cosign sign --yes "@sha256:8d01..."  → parsing reference: could not parse reference
+```
+
+`image` 这个 output 是**预检步骤**（`id: pre`）写出的，`meta` 只产出
+tags / sha_short / digest_tag。写成 `steps.meta.outputs.image` 时展开为空串，
+于是引用变成 `@sha256:...` —— 报错说的是"引用格式错"，不是"变量不存在"，
+这一类空变量错误只能靠静态核对"引用方 vs 产出方"来防。
+
+**④ 新增五条守卫**（`tests/test_ci_config.py`）
 
 - `test_the_workflow_actually_triggers_on_version_tags`：`on.push.tags` 必须覆盖
   `publish` 条件里认的 tag 前缀 —— 这两处各写一套就等于永远不触发；
@@ -34,8 +57,13 @@
   登记的必需检查，必须等于"没有 schedule/dispatch 专属 `if` 的 job 集合"。
   这份名单不在仓库里，改 job 名或新增 job 时两边会静默错开：少一个 ⇒ 漏门禁，
   多一个 ⇒ PR 永久卡在"Waiting for status to be reported"。
+- `test_publish_image_path_is_lowercased`：`IMAGE` 拼装处必须转小写。
+  `docker build` 本地构建不校验仓库名，只有 `--push` 才报错。
+- `test_publish_only_references_outputs_it_declares`：逐个核对
+  `steps.<id>.outputs.<key>` 的 key 是否真的由那个步骤写出（先剥掉 shell 注释，
+  否则解释该 bug 的注释文字本身会被当成引用）。
 
-**③ 顺带补一条工作区换行守卫**：`test_workflow_and_compose_files_use_lf_on_disk`。
+**⑤ 顺带补一条工作区换行守卫**：`test_workflow_and_compose_files_use_lf_on_disk`。
 往 `ci.yml` 里插几段注释曾让整份文件在工作区变成 CRLF（1297 行），功能零影响、
 测试全绿，只有 `git status` 一直显示"已修改"。此前只有 `.py` 有这条守卫。
 
