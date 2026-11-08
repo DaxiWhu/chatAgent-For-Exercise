@@ -1160,7 +1160,14 @@ jobs:
         id: pre
         run: |
           set -eu
-          IMAGE="ghcr.io/${{ github.repository }}"
+          # ⚠️ 必须转小写。`github.repository` 保留仓库名的**原始大小写**
+          # （本仓库是 `DaxiWhu/chatAgent-For-Exercise`），而 OCI / registry 的
+          # 仓库名规范要求全小写，docker 会直接拒绝：
+          #   invalid tag "ghcr.io/DaxiWhu/chatAgent-For-Exercise:sha-xxx":
+          #   repository name must be lowercase
+          # 这条只在**真的推送**时才炸，`docker build` 本地构建看不出来。
+          # 2026-11-08 首次真跑发布即撞上（此前该 job 从未被触发过）。
+          IMAGE="ghcr.io/$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           if echo "${{ secrets.GITHUB_TOKEN }}" \
                | docker login ghcr.io -u "${{ github.actor }}" --password-stdin 2>/dev/null; then

@@ -566,7 +566,7 @@ def test_publish_skips_instead_of_failing_without_registry(ci):
 def test_publish_tags_the_image_with_the_commit_sha(ci):
     """镜像标签必须含 commit 短哈希。
 
-    `:main` 是个**会被下一次推送覆盖**的滚动指针，而本项目缺的恰恰是
+    版本号 tag 可以被人重新指向同一个 tag 名，而本项目缺的恰恰是
     "线上跑的到底是哪个 commit"这个可反查性。只有 sha 标签能回答它。
     """
     steps = _publish_job(ci).get("steps") or []
@@ -574,6 +574,32 @@ def test_publish_tags_the_image_with_the_commit_sha(ci):
     assert meta, "发布流程没有从 git 取 commit 短哈希来打标签"
     body = str(meta[0]["run"])
     assert "sha-" in body, "镜像标签里没有 sha- 前缀，无法从标签反查 commit"
+
+
+def test_publish_image_path_is_lowercased(ci):
+    """镜像仓库名必须全小写，而 `github.repository` **保留原始大小写**。
+
+    2026-11-08 首次真跑发布就撞上（此前该 job 从未被触发过）：
+
+        ERROR: invalid tag "ghcr.io/DaxiWhu/chatAgent-For-Exercise:sha-23f8a89c0030":
+        repository name must be lowercase
+
+    这条的隐蔽性在于：`docker build` 本地构建完全正常，只有 `--push` 那一步
+    才校验仓库名 —— 于是"看起来完全正确"的一行拼装能让整条发布链路必然失败，
+    而失败信息藏在 buildx 日志里，不在配置检查能覆盖的范围内。
+    """
+    pre = next((s for s in _publish_steps(ci) if s.get("id") == "pre"), None)
+    assert pre, "找不到 registry 预检步骤（IMAGE 在那里拼装）"
+    body = str(pre["run"])
+    m = re.search(r'IMAGE="ghcr\.io/(.+?)"', body)
+    assert m, "找不到 IMAGE 的拼装处 —— 这段守卫需要跟着改"
+    expr = m.group(1)
+    lowered = ("[:lower:]" in expr) or ("${" in expr and ",," in expr) or (".lower()" in expr)
+    assert lowered, (
+        f"镜像路径没有转小写：ghcr.io/{expr}\n"
+        "`github.repository` 是 `DaxiWhu/chatAgent-For-Exercise`（含大写），"
+        "registry 会拒绝 —— 发布必然失败，且只在真推送时暴露"
+    )
 
 
 def test_publish_builds_with_the_same_args_as_ci(ci):
